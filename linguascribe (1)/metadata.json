@@ -1,0 +1,6 @@
+
+{
+  "name": "LinguaScribe",
+  "description": "An intelligent web application that provides real-time language translation and automatically organizes the translated content into context-aware notes in 500-word chunks, with speech input and UI localization.",
+  "requestFramePermissions": ["microphone"]
+}
