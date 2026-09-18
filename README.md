@@ -88,11 +88,65 @@ Rust 的选择有先例:OpenAI 的 **Codex CLI 已从 TypeScript 重写为 Rust*
 ## 目录
 
 ```
+src/               内核源码(已实现最小可用版本)
+  lib.rs           库入口
+  message.rs       中立消息格式(provider 无关)
+  llm.rs           OpenAI 格式客户端(流式 + 工具调用分片拼接)
+  agent.rs         agent 循环(并行工具调度 + 每轮快照)
+  session.rs       会话与 JSONL 持久化(SessionStore trait)
+  tools/
+    mod.rs         工具注册表(冲突默认 fail loud)
+    base.rs        四个基础工具 read / write / edit / bash
+  main.rs          CLI(交互 / 打印 / JSON 三模式)
 docs/
   SPEC.md          完整规格(所有决策的详细定义)
-src/               内核与插件源码(待建)
+```
+
+## 快速开始
+
+```bash
+# 配置
+export NGU_API_KEY=...
+export NGU_BASE_URL=https://api.b.ai/v1
+export NGU_MODEL=deepseek-v4.1-flash
+
+# 构建(产出单文件原生可执行)
+cargo build --release        # → target/release/ngu
+
+# 三种模式
+ngu                                     # 交互模式
+ngu -p "列出当前目录"                    # 打印模式
+echo "总结这个文件" | ngu --json         # JSON 模式(供其他 agent 调用)
+ngu --session <id> -p "继续"             # 续接会话
+ngu sessions                            # 会话列表
+ngu models                              # 可用模型
 ```
 
 ## 状态
 
-前期准备阶段:规格文档编写中。
+**最小可用内核已实现并通过端到端验证。**
+
+| 已实现 | 说明 |
+|---|---|
+| agent 循环 | 多步循环、**并行工具调度**、每轮配置快照 |
+| 模型客户端 | 仅 OpenAI 格式;流式;工具调用分片拼接;缓存命中统计 |
+| 中立消息格式 | provider 无关,只在请求边界转换 |
+| 四个基础工具 | `read` / `write` / `edit` / `bash`,按 ACI 原则限界输出 |
+| 工具注册表 | 冲突默认 fail loud,覆盖记录可查 |
+| 会话持久化 | JSONL 追加写 + `SessionStore` trait(预留 SQLite 后端) |
+| CLI | 交互 / 打印 / JSON 三模式,可被其他 agent 程序化调用 |
+| 性能可测量 | 每轮返回 `model_ms` / `tools_ms` 时间分解 |
+
+**端到端验证**(`deepseek-v4.1-flash` @ `api.b.ai`):
+
+| 验证项 | 结果 |
+|---|---|
+| 工具调用 | ✅ 模型正确调用 `read`,参数与结果回灌正常 |
+| 多步循环 | ✅ 最多 4 步完成写→改→读链路 |
+| **并行调度** | ✅ 一轮请求 3 个工具并发执行,总耗时 53 ms |
+| 会话续接 | ✅ 跨进程记住上下文("42") |
+| **KV cache 命中** | ✅ `cached=768/1664`,续接会话时 `in=33 cached=768` |
+| 文件落盘 | ✅ `write` + `edit` 后文件实际内容为 `hi kernel` |
+| 管道 / JSON 调用 | ✅ `echo ... \| ngu --json` 返回结构化结果 |
+
+**待实现**:插件机制(隔离域 / epoch / effect)、热加载(`apply_change`)、缓存策略档位、上下文注入引擎、动态加载层(Yellow)、工作区 git 快照、权限接口。

@@ -241,6 +241,98 @@ Rust 的 RAII 让这件事比 JS 更干净:disposer 是 `Box<dyn FnOnce()>` 或�
 
 **预估规模:600~900 行 Rust**(比 TS 版略多,因为要显式处理所有权与生命周期)。
 
+### 2.6 权限接口:内核只提供检查点
+
+**内核不设访问权限,但把"权限检查"做成接口供插件使用。**
+
+```
+内核提供:权限检查点(接口)
+   ↓
+插件实现:沙箱插件 / 只读模式插件 / 审批插件 / 企业策略插件
+   ↓
+聚合规则:保守优先(deny wins)
+```
+
+```rust
+// 内核侧:只提供注册与检查,不含任何策略
+kernel.permissions().register_provider(provider);   // 插件注册
+kernel.permissions().check(action, ctx).await       // 内核在关键点调用
+```
+
+**检查点位置**:工具执行前、文件读写前、命令执行前、网络请求前、热加载应用前。
+
+**聚合必须是"收集式 + deny wins"**:
+
+- **收集式**:顺序无关,只是聚合
+- **deny wins**:任何 provider 说 deny,结果就是 deny;全都没有意见才放行
+
+**这是硬规则**:把权限检查做成管道式(顺序相关)会让插件加载顺序影响安全结论,是致命缺陷。
+
+### 2.7 冲突处理:默认 fail loud
+
+冲突有三种形态,分别处理:
+
+| 形态 | 处理 |
+|---|---|
+| **服务名冲突** | 同隔离域内第二次 `provide` 同名服务 → **报错**;不同域互不干扰 |
+| **工具名冲突** | 按贡献声明的策略处理(见下) |
+| **资源竞争** | 共享池 + 引用计数(见 5.4) |
+
+工具注册的冲突策略:
+
+```rust
+kernel.tools().register(ToolDef {
+    name: "search",
+    conflict: Conflict::Error,        // 默认:冲突即报错
+    // Conflict::Override,            // 覆盖,但记录被覆盖者
+    // Conflict::Priority(10),        // 高优先级胜出
+    // Conflict::Namespaced,          // 自动加插件前缀
+});
+```
+
+**默认必须是 `Error`**。静默覆盖是插件系统最危险的失败模式:一个插件悄悄替换了另一个插件的安全检查,不留任何痕迹。
+
+**不用"默认加前缀"的原因**:工具名会进入模型上下文,`websearch__search` 这类前缀污染 prompt、浪费 token。命名空间只在显式要求时使用。
+
+**冲突必须可查询**:
+
+```rust
+kernel.tools().owners("search")      // 谁注册了 search
+kernel.tools().overrides()           // 哪些被覆盖了、被谁
+kernel.services().conflicts()        // 服务注册冲突记录
+```
+
+### 2.8 顺序控制:加载顺序与执行顺序
+
+**加载顺序 = 依赖图自动排序**,优先级明确:
+
+| 优先级 | 机制 | 用途 |
+|---|---|---|
+| 1(最高) | `after` / `before` / `inject` | 有真实依赖必须遵守 |
+| 2 | `stages` 阶段 | 粗粒度分组 |
+| 3 | `order` 数值 | 阶段内精细排序 |
+| 4(兜底) | 注册顺序 | 稳定排序,保证可复现 |
+
+- 依赖关系**压倒一切**——`order` 再小也不能违反 `after`
+- **循环依赖 → 报错**,并指出环
+- 同层 `order` 相同 → 按名称排序(保证确定性)
+
+**执行顺序按场景区分,且必须分清两类语义**:
+
+| 场景 | 机制 | 语义 |
+|---|---|---|
+| 事件监听器 | 优先级 + 注册顺序(稳定排序) | 收集式 |
+| 提示词段 | `order` 数值(先 order 升序,同号按名称) | 管道式 |
+| 工具调用前后钩子 | 显式 stage 数值 | 管道式 |
+| 权限检查 | **顺序无关**,deny wins | 收集式 |
+| 工具同名冲突 | 冲突策略决定 | — |
+
+**管道式(pipeline)**:有明确先后,前一个的输出是后一个的输入——顺序**有语义**,必须可控。
+
+**收集式(collection)**:顺序无关,只是聚合——顺序**无意义**,不得依赖。
+
+**分不清这两类就会出 bug**:把权限检查做成管道式,插件加载顺序就会影响安全结论。
+
 ---
 
 ## 3. 热加载
@@ -412,6 +504,84 @@ KV cache 是**前缀缓存**:前缀中任一 token 变化,从该位置起全部�
 ### 4.7 物理限制(诚实记录)
 
 换 provider / model 时,**缓存必然从头开始**——不同模型的缓存空间不共享。换 API 这个动作本身就该被理解为"牺牲一次缓存"。
+
+### 4.8 上下文注入引擎
+
+机制参考 SillyTavern 的 World Info(`I:\SillyTavern\public\scripts\world-info.js`,5605 行),按 agent 场景改造。它解决的问题是:**在有限上下文里,动态决定注入什么内容、注入到哪里。**
+
+#### 条目结构
+
+每个可注入条目带以下控制维度:
+
+| 维度 | 作用 |
+|---|---|
+| `constant` | 常驻:不靠触发条件,始终激活 |
+| `triggers` | 触发条件(关键词 / 路径 / 工具名) |
+| `selective` | 多条件逻辑组合 |
+| `position` | 注入位置(见下) |
+| `depth` | 注入深度(历史第 n 层) |
+| `role` | 以什么角色注入(system / user / assistant) |
+| `order` | 排序 |
+| `group` / `group_weight` | 分组竞争 |
+| `scan_depth` | 只在最近 n 条消息里匹配 |
+| `delay_until_recursion` | 延迟到第 n 层递归才可用 |
+| `prevent_recursion` | 本条目不触发递归 |
+| `ignore_budget` | 不受预算限制 |
+| `enabled` | 启用开关 |
+
+#### 预算机制:按上下文百分比
+
+```
+budget = round(budget_percent × max_context / 100)      // 默认 25%
+if budget_cap > 0 and budget > budget_cap: budget = budget_cap
+```
+
+- 预算是**上下文的百分比**——自动适应不同模型的窗口大小
+- 另有绝对上限 `cap`
+- 累计内容超预算 → **停止激活新条目**(已激活的保留),而非硬切断
+- `ignore_budget` 条目**仍可激活**(关键内容可突破预算,如安全策略)
+
+#### 扫描状态机
+
+```
+INITIAL         → 在最近 scan_depth 条消息里匹配
+RECURSION       → 把新激活条目的内容再扫一遍,可能触发更多条目
+MIN_ACTIVATIONS → 激活数不足时,加深扫描范围再来一轮
+NONE            → 结束
+```
+
+**递归激活**是本机制的核心价值:激活的内容成为新的匹配源。对 agent 的用途是**上下文自我扩展**——读到某个文件后自动注入相关文档或技能。
+
+#### 插入位置(与缓存策略联动)
+
+```
+prefix              提示词前缀区(破坏缓存)
+history_head        历史开头
+at_depth(n)         历史第 n 层 ← 关键:不破坏前缀
+history_tail        历史末尾(追加,不破坏前缀)
+```
+
+**`at_depth` + `role` 是保持前缀稳定的主要手段**:把动态内容作为消息插入历史深处,而不是改写前缀。
+
+**与第 4 章档位联动**:
+
+| 缓存档位 | 注入到前缀区 | 注入到历史深处 |
+|---|---|---|
+| `Freshness` | 允许 | 允许 |
+| `Balanced` | 仅在无历史深处位置可用时 | 优先 |
+| `CacheFirst` | **拒绝**,改用历史深处 | 允许 |
+
+#### 分组竞争
+
+同组条目**只选一个**(按 `group_weight` 加权)。对 agent 的用途:**多个相似技能只加载一个**,省预算、避免重复。
+
+#### 与 SillyTavern 的差异(必须改造的地方)
+
+| SillyTavern | Nguruvilu | 理由 |
+|---|---|---|
+| `probability` 随机激活 | **移除**,改为确定性排序 | 随机会让同一输入产生不同上下文,破坏可复现性,且与缓存策略冲突(每次激活不同内容 → 前缀不稳定) |
+| 内嵌世界书(角色卡) | 不采用 | 内嵌不利于去重与版本管理;走 Yellow 的引用式设计 |
+| 面向角色扮演 | 面向任务 | 触发条件从"关键词"扩展到"路径 / 工具名 / 任务状态" |
 
 ---
 
@@ -689,7 +859,97 @@ HTTP 客户端必须复用连接(keep-alive / 连接池),不得每请求重新�
 
 理念与包格式**原样保留**:纯引用清单(只存地址 + 版本 + sha1,零内容)、哈希去重、安装台账、版本兼容声明、组件协议标注。
 
-### 10.4 对接点(内核需要提供)
+### 10.4 装配清单:`assembly.yaml`
+
+整合包必须能声明"**怎么装配**"——顺序、配置、依赖、失败策略。平铺的插件列表不够,因此新增 `assembly.yaml`,取代原来的 `plugins.json`,并**统一管理插件 / MCP / 技能**(三者平级)。
+
+```yaml
+version: 1
+
+# 默认策略(可被单个条目覆盖)
+defaults:
+  scope: session          # session | global
+  conflict: error         # error | override | priority(n) | namespaced
+  on_failure: abort       # abort | skip | retry
+  load: eager             # eager | lazy
+
+# 加载阶段:按阶段顺序执行;阶段内按 依赖 → order → 注册顺序
+stages:
+  - name: foundation
+    plugins:
+      - id: fs-tools
+        source: "npm:@dshd/fs-tools@^1.2"
+        order: 10
+      - id: shell-tools
+        source: "npm:@dshd/shell-tools@^1.0"
+        order: 20
+
+  - name: services
+    plugins:
+      - id: compaction
+        source: "npm:@dshd/compaction@^0.5"
+        order: 10
+        config:
+          threshold_tokens: 150000
+          keep_recent_turns: 20
+      - id: mcp-client
+        source: "npm:@dshd/mcp-client@^1.0"
+        order: 20
+        after: [compaction]
+
+  - name: extensions
+    plugins:
+      - id: search
+        source: "npm:@dshd/search@^2.0"
+        order: 10
+        on_failure: skip
+      - id: computer-use
+        source: "subprocess:./plugins/computer-use.js"
+        order: 20
+        on_failure: skip
+        platform: [win32, darwin]
+    mcp:
+      - id: github-mcp
+        transport: stdio
+        command: npx
+        args: ["-y", "@modelcontextprotocol/server-github"]
+        order: 10
+        after: [mcp-client]
+    skills:
+      - id: pdf-tools
+        source: "github:owner/repo@skills/pdf@v1"
+        sha1: "…"
+        order: 10
+
+teardown:
+  reverse_stages: true
+```
+
+**条目字段**:
+
+| 字段 | 作用 |
+|---|---|
+| `source` | 来源:npm / git / 本地 / 子进程 / 包内 |
+| `order` | 阶段内排序 |
+| `after` / `before` | 显式依赖顺序 |
+| `config` | 条目配置 |
+| `scope` | `session`(默认)或 `global`(需用户同意) |
+| `conflict` | 同名冲突策略 |
+| `on_failure` | `abort` / `skip` / `retry` |
+| `load` | `eager` / `lazy` |
+| `platform` | 平台限定 |
+| `requires` | 版本/能力约束 |
+
+**与包内其他文件的关系**:
+
+| 文件 | 变化 |
+|---|---|
+| `dsh.index.json` | 保留(包身份、版本、协议、依赖声明) |
+| `plugins.json` | **被 `assembly.yaml` 取代** |
+| `mcp.json` | 保留,但也可在 `assembly.yaml` 中声明(需要顺序) |
+| `soul.md` / `models.json` / `patches.yaml` / `presets/` | 保留不变 |
+
+### 10.5 对接点(内核需要提供)
 
 | # | Yellow 现在调用 | 内核需要提供 |
 |---|---|---|
@@ -703,7 +963,7 @@ HTTP 客户端必须复用连接(keep-alive / 连接池),不得每请求重新�
 | 8 | `cordis.patch.yml` 补丁合并 | `kernel.patch_composition(rows)` |
 | 9 | `settings.yaml` 的 `llm-pi-ai` 段 | `kernel.set_model_route(route)` |
 
-### 10.5 改造方向
+### 10.6 改造方向
 
 从"写配置文件 + 建新会话"改成"调 `apply_change` 热加载"(作用域默认 `Session`)。
 
@@ -719,6 +979,64 @@ HTTP 客户端必须复用连接(keep-alive / 连接池),不得每请求重新�
 2. **手机端(Blue)改造范围**:多标签 UI 由谁实现
 3. **computer use 的跨平台方案**:原生模块选型与子进程协议
 4. **Yellow 重构范围**:现有 JS 实现是搬为插件,还是用 Rust 重写加载层
+
+---
+
+## 12. CLI 接口
+
+`ngu` 是内核的参考前端,同时是**其他 agent 调用内核的契约**。
+
+### 12.1 三种模式
+
+| 模式 | 触发 | 用途 |
+|---|---|---|
+| **交互** | 无 `-p`,stdin 是终端 | 人工使用(REPL) |
+| **打印** | `-p "<prompt>"`,或 stdin 非终端 | 脚本、管道 |
+| **JSON** | 追加 `--json` | **其他 agent 程序化调用** |
+
+```bash
+ngu -p "列出当前目录"                      # 打印模式
+echo "总结这个文件" | ngu --json           # 管道 + JSON
+ngu --session <id> -p "继续"               # 继续会话
+ngu sessions                               # 列出会话
+ngu models                                 # 列出可用模型
+```
+
+### 12.2 环境变量
+
+| 变量 | 作用 |
+|---|---|
+| `NGU_API_KEY`(或 `OPENAI_API_KEY`) | API key |
+| `NGU_BASE_URL`(或 `OPENAI_BASE_URL`) | API base(含版本段) |
+| `NGU_MODEL` | 模型 id |
+| `NGU_HOME` | 会话存储根(默认 `<cwd>/.nguruvilu`) |
+| `NGU_SHELL` | `bash` 工具的 shell(默认 Windows 用 PowerShell,其余用 `sh`) |
+
+### 12.3 JSON 输出契约
+
+其他 agent 依赖这个结构,**字段只增不减**:
+
+```json
+{
+  "ok": true,
+  "session_id": "20260918-120000-ab12cd",
+  "text": "最终回答",
+  "steps": 3,
+  "tool_calls": 5,
+  "usage": { "input": 1234, "output": 567, "cached": 900 },
+  "timing": { "model_ms": 2100, "tools_ms": 480 },
+  "messages": [ /* 本轮新增的中立格式消息 */ ]
+}
+```
+
+- `ok` 为 `false` 时进程以非零码退出,错误走 stderr
+- `timing` 是性能硬要求 7.9 的落点:调用方可以据此判断时间花在模型还是工具上
+
+### 12.4 被调用时的约定
+
+- **stdout 只放结果**:进度、工具轨迹一律走 stderr,保证管道可用
+- **退出码**:0 成功,1 失败
+- **会话可续**:`--session <id>` 复用历史,`--new-session` 强制新开
 
 ---
 

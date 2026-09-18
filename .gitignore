@@ -2,10 +2,12 @@
 node_modules/
 dist/
 build/
+target/
 *.tsbuildinfo
 
 # 运行时数据
 .dshd/
+.nguruvilu/
 workspace/
 tmp/
 *.log
