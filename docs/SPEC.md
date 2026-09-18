@@ -1,6 +1,8 @@
-# dshd-core 规格
+# Nguruvilu 规格
 
-本文档是 dshd-core 的**唯一权威规格**。所有实现必须服从本文档;与本文档冲突的代码是错的。
+本文档是 Nguruvilu 的**唯一权威规格**。所有实现必须服从本文档;与本文档冲突的代码是错的。
+
+**Nguruvilu** 是独立 agent 内核,CLI 名 `ngu`,语言 **Rust**。它与 dshd 家族是内核与发行版的关系:内核独立演进,dshd 是使用方之一。
 
 ---
 
@@ -30,7 +32,7 @@
 - 手机远程控制
 - MCP 客户端
 - 技能(skills)
-- 压缩(compaction)——**待定,见第 10 节**
+- **压缩(compaction)** —— 纯插件
 - 审批与权限
 - 沙箱
 - TUI / Web UI
@@ -42,91 +44,103 @@
 
 | 工具 | 参数 | 说明 |
 |---|---|---|
-| `read` | `path`, `startLine?`, `endLine?` | 按行范围读取,返回带行号内容。比 `cat` 省大量 token |
+| `read` | `path`, `start_line?`, `end_line?` | 按行范围读取,返回带行号内容。比 `cat` 省大量 token |
 | `write` | `path`, `content` | 覆盖写入 |
-| `edit` | `path`, `oldStr`, `newStr` | 字符串替换。比 `sed` 可靠(不依赖行号) |
-| `bash` | `command`, `timeout?` | 执行任意 shell 命令,兜底一切 |
+| `edit` | `path`, `old_str`, `new_str` | 字符串替换。比 `sed` 可靠(不依赖行号) |
+| `bash` | `command`, `timeout_ms?` | 执行任意 shell 命令,兜底一切 |
 
-实现参考:Pi 的四个工具合计 443 行(`read` 138 / `write` 41 / `edit` 131 / `bash` 133)。
+设计参考:Pi 的四个工具合计 443 行。
 
 ### 1.4 内核扩展点
 
 内核虽小,但必须暴露以下接口,否则插件无法工作:
 
-```js
+```rust
 // 工具注册
-kernel.tools.register(def)              // def: { name, description, parameters, execute }
-kernel.tools.unregister(name)
+kernel.tools().register(def)?;          // def: ToolDef { name, description, parameters, execute }
+kernel.tools().unregister(name);
 
 // 服务提供与消费(配合隔离,见 2.2)
-kernel.services.provide(name, impl)
-kernel.services.get(name)               // 跨隔离域查找,找不到返回 undefined
+kernel.services().provide::<T>(name, impl)?;
+kernel.services().get::<T>(name) -> Option<Arc<T>>;
 
-// 生命周期事件
-kernel.events.on(event, handler)        // 返回 disposer
-// 事件:turn:start / turn:end / tool:before / tool:after / session:create / plugin:loaded ...
+// 生命周期事件(返回 disposer,自动登记为 effect)
+kernel.events().on(Event::TurnStart, handler)?;
 
 // 会话操作(子代理插件需要)
-kernel.sessions.create(opts) / list() / get(id) / fork(id)
+kernel.sessions().create(opts).await?;
+kernel.sessions().list();
+kernel.sessions().get(id);
+kernel.sessions().fork(id).await?;
 
 // agent 创建(子代理插件需要)
-kernel.agent.spawn(scope)
+kernel.agent().spawn(scope).await?;
 
 // 模型路由(所有插件可能需要)
-kernel.llm.route() / kernel.llm.setRoute(route)
+kernel.llm().route();
+kernel.llm().set_route(route).await?;
 
 // 热加载入口(见第 3 节)
-kernel.applyChange(patch)
+kernel.apply_change(patch).await?;
 ```
+
+事件清单:`TurnStart` / `TurnEnd` / `ToolBefore` / `ToolAfter` / `SessionCreate` / `PluginLoaded` / `RuntimeChanged`。
 
 ---
 
 ## 2. 插件机制
 
-机制来源:Cordis(`vendor/cordis/src/`,MIT)。**抄精简版,不抄全套。**
+设计来源:Cordis(`vendor/cordis/src/`,MIT)。**Rust 实现只能参考设计、重写代码**——Cordis 是 TypeScript,Rust 的所有权模型让实现方式不同(反而更干净)。
 
 ### 2.1 插件形态
 
-```js
-// 三种形态等价,内部统一 resolve 出 callback
-export function apply(ctx, config) { ... }        // 函数
-export default class X { constructor(ctx, config) {} }  // 类
-export default { apply(ctx, config) { ... } }     // 对象
-
-// 元数据
-export const name = 'my-plugin'
-export const inject = ['someService']             // 依赖的服务:不全则等待
-export const provide = ['myService']              // 自己提供的服务
-export const Config = schema                       // 配置校验(可选)
+```rust
+pub trait Plugin: Send + Sync + 'static {
+    fn name(&self) -> &str { "unnamed" }
+    /// 依赖的服务:不全则等待(PENDING)
+    fn inject(&self) -> &[&str] { &[] }
+    /// 自己提供的服务
+    fn provide(&self) -> &[&str] { &[] }
+    /// 配置校验
+    fn validate(&self, config: &Value) -> Result<()> { Ok(()) }
+    /// 插件主体
+    fn apply(&self, ctx: &Context, config: Value) -> Result<()>;
+}
 ```
 
-### 2.2 服务与隔离(realm)——解法乙
+### 2.2 服务与隔离(realm)
 
 **要求:同一进程内,不同会话的服务实例互相隔离。**
 
-实现方式(抄 Cordis,核心极小):
+隔离映射用"可覆盖的 map"表达,而非 JS 的原型链:
 
-```js
-// 隔离映射:服务名 → scope label(Symbol)
-// 用原型链表达:子上下文继承父级映射,可覆盖某个服务名
-function isolate(ctx, name, label) {
-  const shadow = Object.create(ctx[ISOLATE])
-  shadow[name] = label ?? Symbol(name)
-  return extend(ctx, { [ISOLATE]: shadow })
-}
+```rust
+/// 服务名 → realm 标识。子上下文 clone 父级映射,可覆盖单个服务名。
+#[derive(Clone, Default)]
+pub struct RealmMap(HashMap<String, RealmId>);
 
-// 同域判断:一个服务实例只在同标签下可见
-function sameRealm(ctxA, ctxB, name) {
-  return ctxA[ISOLATE][name] === ctxB[ISOLATE][name]
+impl Context {
+    /// 为某个服务名开一个新的隔离域
+    pub fn isolate(&self, name: &str) -> Context {
+        let mut map = self.realm_map.clone();
+        map.0.insert(name.to_string(), RealmId::new());
+        self.extend_with(map)
+    }
 }
 ```
 
-服务注册时,key 不是字符串名,而是**隔离映射算出的 symbol**:
+服务表按 `(服务名, realm 标识)` 存放:
 
-```js
-function serviceKey(ctx, name) {
-  ctx.root[ISOLATE][name] ??= Symbol(name)
-  return ctx[ISOLATE][name]
+```rust
+services: HashMap<(String, RealmId), Arc<dyn Any + Send + Sync>>,
+```
+
+查找时先算 realm 标识,再取实例:
+
+```rust
+fn service_key(ctx: &Context, name: &str) -> (String, RealmId) {
+    let realm = ctx.realm_map.0.get(name).copied().unwrap_or_else(|| ctx.root_realm(name));
+    (name.to_string(), realm)
 }
 ```
 
@@ -138,20 +152,24 @@ function serviceKey(ctx, name) {
 
 **这是"全部热加载"的引擎。** 插件不靠"手动卸载再加载",靠 epoch:
 
-```js
-function refresh(fiber) {
-  let epoch = ''
-  for (const name of Object.keys(fiber.inject)) {
-    const impl = fiber.store[name]
-    if (!impl) { epoch = INACTIVE; break }   // 缺依赖 → 不激活
-    epoch += ':' + impl.fiber.uid            // 把每个依赖的 fiber id 拼进 epoch
-  }
-  setEpoch(fiber, epoch)                      // epoch 变了 → 自动卸载旧的 + 加载新的
+```rust
+fn refresh(&mut self) {
+    let mut epoch = String::new();
+    for name in self.inject.iter() {
+        match self.store.get(name) {
+            // 缺依赖 → 不激活
+            None => { self.set_epoch(Epoch::Inactive); return }
+            // 把每个依赖的 fiber id 拼进 epoch
+            Some(impl_) => epoch.push_str(&format!(":{}", impl_.fiber_id)),
+        }
+    }
+    // epoch 变了 → 自动卸载旧的 + 加载新的
+    self.set_epoch(Epoch::Active(epoch));
 }
 ```
 
 - 依赖的服务被替换 → 新实例 fiber id 不同 → epoch 变 → **自动重载**
-- 依赖消失 → epoch 变 INACTIVE → 自动卸载,进入 PENDING 等待
+- 依赖消失 → epoch 变 Inactive → 自动卸载,进入 Pending 等待
 - 依赖重新出现 → 自动激活
 
 **任何服务的增删替换,沿依赖链自动传播,不需要手写传播代码。**
@@ -160,22 +178,25 @@ function refresh(fiber) {
 
 **所有副作用必须通过 effect 登记**,这是热卸载不残留的唯一保证:
 
-```js
-ctx.effect(() => {
-  const timer = setInterval(...)
-  return () => clearInterval(timer)     // disposer
-}, 'label')
+```rust
+// execute 立即执行,返回的 disposer 被收集
+ctx.effect(|ctx| {
+    let handle = ctx.spawn_timer(Duration::from_secs(10), tick);
+    move || { handle.cancel(); }        // disposer
+})?;
 ```
 
-- `execute` 立即执行,返回的 disposer 被收集
+- 返回的 disposer 被收集到当前 fiber
 - fiber 卸载时**逆序**执行所有 disposer(支持异步,卸载等待完成)
 - 注册服务、监听事件、注册工具、定时器——**全部走 effect**
 
-### 2.5 抄什么、砍什么
+Rust 的 RAII 让这件事比 JS 更干净:disposer 是 `Box<dyn FnOnce()>` 或实现 `Drop` 的守卫对象,所有权明确。
 
-| 从 Cordis 抄 | 说明 |
+### 2.5 参考什么、砍什么
+
+| 参考 Cordis | 说明 |
 |---|---|
-| `isolate()` + 隔离映射 | 核心 4 行 + 查找逻辑 |
+| `isolate()` + 隔离映射 | 核心思路 + 查找逻辑 |
 | Fiber 的 epoch 机制 | 热加载引擎 |
 | effect 撤销体系 | 卸载安全底线 |
 | `provide` / `get` / `notify` | 服务注册与依赖传播 |
@@ -184,11 +205,11 @@ ctx.effect(() => {
 |---|---|
 | Loader(从 cordis.yml 读清单) | 用 Yellow 的包清单代替 |
 | `intercept` 拦截配置 | 无多插件配置合并需求 |
-| HMR 诊断栈(`getOuterStack`、`EffectMeta`) | 第三方插件开发体验,用不到 |
-| `@Inject` 装饰器 | `inject` 数组足够 |
+| HMR 诊断栈 | 第三方插件开发体验,用不到 |
+| 装饰器 | `inject` 数组足够 |
 | 平面划分(host plane / agent plane) | 单进程单用户场景不需要 |
 
-**预估精简版规模:500~700 行。**
+**预估规模:600~900 行 Rust**(比 TS 版略多,因为要显式处理所有权与生命周期)。
 
 ---
 
@@ -198,34 +219,37 @@ ctx.effect(() => {
 
 所有热加载走一个函数,保证可校验、可回滚、可审计:
 
-```js
-async function applyChange(patch) {
-  const backup = snapshotState()
-  try {
-    validate(patch)                  // 校验
-    await apply(patch)               // 应用(可能异步:连 MCP)
-    runtime.version++                // 版本号
-    emit('runtime/changed', patch)   // 通知 UI / 日志
-    if (patch.persist) save(patch)   // 可选落盘
-  } catch (e) {
-    restore(backup)                  // 失败回滚,旧配置原样保留
-    throw e
-  }
+```rust
+pub async fn apply_change(&self, patch: Patch) -> Result<()> {
+    let backup = self.snapshot_state();
+    match self.try_apply(&patch).await {
+        Ok(()) => {
+            self.bump_version();
+            self.emit(Event::RuntimeChanged(patch.clone()));
+            if patch.persist { self.save(&patch)?; }
+            Ok(())
+        }
+        Err(e) => {
+            self.restore(backup);       // 失败回滚,旧配置原样保留
+            Err(e)
+        }
+    }
 }
 ```
 
-**事务性要求**:新配置失败不得破坏旧配置。典型场景——热加载新 MCP 但连不上,必须"先建后换":新连接成功才替换,失败保留旧的继续跑。
+**事务性要求**:新配置失败不得破坏旧配置。典型场景——热加载新 MCP 但连不上,必须"**先建后换**":新连接成功才替换,失败保留旧的继续跑。
 
 ### 3.2 每轮快照
 
 避免竞态的关键。循环每轮开始读一次快照:
 
-```js
-async function runTurn(session, userMsg) {
-  const snap = runtime.snapshot()        // 本轮冻结
-  const tools = [...snap.tools.values()]
-  const route = snap.modelRoute
-  // 整轮使用 snap,不受并发热加载影响
+```rust
+async fn run_turn(&self, session: &Session, user_msg: Message) -> Result<()> {
+    let snap = self.runtime.snapshot();      // 本轮冻结
+    let tools = snap.tools();
+    let route = snap.model_route();
+    // 整轮使用 snap,不受并发热加载影响
+    ...
 }
 ```
 
@@ -233,31 +257,31 @@ async function runTurn(session, userMsg) {
 
 ### 3.3 作用域
 
-```js
-applyChange({ scope: 'session', id, patch })   // 只对该会话生效(默认)
-applyChange({ scope: 'global',      patch })   // 对所有会话生效
+```rust
+kernel.apply_change(Patch::new(..).scope(Scope::Session(session_id))).await?;  // 默认
+kernel.apply_change(Patch::new(..).scope(Scope::Global)).await?;
 ```
 
 | 作用域 | 默认策略 | 说明 |
 |---|---|---|
-| `session` | 无需同意 | 整合包加载走这里,包 A 不污染包 B |
-| `global` | **需要用户同意** | 影响所有会话,含以后新建的 |
+| `Session` | 无需同意 | 整合包加载走这里,包 A 不污染包 B |
+| `Global` | **需要用户同意** | 影响所有会话,含以后新建的 |
 
 ### 3.4 同意逻辑(策略表)
 
-```js
-policy[patch.type] → 'auto-allow' | 'ask' | 'deny'
+```rust
+policy: HashMap<ChangeKind, Consent>   // Consent = AutoAllow | Ask | Deny
 ```
 
 | 变更类别 | 默认策略 |
 |---|---|
-| 会话级任何变更 | `auto-allow`(不打扰) |
-| 全局加技能 / 加 MCP | `ask` |
-| 全局换模型路由(自己换 API) | `ask`(用户可改 auto) |
-| 全局改人设 / 提示词 | `ask` |
-| 全局降权限 / 关沙箱 | **`deny`**(不可自动同意) |
+| 会话级任何变更 | `AutoAllow`(不打扰) |
+| 全局加技能 / 加 MCP | `Ask` |
+| 全局换模型路由(自己换 API) | `Ask`(用户可改 Auto) |
+| 全局改人设 / 提示词 | `Ask` |
+| 全局降权限 / 关沙箱 | **`Deny`**(不可自动同意) |
 
-**`ask` 的交互**:
+**`Ask` 的交互**:
 
 ```
 Agent 请求:全局添加 MCP 服务器「xxx」
@@ -269,7 +293,7 @@ Agent 请求:全局添加 MCP 服务器「xxx」
   [ ] 以后这类变更都自动立即生效
 ```
 
-勾选"以后自动"→ 该类别加入 `auto-allow`,写入用户设置。
+勾选"以后自动"→ 该类别加入 `AutoAllow`,写入用户设置。
 
 ---
 
@@ -288,16 +312,16 @@ Agent 请求:全局添加 MCP 服务器「xxx」
 
 | 档位 | 行为 | 适合 |
 |---|---|---|
-| **新鲜优先** `freshness` | 立即改写 prompt,不管缓存 | 干活要紧 |
-| **平衡** `balanced`(默认) | 能追加就追加,结构性变更才改写 | 默认 |
-| **省钱优先** `cache-first` | 一切走追加,易变内容推后 | 长对话、成本敏感 |
+| **新鲜优先** `Freshness` | 立即改写 prompt,不管缓存 | 干活要紧 |
+| **平衡** `Balanced`(默认) | 能追加就追加,结构性变更才改写 | 默认 |
+| **省钱优先** `CacheFirst` | 一切走追加,易变内容推后 | 长对话、成本敏感 |
 
 **第二层:按类别覆盖**
 
 ```yaml
-cachePolicy:
+cache_policy:
   default: balanced
-  byChange:
+  by_change:
     model-route: freshness      # 换 API 必须立刻生效
     skill: balanced
     persona: freshness
@@ -306,9 +330,9 @@ cachePolicy:
 
 **第三层:单次强制覆盖**
 
-```js
-applyChange({ ..., cachePolicy: 'force-fresh' })   // 这次不管缓存
-applyChange({ ..., cachePolicy: 'defer' })         // 攒到下个会话生效
+```rust
+apply_change(patch.cache_policy(CachePolicy::ForceFresh)).await?;  // 这次不管缓存
+apply_change(patch.cache_policy(CachePolicy::Defer)).await?;       // 攒到下个会话生效
 ```
 
 ### 4.3 追加式 vs 改写式
@@ -322,7 +346,7 @@ KV cache 是**前缀缓存**:前缀中任一 token 变化,从该位置起全部�
 [N+1] user: 新消息
 ```
 
-**追加式**(声明 `systemPromptUpdate: 'in-history'` 时):
+**追加式**(声明 `system_prompt_update: "in-history"` 时):
 ```
 [0] system: 旧提示词     ← 不变,缓存命中
 [1..N] 历史消息           ← 不变,缓存命中
@@ -351,9 +375,9 @@ KV cache 是**前缀缓存**:前缀中任一 token 变化,从该位置起全部�
 "追加式"依赖模型/API 支持**会话历史中的 system 消息**:
 
 - **要探测**:能否在 messages 中间插 system 消息并被正确理解
-- **要可配置**:模型目录里带能力标记(`systemPromptUpdate: 'in-history'`)
+- **要可配置**:模型目录里带能力标记(`system_prompt_update: "in-history"`)
 - **要有回退**:探测失败或报错时自动退回改写式,**不能因此让请求失败**
-- **显式声明,不猜**(照抄 DSH 的做法)
+- **显式声明,不猜**
 
 ### 4.7 物理限制(诚实记录)
 
@@ -373,35 +397,38 @@ KV cache 是**前缀缓存**:前缀中任一 token 变化,从该位置起全部�
 
 ### 5.2 会话配置分层
 
-```js
-// 进程级基线(所有会话共享的起点)
-const base = {
-  tools: Map, mcp: Map, skillDirs: Set, modelRoute: {}, persona: '',
+```rust
+/// 进程级基线(所有会话共享的起点)
+pub struct BaseConfig {
+    tools: ToolSet,
+    mcp: McpSet,
+    skill_dirs: HashSet<PathBuf>,
+    model_route: ModelRoute,
+    persona: String,
 }
 
-// 会话级覆盖(整合包加载到这里,不碰基线)
-const session = {
-  id,
-  overlay: {
-    tools:     { add: Map, remove: Set },
-    mcp:       { add: Map, remove: Set },
-    skillDirs: { add: Set, remove: Set },
-    modelRoute: {...},
-    persona:    '...',
-  },
+/// 会话级覆盖(整合包加载到这里,不碰基线)
+pub struct Overlay {
+    tools: Delta<ToolDef>,
+    mcp: Delta<McpSpec>,
+    skill_dirs: Delta<PathBuf>,
+    model_route: Option<ModelRoute>,
+    persona: Option<String>,
 }
 
-// 生效配置 = 基线 + 覆盖
-function resolve(session) {
-  return {
-    tools: merge(base.tools, session.overlay.tools),
-    mcp:   merge(base.mcp,   session.overlay.mcp),
-    ...
-  }
+/// 生效配置 = 基线 + 覆盖
+impl Session {
+    pub fn resolve(&self, base: &BaseConfig) -> ResolvedConfig {
+        ResolvedConfig {
+            tools: base.tools.merged(&self.overlay.tools),
+            mcp: base.mcp.merged(&self.overlay.mcp),
+            ..
+        }
+    }
 }
 ```
 
-### 5.3 多设备与多标签(方案 C)
+### 5.3 多设备与多标签
 
 **同一部手机可开多个会话(多标签)。**
 
@@ -415,18 +442,18 @@ function resolve(session) {
 需要:
 - **客户端**:会话列表 / 标签切换 UI
 - **服务端**:会话列表 API + 每会话独立配置(天然契合 5.2)
-- **隧道**:多会话共用一条隧道,靠 `sessionId` 区分(现有帧多路复用已支持)
+- **隧道**:多会话共用一条隧道,靠 `session_id` 区分(现有帧多路复用已支持)
 
 ### 5.4 共享资源池
 
 同一进程内,相同资源**只建一份**,按引用计数复用:
 
-```js
-mcpPool: Map<specHash, { conn, refCount: Set<sessionId> }>
-// 会话加入 → refCount.add(id);离开 → refCount.delete(id);空集才真正关闭
+```rust
+mcp_pool: HashMap<SpecHash, Pooled<McpConn>>,
+// Pooled 持有 conn + HashSet<SessionId>;会话加入/离开调整计数;空集才真正关闭
 ```
 
-模型客户端同理:按 `(provider, baseURL, apiKey)` 复用。
+模型客户端同理:按 `(provider, base_url, api_key)` 复用。
 
 ---
 
@@ -434,32 +461,120 @@ mcpPool: Map<specHash, { conn, refCount: Set<sessionId> }>
 
 ### 6.1 只支持 OpenAI 格式
 
-**砍掉多 provider 适配。** 参考对比:Pi 的 `ai` 包 179 文件 / 22.5k 行几乎全在适配 Anthropic / Google / Mistral / Azure / Bedrock 的差异。只做 OpenAI 格式可将其压缩到几百行。
+**砍掉多 provider 适配。** 对比:Pi 的 `ai` 包 179 文件 / 22.5k 行几乎全在适配 Anthropic / Google / Mistral / Azure / Bedrock 的差异。只做 OpenAI 格式可压缩到几百行。
 
 ### 6.2 中立消息格式
 
-**存储用自有中立格式,请求时按当前 provider 转换**(参考 Pi 的 `convertToLlm`,只在 LLM 调用边界转换一次)。
+**存储用自有中立格式,请求时转换**(参考 Pi 的 `convertToLlm`,只在 LLM 调用边界转换一次)。
 
 这是**中途换模型的前提**——历史消息不能绑定某家 provider 的格式。
+
+```rust
+pub enum Message {
+    System { text: String },
+    User { parts: Vec<Part> },
+    Assistant { parts: Vec<Part>, tool_calls: Vec<ToolCall> },
+    ToolResult { call_id: String, content: String },
+}
+
+/// 只在请求边界转换一次
+fn to_openai(messages: &[Message]) -> Vec<OpenAiMessage> { .. }
+```
 
 ### 6.3 能力声明
 
 模型目录携带能力标记,显式声明不猜:
 
-```js
-{
-  id: 'xxx',
-  systemPromptUpdate: 'in-history',   // 可选;存在时值必须精确匹配
-  contextWindow: 128000,
-  maxOutputTokens: 8192,
+```rust
+pub struct ModelInfo {
+    pub id: String,
+    pub system_prompt_update: Option<SystemPromptUpdate>,  // 存在时值必须精确匹配
+    pub context_window: usize,
+    pub max_output_tokens: usize,
 }
 ```
 
 ---
 
-## 7. 插件规划
+## 7. 性能硬要求
 
-### 7.1 两类插件
+**依据:瓶颈不在模型而在框架。** 实测数据——单次 LLM 调用约 800ms,若 agent 总共 15 秒,模型只占约 **5%**;**工具执行占 agent 总请求时间的 35~61%**;上下文膨胀与多步复合造成的延迟常超过模型本身。
+
+因此以下为**硬要求**,不是"优化建议":
+
+### 7.1 工具必须并行调度
+
+模型一轮请求的多个**独立**工具必须同时执行,不得串行等待。串行 5 个工具 × 1 秒 = 5 秒;并行 = 1 秒。
+
+Rust 用 `tokio::join!` / `JoinSet` 实现真并发。
+
+### 7.2 上下文必须增量构建
+
+**不得每轮重新序列化整个历史。** 缓存已构建的请求前缀,只追加新消息。
+
+配套要求:中立消息格式 + 借用式序列化(见 7.4)。
+
+### 7.3 流式输出不得经中间缓冲
+
+模型 token 一到就交给消费端。禁止:批量刷新、跨进程中转、等待完整响应。
+
+### 7.4 零拷贝序列化
+
+序列化优先用借用(`&str` / `Cow`)而非克隆;大工具结果避免深拷贝。
+
+### 7.5 无 GC 停顿
+
+Rust 天然满足。**不得引入会带来全局停顿的运行时**(这条同时排除了"内核用脚本引擎实现"的方案——脚本引擎只能作为插件层)。
+
+### 7.6 连接复用
+
+HTTP 客户端必须复用连接(keep-alive / 连接池),不得每请求重新握手。
+
+### 7.7 工具结果流式处理
+
+大输出(如 `bash` 产生 10MB 日志)必须**边收边处理**(截断/落盘/摘要),不得等全部收完再处理。
+
+### 7.8 prompt 前缀稳定
+
+保持前缀逐字节稳定(见 4.4),使服务端 KV cache 可复用——**服务端少算,首 token 更快**。
+
+### 7.9 每轮开销可测量
+
+内核必须暴露每轮的时间分解:TTFT、模型生成、工具执行、上下文构建、框架自身。**无法测量的开销无法优化。**
+
+---
+
+## 8. 插件规划
+
+### 8.1 插件运行时:三层架构
+
+```
+┌─ 内核(Rust 原生)────────────────────────────┐
+│  会话 / 循环 / 模型(OpenAI) / 工具表          │
+│  四个基础工具 read/write/edit/bash            │
+│  插件机制:隔离域 + 依赖 + 热重载 + 撤销        │
+└──────────────────────────────────────────────┘
+        ↕ 宿主接口
+┌─ 插件运行时(嵌入脚本引擎)────────────────────┐
+│  轻量工具插件:搜索、todo、提示词处理、技能      │
+│  → 热加载天然(重新加载脚本即可,无 ABI 问题)   │
+└──────────────────────────────────────────────┘
+        ↕ JSON-RPC over stdio
+┌─ 子进程插件(任何语言)───────────────────────┐
+│  computer use、MCP 客户端、手机远程控制        │
+│  → 隔离最好、崩溃不影响内核、可用 JS 写        │
+└──────────────────────────────────────────────┘
+```
+
+**分层的理由:**
+
+1. **轻量插件走脚本** → 热加载**天然成立**(重新加载文件即可),完全绕开 Rust 的 ABI/卸载难题
+2. **重活/外部服务走子进程** → computer use、MCP、远程控制本来就需要系统访问或长连接,子进程隔离最好,且可用任意语言写
+3. **内核保持纯 Rust** → 单文件、快、稳
+
+**脚本引擎选型**:待定(见第 11 节)。倾向 QuickJS(`rquickjs`,约 1MB,可静态编译),因为现有 dshd 的 JS 代码可直接复用为插件,且 Pi/DSH 的插件设计可借鉴。
+
+### 8.2 两类插件
 
 | 类型 | 特征 | 例子 |
 |---|---|---|
@@ -468,18 +583,19 @@ mcpPool: Map<specHash, { conn, refCount: Set<sessionId> }>
 
 服务型插件依赖 1.4 的"提供服务"扩展点。
 
-### 7.2 四类首批插件
+### 8.3 首批插件
 
 | 插件 | 类型 | 可行性 | 要点 |
 |---|---|---|---|
 | **搜索** | 工具型 | 完美 | 纯 HTTP,零障碍 |
-| **computer use** | 工具型 | 可行 | 截图 + 鼠标键盘;依赖原生模块,跨平台分别处理 |
-| **子代理** | 工具型 + 服务依赖 | 可行 | 需内核暴露"创建 agent / 会话"接口 |
+| **压缩** | 服务型 | 可行 | 每轮核心路径,需注意 7.2 的增量构建 |
 | **手机远程控制** | **服务型** | 可行 | 需内核支持插件提供网络服务;复用现有 White 隧道 |
+| **子代理** | 工具型 + 服务依赖 | 可行 | 需内核暴露"创建 agent / 会话"接口 |
+| **computer use** | 工具型 | 可行 | 截图 + 鼠标键盘;走子进程插件,跨平台分别处理 |
 
 ---
 
-## 8. 工作区 git 自动快照
+## 9. 工作区 git 自动快照
 
 **内核提供 git 快照服务**(不是 git 全局配置):
 
@@ -499,48 +615,47 @@ mcpPool: Map<specHash, { conn, refCount: Set<sessionId> }>
 
 ---
 
-## 9. Yellow 整合包对接
+## 10. Yellow 整合包对接
 
 Yellow 的理念与包格式**原样保留**(纯引用清单、sha1 去重、台账、版本兼容声明、协议标注),只改**落地层**。
 
 | # | Yellow 现在调用 | 内核需要提供 |
 |---|---|---|
-| 1 | `dsh plugin add <pkg>` | `kernel.loadPlugin(name)` |
-| 2 | `agentPreset.read` | `kernel.readPreset(id)` |
-| 3 | `agentPreset.select` | `kernel.applyPreset(sessionId, id)` |
-| 4 | `session.create` | `kernel.sessions.create({preset})` |
-| 5 | `session.fork` | `kernel.sessions.fork(id)` |
-| 6 | `dsh-skill-filesystem` 的 `customSkillDirs` | `kernel.registerSkillDir(dir)` |
-| 7 | `dsh-mcp-client` 挂载行 | `kernel.addMCPServer(spec)` |
-| 8 | `cordis.patch.yml` 补丁合并 | `kernel.patchComposition(rows)` |
-| 9 | `settings.yaml` 的 `llm-pi-ai` 段 | `kernel.setModelRoute(route)` |
+| 1 | `dsh plugin add <pkg>` | `kernel.load_plugin(name)` |
+| 2 | `agentPreset.read` | `kernel.read_preset(id)` |
+| 3 | `agentPreset.select` | `kernel.apply_preset(session_id, id)` |
+| 4 | `session.create` | `kernel.sessions().create(opts)` |
+| 5 | `session.fork` | `kernel.sessions().fork(id)` |
+| 6 | `dsh-skill-filesystem` 的 `customSkillDirs` | `kernel.register_skill_dir(dir)` |
+| 7 | `dsh-mcp-client` 挂载行 | `kernel.add_mcp_server(spec)` |
+| 8 | `cordis.patch.yml` 补丁合并 | `kernel.patch_composition(rows)` |
+| 9 | `settings.yaml` 的 `llm-pi-ai` 段 | `kernel.set_model_route(route)` |
 
-**改造方向**:从"写配置文件 + 建新会话"改成"调 `applyChange` 热加载"(作用域默认 `session`)。
+**改造方向**:从"写配置文件 + 建新会话"改成"调 `apply_change` 热加载"(作用域默认 `Session`)。
 
 ---
 
-## 10. 待定问题
+## 11. 待定问题
 
-1. **压缩(compaction)是否进内核?**
-   - 进:长对话立即可用,但内核变大
-   - 不进:作为服务型插件,但它是"每轮都要用"的核心路径
-   - 倾向:**作为内置服务**,但通过插件机制挂载(可替换实现)
-2. **会话持久化格式**:JSONL / SQLite / 两者?
-3. **手机端(Blue)改造范围**:多标签 UI 由谁实现
-4. **computer use 的跨平台方案**:原生模块选型
-5. **内核语言**:TypeScript(与参考代码一致)还是其他
+1. **插件运行时脚本引擎**:QuickJS / Rhai / Lua / 纯子进程(见 8.1)
+2. **会话持久化格式**:JSONL / SQLite(vendored)/ JSONL + trait 接口
+3. **异步运行时**:默认 tokio(除非有特殊约束)
+4. **手机端(Blue)改造范围**:多标签 UI 由谁实现
+5. **computer use 的跨平台方案**:原生模块选型与子进程协议
 
 ---
 
 ## 附:实现顺序
 
 1. **内核骨架**:会话 + 循环 + 模型(OpenAI)+ 工具表 + 4 工具
-2. **中立消息格式 + `convertToLlm`**(换 API 的前提,必须一开始就有)
-3. **插件机制**:`isolate` + epoch + effect(500~700 行)
-4. **`applyChange` + 每轮快照 + 作用域 + 同意逻辑**
-5. **缓存策略三档 + prompt 分区**
-6. **会话配置分层 + 共享资源池**
-7. **工作区 git 快照服务**
-8. **插件**:搜索 → 手机远程 → 子代理 → computer use
-9. **Yellow 对接改造**
-10. **UI 与远程**(复用现有隧道 / TUI)
+2. **中立消息格式 + 请求转换**(换 API 的前提,必须一开始就有)
+3. **性能骨架**:并行工具调度 + 增量上下文 + 流式直连(第 7 节是硬要求,不能事后补)
+4. **插件机制**:隔离域 + epoch + effect(600~900 行)
+5. **`apply_change` + 每轮快照 + 作用域 + 同意逻辑**
+6. **缓存策略三档 + prompt 分区**
+7. **会话配置分层 + 共享资源池**
+8. **工作区 git 快照服务**
+9. **插件运行时**:脚本引擎接入 + 子进程协议
+10. **插件**:搜索 → 压缩 → 手机远程 → 子代理 → computer use
+11. **Yellow 对接改造**
+12. **UI 与远程**(复用现有隧道 / TUI)
