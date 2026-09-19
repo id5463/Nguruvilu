@@ -35,6 +35,11 @@ pub enum UserEvent {
 }
 
 fn main() -> anyhow::Result<()> {
+    // WebView2 takes its profile location from the environment. Setting it here
+    // keeps the browser profile out of whatever directory the app was launched
+    // from, which may be read-only.
+    std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", state::data_directory());
+
     // A prompt on the command line is sent as soon as the page is ready. It
     // makes the window scriptable and gives the shell a smoke test that does
     // not depend on someone watching the screen.

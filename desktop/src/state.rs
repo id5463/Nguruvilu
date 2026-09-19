@@ -8,6 +8,7 @@
 //! while agent turns run on a tokio runtime. They meet at one seam — a
 //! [`EventLoopProxy`] carrying JSON to evaluate in the page.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
@@ -123,7 +124,7 @@ impl AppState {
             skills: Mutex::new(skills),
         });
 
-        let store = JsonlStore::open(JsonlStore::default_root())?;
+        let store = JsonlStore::open(sessions_root())?;
 
         // Resume the most recent session when there is one: a desktop app that
         // forgets the conversation on every launch is not much of a desktop app.
@@ -340,6 +341,29 @@ impl AppState {
         ))
         .context("building the model client")
     }
+}
+
+/// Where sessions live for the desktop shell.
+///
+/// Deliberately not the current directory: a windowed app is launched from
+/// wherever its executable happens to sit — a desktop shortcut, a read-only
+/// share, `dist/` — and writing a session store there either litters that
+/// directory or fails outright.
+fn sessions_root() -> PathBuf {
+    if let Ok(home) = std::env::var("NGU_HOME") {
+        if !home.trim().is_empty() {
+            return PathBuf::from(home).join("sessions");
+        }
+    }
+    match Settings::path().parent() {
+        Some(dir) => dir.join("sessions"),
+        None => JsonlStore::default_root(),
+    }
+}
+
+/// Where WebView2 keeps its profile for this app.
+pub fn data_directory() -> PathBuf {
+    sessions_root().parent().map(|dir| dir.join("webview")).unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Streams loop progress into the page.
