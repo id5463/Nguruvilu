@@ -27,6 +27,7 @@ thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 zip = "2"
+libloading = "0.8"
 sha1 = "0.10"
 
 [profile.release]

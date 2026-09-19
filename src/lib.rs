@@ -22,6 +22,7 @@
 pub mod agent;
 pub mod assembly;
 pub mod context;
+pub mod dylib;
 pub mod git;
 pub mod hotreload;
 pub mod ledger;
@@ -38,6 +39,7 @@ pub mod tools;
 pub use agent::{Agent, AgentOutcome};
 pub use assembly::{Assembly, EntryKind, OnFailure, Plan, PlannedStep, Scope};
 pub use context::{Injection, InjectionEngine, InjectionEntry, Position};
+pub use dylib::{DynamicPlugin, HostApi, PluginMeta, ToolSpec, ABI_VERSION};
 pub use git::{GitSnapshot, SnapshotRecord};
 pub use hotreload::{
     AppliedChange, ApplyOutcome, CachePolicy, Change, ChangeKind, ChangePayload, ChangeScope,

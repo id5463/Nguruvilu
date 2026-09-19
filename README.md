@@ -101,6 +101,7 @@ src/
   skills.rs        技能系统(目录扫描 / frontmatter 解析 / 目录注入 / 加载工具)
   mcp.rs           MCP 客户端(stdio,JSON-RPC,并发安全)
   pack.rs          整合包(.dshpack zip:打包 / 校验 / 安装 / 清单)
+  dylib.rs         动态库插件(最小 C ABI + JSON API、ABI 校验、热更新)
   assembly.rs      装配清单(阶段 / 依赖 / order / 平台过滤 / 循环检测)
   ledger.rs        安装台账(哈希去重,原子写)
   loader.rs        动态加载层(插件·MCP·技能三者平级加载 + 回滚)
@@ -162,6 +163,7 @@ ngu models                               # 可用模型
 | 工具注册表 | ✅ | 冲突默认 fail loud,覆盖记录可查 |
 | 会话持久化 | ✅ | JSONL 追加写 + `SessionStore` trait;损坏行容错 |
 | **插件机制** | ✅ | 隔离域(realm)、epoch 自动重载、effect 逆序撤销、依赖等待、失败回滚 |
+| **动态库插件** | ✅ | 最小 C ABI(char* + i32)+ 全 JSON API;ABI 版本校验;库永不卸载;热更新用新文件名 |
 | **权限接口** | ✅ | 收集式 + deny-wins,顺序无关 |
 | **技能系统** | ✅ | 目录扫描、frontmatter、目录注入提示词、按需加载工具 |
 | **MCP** | ✅ | stdio JSON-RPC 客户端,工具自动注册与命名空间隔离 |
@@ -190,6 +192,7 @@ ngu models                               # 可用模型
 
 ## 下一步
 
-* QuickJS 插件运行时接入(脚本插件热加载,插件目前须编译期内核内定义)
+* 子进程插件协议(隔离 + 任意语言 + MCP 生态复用)
+* QuickJS 插件运行时(可选优化:改 JS 文件即生效,免编译)
 * 子进程插件协议(computer use 等重活)
 * 移动端多标签会话(方案 C)

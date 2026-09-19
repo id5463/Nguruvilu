@@ -241,7 +241,46 @@ Rust 的 RAII 让这件事比 JS 更干净:disposer 是 `Box<dyn FnOnce()>` 或�
 
 **预估规模:600~900 行 Rust**(比 TS 版略多,因为要显式处理所有权与生命周期)。
 
-### 2.6 权限接口:内核只提供检查点
+### 2.6 动态库插件:最小 ABI,全 JSON API
+
+Rust 没有稳定 ABI,所以动态库插件**不能**直接导出 Rust 函数——结构体布局、`String` 表示、enum 标签、trait object vtable 都没有承诺。解法不是换语言,而是**把 ABI 面缩到只剩 C 兼容类型**:
+
+| 层面 | 内容 |
+|---|---|
+| **ABI** | 四个导出函数 + 一张 `#[repr(C)]` 函数指针表;穿越边界的只有 `*const c_char`、`i32` 和 `*mut c_void` |
+| **API** | JSON:插件描述、工具定义、每次调用的参数与结果,由 `ABI_VERSION` 版本化 |
+
+插件必须导出的符号:
+
+| 符号 | 作用 |
+|---|---|
+| `ngu_describe() -> *const c_char` | 元数据 JSON(名称、版本、依赖、ABI 版本) |
+| `ngu_init(host: *const HostApi) -> i32` | 接收宿主能力表;非 0 表示拒绝加载 |
+| `ngu_call(tool, args) -> *const c_char` | 全部工具调用,JSON 进 JSON 出 |
+| `ngu_free_string(ptr)` | 释放 `ngu_call` 返回的字符串 |
+| `ngu_shutdown()` | 可选,卸载前的清理 |
+
+宿主能力表(`HostApi`)里的每个字段都是 C 函数指针,并携带一个 `user_data` 不透明指针——这是无捕获的 C 函数找到自己所属插件实例的唯一方式。
+
+**为什么已加载的库永不卸载**:卸载共享库只在"没有任何指针指向它"时安全。插件注册工具时把函数指针交给了宿主,`dlclose` 之后再调用就是 use-after-free。因此**库保持映射到进程结束**。
+
+**热更新怎么做**:加载新版本(不同文件名)→ 把贡献切换到新版 → 旧版保持映射。代价是每次更新泄漏几 MB,换绝对安全。
+
+**静态状态是 per-module 的**:同一文件加载两次共享静态数据(实际只有一个活跃实例);不同文件名的副本各自独立——这正是"热更新用新文件名"可行的原因,也是插件测试必须各自用副本的原因。
+
+**两条插件路线的分工**:
+
+| | 动态库插件 | 子进程插件 |
+|---|---|---|
+| 性能 | 原生,无 IPC | 每次调用有 IPC 往返 |
+| 隔离 | 无,崩溃带走内核 | 进程级隔离 |
+| 语言 | Rust(与内核同语言) | 任意 |
+| 信任要求 | 必须可信 | 可不信任 |
+
+两者不冲突,共用同一套 JSON API。加载来源写作 `dylib:<路径>`(显式声明,绝不从扩展名推断)。
+
+---
+### 2.7 权限接口:内核只提供检查点
 
 **内核不设访问权限,但把"权限检查"做成接口供插件使用。**
 
@@ -268,7 +307,7 @@ kernel.permissions().check(action, ctx).await       // 内核在关键点调用
 
 **这是硬规则**:把权限检查做成管道式(顺序相关)会让插件加载顺序影响安全结论,是致命缺陷。
 
-### 2.7 冲突处理:默认 fail loud
+### 2.8 冲突处理:默认 fail loud
 
 冲突有三种形态,分别处理:
 
@@ -302,7 +341,7 @@ kernel.tools().overrides()           // 哪些被覆盖了、被谁
 kernel.services().conflicts()        // 服务注册冲突记录
 ```
 
-### 2.8 顺序控制:加载顺序与执行顺序
+### 2.9 顺序控制:加载顺序与执行顺序
 
 **加载顺序 = 依赖图自动排序**,优先级明确:
 
@@ -1073,7 +1112,8 @@ ngu models                                 # 列出可用模型
 | 2.2 隔离域 | ✅ | `plugin.rs`:`RealmMap`(含默认 realm)、`(name, realm)` 服务键 |
 | 2.3 epoch | ✅ | `plugin.rs`:`refresh()` 沿依赖图自动重载;依赖消失时 fiber 保留为 Pending |
 | 2.4 effect | ✅ | `plugin.rs`:disposer 逆序执行,卸载清理服务与工具 |
-| 2.6 权限接口 | ✅ | `plugin.rs`:`PermissionStack`,收集式 + deny-wins |
+| 2.6 动态库插件 | ✅ | `dylib.rs`:最小 C ABI(char* + i32)、全 JSON API、ABI 版本校验、库永不卸载、热更新用新文件名 |
+| 2.7 权限接口 | ✅ | `plugin.rs`:`PermissionStack`,收集式 + deny-wins |
 | 2.7 冲突处理 | ✅ | `tools/mod.rs` + `plugin.rs`:默认 fail loud,覆盖记录可查 |
 | 2.8 顺序控制 | ✅ | `assembly.rs`:依赖拓扑 → 阶段 → order → 声明顺序 |
 | 3 热加载 | ✅ | `hotreload.rs`:`apply_change`、每轮快照、作用域、同意策略表 |
@@ -1082,14 +1122,15 @@ ngu models                                 # 列出可用模型
 | 5 多会话与隔离 | ✅ | `plugin.rs` 隔离域 + `loader.rs` 按 scope 选 realm |
 | 6 模型层 | ✅ | `llm.rs` 仅 OpenAI 格式;`message.rs` 中立格式 + 边界转换 |
 | 7 性能硬要求 | ✅ | 并行调度(JoinSet)、增量请求构建、流式直连、时间分解 |
-| 8 插件规划 | ⏳ | 运行时分层已定(内核 Rust + 脚本 + 子进程);QuickJS 接入待做 |
+| 8 插件规划 | ⚠️ | 动态库插件已实现(dylib.rs + examples/demo-plugin);子进程插件协议与 QuickJS 待做 |
 | 9 git 快照 | ✅ | `git.rs`:快照、历史、回滚(含删除快照后新增的文件) |
 | 10 动态加载层 | ✅ | `assembly.rs` + `ledger.rs` + `loader.rs` + `mcp.rs`(技能/MCP/插件平级) |
 | 12 CLI | ✅ | `main.rs`:三运行模式 + 8 个管理子命令 |
 
 **尚未实现**(诚实记录):
 
-- **QuickJS 插件运行时**:插件目前必须是内核内定义的(编译期)。脚本插件热加载是下一步。
+- **子进程插件协议**:动态库插件已能热更新,但没有隔离。需要隔离的插件(computer use、不信任来源)要走子进程,协议待定。
+- **QuickJS 插件运行时**:已降级为可选优化。动态库插件解决了 Rust 插件的热更新问题,QuickJS 只在需要「改 JS 文件立即生效、不编译」时才值得引入。
 - **子进程插件协议**:computer use 等重活插件需要它;MCP 已经走通同一条路。
 - **streamable-http MCP**:声明可解析,但只连 stdio;HTTP 传输会明确报告"未实现"而非静默跳过。
 - **手机端多标签会话**:服务端模型已就绪(会话级隔离 + 作用域),客户端未做。

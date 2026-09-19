@@ -17,9 +17,10 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 
 use crate::assembly::{EntryKind, OnFailure, PlannedStep, Plan, Scope, SkippedEntry, Transport};
+use crate::dylib::DynamicPlugin;
 use crate::ledger::{Ledger, LedgerEntry};
 use crate::mcp::{McpClient, McpSpec};
-use crate::plugin::{Kernel, RealmMap};
+use crate::plugin::{Kernel, Plugin as _, RealmMap};
 use crate::session::now_iso;
 use crate::skills::{register_skill_tool, SkillRegistry};
 use crate::tools::{ConflictPolicy, ToolDef, ToolFuture};
@@ -214,7 +215,20 @@ impl Loader {
     /// would be a security hole rather than a feature. Anything else is
     /// refused with a clear message.
     fn load_plugin(&mut self, step: &PlannedStep) -> Result<Outcome> {
-        let name = plugin_name(&step.source, &step.id);
+        // `dylib:<path>` defines the plugin on the spot by loading a shared
+        // library. This is the only source form that runs native code, so it is
+        // always explicit in the manifest — never inferred from a file
+        // extension.
+        let name = if let Some(raw) = step.source.strip_prefix("dylib:") {
+            let path = self.resolve_source(raw);
+            let plugin = unsafe { DynamicPlugin::load(&path) }
+                .with_context(|| format!("loading dynamic plugin from {}", path.display()))?;
+            let name = plugin.name().to_string();
+            self.kernel.define(Arc::new(plugin));
+            name
+        } else {
+            plugin_name(&step.source, &step.id)
+        };
 
         if self.kernel.plugin(&name).is_none() {
             return Err(anyhow!(
@@ -422,6 +436,25 @@ impl Loader {
         }
         register_skill_tool(self.kernel.tools_mut(), Arc::new(self.skills.clone()))?;
         Ok(())
+    }
+
+    /// Resolve a source path against the pack directory when it is relative.
+    fn resolve_source(&self, raw: &str) -> PathBuf {
+        let candidate = PathBuf::from(raw);
+        if candidate.is_absolute() {
+            return candidate;
+        }
+        match &self.pack_dir {
+            Some(dir) => {
+                let joined = dir.join(&candidate);
+                if joined.exists() {
+                    joined
+                } else {
+                    candidate
+                }
+            }
+            None => candidate,
+        }
     }
 
     /// Resolve the realm for an entry from its scope.
