@@ -113,6 +113,13 @@ docs/
   SPEC.md          完整规格(所有决策的详细定义)
 tests/
   kernel.rs        跨模块集成测试
+  dylib.rs         动态库插件集成测试
+desktop/           桌面应用(独立 crate,产出单文件 exe)
+  src/main.rs      窗口 + 事件循环 + IPC 接线
+  src/state.rs     应用状态与命令处理
+  ui/index.html    三面板界面(编译进 exe)
+examples/
+  demo-plugin/     示例动态库插件(自己定义 ABI)
 ```
 
 ## 快速开始
@@ -150,6 +157,52 @@ ngu runtime                              # 策略表与生效配置
 ngu models                               # 可用模型
 ```
 
+## 桌面应用(单文件 exe)
+
+`desktop/` 是一个**独立 crate**,产出一个 exe:双击即开窗口,**零解压、零外部资源文件**。
+
+| | |
+|---|---|
+| 窗口 | tao(原生窗口,非浏览器) |
+| 渲染 | wry + 系统 WebView2(Win10/11 自带) |
+| 界面 | HTML/CSS/JS,用 `include_str!` 编译进 exe |
+| 产物 | `ngu-desktop.exe` 4.6 MB |
+
+对比 Electron portable(391 MB 自解压包,每次启动解压 2~3 分钟):**4.6 MB,点开即出窗口**。
+
+### 构建与运行
+
+```bash
+cargo build --manifest-path desktop/Cargo.toml --release
+# → desktop/target/release/ngu-desktop.exe
+
+ngu-desktop.exe                             # 打开窗口
+ngu-desktop.exe --prompt "读一下 notes.txt"  # 打开窗口并自动发一条消息
+```
+
+### 界面
+
+| 面板 | 内容 |
+|---|---|
+| 左 | 会话列表:切换 / 删除 / 新建;启动时自动续接最近会话 |
+| 中 | 对话流:流式文本、工具调用卡片、工具结果 |
+| 右 | 运行时(模型 / 缓存策略 / 配置版本 / 插件)、技能、工具表、最近工具输出 |
+| 下 | 输入框(Enter 发送,Shift+Enter 换行)+ 状态栏(步数 / token / 缓存命中 / 耗时) |
+
+界面与内核的分工:窗口和 webview 在 tao 事件循环线程上,agent 轮次在 tokio runtime 上,
+两者只在一处交汇——`UserEvent::ToUi` 把 JSON 送进页面,webview 的 IPC handler 把命令送回来。
+
+### 一个值得记录的坑
+
+`const ipc = ...` 在脚本顶层声明,会与 wry 注入的 `window.ipc` 冲突,抛出**解析期**
+SyntaxError。后果极具迷惑性:
+
+- 窗口正常打开,HTML 完整渲染,`document.scripts.length === 1`
+- 但**整个脚本不执行,包括它的第一行**
+- `window.ngu` 永远是 `undefined`,控制台没有可见报错
+- `node --check` 检测不出来,因为 node 里没有 `window.ipc` 这个预置属性
+
+改名即可(`ui/index.html` 里叫 `toShell`,并留有注释说明原因)。
 ## 状态
 
 **完整架构已实现:125 个测试通过(100 单元 + 25 集成)。**
@@ -173,7 +226,9 @@ ngu models                               # 可用模型
 | **全部热加载** | ✅ | `apply_change` 统一入口、会话/全局作用域、同意策略表、每轮快照 |
 | **上下文注入引擎** | ✅ | 预算百分比+上限、触发、深度注入、分组竞争、递归激活 |
 | **工作区 git 快照** | ✅ | 每轮前后自动提交、历史、回滚(含删除新增文件) |
-| CLI | ✅ | 交互 / 打印 / JSON 三模式 + 8 个管理子命令 |
+| CLI | ✅ | 交互 / 打印 / JSON 三模式 + 12 个管理子命令 |
+| **桌面应用** | ✅ | desktop/:
+gu-desktop.exe 4.6 MB 单文件,tao + wry,界面编译进 exe,三面板 |
 
 ## 端到端验证(`deepseek-v4.1-flash` @ `api.b.ai`)
 
@@ -192,6 +247,7 @@ ngu models                               # 可用模型
 
 ## 下一步
 
+* 服务端 API 层(HTTP/WebSocket)——手机端与 Web 前端的共同前提
 * 子进程插件协议(隔离 + 任意语言 + MCP 生态复用)
 * QuickJS 插件运行时(可选优化:改 JS 文件即生效,免编译)
 * 子进程插件协议(computer use 等重活)
