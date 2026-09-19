@@ -39,6 +39,26 @@
   }
   h2:not(:first-child) { margin-top: 18px; }
 
+/* ---- packages ---- */
+  .pack {
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 7px 9px; margin-bottom: 6px; background: #191d24;
+  }
+  .pack-head { display: flex; align-items: center; gap: 6px; }
+  .pack-name {
+    flex: 1; min-width: 0; font-size: 12px; color: #dbe4f2;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .pack-meta { font-size: 10.5px; color: var(--dim); margin-top: 3px; }
+  .notice {
+    border-radius: 6px; padding: 7px 9px; margin-bottom: 8px;
+    font-size: 11.5px; line-height: 1.5;
+    background: #182420; border: 1px solid #2b4a3a; color: #9fe0bb;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .notice.bad { background: #2a1a1a; border-color: #5a2b2b; color: #f0b0b0; }
+  .hint.tight { margin-top: 4px; }
+
   /* ---- settings ---- */
   .warn {
     background: #2a2118; border: 1px solid #5a4426; color: var(--warn);
@@ -52,7 +72,12 @@
     border: 1px solid var(--line); border-radius: 6px;
     padding: 6px 8px; font: inherit; font-size: 12px;
   }
-  label.field input:focus { outline: none; border-color: #35507a; }
+  label.field input:focus, label.field select:focus { outline: none; border-color: #35507a; }
+  label.field select {
+    width: 100%; background: #1b1f26; color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px 8px; font: inherit; font-size: 12px;
+  }
   .row { display: flex; gap: 6px; align-items: center; }
   button.small {
     padding: 6px 12px; cursor: pointer; font: inherit; font-size: 12px;
@@ -62,6 +87,12 @@
   button.small:hover { background: #2b4c72; }
   button.small.ghost { background: #1d222a; color: #b9c4d4; border-color: var(--line); }
   button.small.ghost:hover { background: #232a34; }
+  button.tiny {
+    font: inherit; font-size: 9.5px; padding: 1px 6px; margin-left: 6px;
+    background: #1d222a; color: #9fb0c6; border: 1px solid var(--line);
+    border-radius: 4px; cursor: pointer; text-transform: none; letter-spacing: 0;
+  }
+  button.tiny:hover { background: #232a34; color: #dbe4f2; }
   .hint { color: var(--dim); font-size: 10.5px; margin-top: 6px; word-break: break-all; line-height: 1.5; }
   .saved { color: var(--ok); font-size: 10.5px; }
 
@@ -204,14 +235,40 @@
         <input id="set-api-key" type="password" placeholder="sk-..." spellcheck="false">
       </label>
       <label class="field">
-        <span class="cap">Model</span>
-        <input id="set-model" placeholder="model-id" spellcheck="false">
+        <span class="cap">Model <button class="tiny" id="btn-fetch-models" type="button">fetch list</button></span>
+        <input id="set-model" list="model-options" placeholder="model-id" spellcheck="false">
+      </label>
+      <datalist id="model-options"></datalist>
+      <label class="field">
+        <span class="cap">Thinking effort</span>
+        <select id="set-effort">
+          <option value="">provider default</option>
+          <option value="none">none &mdash; no thinking</option>
+          <option value="minimal">minimal &mdash; cheapest</option>
+          <option value="low">low</option>
+          <option value="medium">medium</option>
+          <option value="high">high</option>
+          <option value="xhigh">xhigh</option>
+          <option value="max">max &mdash; most thorough</option>
+        </select>
       </label>
       <div class="row">
         <button class="small" id="save-settings">Save</button>
         <span class="saved" id="settings-saved" hidden>saved</span>
       </div>
       <div class="hint" id="settings-path"></div>
+    </div>
+
+    <h2>Packages</h2>
+    <div id="packages">
+      <div class="row" style="flex-wrap: wrap; gap: 4px;">
+        <button class="small" id="btn-install">Install&hellip;</button>
+        <button class="small ghost" id="btn-pack">Pack&hellip;</button>
+        <button class="small ghost" id="btn-verify">Verify&hellip;</button>
+      </div>
+      <div class="hint tight" id="packs-dir"></div>
+      <div id="pack-notice" hidden></div>
+      <div id="pack-list" style="margin-top: 8px;"></div>
     </div>
 
     <h2>Runtime</h2>
@@ -260,9 +317,16 @@ const send = document.getElementById("send");
 const setBaseUrl = document.getElementById("set-base-url");
 const setApiKey = document.getElementById("set-api-key");
 const setModel = document.getElementById("set-model");
+const setEffort = document.getElementById("set-effort");
 const notConfigured = document.getElementById("not-configured");
 const settingsSaved = document.getElementById("settings-saved");
 const settingsPath = document.getElementById("settings-path");
+
+const modelOptions = document.getElementById("model-options");
+
+const packList = document.getElementById("pack-list");
+const packsDir = document.getElementById("packs-dir");
+const packNotice = document.getElementById("pack-notice");
 
 // The assistant turn currently being streamed, if any.
 let live = null;
@@ -384,6 +448,71 @@ function appendUserTurn(text) {
 
 // ---------------------------------------------------------------- panels
 
+/// Show a short result line above the pack list.
+function notice(text, bad) {
+  packNotice.hidden = false;
+  packNotice.className = "notice" + (bad ? " bad" : "");
+  packNotice.textContent = text;
+}
+
+/// Offer the fetched catalog in the Model field.
+function renderModels(list) {
+  modelOptions.replaceChildren();
+  const models = list || [];
+  for (const model of models) {
+    const option = document.createElement("option");
+    option.value = model.id;
+    if (model.owned_by && model.owned_by !== "unknown") option.label = model.owned_by;
+    modelOptions.append(option);
+  }
+  if (models.length === 0) {
+    notice("The endpoint returned no models.", true);
+  } else {
+    notice(
+      "Fetched " + models.length + " models from the endpoint. " +
+      "The Model field now suggests them \u2014 type to filter, or keep your own value.",
+      false
+    );
+  }
+}
+
+/// Render the installed packs, each with its own Apply action.
+function renderPacks(list) {
+  packList.replaceChildren();
+  const packs = (list && list.packs) || [];
+  packsDir.textContent = list && list.dir ? "Installed in " + list.dir : "";
+
+  if (packs.length === 0) {
+    packList.append(el("div", "empty", "No packs installed. Use Install to add one."));
+    return;
+  }
+
+  for (const pack of packs) {
+    const box = el("div", "pack");
+    const head = el("div", "pack-head");
+    head.append(el("span", "pack-name", pack.name + " " + pack.version));
+
+    if (pack.assembly) {
+      const apply = el("button", "small", "Apply");
+      apply.title = "Load this pack's plugins, MCP servers, and skills";
+      apply.addEventListener("click", () => {
+        notice("Applying " + pack.name + " " + pack.version + "\u2026", false);
+        toShell({ cmd: "apply_pack", path: pack.assembly });
+      });
+      head.append(apply);
+    }
+    box.append(head);
+
+    const meta = [
+      pack.license || "no license",
+      pack.assembly ? "assembly yes" : "no assembly",
+    ].join(" \u00b7 ");
+    box.append(el("div", "pack-meta", meta));
+    if (pack.summary) box.append(el("div", "pack-meta", pack.summary));
+    packList.append(box);
+  }
+}
+
 function renderSessions(list) {
   sessionList.replaceChildren();
   for (const s of list || []) {
@@ -415,6 +544,7 @@ function renderSettings(status) {
   if (!settingsDirty) {
     setBaseUrl.value = status.base_url || "";
     setModel.value = status.model || "";
+    setEffort.value = status.reasoning_effort || "";
     // The key is never sent back in full; an empty box means "unchanged".
     setApiKey.value = "";
     setApiKey.placeholder = status.api_key_masked
@@ -451,6 +581,7 @@ function renderStatus(status) {
     ["endpoint", status.base_url || "(not set)"],
     ["key", status.api_key_masked || "(not set)"],
     ["model", status.model],
+    ["thinking", status.reasoning_effort || "(provider default)"],
     ["cache", status.cache_policy],
     ["config v", String(status.config_version)],
     ["plugins", (status.plugins || []).join(", ") || "none"],
@@ -502,6 +633,46 @@ function setBusy(value) {
 window.ngu = {
   receive(event) {
     switch (event.ev) {
+      case "models":
+        renderModels(event.list);
+        break;
+      case "packs":
+        renderPacks(event.list);
+        break;
+      case "pack_installed":
+        notice("Installed " + event.pack.name + " " + event.pack.version + "\n" + event.pack.path, false);
+        break;
+      case "pack_built":
+        notice(
+          "Packed " + event.pack.files + " files \u2192 " + event.pack.archive +
+          (event.pack.has_assembly ? "" : "\nnote: this pack has no assembly.yaml, so it loads nothing yet"),
+          false
+        );
+        break;
+      case "pack_verified": {
+        const report = event.report;
+        const warnings = (report.warnings || []).length;
+        notice(
+          "Verified " + report.name + " " + report.version +
+          " \u00b7 " + report.files + " files \u00b7 " +
+          (report.has_assembly ? "assembly present" : "no assembly") +
+          (warnings ? "\n" + report.warnings.join("\n") : ""),
+          warnings > 0
+        );
+        break;
+      }
+      case "pack_applied": {
+        const loaded = (event.loaded || []).length;
+        const failed = (event.failed || []).length;
+        const skipped = (event.skipped || []).length;
+        let text = "Applied " + loaded + " entries";
+        if (failed) text += " \u00b7 " + failed + " failed";
+        if (skipped) text += " \u00b7 " + skipped + " skipped";
+        for (const entry of event.failed || []) text += "\n" + entry.id + ": " + entry.error;
+        for (const entry of event.skipped || []) text += "\n" + entry.id + ": " + entry.reason;
+        notice(text, failed > 0);
+        break;
+      }
       case "sessions":
         renderSessions(event.list);
         break;
@@ -586,7 +757,7 @@ document.getElementById("new-session").addEventListener("click", () => {
 
 // ---------------------------------------------------------------- settings
 
-for (const field of [setBaseUrl, setApiKey, setModel]) {
+for (const field of [setBaseUrl, setApiKey, setModel, setEffort]) {
   field.addEventListener("input", () => { settingsDirty = true; });
 }
 
@@ -597,6 +768,7 @@ function saveSettings() {
     cmd: "save_settings",
     base_url: setBaseUrl.value.trim(),
     model: setModel.value.trim(),
+    reasoning_effort: setEffort.value,
   };
   if (setApiKey.value.trim() !== "") {
     payload.api_key = setApiKey.value.trim();
@@ -614,8 +786,19 @@ setApiKey.addEventListener("keydown", (event) => {
   }
 });
 
+// ---------------------------------------------------------------- packages
+
+document.getElementById("btn-install").addEventListener("click", () => toShell({ cmd: "pick_install" }));
+document.getElementById("btn-fetch-models").addEventListener("click", () => {
+  notice("Fetching the model list\u2026", false);
+  toShell({ cmd: "fetch_models" });
+});
+document.getElementById("btn-pack").addEventListener("click", () => toShell({ cmd: "pick_pack" }));
+document.getElementById("btn-verify").addEventListener("click", () => toShell({ cmd: "pick_verify" }));
+
 // The page is loaded and listening; ask the shell for initial state.
 toShell({ cmd: "ready" });
+toShell({ cmd: "list_packs" });
 </script>
 </body>
 </html>

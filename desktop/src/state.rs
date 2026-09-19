@@ -8,7 +8,7 @@
 //! while agent turns run on a tokio runtime. They meet at one seam — a
 //! [`EventLoopProxy`] carrying JSON to evaluate in the page.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
@@ -116,6 +116,11 @@ impl AppState {
             model: model.clone(),
             temperature: None,
             max_tokens: None,
+            reasoning_effort: if settings.reasoning_effort.trim().is_empty() {
+                None
+            } else {
+                Some(settings.reasoning_effort.clone())
+            },
         });
 
         let config = Arc::new(SharedConfig {
@@ -169,6 +174,11 @@ impl AppState {
                 model,
                 temperature: None,
                 max_tokens: None,
+                reasoning_effort: if settings.reasoning_effort.trim().is_empty() {
+                    None
+                } else {
+                    Some(settings.reasoning_effort.clone())
+                },
             },
             busy: false,
             settings,
@@ -186,6 +196,7 @@ impl AppState {
             "title": self.session.title(),
             "messages": self.session.messages.len(),
             "model": snapshot.model_route.model,
+            "reasoning_effort": self.settings.reasoning_effort,
             "base_url": snapshot.model_route.base_url,
             "cache_policy": format!("{:?}", snapshot.cache_policy),
             "config_version": snapshot.version,
@@ -310,11 +321,18 @@ impl AppState {
     ///
     /// Applying matters as much as saving: a user who just typed a key expects
     /// the next message to use it, not the next launch.
-    pub fn save_settings(&mut self, base_url: &str, api_key: &str, model: &str) -> Result<()> {
+    pub fn save_settings(
+        &mut self,
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+        reasoning_effort: &str,
+    ) -> Result<()> {
         let settings = Settings {
             base_url: base_url.trim().to_string(),
             api_key: api_key.trim().to_string(),
             model: model.trim().to_string(),
+            reasoning_effort: reasoning_effort.trim().to_string(),
         };
         settings.save()?;
         self.settings = settings;
@@ -332,14 +350,97 @@ impl AppState {
         Ok(())
     }
 
+    /// Installed packs.
+    pub fn packs(&self) -> Result<Value> {
+        let dir = nguruvilu::pack::default_packs_dir();
+        let packs = nguruvilu::pack::installed(&dir)?;
+        Ok(json!({
+            "dir": dir.display().to_string(),
+            "packs": packs.iter().map(|pack| json!({
+                "name": pack.manifest.name,
+                "version": pack.manifest.version_id,
+                "license": pack.manifest.license,
+                "summary": pack.manifest.summary,
+                "path": pack.path.display().to_string(),
+                "assembly": pack.assembly.as_ref().map(|p| p.display().to_string()),
+            })).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// Install an archive and report what landed.
+    pub fn install_pack(&mut self, archive: &Path) -> Result<Value> {
+        let dir = nguruvilu::pack::default_packs_dir();
+        let placed = nguruvilu::pack::install(archive, &dir)?;
+        Ok(json!({
+            "name": placed.manifest.name,
+            "version": placed.manifest.version_id,
+            "path": placed.path.display().to_string(),
+            "assembly": placed.assembly.as_ref().map(|p| p.display().to_string()),
+        }))
+    }
+
+    /// Build an archive from a pack directory.
+    pub fn pack_dir(&self, dir: &Path, out: Option<&Path>) -> Result<Value> {
+        let manifest = nguruvilu::pack::read_manifest(dir)?;
+        let archive = match out {
+            Some(path) => path.to_path_buf(),
+            None => dir.join(format!("{}-{}.dshpack", manifest.name, manifest.version_id)),
+        };
+        let packed = nguruvilu::pack::pack(dir, &archive)?;
+        let contents = nguruvilu::pack::inspect(dir)?;
+        Ok(json!({
+            "name": packed.name,
+            "version": packed.version_id,
+            "archive": archive.display().to_string(),
+            "files": contents.files.len(),
+            "has_assembly": contents.has_assembly,
+        }))
+    }
+
+    /// Verify an archive without installing it.
+    pub fn verify_pack(&self, archive: &Path) -> Result<Value> {
+        let report = nguruvilu::pack::verify(archive)?;
+        Ok(json!({
+            "name": report.manifest.name,
+            "version": report.manifest.version_id,
+            "license": report.manifest.license,
+            "files": report.contents.files.len(),
+            "has_assembly": report.contents.has_assembly,
+            "warnings": report.warnings,
+        }))
+    }
+
+    /// Take the kernel out, so an async load can run without holding the lock.
+    pub fn take_kernel(&mut self) -> Kernel {
+        std::mem::replace(&mut self.kernel, Kernel::new())
+    }
+
+    /// Put a kernel back and make its tools visible to the next turn.
+    ///
+    /// Applying a pack changes the tool table, and the runtime is what a turn
+    /// reads it from — so both have to move together.
+    pub fn restore_kernel(&mut self, kernel: Kernel) -> Result<()> {
+        self.kernel = kernel;
+        let tools = Arc::new(self.kernel.tools().clone());
+        let mut runtime = self.config.runtime.lock().expect("runtime lock");
+        runtime.set_tools(tools);
+        Ok(())
+    }
+
     /// A client for the current route.
     pub fn client(&self) -> Result<LlmClient> {
-        LlmClient::new(LlmConfig::new(
+        let mut config = LlmConfig::new(
             self.route.base_url.clone(),
             self.route.api_key.clone(),
             self.route.model.clone(),
-        ))
-        .context("building the model client")
+        );
+        // Reasoning effort is the main cost lever on a reasoning model, so it
+        // travels with every request rather than being chosen per call.
+        let effort = self.settings.reasoning_effort.trim();
+        if !effort.is_empty() && effort != "default" {
+            config.reasoning_effort = Some(effort.to_string());
+        }
+        LlmClient::new(config).context("building the model client")
     }
 }
 

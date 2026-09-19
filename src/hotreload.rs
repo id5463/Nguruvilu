@@ -43,6 +43,9 @@ pub struct ModelRoute {
     /// Output ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Reasoning effort for this route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 impl Default for ModelRoute {
@@ -54,6 +57,7 @@ impl Default for ModelRoute {
             model: "gpt-4o-mini".into(),
             temperature: None,
             max_tokens: None,
+            reasoning_effort: None,
         }
     }
 }
@@ -903,6 +907,7 @@ mod tests {
                     model: "deepseek-v4.1-flash".into(),
                     temperature: Some(0.2),
                     max_tokens: Some(4096),
+                    reasoning_effort: None,
                 }),
             ))
             .unwrap();

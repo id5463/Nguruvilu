@@ -106,6 +106,10 @@ struct Cli {
     #[arg(long = "skill-dir", global = true)]
     skill_dirs: Vec<PathBuf>,
 
+    /// Reasoning effort: minimal, low, medium, or high.
+    #[arg(long, env = "NGU_REASONING_EFFORT", global = true)]
+    reasoning_effort: Option<String>,
+
     /// Persona text, applied as a session-scoped hot change.
     #[arg(long)]
     persona: Option<String>,
@@ -227,6 +231,9 @@ enum ConfigAction {
         /// Model id.
         #[arg(long)]
         model: Option<String>,
+        /// Reasoning effort: none, minimal, low, medium, high, xhigh, or max.
+        #[arg(long)]
+        reasoning_effort: Option<String>,
     },
     /// Print the settings file path.
     Path,
@@ -482,6 +489,13 @@ async fn run() -> Result<()> {
 
     let tools = Arc::new(kernel.tools().clone());
 
+    // The flag wins over the stored setting.
+
+    let effective_effort = cli
+        .reasoning_effort
+        .clone()
+        .unwrap_or_else(|| settings.reasoning_effort.clone());
+
     let mut runtime = Runtime::new(Arc::clone(&tools))
         .with_route(ModelRoute {
             provider: "openai".into(),
@@ -490,6 +504,11 @@ async fn run() -> Result<()> {
             model: model.clone(),
             temperature: None,
             max_tokens: None,
+            reasoning_effort: if effective_effort.trim().is_empty() {
+                None
+            } else {
+                Some(effective_effort.clone())
+            },
         })
         .with_skill_roots(
             skills
@@ -1334,7 +1353,7 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             println!("{}", Settings::path().display());
             Ok(())
         }
-        Some(ConfigAction::Set { base_url, api_key, model }) => {
+        Some(ConfigAction::Set { base_url, api_key, model, reasoning_effort }) => {
             let mut settings = Settings::load()?;
             if let Some(value) = base_url {
                 settings.base_url = value.trim().to_string();
@@ -1344,6 +1363,9 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             }
             if let Some(value) = model {
                 settings.model = value.trim().to_string();
+            }
+            if let Some(value) = reasoning_effort {
+                settings.reasoning_effort = value.trim().to_string();
             }
             settings.save()?;
 
@@ -1364,6 +1386,14 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
                 println!("  endpoint: {}", if settings.base_url.is_empty() { "(not set)" } else { &settings.base_url });
                 println!("  key:      {}", if settings.api_key.is_empty() { "(not set)" } else { "(stored)" });
                 println!("  model:    {}", settings.model_or_default());
+                println!(
+                    "  thinking: {}",
+                    if settings.reasoning_effort.trim().is_empty() {
+                        "(provider default)"
+                    } else {
+                        &settings.reasoning_effort
+                    }
+                );
                 if !settings.is_configured() {
                     println!("\nstill missing: {}", settings.missing().join(", "));
                 }
@@ -1403,6 +1433,14 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
                 if effective.api_key.is_empty() { "(not set)".to_string() } else { effective.masked_key() }
             );
             println!("model:         {}", effective.model_or_default());
+            println!(
+                "thinking:      {}",
+                if effective.reasoning_effort.trim().is_empty() {
+                    "(provider default)"
+                } else {
+                    &effective.reasoning_effort
+                }
+            );
             if !effective.is_configured() {
                 println!("\nnot configured — set it with:");
                 println!("  ngu config set --base-url https://your-host/v1 --api-key sk-...");

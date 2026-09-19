@@ -29,6 +29,13 @@ pub struct LlmConfig {
     pub temperature: Option<f32>,
     /// Output token ceiling; omitted when `None`.
     pub max_tokens: Option<u32>,
+    /// Reasoning effort, sent as `reasoning_effort`.
+    ///
+    /// Providers that do not reason ignore it; providers that do treat it as
+    /// the main cost lever. Measured against a real endpoint, `minimal` cut one
+    /// answer from 137 output tokens to 69, so it is worth exposing rather than
+    /// leaving every request at the provider default.
+    pub reasoning_effort: Option<String>,
     /// Request timeout in seconds.
     pub timeout_secs: u64,
 }
@@ -42,6 +49,7 @@ impl LlmConfig {
             model: model.into(),
             temperature: None,
             max_tokens: None,
+            reasoning_effort: None,
             timeout_secs: 300,
         }
     }
@@ -206,11 +214,24 @@ impl LlmClient {
                         }
                     }
 
-                    // Providers spell the reasoning channel differently; accept the common ones.
+                    // Providers spell the reasoning channel differently, and reading
+                    // only one spelling loses it silently: DeepSeek, Moonshot, Zhipu,
+                    // DashScope and llama.cpp use `reasoning_content`, while vLLM,
+                    // Groq, Together and Ollama use `reasoning`. OpenRouter adds a
+                    // typed `reasoning_details` array on top of both.
                     for key in ["reasoning_content", "reasoning"] {
                         if let Some(text) = delta.get(key).and_then(|c| c.as_str()) {
                             if !text.is_empty() {
                                 let _ = tx.send(Ok(LlmEvent::ReasoningDelta(text.to_string()))).await;
+                            }
+                        }
+                    }
+                    if let Some(parts) = delta.get("reasoning_details").and_then(|d| d.as_array()) {
+                        for part in parts {
+                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                if !text.is_empty() {
+                                    let _ = tx.send(Ok(LlmEvent::ReasoningDelta(text.to_string()))).await;
+                                }
                             }
                         }
                     }
@@ -275,12 +296,50 @@ impl LlmClient {
             body["temperature"] = json!(t);
         }
         if let Some(m) = self.config.max_tokens {
-            body["max_tokens"] = json!(m);
+            // `max_tokens` is deprecated across OpenAI, Groq, Moonshot, and
+            // DashScope; `max_completion_tokens` is the current name. Providers
+            // that never adopted it ignore the field rather than failing.
+            body["max_completion_tokens"] = json!(m);
         }
         body
     }
 
     /// Fetch the model catalog. Used to verify a route and discover ids.
+    /// Fetch the model catalog with the provider's own metadata.
+    ///
+    /// Asking the endpoint beats making a user type a model id from memory: a
+    /// gateway can front dozens of models and the list changes without notice.
+    /// An endpoint that answers `/models` but reports nothing useful still yields
+    /// ids, so this degrades rather than fails.
+    pub async fn list_models_detailed(&self) -> Result<Vec<ModelInfo>> {
+        let url = format!("{}/models", self.config.base_url.trim_end_matches('/'));
+        let response = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.config.api_key)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("provider returned {status}: {}", truncate(&text, 500)));
+        }
+
+        // A catalog is `{"data": [...]}`; some gateways return a bare array.
+        let catalog: ModelCatalog = match serde_json::from_str(&text) {
+            Ok(catalog) => catalog,
+            Err(_) => ModelCatalog {
+                data: serde_json::from_str::<Vec<ModelInfo>>(&text).unwrap_or_default(),
+            },
+        };
+
+        let mut models = catalog.data;
+        models.retain(|model| !model.id.trim().is_empty());
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(models)
+    }
+
     pub async fn list_models(&self) -> Result<Vec<String>> {
         let url = format!("{}/models", self.config.base_url.trim_end_matches('/'));
         let response = self
@@ -358,8 +417,48 @@ pub fn assemble_calls(parts: &[(usize, PartialCallView)]) -> Vec<ToolCall> {
         .collect()
 }
 
+/// One entry from a provider's model catalog.
+///
+/// Providers report more than an id: `owned_by` says which vendor a model
+/// actually belongs to (useful when a gateway fronts several), and
+/// `supported_endpoint_types` says which API dialects it serves.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelInfo {
+    /// Model id, as passed in a request.
+    pub id: String,
+    /// Vendor the provider attributes it to.
+    #[serde(default)]
+    pub owned_by: Option<String>,
+    /// Creation timestamp, when reported.
+    #[serde(default)]
+    pub created: Option<i64>,
+    /// Endpoint families the model serves, e.g. `["openai", "anthropic"]`.
+    #[serde(default, alias = "supported_endpoint_types")]
+    pub endpoint_types: Vec<String>,
+}
+
+impl ModelInfo {
+    /// A short label for a picker: the id, plus the vendor when it is known.
+    pub fn label(&self) -> String {
+        match &self.owned_by {
+            Some(owner) if !owner.is_empty() && owner != "unknown" => {
+                format!("{}  ({})", self.id, owner)
+            }
+            _ => self.id.clone(),
+        }
+    }
+}
+
+/// A model catalog, as reported by the provider.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelCatalog {
+    /// Entries.
+    #[serde(default)]
+    pub data: Vec<ModelInfo>,
+}
+
 /// Read-only view of an assembled call, used by [`assemble_calls`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PartialCallView {
     /// Provider call id.
     pub id: String,
@@ -369,16 +468,64 @@ pub struct PartialCallView {
     pub arguments: String,
 }
 
+/// Read token accounting, tolerating every spelling in the wild.
+///
+/// There is no single field name for cache hits: OpenAI reports
+/// `prompt_tokens_details.cached_tokens`, DeepSeek and SiliconFlow report
+/// `prompt_cache_hit_tokens`, Together has a flat `cached_tokens`, xAI nests it
+/// under `input_tokens_details`, and Anthropic-shaped gateways use
+/// `cache_read_input_tokens`. Reading only one spelling silently reports zero,
+/// with no error to notice.
+///
+/// `prompt_tokens` is inclusive of cached tokens on every provider checked, so
+/// `input` is reported as-is rather than having the cached count subtracted.
 fn extract_usage(usage: &Value) -> TokenUsage {
-    let input = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-    let output = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-    let cached = usage
-        .get("prompt_tokens_details")
-        .and_then(|d| d.get("cached_tokens"))
+    let input = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
         .and_then(|v| v.as_u64())
-        .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(|v| v.as_u64()))
         .unwrap_or(0);
-    TokenUsage { input: input.saturating_sub(cached), output, cached }
+    let output = usage
+        .get("completion_tokens")
+        .or_else(|| usage.get("output_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let cached = first_u64(
+        usage,
+        &[
+            &["prompt_tokens_details", "cached_tokens"][..],
+            &["input_tokens_details", "cached_tokens"][..],
+            &["prompt_cache_hit_tokens"][..],
+            &["cached_tokens"][..],
+            &["cache_read_input_tokens"][..],
+        ],
+    );
+
+    TokenUsage { input, output, cached }
+}
+
+/// Walk key paths and return the first one that holds a number.
+fn first_u64(value: &Value, paths: &[&[&str]]) -> u64 {
+    for path in paths {
+        let mut current = value;
+        let mut found = true;
+        for key in path.iter() {
+            match current.get(*key) {
+                Some(next) => current = next,
+                None => {
+                    found = false;
+                    break;
+                }
+            }
+        }
+        if found {
+            if let Some(number) = current.as_u64() {
+                return number;
+            }
+        }
+    }
+    0
 }
 
 fn truncate(text: &str, max: usize) -> String {
