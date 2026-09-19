@@ -163,7 +163,7 @@ impl Settings {
 }
 
 /// The user's home directory.
-fn home_dir() -> PathBuf {
+pub fn home_dir() -> PathBuf {
     if let Ok(profile) = std::env::var("USERPROFILE") {
         if !profile.trim().is_empty() {
             return PathBuf::from(profile);

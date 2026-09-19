@@ -400,12 +400,14 @@ fn sanitize(value: &str) -> String {
 /// The default packs directory: `$NGU_HOME/packs`, else `<cwd>/.nguruvilu/packs`.
 pub fn default_packs_dir() -> PathBuf {
     if let Ok(home) = std::env::var("NGU_HOME") {
-        return PathBuf::from(home).join("packs");
+        if !home.trim().is_empty() {
+            return PathBuf::from(home).join("packs");
+        }
     }
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".nguruvilu")
-        .join("packs")
+    // The user's home, not the current directory: packs are installed for the
+    // user, and the directory the command happened to run in is not a place to
+    // leave state.
+    crate::settings::home_dir().join(".nguruvilu").join("packs")
 }
 
 /// Read the pack's assembly manifest, when present.

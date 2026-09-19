@@ -881,10 +881,18 @@ async fn apply_assembly(
     let assembly = Assembly::from_file(file)?;
     let plan = assembly.plan(platform)?;
 
+    // Prefer the pack's own identity manifest over the file name, so the ledger
+    // records which pack a contribution came from rather than which file
+    // happened to describe it.
     let pack = file
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "pack".into());
+        .parent()
+        .and_then(|dir| nguruvilu::pack::read_manifest(dir).ok())
+        .map(|manifest| format!("{}-{}", manifest.name, manifest.version_id))
+        .unwrap_or_else(|| {
+            file.file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "pack".into())
+        });
 
     let mut kernel = Kernel::new();
     if !skills.is_empty() {

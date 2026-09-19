@@ -228,6 +228,97 @@ SyntaxError。后果极具迷惑性:
 - `node --check` 检测不出来,因为 node 里没有 `window.ipc` 这个预置属性
 
 改名即可(`ui/index.html` 里叫 `toShell`,并留有注释说明原因)。
+## 整合包(`.dshpack`):打包与读包
+
+整合包是一个 **zip 归档**,装三样东西:身份清单、装配清单、以及装配引用的内容。
+
+```
+my-pack/                        ← 包目录(打包的输入)
+  dsh.index.json                ← 身份:名称/版本/协议/内核版本/依赖
+  assembly.yaml                 ← 装配:加载什么、什么顺序
+  skills/pdf-tools/SKILL.md     ← 内容
+  plugins/ngu_demo_plugin.dll
+```
+
+### 打包
+
+```bash
+ngu pack ./my-pack                              # → my-pack-<version>.dshpack
+ngu pack ./my-pack --out /tmp/custom.dshpack    # 指定输出路径
+```
+
+包目录**必须**有 `dsh.index.json`。没有清单的归档无法被识别,宁可打不出来。
+
+打包时自动排除 `.git/`、`target/`、`node_modules/`,条目按名称排序(同样内容的两次打包可逐字节比较)。
+
+### 读包
+
+三种方式,按需要选:
+
+```bash
+# 1. 校验:清单是否合法、有没有装配清单、协议是否声明
+ngu verify my-pack-1.0.0.dshpack
+ngu verify my-pack-1.0.0.dshpack --json        # 机器可读
+
+# 2. 用系统工具直接看(它就是标准 zip,不依赖 ngu)
+unzip -l my-pack-1.0.0.dshpack
+#   Windows: 右键 → 打开方式 → 资源管理器;或 Expand-Archive
+
+# 3. 安装后看它加载什么
+ngu install my-pack-1.0.0.dshpack
+ngu packs
+ngu assembly <安装目录>/assembly.yaml           # 预览加载计划,不执行
+ngu apply    <安装目录>/assembly.yaml           # 真正加载
+```
+
+**为什么是 zip**:任何平台上的任何普通工具都能打开、查看、取出单个文件。检查一个包,
+或者从里面捞一个文件出来,都不该需要本内核。条目用 deflate 压缩并保留文件模式,
+所以包里带的脚本解包后仍可执行。
+
+### 安装与应用
+
+```bash
+ngu install my-pack-1.0.0.dshpack               # → ~/.nguruvilu/packs/<name>-<version>/
+ngu install my-pack-1.0.0.dshpack --into /opt/packs
+ngu packs                                        # 列出已安装
+ngu apply <pack>/assembly.yaml                   # 加载它的插件 / MCP / 技能
+```
+
+安装目录**带版本号**,所以同一个包的两个版本共存,而不是互相覆盖。解包逐条进行,
+并**拒绝逃逸目标目录的条目路径**。
+
+应用之后,台账 `~/.nguruvilu/installed.json` 记录每个贡献来自哪个包:
+
+```json
+{ "kind": "plugin", "id": "demo", "pack": "demo-pack-1.0.0", "scope": "session" }
+```
+
+### 装配清单里能写什么
+
+```yaml
+version: 1
+name: demo-pack
+defaults:
+  scope: session        # session | global
+  on_failure: skip      # abort | skip | retry
+stages:
+  - name: foundation
+    plugins:
+      - id: demo
+        source: "dylib:./plugins/ngu_demo_plugin.dll"   # 相对包目录解析
+        order: 10
+  - name: extensions
+    skills:
+      - id: pdf
+        source: "./skills"
+    mcp:
+      - id: files
+        transport: stdio
+        command: npx
+        args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+```
+
+顺序优先级:依赖图 → 阶段顺序 → `order` → 声明顺序;有环直接报错。
 ## 状态
 
 **完整架构已实现:125 个测试通过(100 单元 + 25 集成)。**

@@ -133,15 +133,19 @@ impl JsonlStore {
         Ok(Self { root })
     }
 
-    /// The default root: `$NGU_HOME/sessions`, else `<cwd>/.nguruvilu/sessions`.
+    /// The default root: `$NGU_HOME/sessions`, else `~/.nguruvilu/sessions`.
     pub fn default_root() -> PathBuf {
         if let Ok(home) = std::env::var("NGU_HOME") {
-            return PathBuf::from(home).join("sessions");
+            if !home.trim().is_empty() {
+                return PathBuf::from(home).join("sessions");
+            }
         }
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(".nguruvilu")
-            .join("sessions")
+        // The user's home, not the current directory. Sessions belong to the
+        // user, and the directory a command happened to run in is not a place to
+        // leave state — it may be a read-only checkout, or someone else's repo.
+        // The desktop shell resolves the same path, so both frontends see one
+        // history.
+        crate::settings::home_dir().join(".nguruvilu").join("sessions")
     }
 
     fn path_for(&self, id: &str) -> PathBuf {
