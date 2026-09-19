@@ -174,6 +174,29 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Build a `.dshpack` archive from a pack directory.
+    Pack {
+        /// Pack directory (must contain dsh.index.json).
+        dir: PathBuf,
+        /// Output archive path. Defaults to <name>-<version>.dshpack.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+    /// Install a `.dshpack` archive.
+    Install {
+        /// Archive to install.
+        file: PathBuf,
+        /// Directory to install into.
+        #[arg(long)]
+        into: Option<PathBuf>,
+    },
+    /// List installed packs.
+    Packs,
+    /// Verify a `.dshpack` archive without installing it.
+    Verify {
+        /// Archive to verify.
+        file: PathBuf,
+    },
     /// Print the runtime's policy table and effective configuration.
     Runtime,
 }
@@ -336,6 +359,10 @@ async fn run() -> Result<()> {
         Some(Command::Snapshot { action, commit, limit }) => {
             return snapshot_command(&cli, action, commit.as_deref(), *limit, cli.json)
         }
+        Some(Command::Pack { dir, out }) => return pack_command(dir, out.as_ref(), cli.json),
+        Some(Command::Install { file, into }) => return install_command(file, into.as_ref(), cli.json),
+        Some(Command::Packs) => return list_packs(cli.json),
+        Some(Command::Verify { file }) => return verify_command(file, cli.json),
         Some(Command::Runtime) => {
             return show_runtime(&model, &base_url, cache_policy, &skills, cli.json)
         }
@@ -364,10 +391,18 @@ async fn run() -> Result<()> {
         let assembly = Assembly::from_file(file)?;
         let plan = assembly.plan(platform)?;
 
+        // Prefer the pack's own identity manifest over the file name, so the
+        // ledger records which pack a contribution came from rather than which
+        // file happened to describe it.
         let pack = file
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "pack".into());
+            .parent()
+            .and_then(|dir| nguruvilu::pack::read_manifest(dir).ok())
+            .map(|manifest| format!("{}-{}", manifest.name, manifest.version_id))
+            .unwrap_or_else(|| {
+                file.file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "pack".into())
+            });
 
         let mut loader = Loader::new(kernel, default_ledger_path(), pack).with_pack_dir(
             file.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")),
@@ -957,6 +992,156 @@ fn show_runtime(
         }
     }
     println!("\nskills found: {}", skills.len());
+    Ok(())
+}
+
+fn pack_command(dir: &PathBuf, out: Option<&PathBuf>, as_json: bool) -> Result<()> {
+    let manifest = nguruvilu::pack::read_manifest(dir)?;
+    let archive = match out {
+        Some(path) => path.clone(),
+        None => PathBuf::from(format!("{}-{}.dshpack", manifest.name, manifest.version_id)),
+    };
+
+    let packed = nguruvilu::pack::pack(dir, &archive)?;
+    let contents = nguruvilu::pack::inspect(dir)?;
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "archive": archive.display().to_string(),
+                "name": packed.name,
+                "version": packed.version_id,
+                "license": packed.license,
+                "files": contents.files.len(),
+                "has_assembly": contents.has_assembly,
+            }))?
+        );
+    } else {
+        println!(
+            "packed {} {} → {}",
+            packed.name,
+            packed.version_id,
+            archive.display()
+        );
+        println!("{} files", contents.files.len());
+        if !contents.has_assembly {
+            println!("note: no assembly.yaml — the pack loads nothing yet");
+        }
+    }
+    Ok(())
+}
+
+fn install_command(file: &PathBuf, into: Option<&PathBuf>, as_json: bool) -> Result<()> {
+    let packs_dir = into.cloned().unwrap_or_else(nguruvilu::pack::default_packs_dir);
+    let placed = nguruvilu::pack::install(file, &packs_dir)?;
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "name": placed.manifest.name,
+                "version": placed.manifest.version_id,
+                "path": placed.path.display().to_string(),
+                "assembly": placed.assembly.as_ref().map(|p| p.display().to_string()),
+            }))?
+        );
+    } else {
+        println!(
+            "installed {} {} → {}",
+            placed.manifest.name,
+            placed.manifest.version_id,
+            placed.path.display()
+        );
+        match &placed.assembly {
+            Some(assembly) => println!("assembly: {}", assembly.display()),
+            None => println!("no assembly.yaml in this pack"),
+        }
+    }
+    Ok(())
+}
+
+fn list_packs(as_json: bool) -> Result<()> {
+    let packs_dir = nguruvilu::pack::default_packs_dir();
+    let packs = nguruvilu::pack::installed(&packs_dir)?;
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "packs_dir": packs_dir.display().to_string(),
+                "packs": packs.iter().map(|p| serde_json::json!({
+                    "name": p.manifest.name,
+                    "version": p.manifest.version_id,
+                    "license": p.manifest.license,
+                    "path": p.path.display().to_string(),
+                    "has_assembly": p.assembly.is_some(),
+                })).collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(());
+    }
+
+    if packs.is_empty() {
+        println!("no packs installed in {}", packs_dir.display());
+        return Ok(());
+    }
+    println!("{:<24} {:<12} {:<10} {}", "name", "version", "license", "assembly");
+    for pack in packs {
+        println!(
+            "{:<24} {:<12} {:<10} {}",
+            pack.manifest.name,
+            pack.manifest.version_id,
+            pack.manifest.license,
+            if pack.assembly.is_some() { "yes" } else { "no" }
+        );
+    }
+    Ok(())
+}
+
+fn verify_command(file: &PathBuf, as_json: bool) -> Result<()> {
+    let report = nguruvilu::pack::verify(file)?;
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": report.warnings.is_empty(),
+                "manifest": {
+                    "name": report.manifest.name,
+                    "version": report.manifest.version_id,
+                    "license": report.manifest.license,
+                    "kernel_version": report.manifest.kernel_version,
+                    "requires": report.manifest.dependencies.kernel,
+                },
+                "files": report.contents.files.len(),
+                "has_assembly": report.contents.has_assembly,
+                "warnings": report.warnings,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{} {} (license {}, built against kernel {})",
+        report.manifest.name,
+        report.manifest.version_id,
+        report.manifest.license,
+        report.manifest.kernel_version
+    );
+    if let Some(range) = &report.manifest.dependencies.kernel {
+        println!("requires kernel {range}");
+    }
+    println!("{} files", report.contents.files.len());
+    if report.warnings.is_empty() {
+        println!("no problems found");
+    } else {
+        for warning in &report.warnings {
+            println!("warning: {warning}");
+        }
+    }
     Ok(())
 }
 

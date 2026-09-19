@@ -29,6 +29,7 @@ pub mod llm;
 pub mod loader;
 pub mod mcp;
 pub mod message;
+pub mod pack;
 pub mod plugin;
 pub mod session;
 pub mod skills;
@@ -47,6 +48,7 @@ pub use llm::{LlmClient, LlmConfig, LlmEvent};
 pub use loader::{LoadReport, Loader, Outcome};
 pub use mcp::{McpClient, McpSpec, McpTool};
 pub use message::{Message, Role, ToolCall};
+pub use pack::{InstalledPack, PackManifest, VerifyReport};
 pub use plugin::{
     Action, Contributions, Decision, FiberState, Kernel, PermissionProvider, PermissionStack,
     Plugin, PluginCtx, RealmId, RealmMap, ReloadEvent,
