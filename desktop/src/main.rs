@@ -201,6 +201,41 @@ async fn dispatch(
             emit(&proxy, json!({ "ev": "status", "status": status }));
         }
 
+        "save_settings" => {
+            let base_url = command.get("base_url").and_then(|v| v.as_str()).unwrap_or("");
+            let api_key_field = command.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
+            let keep_key = command.get("keep_api_key").and_then(|v| v.as_bool()).unwrap_or(false);
+            let model = command.get("model").and_then(|v| v.as_str()).unwrap_or("");
+
+            let outcome = {
+                let mut guard = state.lock().expect("state lock");
+                // A blank key box means "keep the stored key": the panel never
+                // receives the key back, so it cannot send it again, and treating
+                // blank as "erase" would silently break the next request.
+                let api_key = if keep_key || api_key_field.trim().is_empty() {
+                    guard.settings.api_key.clone()
+                } else {
+                    api_key_field.to_string()
+                };
+                guard.save_settings(base_url, &api_key, model)
+            };
+
+            match outcome {
+                Ok(()) => {
+                    eprintln!("[settings] saved to {}", nguruvilu::settings::Settings::path().display());
+                    let status = state.lock().expect("state lock").describe();
+                    emit(&proxy, json!({ "ev": "status", "status": status }));
+                    emit(&proxy, json!({ "ev": "settings_saved" }));
+                }
+                Err(error) => {
+                    emit(
+                        &proxy,
+                        json!({ "ev": "error", "message": format!("saving settings: {error:#}") }),
+                    );
+                }
+            }
+        }
+
         "status" => {
             let status = state.lock().expect("state lock").describe();
             emit(&proxy, json!({ "ev": "status", "status": status }));

@@ -154,6 +154,8 @@ ngu snapshot restore <commit>            # 回滚
 
 # 运行时
 ngu runtime                              # 策略表与生效配置
+ngu config show                          # 当前 API 配置与设置文件路径
+ngu config set --base-url <url> --api-key <key> --model <id>
 ngu models                               # 可用模型
 ```
 
@@ -170,6 +172,29 @@ ngu models                               # 可用模型
 
 对比 Electron portable(391 MB 自解压包,每次启动解压 2~3 分钟):**4.6 MB,点开即出窗口**。
 
+### 配置(endpoint / key / model)
+
+三处配置,优先级从高到低:**命令行参数 → 环境变量 → 设置文件**。
+
+设置文件默认在 `~/.nguruvilu/settings.json`(`$NGU_HOME` 存在时用 `$NGU_HOME/settings.json`)。
+
+**桌面应用**:右侧面板顶部就是 **Settings**,填 endpoint、API key、model,点 Save 立即生效
+(不用重启)。未配置时面板顶部会显示醒目提示,并列出缺哪些字段。API key 只显示掩码
+(`sk-xxxx...xxxx`),留空表示"保持原值"。
+
+**命令行**:
+
+```bash
+ngu config show                  # 当前生效的配置 + 设置文件路径
+ngu config set --base-url https://your-host/v1 --api-key sk-... --model your-model
+ngu config path                  # 只打印设置文件路径
+```
+
+**endpoint 必须带版本段**,例如 `https://your-host/v1`。
+
+> 刻意**没有默认 endpoint**。猜一个默认值,正是让身处服务商未覆盖地区的用户撞上
+> 一个自己无法解释的 403 的原因。留空会被报告为"未配置"——那是可行动的,而错误的
+> endpoint 不是。
 ### 构建与运行
 
 ```bash

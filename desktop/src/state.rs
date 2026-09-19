@@ -19,6 +19,7 @@ use nguruvilu::hotreload::{Change, ChangePayload, ModelRoute, Runtime};
 use nguruvilu::llm::{LlmClient, LlmConfig};
 use nguruvilu::plugin::Kernel;
 use nguruvilu::session::{JsonlStore, Session, SessionStore};
+use nguruvilu::settings::Settings;
 use nguruvilu::skills::{register_skill_tool, SkillRegistry};
 
 use crate::UserEvent;
@@ -79,18 +80,23 @@ pub struct AppState {
     pub route: ModelRoute,
     /// Whether a turn is running, so the UI can disable input.
     pub busy: bool,
+    /// Effective settings, as the settings panel should display them.
+    pub settings: Settings,
+    /// The last failure, kept here rather than only in the page: a message
+    /// drawn into the DOM vanishes the moment the transcript is re-rendered,
+    /// which is exactly when a user switches sessions to look for it.
+    pub last_error: Option<String>,
 }
 
 impl AppState {
     /// Build the shell's state from the environment.
     pub fn bootstrap() -> Result<Self> {
-        let base_url = std::env::var("NGU_BASE_URL")
-            .or_else(|_| std::env::var("OPENAI_BASE_URL"))
-            .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
-        let api_key = std::env::var("NGU_API_KEY")
-            .or_else(|_| std::env::var("OPENAI_API_KEY"))
-            .unwrap_or_default();
-        let model = std::env::var("NGU_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+        // Settings, not raw environment variables: the shell has to be usable by
+        // someone who has never set one, and changeable without a restart.
+        let settings = Settings::resolve();
+        let base_url = settings.base_url.clone();
+        let api_key = settings.api_key.clone();
+        let model = settings.model_or_default();
 
         // Skills are scanned once at boot; the catalog is part of the prompt.
         let mut skills = SkillRegistry::with_roots(SkillRegistry::default_roots());
@@ -129,6 +135,23 @@ impl AppState {
             store.create(&session)?;
         }
 
+        // The state of the configuration belongs on stderr at startup: it is
+        // the first thing to check when a request fails with a 403 or a 401.
+        if settings.is_configured() {
+            eprintln!(
+                "[settings] endpoint {} | model {} | key {} | file {}",
+                settings.base_url,
+                settings.model_or_default(),
+                settings.masked_key(),
+                Settings::path().display()
+            );
+        } else {
+            eprintln!(
+                "[settings] NOT CONFIGURED (missing: {}) — fill it in from the Settings panel, or run: ngu config set --base-url <url> --api-key <key>",
+                settings.missing().join(", ")
+            );
+        }
+
         if let Err(error) = &scan {
             eprintln!("[skills] scan failed: {error:#}");
         }
@@ -147,6 +170,8 @@ impl AppState {
                 max_tokens: None,
             },
             busy: false,
+            settings,
+            last_error: None,
         })
     }
 
@@ -176,6 +201,11 @@ impl AppState {
                 "owner": owner,
             })).collect::<Vec<_>>(),
             "busy": self.busy,
+            "configured": self.settings.is_configured(),
+            "missing": self.settings.missing(),
+            "api_key_masked": self.settings.masked_key(),
+            "settings_path": Settings::path().display().to_string(),
+            "last_error": self.last_error,
         })
     }
 
@@ -196,7 +226,7 @@ impl AppState {
 
     /// The transcript of the current session, as renderable entries.
     pub fn transcript(&self) -> Value {
-        json!(self
+        let mut entries: Vec<Value> = self
             .session
             .messages
             .iter()
@@ -216,7 +246,19 @@ impl AppState {
                     })).collect::<Vec<_>>(),
                 })
             })
-            .collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+
+        // A failure belongs in the transcript, not only in a status line: it is
+        // what a user scrolls back to read, and re-rendering the session must
+        // not erase it.
+        if let Some(error) = &self.last_error {
+            entries.push(json!({
+                "role": "error",
+                "text": error,
+                "tool_calls": [],
+            }));
+        }
+        json!(entries)
     }
 
     /// Start a fresh session.
@@ -259,6 +301,32 @@ impl AppState {
         runtime.apply(Change::session(
             self.session.id.clone(),
             ChangePayload::ModelRoute(route),
+        ))?;
+        Ok(())
+    }
+
+    /// Persist settings from the settings panel and apply them immediately.
+    ///
+    /// Applying matters as much as saving: a user who just typed a key expects
+    /// the next message to use it, not the next launch.
+    pub fn save_settings(&mut self, base_url: &str, api_key: &str, model: &str) -> Result<()> {
+        let settings = Settings {
+            base_url: base_url.trim().to_string(),
+            api_key: api_key.trim().to_string(),
+            model: model.trim().to_string(),
+        };
+        settings.save()?;
+        self.settings = settings;
+
+        // The route is what a turn actually reads, so it has to move too.
+        self.route.base_url = self.settings.base_url.clone();
+        self.route.api_key = self.settings.api_key.clone();
+        self.route.model = self.settings.model_or_default();
+
+        let mut runtime = self.config.runtime.lock().expect("runtime lock");
+        runtime.apply(Change::session(
+            self.session.id.clone(),
+            ChangePayload::ModelRoute(self.route.clone()),
         ))?;
         Ok(())
     }
@@ -326,6 +394,9 @@ pub async fn run_turn(
     let (client, config, messages) = {
         let mut guard = state.lock().expect("state lock");
         guard.busy = true;
+        // A new attempt supersedes the previous failure; leaving a stale error
+        // on screen while a retry runs would be a lie.
+        guard.last_error = None;
         (guard.client()?, Arc::clone(&guard.config), guard.session.messages.clone())
     };
 
@@ -380,9 +451,11 @@ pub async fn run_turn(
             let _ = proxy.send_event(UserEvent::ToUi(payload));
         }
         Err(error) => {
+            let message = format!("{error:#}");
+            guard.last_error = Some(message.clone());
             let _ = proxy.send_event(UserEvent::ToUi(json!({
                 "ev": "error",
-                "message": format!("{error:#}"),
+                "message": message,
             })));
         }
     }

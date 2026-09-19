@@ -32,6 +32,7 @@ use nguruvilu::llm::{LlmClient, LlmConfig};
 use nguruvilu::loader::Loader;
 use nguruvilu::plugin::{Kernel, Plugin as PluginTrait};
 use nguruvilu::session::{JsonlStore, Session, SessionStore};
+use nguruvilu::settings::Settings;
 use nguruvilu::skills::{register_skill_tool, SkillRegistry};
 use nguruvilu::tools::ToolRegistry;
 
@@ -202,8 +203,33 @@ enum Command {
         #[command(subcommand)]
         action: PluginAction,
     },
+    /// Show or change the stored API settings (endpoint, key, model).
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+    },
     /// Print the runtime's policy table and effective configuration.
     Runtime,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigAction {
+    /// Print the effective settings and where they are stored.
+    Show,
+    /// Write settings to the settings file.
+    Set {
+        /// API endpoint, including the version segment, e.g. https://host/v1.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// API key.
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Model id.
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Print the settings file path.
+    Path,
 }
 
 #[derive(Subcommand, Debug)]
@@ -326,17 +352,22 @@ async fn run() -> Result<()> {
 
     let store = JsonlStore::open(cli.home.clone().unwrap_or_else(JsonlStore::default_root))?;
 
+    // Precedence: command-line flag, then stored settings, then environment.
+    // `Settings::resolve` already folds the environment in, so a machine-level
+    // variable still wins over the file.
+    let settings = Settings::resolve();
     let base_url = cli
         .base_url
         .clone()
-        .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
-        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        .unwrap_or_else(|| settings.base_url.clone());
     let api_key = cli
         .api_key
         .clone()
-        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-        .unwrap_or_default();
-    let model = cli.model.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        .unwrap_or_else(|| settings.api_key.clone());
+    let model = cli
+        .model
+        .clone()
+        .unwrap_or_else(|| settings.model_or_default());
     let cache_policy = parse_cache_policy(&cli.cache_policy)?;
 
     // Skills are scanned once up front so every mode sees the same catalog.
@@ -388,6 +419,7 @@ async fn run() -> Result<()> {
         Some(Command::Packs) => return list_packs(cli.json),
         Some(Command::Verify { file }) => return verify_command(file, cli.json),
         Some(Command::Plugin { action }) => return plugin_command(action, cli.json),
+        Some(Command::Config { action }) => return config_command(action.as_ref(), cli.json),
         Some(Command::Runtime) => {
             return show_runtime(&model, &base_url, cache_policy, &skills, cli.json)
         }
@@ -1284,6 +1316,93 @@ fn plugin_call(path: &PathBuf, tool: &str, args: &str, as_json: bool) -> Result<
             Ok(())
         }
         Err(error) => Err(error),
+    }
+}
+
+/// Show or change the stored settings.
+fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
+    match action {
+        Some(ConfigAction::Path) => {
+            println!("{}", Settings::path().display());
+            Ok(())
+        }
+        Some(ConfigAction::Set { base_url, api_key, model }) => {
+            let mut settings = Settings::load()?;
+            if let Some(value) = base_url {
+                settings.base_url = value.trim().to_string();
+            }
+            if let Some(value) = api_key {
+                settings.api_key = value.trim().to_string();
+            }
+            if let Some(value) = model {
+                settings.model = value.trim().to_string();
+            }
+            settings.save()?;
+
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "ok": true,
+                        "path": Settings::path().display().to_string(),
+                        "base_url": settings.base_url,
+                        "api_key": settings.masked_key(),
+                        "model": settings.model_or_default(),
+                        "configured": settings.is_configured(),
+                    }))?
+                );
+            } else {
+                println!("saved to {}", Settings::path().display());
+                println!("  endpoint: {}", if settings.base_url.is_empty() { "(not set)" } else { &settings.base_url });
+                println!("  key:      {}", if settings.api_key.is_empty() { "(not set)" } else { "(stored)" });
+                println!("  model:    {}", settings.model_or_default());
+                if !settings.is_configured() {
+                    println!("\nstill missing: {}", settings.missing().join(", "));
+                }
+            }
+            Ok(())
+        }
+        None | Some(ConfigAction::Show) => {
+            // `resolve` is what a request would actually use, so this is the
+            // honest answer to "what is configured right now".
+            let effective = Settings::resolve();
+            let stored = Settings::load()?;
+
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "path": Settings::path().display().to_string(),
+                        "base_url": effective.base_url,
+                        "api_key": effective.masked_key(),
+                        "model": effective.model_or_default(),
+                        "configured": effective.is_configured(),
+                        "missing": effective.missing(),
+                        "stored_base_url": stored.base_url,
+                        "stored_model": stored.model,
+                    }))?
+                );
+                return Ok(());
+            }
+
+            println!("settings file: {}", Settings::path().display());
+            println!(
+                "endpoint:      {}",
+                if effective.base_url.is_empty() { "(not set)" } else { &effective.base_url }
+            );
+            println!(
+                "api key:       {}",
+                if effective.api_key.is_empty() { "(not set)".to_string() } else { effective.masked_key() }
+            );
+            println!("model:         {}", effective.model_or_default());
+            if !effective.is_configured() {
+                println!("\nnot configured — set it with:");
+                println!("  ngu config set --base-url https://your-host/v1 --api-key sk-...");
+            } else if effective.base_url != stored.base_url || effective.api_key != stored.api_key {
+                println!("\n(an environment variable is overriding the stored file)");
+            }
+            Ok(())
+        }
     }
 }
 

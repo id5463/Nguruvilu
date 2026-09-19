@@ -33,6 +33,7 @@ pub mod message;
 pub mod pack;
 pub mod plugin;
 pub mod session;
+pub mod settings;
 pub mod skills;
 pub mod tools;
 
@@ -55,6 +56,7 @@ pub use plugin::{
     Action, Contributions, Decision, FiberState, Kernel, PermissionProvider, PermissionStack,
     Plugin, PluginCtx, RealmId, RealmMap, ReloadEvent,
 };
+pub use settings::Settings;
 pub use session::{Session, SessionStore};
 pub use skills::{Skill, SkillRegistry};
 pub use tools::{ToolDef, ToolRegistry};

@@ -14,6 +14,7 @@
     --accent: #6ea8fe;
     --ok: #7ddc9a;
     --bad: #ff8f8f;
+    --warn: #e8c98a;
     --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
   }
   * { box-sizing: border-box; }
@@ -37,6 +38,32 @@
     color: var(--dim); margin: 0 0 8px; font-weight: 600;
   }
   h2:not(:first-child) { margin-top: 18px; }
+
+  /* ---- settings ---- */
+  .warn {
+    background: #2a2118; border: 1px solid #5a4426; color: var(--warn);
+    border-radius: 6px; padding: 8px 10px; font-size: 11.5px;
+    margin-bottom: 10px; line-height: 1.5;
+  }
+  label.field { display: block; margin-bottom: 8px; }
+  label.field .cap { display: block; font-size: 10.5px; color: var(--dim); margin-bottom: 3px; }
+  label.field input {
+    width: 100%; background: #1b1f26; color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px 8px; font: inherit; font-size: 12px;
+  }
+  label.field input:focus { outline: none; border-color: #35507a; }
+  .row { display: flex; gap: 6px; align-items: center; }
+  button.small {
+    padding: 6px 12px; cursor: pointer; font: inherit; font-size: 12px;
+    background: #24405f; color: #dbe8fb;
+    border: 1px solid #35507a; border-radius: 6px;
+  }
+  button.small:hover { background: #2b4c72; }
+  button.small.ghost { background: #1d222a; color: #b9c4d4; border-color: var(--line); }
+  button.small.ghost:hover { background: #232a34; }
+  .hint { color: var(--dim); font-size: 10.5px; margin-top: 6px; word-break: break-all; line-height: 1.5; }
+  .saved { color: var(--ok); font-size: 10.5px; }
 
   /* ---- session list ---- */
   .sess {
@@ -87,6 +114,15 @@
     max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-word;
   }
   .tool-result.bad { border-color: #4a2b2b; color: #e0a9a9; }
+  .err-entry {
+    background: #2a1a1a; border: 1px solid #5a2b2b; color: #f0b0b0;
+    border-radius: 6px; padding: 10px 12px; margin-bottom: 16px;
+    font-size: 12px; white-space: pre-wrap; word-break: break-word;
+  }
+  .err-entry .cap {
+    display: block; font-size: 10px; text-transform: uppercase;
+    letter-spacing: .08em; color: #c98a8a; margin-bottom: 5px;
+  }
   .empty { color: var(--dim); font-style: italic; }
   .caret {
     display: inline-block; width: 7px; height: 14px; margin-left: 2px;
@@ -129,6 +165,7 @@
   }
   #status .dot { color: var(--ok); }
   #status .dot.busy { color: var(--accent); }
+  #status .dot.unset { color: var(--warn); }
 
   /* ---- details ---- */
   .kv { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; padding: 2px 0; }
@@ -155,6 +192,28 @@
   <main id="stream" class="panel"></main>
 
   <aside id="details" class="panel">
+    <h2>Settings</h2>
+    <div id="settings">
+      <div class="warn" id="not-configured" hidden></div>
+      <label class="field">
+        <span class="cap">API endpoint</span>
+        <input id="set-base-url" placeholder="https://your-host/v1" spellcheck="false">
+      </label>
+      <label class="field">
+        <span class="cap">API key</span>
+        <input id="set-api-key" type="password" placeholder="sk-..." spellcheck="false">
+      </label>
+      <label class="field">
+        <span class="cap">Model</span>
+        <input id="set-model" placeholder="model-id" spellcheck="false">
+      </label>
+      <div class="row">
+        <button class="small" id="save-settings">Save</button>
+        <span class="saved" id="settings-saved" hidden>saved</span>
+      </div>
+      <div class="hint" id="settings-path"></div>
+    </div>
+
     <h2>Runtime</h2>
     <div id="runtime-info"></div>
     <h2>Skills</h2>
@@ -198,9 +257,19 @@ const toolInfo = document.getElementById("tool-info");
 const input = document.getElementById("input");
 const send = document.getElementById("send");
 
+const setBaseUrl = document.getElementById("set-base-url");
+const setApiKey = document.getElementById("set-api-key");
+const setModel = document.getElementById("set-model");
+const notConfigured = document.getElementById("not-configured");
+const settingsSaved = document.getElementById("settings-saved");
+const settingsPath = document.getElementById("settings-path");
+
 // The assistant turn currently being streamed, if any.
 let live = null;
 let busy = false;
+// Whether the user has typed into the settings fields since the last status
+// push. Without this, an incoming status would overwrite what they are typing.
+let settingsDirty = false;
 
 function el(tag, cls, text) {
   const node = document.createElement(tag);
@@ -227,6 +296,11 @@ function clearStream(entries) {
 function renderEntry(entry) {
   if (entry.role === "system") return;
 
+  if (entry.role === "error") {
+    stream.append(errorBlock(entry.text));
+    return;
+  }
+
   if (entry.role === "tool") {
     // A stored tool result is shown inline; the details panel keeps the latest.
     stream.append(el("div", "tool-result", entry.text));
@@ -242,6 +316,13 @@ function renderEntry(entry) {
   }
   if (entry.text) turn.append(el("div", "body", entry.text));
   stream.append(turn);
+}
+
+function errorBlock(text) {
+  const box = el("div", "err-entry");
+  box.append(el("span", "cap", "request failed"));
+  box.append(document.createTextNode(text));
+  return box;
 }
 
 function startAssistantTurn() {
@@ -325,6 +406,34 @@ function renderSessions(list) {
   }
 }
 
+function renderSettings(status) {
+  settingsPath.textContent = status.settings_path
+    ? "Stored in " + status.settings_path
+    : "";
+
+  // Never overwrite a field the user is in the middle of typing into.
+  if (!settingsDirty) {
+    setBaseUrl.value = status.base_url || "";
+    setModel.value = status.model || "";
+    // The key is never sent back in full; an empty box means "unchanged".
+    setApiKey.value = "";
+    setApiKey.placeholder = status.api_key_masked
+      ? status.api_key_masked + "  (leave blank to keep)"
+      : "sk-...";
+  }
+
+  const missing = status.missing || [];
+  if (status.configured) {
+    notConfigured.hidden = true;
+  } else {
+    notConfigured.hidden = false;
+    notConfigured.textContent =
+      "Not configured: " + missing.join(", ") +
+      ". Fill in the endpoint and key below, then Save. " +
+      "The endpoint must include the version segment, for example https://host/v1.";
+  }
+}
+
 function renderStatus(status) {
   if (!status) return;
 
@@ -333,10 +442,14 @@ function renderStatus(status) {
     (status.messages === undefined ? 0 : status.messages) + " messages \u00b7 " +
     (status.tools || []).length + " tools";
 
+  renderSettings(status);
+
   runtimeInfo.replaceChildren();
   const rows = [
     ["session", status.session],
     ["title", status.title || "(untitled)"],
+    ["endpoint", status.base_url || "(not set)"],
+    ["key", status.api_key_masked || "(not set)"],
     ["model", status.model],
     ["cache", status.cache_policy],
     ["config v", String(status.config_version)],
@@ -366,13 +479,22 @@ function renderStatus(status) {
   for (const name of status.tools || []) toolInfo.append(el("span", "chip", name));
 
   setBusy(!!status.busy);
+  if (!status.configured) {
+    document.getElementById("dot").className = "dot unset";
+    document.getElementById("state").textContent = "not configured";
+  }
 }
 
 function setBusy(value) {
   busy = value;
   send.disabled = value;
-  document.getElementById("dot").className = "dot" + (value ? " busy" : "");
-  document.getElementById("state").textContent = value ? "working\u2026" : "idle";
+  if (!value) {
+    document.getElementById("dot").className = "dot";
+    document.getElementById("state").textContent = "idle";
+  } else {
+    document.getElementById("dot").className = "dot busy";
+    document.getElementById("state").textContent = "working\u2026";
+  }
 }
 
 // ---------------------------------------------------------------- events
@@ -388,6 +510,11 @@ window.ngu = {
         break;
       case "status":
         renderStatus(event.status);
+        break;
+      case "settings_saved":
+        settingsDirty = false;
+        settingsSaved.hidden = false;
+        setTimeout(() => { settingsSaved.hidden = true; }, 2000);
         break;
       case "turn_start":
         appendUserTurn(event.text);
@@ -419,7 +546,8 @@ window.ngu = {
       case "error":
         endAssistantTurn();
         setBusy(false);
-        stream.append(el("div", "tool-result bad", "error: " + event.message));
+        // Kept in the transcript by the shell, so it survives a session switch.
+        stream.append(errorBlock(event.message));
         scrollToEnd();
         break;
       case "step":
@@ -454,6 +582,36 @@ input.addEventListener("keydown", (event) => {
 });
 document.getElementById("new-session").addEventListener("click", () => {
   toShell({ cmd: "new_session" });
+});
+
+// ---------------------------------------------------------------- settings
+
+for (const field of [setBaseUrl, setApiKey, setModel]) {
+  field.addEventListener("input", () => { settingsDirty = true; });
+}
+
+function saveSettings() {
+  // A blank key box means "keep the stored key": the shell never sends the key
+  // back, so an empty field must not be read as "erase it".
+  const payload = {
+    cmd: "save_settings",
+    base_url: setBaseUrl.value.trim(),
+    model: setModel.value.trim(),
+  };
+  if (setApiKey.value.trim() !== "") {
+    payload.api_key = setApiKey.value.trim();
+  } else {
+    payload.keep_api_key = true;
+  }
+  toShell(payload);
+}
+
+document.getElementById("save-settings").addEventListener("click", saveSettings);
+setApiKey.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    saveSettings();
+  }
 });
 
 // The page is loaded and listening; ask the shell for initial state.
