@@ -195,6 +195,42 @@ ngu config path                  # 只打印设置文件路径
 > 刻意**没有默认 endpoint**。猜一个默认值,正是让身处服务商未覆盖地区的用户撞上
 > 一个自己无法解释的 403 的原因。留空会被报告为"未配置"——那是可行动的,而错误的
 > endpoint 不是。
+### 思考强度(reasoning_effort)
+
+推理模型的成本主要由「想多久」决定,所以这是一个独立开关,而不是藏在提示词里。
+
+| 位置 | 用法 |
+|---|---|
+| 桌面 | 右侧面板 **Thinking effort** 下拉:`provider default / none / minimal / low / medium / high / xhigh / max` |
+| 命令行 | `ngu config set --reasoning-effort minimal`,或每次 `ngu --reasoning-effort high -p "..."` |
+| 环境变量 | `NGU_REASONING_EFFORT` |
+
+实测同一道推理题(`deepseek-v4.1-flash`):默认 **269** output tokens → `minimal` **230** tokens。
+
+发送的是**扁平顶层字段** `reasoning_effort` —— 这是 Chat Completions 的规范写法。
+嵌套的 `reasoning: {effort: ...}` 属于 Responses API,不是同一个接口,不要混用。
+
+### 模型列表
+
+`GET /v1/models` 是事实标准,所以不必手填模型名:
+
+* **桌面**:启动时自动拉取,填进 Model 字段的候选列表(可输入过滤,也可填自己的值);另有 `fetch list` 按钮
+* **命令行**:`ngu models`
+
+实测一个网关返回了 48 个模型,并附带 `owned_by` 与 `supported_endpoint_types`。
+
+### 兼容性说明
+
+不同 provider 对同一件事的字段名并不一致,而**读错不会报错,只会静默给出 0 或空串**。内核按下面的方式兼容:
+
+| 内容 | 读取的字段(按顺序取第一个有值的) |
+|---|---|
+| 缓存命中 | `prompt_tokens_details.cached_tokens`、`input_tokens_details.cached_tokens`、`prompt_cache_hit_tokens`、`cached_tokens`、`cache_read_input_tokens` |
+| 推理内容 | `reasoning_content`、`reasoning`、`reasoning_details[].text` |
+| 用量 | `prompt_tokens` / `completion_tokens`,回退 `input_tokens` / `output_tokens` |
+
+`prompt_tokens` 在所有查过的 provider 上都**已包含**缓存命中的部分,所以不再做减法。
+输出上限发送 `max_completion_tokens`(`max_tokens` 已在 OpenAI、Groq、Moonshot、DashScope 弃用)。
 ### 构建与运行
 
 ```bash
