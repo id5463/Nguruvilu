@@ -92,7 +92,7 @@ pub struct OverrideRecord {
 }
 
 /// The kernel's mutable tool table.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, ToolDef>,
     overrides: Vec<OverrideRecord>,
@@ -141,6 +141,15 @@ impl ToolRegistry {
     /// Remove a tool, returning whether it existed.
     pub fn unregister(&mut self, name: &str) -> bool {
         self.tools.remove(name).is_some()
+    }
+
+    /// Remove every tool contributed by `owner`, returning how many went.
+    ///
+    /// Unloading a plugin must not leave its tools callable.
+    pub fn retain_owner(&mut self, owner: &str) -> usize {
+        let before = self.tools.len();
+        self.tools.retain(|_, def| def.owner != owner);
+        before - self.tools.len()
     }
 
     /// Look up a tool.

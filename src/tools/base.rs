@@ -94,12 +94,16 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<()> {
         ConflictPolicy::Error,
     )?;
 
+    let shell = detect_shell();
     registry.register(
         ToolDef::new(
             "bash",
-            "Run a shell command and return its combined output. \
-             Set timeout_ms to bound long-running commands. \
-             Output is truncated when very large.",
+            format!(
+                "Run a shell command and return its combined output.\n\
+                 The command runs in {} — {} \n\
+                 Set timeout_ms to bound long-running commands. Output is truncated when very large.",
+                shell.label, shell.syntax_hint
+            ),
             json!({
                 "type": "object",
                 "properties": {
@@ -250,7 +254,8 @@ async fn bash_tool(args: Value) -> Result<String> {
     );
     let cwd = args.get("cwd").and_then(|c| c.as_str()).map(resolve_path);
 
-    let (program, program_args) = shell_invocation(command);
+    let shell = detect_shell();
+    let (program, program_args) = shell.invocation(command);
 
     let mut cmd = Command::new(&program);
     cmd.args(&program_args)
@@ -263,7 +268,7 @@ async fn bash_tool(args: Value) -> Result<String> {
 
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("spawning {program}"))?;
+        .with_context(|| format!("spawning {program} (shell: {})", shell.label))?;
 
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
@@ -318,38 +323,159 @@ async fn bash_tool(args: Value) -> Result<String> {
         out.push_str("(no output)");
     }
 
-    let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
-    Ok(format!("exit code: {code}\n{out}"))
+    let code = status.code();
+    // On failure, name the shell so the model can correct its syntax on the
+    // next attempt instead of retrying the same wrong command.
+    let mut result = format!(
+        "exit code: {}\n{out}",
+        code.map(|c| c.to_string()).unwrap_or_else(|| "signal".into())
+    );
+    if code != Some(0) {
+        result.push_str(&format!("\n(shell: {})", shell.label));
+    }
+    Ok(result)
 }
 
-/// Build the shell invocation for a command string.
+/// The shell a `bash` command runs in.
+#[derive(Debug, Clone)]
+pub struct ShellSpec {
+    /// Executable path or name.
+    pub program: String,
+    /// Arguments placed before the command string.
+    pub args: Vec<String>,
+    /// Human-readable label shown to the model.
+    pub label: String,
+    /// One-line syntax hint shown to the model.
+    pub syntax_hint: String,
+}
+
+impl ShellSpec {
+    /// The full argv for one command.
+    fn invocation(&self, command: &str) -> (String, Vec<String>) {
+        let mut args = self.args.clone();
+        args.push(command.to_string());
+        (self.program.clone(), args)
+    }
+}
+
+/// Detect the shell once and reuse it.
 ///
-/// Windows defaults to PowerShell because that is the platform's real shell
-/// surface; `NGU_SHELL` overrides it (for example `NGU_SHELL=cmd /C` or
-/// `NGU_SHELL=bash -c`).
-fn shell_invocation(command: &str) -> (String, Vec<String>) {
+/// Resolution order:
+///
+/// 1. `NGU_SHELL` — an explicit override, e.g. `NGU_SHELL=cmd /C`.
+/// 2. On Windows, Git Bash when installed. Models overwhelmingly write POSIX
+///    commands, and Git Bash both understands them and resolves Windows paths,
+///    so it is the better default than PowerShell. WSL's `bash.exe` is
+///    deliberately not selected: its filesystem is isolated from the Windows
+///    working directory.
+/// 3. PowerShell on Windows, `bash`/`sh` elsewhere.
+pub fn detect_shell() -> ShellSpec {
+    use std::sync::OnceLock;
+    static SHELL: OnceLock<ShellSpec> = OnceLock::new();
+    SHELL.get_or_init(resolve_shell).clone()
+}
+
+fn resolve_shell() -> ShellSpec {
     if let Ok(custom) = std::env::var("NGU_SHELL") {
         let mut parts = custom.split_whitespace();
         if let Some(program) = parts.next() {
-            let mut args: Vec<String> = parts.map(str::to_string).collect();
-            args.push(command.to_string());
-            return (program.to_string(), args);
+            return ShellSpec {
+                program: program.to_string(),
+                args: parts.map(str::to_string).collect(),
+                label: format!("`{custom}` (from NGU_SHELL)"),
+                syntax_hint: "use the syntax that shell expects".to_string(),
+            };
         }
     }
 
     if cfg!(windows) {
-        (
-            "powershell".to_string(),
-            vec![
+        if let Some(git_bash) = find_git_bash() {
+            return ShellSpec {
+                program: git_bash,
+                args: vec!["-c".to_string()],
+                label: "Git Bash (POSIX shell)".to_string(),
+                syntax_hint: "write POSIX commands such as `ls -la`, `grep -rn`, `find . -name`; \
+                              Windows paths like `C:\\dir` also work, and `pwd` reports `/c/dir` form"
+                    .to_string(),
+            };
+        }
+        return ShellSpec {
+            program: "powershell".to_string(),
+            args: vec![
                 "-NoProfile".to_string(),
                 "-NonInteractive".to_string(),
                 "-Command".to_string(),
-                command.to_string(),
             ],
-        )
-    } else {
-        ("sh".to_string(), vec!["-c".to_string(), command.to_string()])
+            label: "Windows PowerShell (not a POSIX shell)".to_string(),
+            syntax_hint: "write PowerShell: `Get-ChildItem` not `ls -la`, \
+                          `Select-String` not `grep`, `$env:NAME` not `$NAME`"
+                .to_string(),
+        };
     }
+
+    for candidate in ["bash", "sh"] {
+        if which(candidate).is_some() {
+            return ShellSpec {
+                program: candidate.to_string(),
+                args: vec!["-c".to_string()],
+                label: format!("`{candidate}` (POSIX shell)"),
+                syntax_hint: "write POSIX commands".to_string(),
+            };
+        }
+    }
+
+    ShellSpec {
+        program: "sh".to_string(),
+        args: vec!["-c".to_string()],
+        label: "`sh` (POSIX shell)".to_string(),
+        syntax_hint: "write POSIX commands".to_string(),
+    }
+}
+
+/// Locate Git Bash on Windows, skipping WSL's `bash.exe` under System32.
+fn find_git_bash() -> Option<String> {
+    const CANDIDATES: [&str; 4] = [
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+    ];
+    for candidate in CANDIDATES {
+        if Path::new(candidate).exists() {
+            return Some(candidate.to_string());
+        }
+    }
+    // Fall back to PATH, but never to the WSL shim.
+    let found = which("bash")?;
+    let lowered = found.to_lowercase();
+    if lowered.contains("system32") || lowered.contains("syswow64") {
+        return None;
+    }
+    Some(found)
+}
+
+/// Minimal `which`: look the program up on `PATH`.
+fn which(program: &str) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    let extensions: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".EXE;.CMD;.BAT".to_string())
+            .split(';')
+            .map(|e| e.to_lowercase())
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+
+    for dir in std::env::split_paths(&path) {
+        for ext in &extensions {
+            let candidate = dir.join(format!("{program}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate.display().to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Keep the head and tail of an oversized output.

@@ -88,18 +88,29 @@ Rust 的选择有先例:OpenAI 的 **Codex CLI 已从 TypeScript 重写为 Rust*
 ## 目录
 
 ```
-src/               内核源码(已实现最小可用版本)
+src/
   lib.rs           库入口
-  message.rs       中立消息格式(provider 无关)
-  llm.rs           OpenAI 格式客户端(流式 + 工具调用分片拼接)
-  agent.rs         agent 循环(并行工具调度 + 每轮快照)
-  session.rs       会话与 JSONL 持久化(SessionStore trait)
+  message.rs       中立消息格式(provider 无关,请求边界转换)
+  llm.rs           OpenAI 格式客户端(流式 + 工具调用分片拼接 + 缓存统计)
+  agent.rs         agent 循环(并行工具调度 + 每轮配置快照 + 时间分解)
+  session.rs       会话与 JSONL 持久化(SessionStore trait,预留后端替换)
   tools/
-    mod.rs         工具注册表(冲突默认 fail loud)
-    base.rs        四个基础工具 read / write / edit / bash
-  main.rs          CLI(交互 / 打印 / JSON 三模式)
+    mod.rs         工具注册表(冲突默认 fail loud + 覆盖记录可查)
+    base.rs        四个基础工具 read / write / edit / bash(ACI 原则限界输出)
+  plugin.rs        插件内核(隔离域 / epoch 自动重载 / 依赖 / effect 撤销 / 权限接口)
+  skills.rs        技能系统(目录扫描 / frontmatter 解析 / 目录注入 / 加载工具)
+  mcp.rs           MCP 客户端(stdio,JSON-RPC,并发安全)
+  assembly.rs      装配清单(阶段 / 依赖 / order / 平台过滤 / 循环检测)
+  ledger.rs        安装台账(哈希去重,原子写)
+  loader.rs        动态加载层(插件·MCP·技能三者平级加载 + 回滚)
+  hotreload.rs     热加载(apply_change / 每轮快照 / 作用域 / 同意策略表)
+  context.rs       上下文注入引擎(预算 / 触发 / 深度注入 / 分组 / 递归)
+  git.rs           工作区 git 自动快照(快照 / 历史 / 回滚)
+  main.rs          CLI(交互 / 打印 / JSON + 管理子命令)
 docs/
   SPEC.md          完整规格(所有决策的详细定义)
+tests/
+  kernel.rs        跨模块集成测试
 ```
 
 ## 快速开始
@@ -110,43 +121,74 @@ export NGU_API_KEY=...
 export NGU_BASE_URL=https://api.b.ai/v1
 export NGU_MODEL=deepseek-v4.1-flash
 
-# 构建(产出单文件原生可执行)
+# 构建(产出单文件原生可执行,约 5 MB)
 cargo build --release        # → target/release/ngu
 
-# 三种模式
+# 三种运行模式
 ngu                                     # 交互模式
 ngu -p "列出当前目录"                    # 打印模式
 echo "总结这个文件" | ngu --json         # JSON 模式(供其他 agent 调用)
 ngu --session <id> -p "继续"             # 续接会话
-ngu sessions                            # 会话列表
-ngu models                              # 可用模型
+
+# 技能
+ngu skills --skill-dir ./skills          # 列出技能
+ngu skills --skill-dir ./skills --verbose # 连同正文
+
+# 装配清单(整合包)
+ngu assembly ./assembly.yaml             # 校验并预览加载计划
+ngu apply ./assembly.yaml                # 应用:加载插件 / MCP / 技能
+
+# 工作区快照
+ngu --git-snapshot -p "重构这个模块"      # 每轮前后自动提交
+ngu snapshot list                        # 查看快照
+ngu snapshot restore <commit>            # 回滚
+
+# 运行时
+ngu runtime                              # 策略表与生效配置
+ngu models                               # 可用模型
 ```
 
 ## 状态
 
-**最小可用内核已实现并通过端到端验证。**
+**完整架构已实现:125 个测试通过(100 单元 + 25 集成)。**
 
-| 已实现 | 说明 |
-|---|---|
-| agent 循环 | 多步循环、**并行工具调度**、每轮配置快照 |
-| 模型客户端 | 仅 OpenAI 格式;流式;工具调用分片拼接;缓存命中统计 |
-| 中立消息格式 | provider 无关,只在请求边界转换 |
-| 四个基础工具 | `read` / `write` / `edit` / `bash`,按 ACI 原则限界输出 |
-| 工具注册表 | 冲突默认 fail loud,覆盖记录可查 |
-| 会话持久化 | JSONL 追加写 + `SessionStore` trait(预留 SQLite 后端) |
-| CLI | 交互 / 打印 / JSON 三模式,可被其他 agent 程序化调用 |
-| 性能可测量 | 每轮返回 `model_ms` / `tools_ms` 时间分解 |
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| agent 循环 | ✅ | 多步、**并行工具调度**、每轮配置快照、时间分解 |
+| 模型客户端 | ✅ | 仅 OpenAI 格式;流式;工具调用分片拼接;缓存命中统计 |
+| 中立消息格式 | ✅ | provider 无关,只在请求边界转换 |
+| 四个基础工具 | ✅ | ACI 原则限界输出;跨平台 shell 解析(POSIX 命令在 Windows 可用) |
+| 工具注册表 | ✅ | 冲突默认 fail loud,覆盖记录可查 |
+| 会话持久化 | ✅ | JSONL 追加写 + `SessionStore` trait;损坏行容错 |
+| **插件机制** | ✅ | 隔离域(realm)、epoch 自动重载、effect 逆序撤销、依赖等待、失败回滚 |
+| **权限接口** | ✅ | 收集式 + deny-wins,顺序无关 |
+| **技能系统** | ✅ | 目录扫描、frontmatter、目录注入提示词、按需加载工具 |
+| **MCP** | ✅ | stdio JSON-RPC 客户端,工具自动注册与命名空间隔离 |
+| **装配清单** | ✅ | 阶段 / 依赖拓扑 / order / 平台过滤 / 循环检测 |
+| **动态加载层** | ✅ | 插件·MCP·技能平级加载,台账去重,失败策略(abort/skip/retry) |
+| **全部热加载** | ✅ | `apply_change` 统一入口、会话/全局作用域、同意策略表、每轮快照 |
+| **上下文注入引擎** | ✅ | 预算百分比+上限、触发、深度注入、分组竞争、递归激活 |
+| **工作区 git 快照** | ✅ | 每轮前后自动提交、历史、回滚(含删除新增文件) |
+| CLI | ✅ | 交互 / 打印 / JSON 三模式 + 8 个管理子命令 |
 
-**端到端验证**(`deepseek-v4.1-flash` @ `api.b.ai`):
+## 端到端验证(`deepseek-v4.1-flash` @ `api.b.ai`)
 
 | 验证项 | 结果 |
 |---|---|
-| 工具调用 | ✅ 模型正确调用 `read`,参数与结果回灌正常 |
-| 多步循环 | ✅ 最多 4 步完成写→改→读链路 |
+| 工具调用 | ✅ 模型正确调用工具,参数与结果回灌正常 |
+| 多步循环 | ✅ 最多 6 步完成写→改→读→验证链路 |
 | **并行调度** | ✅ 一轮请求 3 个工具并发执行,总耗时 53 ms |
-| 会话续接 | ✅ 跨进程记住上下文("42") |
+| 会话续接 | ✅ 跨进程记住上下文 |
 | **KV cache 命中** | ✅ `cached=768/1664`,续接会话时 `in=33 cached=768` |
-| 文件落盘 | ✅ `write` + `edit` 后文件实际内容为 `hi kernel` |
+| 文件落盘 | ✅ `write` + `edit` 后文件内容正确 |
+| **技能加载** | ✅ 模型看到技能目录 → 调用 `skill` 工具 → 正确读出指令 |
+| **装配清单** | ✅ 预览加载计划;应用时技能加载成功、插件失败被 `on_failure: skip` 降级并报告 |
+| **git 快照** | ✅ 每轮前后提交;回滚后新增文件被删除、原有文件保留 |
 | 管道 / JSON 调用 | ✅ `echo ... \| ngu --json` 返回结构化结果 |
 
-**待实现**:插件机制(隔离域 / epoch / effect)、热加载(`apply_change`)、缓存策略档位、上下文注入引擎、动态加载层(Yellow)、工作区 git 快照、权限接口。
+## 下一步
+
+* QuickJS 插件运行时接入(脚本插件热加载)
+* 子进程插件协议(computer use 等重活)
+* 移动端多标签会话(方案 C)
+* Yellow 整合包打包/安装(`.dshpack`)

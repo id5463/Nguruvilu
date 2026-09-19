@@ -1040,6 +1040,39 @@ ngu models                                 # 列出可用模型
 
 ---
 
+## 13. 实现状态
+
+截至当前提交,规格中的以下部分已经落地并有测试覆盖(125 个测试:100 单元 + 25 集成):
+
+| 规格章节 | 状态 | 落点 |
+|---|---|---|
+| 1 内核边界 | ✅ | `tools/`(四工具 + 注册表)、`agent.rs`、`session.rs`、`llm.rs` |
+| 2.2 隔离域 | ✅ | `plugin.rs`:`RealmMap`(含默认 realm)、`(name, realm)` 服务键 |
+| 2.3 epoch | ✅ | `plugin.rs`:`refresh()` 沿依赖图自动重载;依赖消失时 fiber 保留为 Pending |
+| 2.4 effect | ✅ | `plugin.rs`:disposer 逆序执行,卸载清理服务与工具 |
+| 2.6 权限接口 | ✅ | `plugin.rs`:`PermissionStack`,收集式 + deny-wins |
+| 2.7 冲突处理 | ✅ | `tools/mod.rs` + `plugin.rs`:默认 fail loud,覆盖记录可查 |
+| 2.8 顺序控制 | ✅ | `assembly.rs`:依赖拓扑 → 阶段 → order → 声明顺序 |
+| 3 热加载 | ✅ | `hotreload.rs`:`apply_change`、每轮快照、作用域、同意策略表 |
+| 4 缓存策略 | ✅ | `hotreload.rs`:`CachePolicy` 三档;`context.rs` 按档位决定注入位置 |
+| 4.8 上下文注入引擎 | ✅ | `context.rs`:预算、触发、深度注入、分组竞争、递归激活(无随机) |
+| 5 多会话与隔离 | ✅ | `plugin.rs` 隔离域 + `loader.rs` 按 scope 选 realm |
+| 6 模型层 | ✅ | `llm.rs` 仅 OpenAI 格式;`message.rs` 中立格式 + 边界转换 |
+| 7 性能硬要求 | ✅ | 并行调度(JoinSet)、增量请求构建、流式直连、时间分解 |
+| 8 插件规划 | ⏳ | 运行时分层已定(内核 Rust + 脚本 + 子进程);QuickJS 接入待做 |
+| 9 git 快照 | ✅ | `git.rs`:快照、历史、回滚(含删除快照后新增的文件) |
+| 10 动态加载层 | ✅ | `assembly.rs` + `ledger.rs` + `loader.rs` + `mcp.rs`(技能/MCP/插件平级) |
+| 12 CLI | ✅ | `main.rs`:三运行模式 + 8 个管理子命令 |
+
+**尚未实现**(诚实记录):
+
+- **QuickJS 插件运行时**:插件目前必须是内核内定义的(编译期)。脚本插件热加载是下一步。
+- **子进程插件协议**:computer use 等重活插件需要它;MCP 已经走通同一条路。
+- **`.dshpack` 打包/安装**:装配清单已可解析应用,包归档格式尚未实现。
+- **streamable-http MCP**:声明可解析,但只连 stdio;HTTP 传输会明确报告"未实现"而非静默跳过。
+- **手机端多标签会话**:服务端模型已就绪(会话级隔离 + 作用域),客户端未做。
+
+---
 ## 附:实现顺序
 
 1. **内核骨架**:会话 + 循环 + 模型(OpenAI)+ 工具表 + 4 工具

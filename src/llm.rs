@@ -114,6 +114,16 @@ impl LlmClient {
         &self.config.model
     }
 
+    /// A clone using a different model id.
+    ///
+    /// The HTTP client is shared, so switching models reuses the connection
+    /// pool instead of reconnecting: a route change must not cost a handshake.
+    pub fn with_model(&self, model: impl Into<String>) -> Self {
+        let mut next = self.clone();
+        next.config.model = model.into();
+        next
+    }
+
     /// Send a streaming completion request.
     ///
     /// Returns a receiver of incremental events. The request itself has
