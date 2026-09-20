@@ -65,6 +65,14 @@ pub struct Settings {
     /// Recent messages kept verbatim when compacting.
     #[serde(default = "default_keep_recent")]
     pub compact_keep_recent: usize,
+
+    /// Extra fields merged into every request body.
+    ///
+    /// This is how a provider difference stays a settings change: an endpoint
+    /// that wants enable_thinking, top_k, or any other field gets it here.
+    /// A null value removes a field the kernel would otherwise send.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra_body: serde_json::Map<String, serde_json::Value>,
 }
 
 fn default_compact_percent() -> u32 {
@@ -268,6 +276,7 @@ mod tests {
             context_window: None,
             compact_percent: 75,
             compact_keep_recent: 8,
+            extra_body: serde_json::Map::new(),
         };
         assert!(settings.is_configured());
         assert!(settings.missing().is_empty());
@@ -284,6 +293,7 @@ mod tests {
             context_window: None,
             compact_percent: 75,
             compact_keep_recent: 8,
+            extra_body: serde_json::Map::new(),
         };
         assert_eq!(settings.model_or_default(), DEFAULT_MODEL);
     }
@@ -329,6 +339,7 @@ mod tests {
             context_window: None,
             compact_percent: 75,
             compact_keep_recent: 8,
+            extra_body: serde_json::Map::new(),
         };
         let text = serde_json::to_string_pretty(&settings).unwrap();
         std::fs::write(&path, &text).unwrap();

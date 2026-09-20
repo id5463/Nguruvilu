@@ -33,6 +33,7 @@ pub mod mcp;
 pub mod message;
 pub mod pack;
 pub mod plugin;
+pub mod request;
 pub mod session;
 pub mod window;
 pub mod settings;
@@ -59,6 +60,7 @@ pub use plugin::{
     Action, Contributions, Decision, FiberState, Kernel, PermissionProvider, PermissionStack,
     Plugin, PluginCtx, RealmId, RealmMap, ReloadEvent,
 };
+pub use request::{ExtraFields, RequestShaper};
 pub use settings::Settings;
 pub use window::{ContextPolicy, ContextWindow, WindowSource};
 pub use session::{Session, SessionStore};

@@ -365,6 +365,7 @@ impl AppState {
             context_window: context_window.filter(|t| *t > 0),
             compact_percent,
             compact_keep_recent: compact_keep_recent.max(1),
+            extra_body: self.settings.extra_body.clone(),
         };
         settings.save()?;
         self.settings = settings;
@@ -483,7 +484,13 @@ impl AppState {
         // Empty means direct, and means the process's own proxy variables stay
         // out of the way.
         config.proxy = self.settings.proxy.clone();
-        LlmClient::new(config).context("building the model client")
+        LlmClient::new(config)
+            .map(|client| {
+                client.with_shaper(nguruvilu::request::from_extra_fields(
+                    self.settings.extra_body.clone(),
+                ))
+            })
+            .context("building the model client")
     }
 }
 

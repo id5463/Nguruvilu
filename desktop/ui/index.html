@@ -93,6 +93,20 @@
     border-radius: 4px; cursor: pointer; text-transform: none; letter-spacing: 0;
   }
   button.tiny:hover { background: #232a34; color: #dbe4f2; }
+  /* A datalist only appears once you type, and WebView2 does not even
+     show its arrow — so the fetched catalog gets a list you can see. */
+  .picker {
+    max-height: 168px; overflow: auto; margin: -4px 0 8px;
+    border: 1px solid var(--line); border-radius: 6px; background: #191d24;
+  }
+  .picker .item {
+    display: flex; justify-content: space-between; gap: 8px;
+    padding: 4px 8px; cursor: pointer; font-size: 11.5px;
+    font-family: var(--mono); color: #b9c4d4;
+  }
+  .picker .item:hover { background: #232a34; color: #e8eefb; }
+  .picker .item.current { background: #24405f; color: #dbe8fb; }
+  .picker .owner { color: var(--dim); font-size: 10px; }
   .hint { color: var(--dim); font-size: 10.5px; margin-top: 6px; word-break: break-all; line-height: 1.5; }
   .saved { color: var(--ok); font-size: 10.5px; }
 
@@ -239,6 +253,7 @@
         <input id="set-model" list="model-options" placeholder="model-id" spellcheck="false">
       </label>
       <datalist id="model-options"></datalist>
+      <div id="model-list" class="picker" hidden></div>
       <label class="field">
         <span class="cap">Proxy (optional)</span>
         <input id="set-proxy" placeholder="http://127.0.0.1:7890" spellcheck="false">
@@ -357,6 +372,7 @@ const settingsSaved = document.getElementById("settings-saved");
 const settingsPath = document.getElementById("settings-path");
 
 const modelOptions = document.getElementById("model-options");
+const modelList = document.getElementById("model-list");
 
 const packList = document.getElementById("pack-list");
 const packsDir = document.getElementById("packs-dir");
@@ -508,25 +524,51 @@ function notice(text, bad) {
   packNotice.textContent = text;
 }
 
-/// Offer the fetched catalog in the Model field.
+/// Offer the fetched catalog as a list you can actually see and click.
+///
+/// A <datalist> only appears once you type into the field, and WebView2 does
+/// not draw its dropdown arrow at all, so the catalog was being fetched and
+/// then hidden. This renders it.
 function renderModels(list) {
-  modelOptions.replaceChildren();
   const models = list || [];
+  modelOptions.replaceChildren();
+  modelList.replaceChildren();
+
   for (const model of models) {
     const option = document.createElement("option");
     option.value = model.id;
-    if (model.owned_by && model.owned_by !== "unknown") option.label = model.owned_by;
     modelOptions.append(option);
   }
+
   if (models.length === 0) {
-    notice("The endpoint returned no models.", true);
-  } else {
-    notice(
-      "Fetched " + models.length + " models from the endpoint. " +
-      "The Model field now suggests them \u2014 type to filter, or keep your own value.",
-      false
-    );
+    modelList.hidden = true;
+    notice("The endpoint returned no models. Check the endpoint and the key.", true);
+    return;
   }
+
+  for (const model of models) {
+    const row = el("div", "item");
+    row.append(el("span", "id", model.id));
+    if (model.owned_by && model.owned_by !== "unknown") {
+      row.append(el("span", "owner", model.owned_by));
+    }
+    row.title = "Use " + model.id;
+    row.addEventListener("click", () => {
+      setModel.value = model.id;
+      settingsDirty = true;
+      for (const other of modelList.children) other.classList.remove("current");
+      row.classList.add("current");
+      notice("Model set to " + model.id + ". Press Save to apply it.", false);
+    });
+    modelList.append(row);
+  }
+
+  modelList.hidden = false;
+  notice(
+    "Fetched " + models.length + " models \\u2014 click one below to use it, " +
+    "or type your own in the Model field.",
+    false
+  );
 }
 
 /// Render the installed packs, each with its own Apply action.

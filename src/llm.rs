@@ -8,6 +8,8 @@
 //! fragments keyed by `index`; this module accumulates them so the loop sees
 //! one complete call per index.
 
+use std::sync::Arc;
+
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -61,6 +63,13 @@ impl LlmConfig {
 /// Token accounting reported by the provider.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
+    /// Reasoning tokens, when the provider reports them.
+    ///
+    /// The honest measure of how much a model thought. Output tokens vary a lot
+    /// between identical runs, so comparing them proves nothing; reasoning
+    /// tokens dropping to zero when effort is "none" does.
+    #[serde(default)]
+    pub reasoning: u64,
     /// Uncached prompt tokens.
     pub input: u64,
     /// Completion tokens.
@@ -106,6 +115,8 @@ struct PartialCall {
 pub struct LlmClient {
     http: reqwest::Client,
     config: LlmConfig,
+    /// Last word on the request body; see [`crate::request::RequestShaper`].
+    shaper: Arc<dyn crate::request::RequestShaper>,
 }
 
 impl LlmClient {
@@ -134,12 +145,35 @@ impl LlmClient {
         };
 
         let http = builder.build().context("building HTTP client")?;
-        Ok(Self { http, config })
+        Ok(Self {
+            http,
+            config,
+            shaper: Arc::new(crate::request::Passthrough),
+        })
     }
 
     /// The configured model id.
     pub fn model(&self) -> &str {
         &self.config.model
+    }
+
+    /// Replace the request shaper.
+    ///
+    /// The shaper has the last word on every request body, so this is the seam
+    /// for provider-specific fields, spellings, and opt-ins.
+    pub fn with_shaper(mut self, shaper: Arc<dyn crate::request::RequestShaper>) -> Self {
+        self.shaper = shaper;
+        self
+    }
+
+    /// The shaper in use, for diagnostics.
+    pub fn shaper_name(&self) -> &str {
+        self.shaper.name()
+    }
+
+    /// The request body this client would send, for inspection and tests.
+    pub fn preview_body(&self, messages: &[Message], tools: &[Value]) -> Value {
+        self.build_body(messages, tools)
     }
 
     /// A clone using a different model id.
@@ -315,12 +349,26 @@ impl LlmClient {
         if let Some(t) = self.config.temperature {
             body["temperature"] = json!(t);
         }
+        // Reasoning effort is the main cost lever on a reasoning model, and it
+        // is a flat top-level field in Chat Completions — the nested
+        // `reasoning: {effort: ...}` object belongs to the Responses API, which
+        // is a different endpoint.
+        if let Some(effort) = &self.config.reasoning_effort {
+            let effort = effort.trim();
+            if !effort.is_empty() && effort != "default" {
+                body["reasoning_effort"] = json!(effort);
+            }
+        }
         if let Some(m) = self.config.max_tokens {
             // `max_tokens` is deprecated across OpenAI, Groq, Moonshot, and
             // DashScope; `max_completion_tokens` is the current name. Providers
             // that never adopted it ignore the field rather than failing.
             body["max_completion_tokens"] = json!(m);
         }
+
+        // Last word goes to the shaper: it exists precisely to express what the
+        // kernel cannot know about a particular endpoint.
+        self.shaper.shape(&mut body);
         body
     }
 
@@ -522,7 +570,15 @@ fn extract_usage(usage: &Value) -> TokenUsage {
         ],
     );
 
-    TokenUsage { input, output, cached }
+    let reasoning = first_u64(
+        usage,
+        &[
+            &["completion_tokens_details", "reasoning_tokens"][..],
+            &["output_tokens_details", "reasoning_tokens"][..],
+        ],
+    );
+
+    TokenUsage { input, output, cached, reasoning }
 }
 
 /// Walk key paths and return the first one that holds a number.
@@ -555,4 +611,78 @@ fn truncate(text: &str, max: usize) -> String {
     let mut out: String = text.chars().take(max).collect();
     out.push_str("… (truncated)");
     out
+}
+
+#[cfg(test)]
+mod body_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn client_with(effort: Option<&str>, extra: serde_json::Map<String, serde_json::Value>) -> LlmClient {
+        let mut config = LlmConfig::new("http://localhost:1/v1", "k", "test-model");
+        config.reasoning_effort = effort.map(str::to_string);
+        LlmClient::new(config)
+            .unwrap()
+            .with_shaper(crate::request::from_extra_fields(extra))
+    }
+
+    #[test]
+    fn reasoning_effort_reaches_the_request_body() {
+        let client = client_with(Some("minimal"), serde_json::Map::new());
+        let body = client.preview_body(&[Message::user("hi")], &[]);
+        assert_eq!(
+            body["reasoning_effort"], "minimal",
+            "the field must actually be sent, not merely stored: {body}"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_default_effort_is_not_sent() {
+        for value in ["", "  ", "default"] {
+            let client = client_with(Some(value), serde_json::Map::new());
+            let body = client.preview_body(&[Message::user("hi")], &[]);
+            assert!(
+                body.get("reasoning_effort").is_none(),
+                "{value:?} should mean 'let the provider decide': {body}"
+            );
+        }
+        let client = client_with(None, serde_json::Map::new());
+        let body = client.preview_body(&[Message::user("hi")], &[]);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn extra_body_fields_reach_the_request_body() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("enable_thinking".into(), json!(true));
+        extra.insert("top_k".into(), json!(40));
+
+        let client = client_with(None, extra);
+        let body = client.preview_body(&[Message::user("hi")], &[]);
+
+        assert_eq!(body["enable_thinking"], true, "{body}");
+        assert_eq!(body["top_k"], 40, "{body}");
+    }
+
+    #[test]
+    fn extra_body_can_remove_a_field_the_kernel_set() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("tool_choice".into(), serde_json::Value::Null);
+
+        let client = client_with(None, extra);
+        let tools = vec![json!({ "type": "function", "function": { "name": "t" } })];
+        let body = client.preview_body(&[Message::user("hi")], &tools);
+
+        assert!(body.get("tools").is_some(), "tools stay");
+        assert!(body.get("tool_choice").is_none(), "tool_choice removed: {body}");
+    }
+
+    #[test]
+    fn the_stream_flag_and_model_are_always_present() {
+        let client = client_with(None, serde_json::Map::new());
+        let body = client.preview_body(&[Message::user("hi")], &[]);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["model"], "test-model");
+    }
 }

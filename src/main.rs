@@ -1652,5 +1652,15 @@ fn require_key(api_key: &str) -> Result<()> {
 fn client(base_url: &str, api_key: &str, model: &str, settings: &Settings) -> Result<LlmClient> {
     let mut config = LlmConfig::new(base_url, api_key, model);
     config.proxy = settings.proxy.clone();
-    LlmClient::new(config).context("building the model client")
+    // Reasoning effort is set here rather than only in the runtime route, so a
+    // one-off --reasoning-effort reaches the wire.
+    let effort = settings.reasoning_effort.trim();
+    if !effort.is_empty() && effort != "default" {
+        config.reasoning_effort = Some(effort.to_string());
+    }
+    LlmClient::new(config)
+        .map(|client| {
+            client.with_shaper(nguruvilu::request::from_extra_fields(settings.extra_body.clone()))
+        })
+        .context("building the model client")
 }
