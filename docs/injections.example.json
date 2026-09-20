@@ -1,0 +1,26 @@
+{
+  "budget_percent": 20,
+  "max_recursion": 3,
+  "entries": [
+    {
+      "id": "project-rules",
+      "content": "Project rule: never edit files under vendor/.",
+      "constant": true,
+      "position": "prefix"
+    },
+    {
+      "id": "rust-style",
+      "content": "This is a Rust project: prefer cargo commands, and run cargo test after edits.",
+      "triggers": ["rust", "cargo", ".rs"],
+      "position": "history-tail"
+    },
+    {
+      "id": "pdf-tools",
+      "content": "For PDFs use pdftotext; report the page count first.",
+      "triggers": ["pdf"],
+      "position": "at-depth",
+      "role": "system",
+      "order": 5
+    }
+  ]
+}

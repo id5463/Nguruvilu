@@ -258,12 +258,58 @@ pub fn estimate_tokens(text: &str) -> usize {
     text.chars().count().div_ceil(4).max(1)
 }
 
+/// Which messages a trigger may match against.
+///
+/// This is not a cosmetic setting. Matching the assistant's own output lets an
+/// injected fragment feed itself: an entry saying "this is a Rust project" makes
+/// the model look for Cargo, its search results contain the word "cargo", the
+/// trigger fires again, and the model keeps believing something that was never
+/// true. Observed in practice, and it cost a dozen wasted tool calls.
+///
+/// So the default reads only what the *user* said. Tool output can be included
+/// deliberately, because external facts are legitimate evidence; the model's own
+/// words never are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScanScope {
+    /// Only user messages. The safe default.
+    #[default]
+    User,
+    /// User messages and tool results, but never the assistant's own text.
+    UserAndTool,
+    /// Every message, including the assistant's output. Can self-reinforce.
+    All,
+}
+
+impl ScanScope {
+    /// Whether a role is visible to triggers.
+    pub fn includes(&self, role: Role) -> bool {
+        match self {
+            ScanScope::User => role == Role::User,
+            ScanScope::UserAndTool => matches!(role, Role::User | Role::Tool),
+            ScanScope::All => true,
+        }
+    }
+
+    /// A short label for display.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScanScope::User => "user",
+            ScanScope::UserAndTool => "user+tool",
+            ScanScope::All => "all",
+        }
+    }
+}
+
 /// Decides what to inject.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InjectionEngine {
     /// Entries, in declaration order.
     #[serde(default)]
     pub entries: Vec<InjectionEntry>,
+    /// Which messages triggers may match against.
+    #[serde(default)]
+    pub scan: ScanScope,
     /// Budget as a percentage of the context window.
     #[serde(default = "default_budget_percent")]
     pub budget_percent: u32,
@@ -286,6 +332,7 @@ impl Default for InjectionEngine {
     fn default() -> Self {
         Self {
             entries: Vec::new(),
+            scan: ScanScope::default(),
             budget_percent: default_budget_percent(),
             budget_cap: None,
             max_recursion: default_max_recursion(),
@@ -541,6 +588,9 @@ impl InjectionEngine {
         };
         let mut text = String::new();
         for message in slice {
+            if !self.scan.includes(message.role) {
+                continue;
+            }
             text.push_str(message.text());
             text.push('\n');
             for call in &message.tool_calls {
@@ -592,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn triggers_are_case_insensitive_and_match_tool_names() {
+    fn triggers_are_case_insensitive() {
         let mut engine = InjectionEngine::new();
         engine.add(InjectionEntry::triggered(
             "grep-tip",
@@ -602,18 +652,70 @@ mod tests {
 
         let upper = engine.inject(&conversation(&["GREP the repo"]), 8000, CachePolicy::Balanced);
         assert_eq!(upper.activated, vec!["grep-tip"]);
+    }
 
-        let mut with_tool = conversation(&["run it"]);
-        with_tool.push(Message::assistant_tools(
+    #[test]
+    fn the_assistants_own_output_does_not_trigger_anything() {
+        // The loop this prevents: an entry claims something, the model acts on
+        // it, the model's own words match the trigger, and the claim keeps
+        // renewing itself. It cost a dozen wasted tool calls in practice.
+        let mut engine = InjectionEngine::new();
+        engine.add(InjectionEntry::triggered(
+            "rust-style",
+            "This is a Rust project",
+            vec!["cargo".into()],
+        ));
+
+        let mut history = conversation(&["draw me a picture"]);
+        history.push(Message::assistant("I will look for Cargo.toml"));
+        history.push(Message::assistant_tools(
             vec![crate::message::ToolCall {
                 id: "c1".into(),
-                name: "grep".into(),
-                arguments: "{}".into(),
+                name: "bash".into(),
+                arguments: r#"{"command":"ls Cargo.toml"}"#.into(),
             }],
             None,
         ));
-        let by_tool = engine.inject(&with_tool, 8000, CachePolicy::Balanced);
-        assert_eq!(by_tool.activated, vec!["grep-tip"]);
+
+        let injection = engine.inject(&history, 8000, CachePolicy::Balanced);
+        assert!(
+            injection.is_empty(),
+            "the model's own mention of cargo must not activate the entry: {:?}",
+            injection.activated
+        );
+    }
+
+    #[test]
+    fn tool_results_can_be_scanned_when_asked_for() {
+        let mut engine = InjectionEngine::new();
+        engine.scan = ScanScope::UserAndTool;
+        engine.add(InjectionEntry::triggered(
+            "grep-tip",
+            "prefer ripgrep",
+            vec!["grep".into()],
+        ));
+
+        let mut history = conversation(&["run it"]);
+        history.push(Message::tool_result("c1", "bash", "grep: command not found"));
+
+        let injection = engine.inject(&history, 8000, CachePolicy::Balanced);
+        assert_eq!(injection.activated, vec!["grep-tip"]);
+    }
+
+    #[test]
+    fn the_full_scope_scans_everything_and_says_so() {
+        assert!(ScanScope::All.includes(Role::Assistant));
+        assert!(ScanScope::All.includes(Role::Tool));
+        assert!(ScanScope::All.includes(Role::User));
+
+        assert!(!ScanScope::User.includes(Role::Assistant));
+        assert!(!ScanScope::User.includes(Role::Tool));
+        assert!(ScanScope::User.includes(Role::User));
+
+        assert!(ScanScope::UserAndTool.includes(Role::Tool));
+        assert!(!ScanScope::UserAndTool.includes(Role::Assistant));
+
+        assert_eq!(ScanScope::default(), ScanScope::User, "the safe default");
     }
 
     #[test]

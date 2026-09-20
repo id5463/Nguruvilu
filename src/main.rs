@@ -601,9 +601,17 @@ async fn run() -> Result<()> {
         Session::new(Some(model.clone()))
     };
     let is_new = !store.root().join(format!("{}.jsonl", session.id)).exists();
-    if is_new {
-        store.create(&session)?;
-    }
+
+    // The session file is created on first write, never here. Creating it up
+    // front leaves an empty file behind whenever a run produces nothing — a
+    // failed request, a bare `--new-session` — and empty sessions are noise the
+    // user has to clean up.
+    let ensure_session = |session: &Session| -> Result<()> {
+        if is_new {
+            store.create(session)?;
+        }
+        Ok(())
+    };
 
     let prompt = match cli.prompt.clone() {
         Some(p) => Some(p),
@@ -636,8 +644,22 @@ async fn run() -> Result<()> {
                 .with_observer(observer);
             let outcome = agent.run(&text).await?;
 
+            ensure_session(&session)?;
             session.messages.extend(outcome.new_messages.clone());
             store.append(&session.id, &outcome.new_messages)?;
+
+            // Record what was injected, so the transcript explains what the model
+            // was actually sent.
+            for record in &outcome.injections {
+                store.append_injection(&session.id, record)?;
+                if !cli.quiet {
+                    eprintln!(
+                        "[injected {}: {} tokens]",
+                        record.activated.join(", "),
+                        record.budget_used
+                    );
+                }
+            }
 
             // Record compactions after the messages they replace, so a reload
             // reduces to the same history the model saw.

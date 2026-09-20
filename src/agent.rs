@@ -168,6 +168,11 @@ pub struct AgentOutcome {
     pub timing: TurnTiming,
     /// Configuration version the turn ran under.
     pub config_version: u64,
+    /// Injections performed during this turn, in order.
+    ///
+    /// Recorded so the session log can explain what the model was actually
+    /// sent; an injected fragment is otherwise invisible after the fact.
+    pub injections: Vec<crate::session::InjectionRecord>,
     /// Compactions performed during this turn, in order.
     ///
     /// The caller persists these so a reloaded session matches what the model
@@ -276,6 +281,7 @@ impl Agent {
             new_messages: vec![user_message],
             timing: TurnTiming::default(),
             config_version: settings.version,
+            injections: Vec::new(),
             compactions: Vec::new(),
         };
 
@@ -317,6 +323,15 @@ impl Agent {
             let (request, injection) = self.build_request(&settings);
             if !injection.is_empty() {
                 self.observer.on_injection(&injection);
+                let mut texts = injection.prefix.clone();
+                texts.extend(injection.tail.iter().cloned());
+                texts.extend(injection.at_depth.iter().map(|(_, _, t)| t.clone()));
+                outcome.injections.push(crate::session::InjectionRecord {
+                    activated: injection.activated.clone(),
+                    relocated: injection.relocated.clone(),
+                    budget_used: injection.budget_used,
+                    texts,
+                });
             }
             // The route may name a different model than the client was built
             // with; switching is a clone, not a reconnect.

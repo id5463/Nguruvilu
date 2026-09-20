@@ -1,0 +1,126 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512"
+     role="img" aria-label="Nguruvilu — 蛇身狐头,带爪的尾巴制造漩涡">
+  <title>Nguruvilu</title>
+  <desc>马普切神话中的水生生物 Ngürüvilu:蛇身狐头,用带爪的尾巴制造漩涡。</desc>
+
+  <defs>
+    <linearGradient id="water" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0b2a45"/>
+      <stop offset="1" stop-color="#04121f"/>
+    </linearGradient>
+
+    <linearGradient id="body" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3fbf8f"/>
+      <stop offset="0.5" stop-color="#1f8f7a"/>
+      <stop offset="1" stop-color="#0f5f66"/>
+    </linearGradient>
+
+    <linearGradient id="fur" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f6a24b"/>
+      <stop offset="1" stop-color="#d4661f"/>
+    </linearGradient>
+
+    <radialGradient id="swirl" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0.55" stop-color="#000" stop-opacity="0"/>
+      <stop offset="0.85" stop-color="#5fe0d0" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#5fe0d0" stop-opacity="0"/>
+    </radialGradient>
+
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="6" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+
+    <!-- 漩涡:一条螺旋,尾巴绕它旋转 -->
+    <path id="spiral" fill="none" stroke="#6fe6d6" stroke-opacity="0.5" stroke-width="2.5"
+          d="M256 256
+             m0 -6
+             a6 6 0 1 1 -6 6
+             a14 14 0 1 0 14 -14
+             a26 26 0 1 0 -26 26
+             a42 42 0 1 0 42 -42
+             a62 62 0 1 0 -62 62
+             a86 86 0 1 0 86 -86"/>
+  </defs>
+
+  <!-- 背景水域 -->
+  <rect width="512" height="512" rx="96" fill="url(#water)"/>
+  <g opacity="0.25" fill="none" stroke="#5fe0d0" stroke-width="1.5">
+    <path d="M40 120 q40 -18 80 0 t80 0 t80 0 t80 0 t80 0"/>
+    <path d="M40 400 q40 -18 80 0 t80 0 t80 0 t80 0 t80 0"/>
+  </g>
+
+  <!-- 漩涡 -->
+  <circle cx="256" cy="268" r="150" fill="url(#swirl)"/>
+  <use href="#spiral" transform="translate(0,12)" filter="url(#glow)"/>
+  <use href="#spiral" transform="rotate(180 256 268) translate(0,12)" stroke="#8ff3e6" stroke-opacity="0.28"/>
+
+  <!-- 蛇身:从狐头盘绕到漩涡中心 -->
+  <path d="M150 214
+           C 96 268, 104 356, 176 386
+           C 250 418, 330 396, 344 336
+           C 356 282, 300 250, 262 276
+           C 232 296, 240 336, 274 340"
+        fill="none" stroke="url(#body)" stroke-width="34"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- 腹部高光 -->
+  <path d="M150 214
+           C 96 268, 104 356, 176 386
+           C 250 418, 330 396, 344 336
+           C 356 282, 300 250, 262 276
+           C 232 296, 240 336, 274 340"
+        fill="none" stroke="#9ff0d4" stroke-opacity="0.45" stroke-width="8"
+        stroke-linecap="round" stroke-dasharray="2 16"/>
+  <!-- 鳞片 -->
+  <g fill="none" stroke="#0a3a3a" stroke-opacity="0.55" stroke-width="2">
+    <path d="M118 300 q10 10 22 2"/>
+    <path d="M126 340 q10 10 22 2"/>
+    <path d="M156 372 q10 10 22 2"/>
+    <path d="M206 388 q10 10 22 2"/>
+    <path d="M262 388 q10 10 22 2"/>
+    <path d="M312 370 q10 10 22 2"/>
+    <path d="M340 330 q10 10 22 2"/>
+    <path d="M330 282 q10 10 22 2"/>
+  </g>
+
+  <!-- 带爪的尾巴:从漩涡里伸出 -->
+  <g stroke="url(#body)" stroke-width="14" stroke-linecap="round" fill="none">
+    <path d="M256 268 C 232 240, 210 222, 196 200"/>
+  </g>
+  <g stroke="#f2f7f5" stroke-width="7" stroke-linecap="round">
+    <path d="M196 200 L 172 176"/>
+    <path d="M196 200 L 188 168"/>
+    <path d="M196 200 L 210 172"/>
+  </g>
+
+  <!-- 狐头 -->
+  <g transform="translate(150 200) rotate(-24)" filter="url(#glow)">
+    <!-- 耳 -->
+    <path d="M-30 -6 L-42 -58 L-6 -30 Z" fill="url(#fur)"/>
+    <path d="M24 -10 L 44 -56 L 54 -22 Z" fill="url(#fur)"/>
+    <path d="M-28 -12 L-36 -46 L-14 -28 Z" fill="#7a2f12" opacity="0.8"/>
+    <path d="M28 -14 L 40 -46 L 46 -26 Z" fill="#7a2f12" opacity="0.8"/>
+    <!-- 脸 -->
+    <path d="M-34 -18
+             C -34 -46, 34 -52, 48 -22
+             C 58 -2, 40 30, 8 34
+             C -18 38, -36 16, -34 -18 Z"
+          fill="url(#fur)"/>
+    <!-- 口鼻 -->
+    <path d="M40 6 C 58 8, 62 20, 46 24 C 30 28, 22 16, 26 8 Z" fill="#fbe9d2"/>
+    <circle cx="60" cy="16" r="4.5" fill="#20120a"/>
+    <!-- 眼 -->
+    <ellipse cx="14" cy="-6" rx="7" ry="8" fill="#12100e"/>
+    <circle cx="16.5" cy="-9" r="2.4" fill="#eafff9"/>
+    <!-- 颊纹 -->
+    <path d="M-6 18 C 8 26, 22 24, 32 16" fill="none" stroke="#7a2f12" stroke-width="3" stroke-opacity="0.7"/>
+  </g>
+
+  <!-- 气泡 -->
+  <g fill="#9ff0d4" opacity="0.6">
+    <circle cx="392" cy="120" r="6"/>
+    <circle cx="424" cy="168" r="3.5"/>
+    <circle cx="366" cy="86" r="3"/>
+    <circle cx="96" cy="126" r="4"/>
+  </g>
+</svg>

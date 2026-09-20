@@ -648,6 +648,12 @@ pub async fn run_turn(
                 eprintln!("[store] append failed: {error:#}");
             }
 
+            for record in &outcome.injections {
+                if let Err(error) = guard.store.append_injection(&guard.session.id, record) {
+                    eprintln!("[store] injection append failed: {error:#}");
+                }
+            }
+
             // Record compactions after the messages they replace, then adopt the
             // agent's reduced history so the live session matches the file.
             for compaction in &outcome.compactions {

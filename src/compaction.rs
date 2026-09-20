@@ -61,6 +61,18 @@ pub struct Plan {
     pub keep: usize,
 }
 
+/// Fewest messages worth summarizing.
+///
+/// Summarizing a single message costs a model call and produces text that says
+/// less than the message did. Observed in practice: a run of one user message
+/// became a 548-character summary whose main content was that nothing had
+/// happened yet. A user message plus its reply is the smallest run that can
+/// carry information the summary might preserve.
+///
+/// The floor is deliberately low: raising it means a short conversation is
+/// never compacted at all, and the window it was meant to protect still fills.
+pub const MIN_SUMMARIZE: usize = 2;
+
 /// Decide what to compact, or `None` when nothing can safely be removed.
 ///
 /// `keep_recent` is a target, not a promise. The split is moved earlier until
@@ -82,8 +94,8 @@ pub fn plan(messages: &[Message], keep_recent: usize) -> Option<Plan> {
         split -= 1;
     }
 
-    if split == 0 {
-        // Nothing left to summarize, or no position where the remainder stands
+    if split < MIN_SUMMARIZE {
+        // Nothing worth summarizing, or no position where the remainder stands
         // on its own. Leaving the history alone is correct.
         return None;
     }
@@ -320,6 +332,7 @@ mod tests {
         // keep_recent = 2 would land on the tool result, which cannot begin a
         // kept region.
         let messages = vec![
+            user("first"),
             user("please read it"),
             assistant_calling("read", "c1"),
             tool_result("c1"),
@@ -329,7 +342,7 @@ mod tests {
 
         // The split moved one earlier, so the call and its result stay together
         // in the kept region.
-        assert_eq!(plan.summarize, 1);
+        assert_eq!(plan.summarize, 2);
         assert_eq!(plan.keep, 3);
         assert_ne!(
             messages[plan.summarize].role,
@@ -477,5 +490,17 @@ mod tests {
     #[test]
     fn the_default_summarizer_is_named_for_diagnostics() {
         assert_eq!(ModelSummarizer::default().name(), "model");
+    }
+
+    #[test]
+    fn a_run_too_small_to_be_worth_summarizing_is_left_alone() {
+        // Summarizing one or two messages costs a model call and says little
+        // more than they did.
+        let two = vec![user("one"), user("two")];
+        assert_eq!(plan(&two, 1), None, "one message is not worth a summary");
+
+        let four = vec![user("one"), user("two"), user("three"), user("four")];
+        // keep_recent = 3 would summarize exactly one; below the floor.
+        assert_eq!(plan(&four, 3), None);
     }
 }

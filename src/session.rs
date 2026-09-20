@@ -95,6 +95,11 @@ pub trait SessionStore: Send + Sync {
     fn append_compaction(&self, _id: &str, _compaction: &crate::compaction::Compaction) -> Result<()> {
         Ok(())
     }
+    /// Record what was injected into a request, so the log explains what the
+    /// model was actually sent.
+    fn append_injection(&self, _id: &str, _record: &InjectionRecord) -> Result<()> {
+        Ok(())
+    }
     /// Load a session, or `None` when it does not exist.
     fn load(&self, id: &str) -> Result<Option<Session>>;
     /// List sessions, most recently updated first.
@@ -109,6 +114,22 @@ pub trait SessionStore: Send + Sync {
     fn root(&self) -> &Path;
 }
 
+/// One injection that happened, for the session log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InjectionRecord {
+    /// Ids of the entries that were placed.
+    pub activated: Vec<String>,
+    /// Entries that were moved because the cache policy refused their position.
+    #[serde(default)]
+    pub relocated: Vec<String>,
+    /// Estimated tokens the fragments cost.
+    #[serde(default)]
+    pub budget_used: usize,
+    /// The text that was placed, so a reader can see it verbatim.
+    #[serde(default)]
+    pub texts: Vec<String>,
+}
+
 /// JSONL-backed store: one file per session.
 pub struct JsonlStore {
     root: PathBuf,
@@ -119,6 +140,13 @@ pub struct JsonlStore {
 enum JsonlLine {
     Header(SessionHeader),
     Message(Message),
+    /// Fragments injected into a request.
+    ///
+    /// Recorded because the session log has to explain what the model was
+    /// actually sent. Without this, a question like "why did it believe that"
+    /// is unanswerable from the transcript: the injected text appears nowhere
+    /// in it.
+    Injection(InjectionRecord),
     /// A compaction: the leading run of messages is stood in for by a summary.
     ///
     /// Recorded as its own line rather than by rewriting the file, because the
@@ -191,8 +219,8 @@ impl JsonlStore {
             match serde_json::from_str::<JsonlLine>(&line) {
                 Ok(JsonlLine::Header(h)) => header = Some(h),
                 Ok(JsonlLine::Message(_)) => count += 1,
-                // A compaction line carries no message of its own.
-                Ok(JsonlLine::Compaction(_)) => {}
+                // Neither a compaction nor an injection carries a message.
+                Ok(JsonlLine::Compaction(_)) | Ok(JsonlLine::Injection(_)) => {}
                 Err(_) => continue,
             }
         }
@@ -242,6 +270,23 @@ impl SessionStore for JsonlStore {
         Ok(())
     }
 
+    fn append_injection(&self, id: &str, record: &InjectionRecord) -> Result<()> {
+        Self::validate_id(id)?;
+        let path = self.path_for(id);
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening {} for append", path.display()))?;
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&JsonlLine::Injection(record.clone()))?
+        )?;
+        file.flush()?;
+        self.touch(id)?;
+        Ok(())
+    }
+
     fn append_compaction(&self, id: &str, compaction: &crate::compaction::Compaction) -> Result<()> {
         Self::validate_id(id)?;
         let path = self.path_for(id);
@@ -281,6 +326,9 @@ impl SessionStore for JsonlStore {
                 Ok(JsonlLine::Header(h)) => header = Some(h),
                 Ok(JsonlLine::Message(m)) => messages.push(m),
                 Ok(JsonlLine::Compaction(c)) => compactions.push(c),
+                // An injection record is evidence, not history: it is not
+                // replayed into the conversation.
+                Ok(JsonlLine::Injection(_)) => {}
                 // A corrupt line is skipped rather than failing the load: an
                 // interrupted append must not cost the whole conversation.
                 Err(_) => continue,
