@@ -161,6 +161,19 @@
   .tool-result.bad { border-color: #4a2b2b; color: #e0a9a9; }
   .err-entry {
   .attached { margin: 6px 0 10px; }
+  /* Reasoning is the model thinking aloud. Shown collapsed by default
+     because it is often longer than the answer, and toggleable because
+     sometimes it is the most informative part. */
+  .reasoning {
+    border-left: 2px solid #3a3f4a; margin: 4px 0 8px; padding: 4px 10px;
+    color: #8a94a6; font-size: 11.5px; font-style: italic;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .reasoning.collapsed { max-height: 2.6em; overflow: hidden; }
+  .reasoning .toggle {
+    display: block; font-style: normal; font-size: 10px; color: #6ea8fe;
+    cursor: pointer; margin-bottom: 3px; user-select: none;
+  }
   .attached img {
     max-width: 100%; max-height: 320px; border-radius: 6px;
     border: 1px solid var(--line); display: block;
@@ -235,14 +248,17 @@
 </head>
 <body>
   <aside id="sessions" class="panel">
+    <div id="slot-sidebar-top"></div>
     <h2>Sessions</h2>
     <div id="session-list"></div>
     <button class="action" id="new-session">+ New session</button>
+    <div id="slot-sidebar-bottom"></div>
   </aside>
 
   <main id="stream" class="panel"></main>
 
   <aside id="details" class="panel">
+    <div id="slot-details-top"></div>
     <h2>Settings</h2>
     <div id="settings">
       <div class="warn" id="not-configured" hidden></div>
@@ -272,7 +288,7 @@
       </div>
       <label class="field">
         <span class="cap">Context window (tokens)</span>
-        <input id="set-window" placeholder="auto" spellcheck="false">
+        <input id="set-window" placeholder="128K, 1M, or a number" spellcheck="false">
       </label>
       <div class="row">
         <label class="field" style="flex:1">
@@ -290,6 +306,10 @@
         When the prompt passes the threshold, the oldest messages are summarized
         and replaced \u2014 tool-call pairs are never split.
       </div>
+      <label class="field">
+        <span class="cap">Max output tokens</span>
+        <input id="set-max-output" placeholder="8K, or blank for provider default" spellcheck="false">
+      </label>
       <label class="field">
         <span class="cap">Thinking effort</span>
         <select id="set-effort">
@@ -329,9 +349,12 @@
     <h2>Tools</h2>
     <div id="tool-info"></div>
     <h2>Tool output</h2>
+    <h2>Tool output</h2>
     <div id="log-info"><span class="empty">No tool output yet.</span></div>
+    <div id="slot-details-bottom"></div>
   </aside>
 
+  <div id="slot-above-composer"></div>
   <div id="composer">
     <textarea id="input" rows="1" placeholder="Ask the kernel something&hellip;  (Enter to send, Shift+Enter for a newline)"></textarea>
     <button id="send">Send</button>
@@ -342,6 +365,10 @@
     <span id="model"></span>
     <span id="stats"></span>
     <span id="timing"></span>
+    <span id="slot-status-bar"></span>
+    <label style="margin-left:auto; cursor:pointer; display:flex; gap:4px; align-items:center;">
+      <input type="checkbox" id="show-reasoning"> show thinking
+    </label>
   </div>
 
 <script>
@@ -373,12 +400,14 @@ const setProxy = document.getElementById("set-proxy");
 const setWindow = document.getElementById("set-window");
 const setPercent = document.getElementById("set-percent");
 const setKeep = document.getElementById("set-keep");
+const setMaxOutput = document.getElementById("set-max-output");
 const notConfigured = document.getElementById("not-configured");
 const settingsSaved = document.getElementById("settings-saved");
 const settingsPath = document.getElementById("settings-path");
 
 const modelOptions = document.getElementById("model-options");
 const modelList = document.getElementById("model-list");
+const showReasoning = document.getElementById("show-reasoning");
 
 const packList = document.getElementById("pack-list");
 const packsDir = document.getElementById("packs-dir");
@@ -446,10 +475,73 @@ function errorBlock(text) {
   return box;
 }
 
+/// Render the panels plugins contributed.
+///
+/// Rebuilt wholesale on every update rather than diffed: a panel is a small
+/// fragment, the update happens when something changed anyway, and a diff would
+/// be a second rendering path to keep correct. Scripts run once per panel after
+/// its fragment is in the document, so they can find the elements they added.
+function renderSlots(panels) {
+  for (const slot of ["sidebar-top", "sidebar-bottom", "details-top", "details-bottom", "status-bar", "above-composer"]) {
+    const container = document.getElementById("slot-" + slot);
+    if (container) container.replaceChildren();
+  }
+
+  for (const panel of panels || []) {
+    const container = document.getElementById("slot-" + panel.slot);
+    if (!container) continue;
+
+    const box = el("div", "panel-fragment");
+    box.dataset.panelId = panel.id;
+    if (panel.title) box.append(el("h2", null, panel.title));
+    const body = el("div", "fragment-body");
+    // A plugin's HTML is trusted to the degree the plugin is: one that can
+    // register a tool can already run code in this process.
+    body.innerHTML = panel.html;
+    box.append(body);
+    container.append(box);
+
+    if (panel.script) {
+      try {
+        new Function("panel", "toShell", panel.script)(box, toShell);
+      } catch (error) {
+        box.append(el("div", "notice bad", "panel script failed: " + error.message));
+      }
+    }
+  }
+}
+
 /// Show an image the model was given.
 ///
 /// Rendering it is the point: the user should see exactly what the model saw,
 /// not merely be told that an image exists.
+/// Show a fragment of the model thinking aloud.
+///
+/// Collapsed by default: reasoning is frequently longer than the answer, and a
+/// transcript that is mostly thinking is hard to read. Toggleable, because
+/// sometimes the thinking is the interesting part — especially when the answer
+/// is wrong and the reason is visible in how it got there.
+function appendReasoning(delta) {
+  if (!live) startAssistantTurn();
+  let box = live.turn.querySelector(".reasoning");
+  if (!box) {
+    box = el("div", "reasoning" + (showReasoning.checked ? "" : " collapsed"));
+    const toggle = el("span", "toggle", showReasoning.checked ? "thinking (click to hide)" : "thinking (click to show)");
+    toggle.addEventListener("click", () => {
+      box.classList.toggle("collapsed");
+      toggle.textContent = box.classList.contains("collapsed")
+        ? "thinking (click to show)"
+        : "thinking (click to hide)";
+    });
+    box.append(toggle);
+    const body = el("span", "thought");
+    box.append(body);
+    live.turn.insertBefore(box, live.body);
+  }
+  box.querySelector(".thought").append(document.createTextNode(delta));
+  scrollToEnd();
+}
+
 function appendImage(container, image) {
   const box = el("div", "attached");
   const img = document.createElement("img");
@@ -666,6 +758,7 @@ function renderSettings(status) {
     setWindow.value = ctx.configured_window ? String(ctx.configured_window) : "";
     setPercent.value = String(ctx.threshold_percent || 75);
     setKeep.value = String(ctx.keep_recent || 8);
+    setMaxOutput.value = status.max_output_tokens || "";
     // The key is never sent back in full; an empty box means "unchanged".
     setApiKey.value = "";
     setApiKey.placeholder = status.api_key_masked
@@ -707,6 +800,7 @@ function renderStatus(status) {
     ["context", (status.context ? (status.context.window / 1000) + "k (" + status.context.window_source + ")" : "")],
     ["prompt tok", status.context && status.context.last_prompt_tokens ? String(status.context.last_prompt_tokens) : "\u2014"],
     ["compact at", (status.context ? status.context.threshold_percent + "%" : "")],
+    ["max output", status.max_output_tokens || "(provider default)"],
     ["cache", status.cache_policy],
     ["config v", String(status.config_version)],
     ["plugins", (status.plugins || []).join(", ") || "none"],
@@ -758,6 +852,9 @@ function setBusy(value) {
 window.ngu = {
   receive(event) {
     switch (event.ev) {
+      case "ui_panels":
+        renderSlots(event.panels);
+        break;
       case "models":
         renderModels(event.list);
         break;
@@ -821,7 +918,7 @@ window.ngu = {
         appendAssistantText(event.delta);
         break;
       case "reasoning":
-        // Reasoning is not shown inline; it would drown the answer.
+        appendReasoning(event.delta);
         break;
       case "tool_start":
         appendToolCall(event.name, event.arguments);
@@ -898,7 +995,7 @@ document.getElementById("new-session").addEventListener("click", () => {
 
 // ---------------------------------------------------------------- settings
 
-for (const field of [setBaseUrl, setApiKey, setModel, setEffort, setProxy, setWindow, setPercent, setKeep]) {
+for (const field of [setBaseUrl, setApiKey, setModel, setEffort, setProxy, setWindow, setPercent, setKeep, setMaxOutput]) {
   field.addEventListener("input", () => { settingsDirty = true; });
 }
 
@@ -914,6 +1011,7 @@ function saveSettings() {
     context_window: parseInt(setWindow.value, 10) || 0,
     compact_percent: parseInt(setPercent.value, 10) || 75,
     compact_keep_recent: parseInt(setKeep.value, 10) || 8,
+    max_output_tokens: setMaxOutput.value.trim(),
   };
   if (setApiKey.value.trim() !== "") {
     payload.api_key = setApiKey.value.trim();

@@ -188,6 +188,25 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
     Ok(())
 }
 
+/// The files a pack would contain, excluding the archive being written.
+///
+/// The default output path sits beside the tree being packed, so a scan that
+/// does not exclude it counts the archive as a member of itself — and a rebuild
+/// embeds the previous archive. Both `pack` and the tool that reports a file
+/// count go through here so the two cannot disagree.
+pub fn packable_files(dir: &Path, out: &Path) -> Result<PackContents> {
+    let mut contents = inspect(dir)?;
+    if let Some(out_name) = out.file_name().map(|n| n.to_string_lossy().to_string()) {
+        contents.files.retain(|relative| {
+            Path::new(relative)
+                .file_name()
+                .map(|name| name.to_string_lossy() != out_name)
+                .unwrap_or(true)
+        });
+    }
+    Ok(contents)
+}
+
 /// Create a `.dshpack` from a directory.
 ///
 /// The directory must carry a manifest; an archive without one cannot be
@@ -202,13 +221,29 @@ pub fn pack(dir: &Path, out: &Path) -> Result<PackManifest> {
         }
     }
 
+    // Scan before creating the output. Packing into the directory being packed
+    // is the ordinary case — `my-pack.dshpack` beside the `my-pack/` tree — and
+    // creating the file first would make the empty archive a member of itself.
+    //
+    // `inspect` returns a sorted list, so the archive is byte-comparable between
+    // builds of the same tree.
+    let mut contents = inspect(dir)?;
+
+    // Belt and braces: an archive left over from an earlier build inside the
+    // directory must never be embedded in the next one.
+    if let Some(out_name) = out.file_name().map(|n| n.to_string_lossy().to_string()) {
+        contents.files.retain(|relative| {
+            Path::new(relative)
+                .file_name()
+                .map(|name| name.to_string_lossy() != out_name)
+                .unwrap_or(true)
+        });
+    }
+
     let file = std::fs::File::create(out)
         .with_context(|| format!("creating {}", out.display()))?;
     let mut writer = zip::ZipWriter::new(file);
 
-    // `inspect` returns a sorted list, so the archive is byte-comparable
-    // between builds of the same tree.
-    let contents = inspect(dir)?;
     for relative in &contents.files {
         let path = dir.join(relative);
         let metadata = std::fs::metadata(&path)

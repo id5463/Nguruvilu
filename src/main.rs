@@ -245,15 +245,18 @@ enum ConfigAction {
         /// it and go direct.
         #[arg(long)]
         proxy: Option<String>,
-        /// Context window in tokens. Pass 0 to go back to automatic.
+        /// Context window: 128K, 1M, or a plain token count. Pass 0 for automatic.
         #[arg(long)]
-        context_window: Option<usize>,
+        context_window: Option<String>,
         /// Compact once this percentage of the window is in use.
         #[arg(long)]
         compact_percent: Option<u32>,
         /// Recent messages kept verbatim when compacting.
         #[arg(long)]
         compact_keep_recent: Option<usize>,
+        /// Output token ceiling: 8K, 32K, or a plain count. Pass 0 to clear.
+        #[arg(long)]
+        max_output_tokens: Option<String>,
     },
     /// Print the settings file path.
     Path,
@@ -474,6 +477,8 @@ async fn run() -> Result<()> {
 
     // The kernel owns the tool table; skills add one tool to it.
     let mut kernel = Kernel::new();
+    // The agent can build and install packs itself.
+    nguruvilu::tools::pack::register(kernel.tools_mut())?;
     if !skills.is_empty() {
         register_skill_tool(kernel.tools_mut(), Arc::new(skills.clone()))?;
     }
@@ -991,6 +996,8 @@ async fn apply_assembly(
         });
 
     let mut kernel = Kernel::new();
+    // The agent can build and install packs itself.
+    nguruvilu::tools::pack::register(kernel.tools_mut())?;
     if !skills.is_empty() {
         register_skill_tool(kernel.tools_mut(), Arc::new(skills.clone()))?;
     }
@@ -1439,6 +1446,7 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             context_window,
             compact_percent,
             compact_keep_recent,
+            max_output_tokens,
         }) => {
             let mut settings = Settings::load()?;
             if let Some(value) = base_url {
@@ -1457,14 +1465,20 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
                 settings.proxy = value.trim().to_string();
             }
             if let Some(value) = context_window {
-                // Zero means "go back to working it out".
-                settings.context_window = if *value == 0 { None } else { Some(*value) };
+                // Accepts `128K`, `1M`, or a plain count. Zero means "go back
+                // to working it out".
+                let tokens = nguruvilu::size::parse_size(value)?;
+                settings.context_window = if tokens == 0 { None } else { Some(tokens) };
             }
             if let Some(value) = compact_percent {
                 settings.compact_percent = (*value).min(100);
             }
             if let Some(value) = compact_keep_recent {
                 settings.compact_keep_recent = (*value).max(1);
+            }
+            if let Some(value) = max_output_tokens {
+                let tokens = nguruvilu::size::parse_size(value)?;
+                settings.max_output_tokens = if tokens == 0 { None } else { Some(tokens) };
             }
             settings.save()?;
 
@@ -1553,7 +1567,7 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
                 .resolve(&effective.model_or_default());
             println!(
                 "context:       {} tokens ({}){}",
-                window.tokens,
+                nguruvilu::size::format_size(window.tokens),
                 window.source.as_str(),
                 if window.source.is_guess() {
                     "  <- a guess; set --context-window if you know better"
@@ -1564,6 +1578,13 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             println!(
                 "compaction:    at {}% of the window, keeping {} recent messages",
                 effective.compact_percent, effective.compact_keep_recent
+            );
+            println!(
+                "max output:    {}",
+                match effective.max_output_tokens {
+                    Some(tokens) => format!("{} tokens", nguruvilu::size::format_size(tokens)),
+                    None => "(provider default)".to_string(),
+                }
             );
             if !effective.is_configured() {
                 println!("\nnot configured — set it with:");
@@ -1680,6 +1701,7 @@ fn client(base_url: &str, api_key: &str, model: &str, settings: &Settings) -> Re
     if !effort.is_empty() && effort != "default" {
         config.reasoning_effort = Some(effort.to_string());
     }
+    config.max_tokens = settings.max_output_tokens.map(|t| t as u32);
     LlmClient::new(config)
         .map(|client| {
             client.with_shaper(nguruvilu::request::from_extra_fields(settings.extra_body.clone()))

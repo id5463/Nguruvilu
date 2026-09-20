@@ -115,6 +115,8 @@ impl AppState {
         let scan = skills.scan();
 
         let mut kernel = Kernel::new();
+        // The agent can build and install packs itself.
+        nguruvilu::tools::pack::register(kernel.tools_mut())?;
         if !skills.is_empty() {
             register_skill_tool(kernel.tools_mut(), Arc::new(skills.clone()))?;
         }
@@ -213,6 +215,7 @@ impl AppState {
             "model": snapshot.model_route.model,
             "reasoning_effort": self.settings.reasoning_effort,
             "proxy": self.settings.proxy,
+            "max_output_tokens": self.settings.max_output_tokens.map(nguruvilu::size::format_size),
             "base_url": snapshot.model_route.base_url,
             "cache_policy": format!("{:?}", snapshot.cache_policy),
             "config_version": snapshot.version,
@@ -359,6 +362,7 @@ impl AppState {
         context_window: Option<usize>,
         compact_percent: u32,
         compact_keep_recent: usize,
+        max_output_tokens: Option<usize>,
     ) -> Result<()> {
         let settings = Settings {
             base_url: base_url.trim().to_string(),
@@ -369,6 +373,7 @@ impl AppState {
             context_window: context_window.filter(|t| *t > 0),
             compact_percent,
             compact_keep_recent: compact_keep_recent.max(1),
+            max_output_tokens: max_output_tokens.filter(|t| *t > 0),
             extra_body: self.settings.extra_body.clone(),
         };
         settings.save()?;

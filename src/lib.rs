@@ -37,6 +37,9 @@ pub mod request;
 pub mod session;
 pub mod window;
 pub mod settings;
+pub mod source;
+pub mod ui;
+pub mod size;
 pub mod skills;
 pub mod tools;
 
@@ -62,6 +65,9 @@ pub use plugin::{
 };
 pub use request::{ExtraFields, RequestShaper};
 pub use settings::Settings;
+pub use source::{FilesystemSource, PackSource};
+pub use ui::{UiPanel, UiRegistry, UiSlot};
+pub use size::{format_size, parse_size};
 pub use window::{ContextPolicy, ContextWindow, WindowSource};
 pub use session::{Session, SessionStore};
 pub use skills::{Skill, SkillRegistry};

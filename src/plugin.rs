@@ -113,6 +113,8 @@ pub type Disposer = Box<dyn FnOnce() + Send>;
 /// What a plugin contributes when it loads.
 #[derive(Default)]
 pub struct Contributions {
+    /// Interface panels this plugin contributes.
+    pub ui: Vec<crate::ui::UiPanel>,
     /// Services this plugin provides, by name.
     pub services: Vec<(String, Arc<dyn Any + Send + Sync>)>,
     /// Tools this plugin registers.
@@ -250,6 +252,8 @@ pub struct Fiber {
     pub state: FiberState,
     /// Failure detail, when `state` is `Failed`.
     pub error: Option<String>,
+    /// Interface panels this fiber contributes.
+    pub ui: Vec<crate::ui::UiPanel>,
     effects: Vec<Disposer>,
     epoch: Epoch,
 }
@@ -483,6 +487,22 @@ impl Kernel {
         self.fiber_tools.get(&fiber).cloned().unwrap_or_default()
     }
 
+    /// Interface panels contributed by every active plugin.
+    ///
+    /// A panel from a plugin that is not active is not sent: a shell showing a
+    /// panel whose plugin failed to load would be presenting a control that does
+    /// nothing.
+    pub fn ui_panels(&self) -> Vec<crate::ui::UiPanel> {
+        let mut registry = crate::ui::UiRegistry::new();
+        for fiber in self.fibers.values() {
+            if fiber.state != FiberState::Active {
+                continue;
+            }
+            registry.extend(fiber.ui.iter().cloned());
+        }
+        registry.panels().into_iter().cloned().collect()
+    }
+
     /// Register a plugin definition without loading an instance.
     pub fn define(&mut self, plugin: Arc<dyn Plugin>) {
         self.plugins.insert(plugin.name().to_string(), plugin);
@@ -525,6 +545,7 @@ impl Kernel {
                 realm: realm.clone(),
                 state: FiberState::Pending,
                 error: None,
+                ui: Vec::new(),
                 effects: Vec::new(),
                 epoch: Epoch::Inactive,
             },
@@ -754,6 +775,7 @@ impl Kernel {
 
         self.fiber_tools.insert(id, registered_tools);
         if let Some(fiber) = self.fibers.get_mut(&id) {
+            fiber.ui = contributions.ui;
             fiber.effects = contributions.effects;
             fiber.epoch = desired;
             fiber.state = FiberState::Active;

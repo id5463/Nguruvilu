@@ -66,6 +66,14 @@ pub struct Settings {
     #[serde(default = "default_keep_recent")]
     pub compact_keep_recent: usize,
 
+    /// Output token ceiling, when the provider accepts one.
+    ///
+    /// Sent as max_completion_tokens. Reasoning tokens count against it, so
+    /// a value that looks generous for the answer can still be tight for a
+    /// model that thinks first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<usize>,
+
     /// Extra fields merged into every request body.
     ///
     /// This is how a provider difference stays a settings change: an endpoint
@@ -226,8 +234,15 @@ impl Settings {
             settings.proxy = value.trim().to_string();
         }
 
+        if let Ok(value) = std::env::var("NGU_MAX_OUTPUT_TOKENS") {
+            if let Ok(tokens) = crate::size::parse_size(&value) {
+                settings.max_output_tokens = Some(tokens);
+            }
+        }
+
         if let Ok(value) = std::env::var("NGU_CONTEXT_WINDOW") {
-            if let Ok(tokens) = value.trim().parse::<usize>() {
+            // Accepts 128K, 1M, or a plain number.
+            if let Ok(tokens) = crate::size::parse_size(&value) {
                 settings.context_window = Some(tokens);
             }
         }
@@ -276,6 +291,7 @@ mod tests {
             context_window: None,
             compact_percent: 75,
             compact_keep_recent: 8,
+            max_output_tokens: None,
             extra_body: serde_json::Map::new(),
         };
         assert!(settings.is_configured());
@@ -293,6 +309,7 @@ mod tests {
             context_window: None,
             compact_percent: 75,
             compact_keep_recent: 8,
+            max_output_tokens: None,
             extra_body: serde_json::Map::new(),
         };
         assert_eq!(settings.model_or_default(), DEFAULT_MODEL);
@@ -339,6 +356,7 @@ mod tests {
             context_window: None,
             compact_percent: 75,
             compact_keep_recent: 8,
+            max_output_tokens: None,
             extra_body: serde_json::Map::new(),
         };
         let text = serde_json::to_string_pretty(&settings).unwrap();

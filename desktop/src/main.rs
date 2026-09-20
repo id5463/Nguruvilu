@@ -370,6 +370,11 @@ async fn dispatch(
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize)
                 .unwrap_or(8);
+            // Accepts a number or a sized string like 8K.
+            let max_output = command
+                .get("max_output_tokens")
+                .and_then(|v| v.as_str())
+                .and_then(|v| nguruvilu::size::parse_size(v).ok());
 
             let outcome = {
                 let mut guard = state.lock().expect("state lock");
@@ -390,6 +395,7 @@ async fn dispatch(
                     context_window,
                     compact_percent,
                     keep_recent,
+                    max_output,
                 )
             };
 
@@ -424,6 +430,10 @@ async fn dispatch(
             } else {
                 apply_pack(state, PathBuf::from(path), Arc::clone(&sink)).await?;
             }
+        }
+
+        "ui_panels" => {
+            emit_panels(&state, &sink);
         }
 
         "status" => {
@@ -640,6 +650,15 @@ fn platform_tag() -> &'static str {
     } else {
         "linux"
     }
+}
+
+/// Send the panels plugins contributed.
+fn emit_panels(state: &Arc<Mutex<AppState>>, sink: &Arc<dyn EventSink>) {
+    let panels = {
+        let guard = state.lock().expect("state lock");
+        guard.kernel.ui_panels()
+    };
+    sink.emit(json!({ "ev": "ui_panels", "panels": panels }));
 }
 
 /// Send one event to the page.
