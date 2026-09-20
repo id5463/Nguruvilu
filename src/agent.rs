@@ -22,9 +22,11 @@ use std::time::Instant;
 use anyhow::Result;
 use tokio::task::JoinSet;
 
+use crate::compaction::{self, Compaction, Summarizer};
 use crate::llm::{self, LlmClient, LlmEvent, PartialCallView, TokenUsage};
 use crate::message::{Message, ToolCall};
 use crate::tools::ToolRegistry;
+use crate::window::{self, ContextPolicy, ContextWindow};
 
 /// Receives progress from the loop. Implementations decide how to render it.
 pub trait AgentObserver: Send + Sync {
@@ -38,6 +40,10 @@ pub trait AgentObserver: Send + Sync {
     fn on_tool_start(&self, _name: &str, _arguments: &str) {}
     /// A tool call finished.
     fn on_tool_end(&self, _name: &str, _ok: bool, _result: &str) {}
+    /// History is being compacted, before the summary is written.
+    fn on_compaction_start(&self, _messages: usize, _window: ContextWindow) {}
+    /// A compaction finished.
+    fn on_compaction(&self, _compaction: &Compaction) {}
 }
 
 /// An observer that discards everything.
@@ -56,6 +62,12 @@ pub struct TurnSettings {
     pub model: String,
     /// Configuration version this snapshot came from.
     pub version: u64,
+    /// Context window, compaction threshold, and how much survives a compaction.
+    ///
+    /// It travels with the rest of the turn's settings so that changing the
+    /// window in a settings panel takes effect on the next turn rather than
+    /// requiring a restart.
+    pub policy: Arc<dyn ContextPolicy>,
 }
 
 /// Supplies turn settings.
@@ -78,6 +90,8 @@ pub struct StaticConfig {
     pub tools: Arc<ToolRegistry>,
     /// Model id.
     pub model: String,
+    /// Context window, threshold, and how much survives a compaction.
+    pub policy: Arc<dyn ContextPolicy>,
 }
 
 impl StaticConfig {
@@ -91,7 +105,14 @@ impl StaticConfig {
             system_prompt: system_prompt.into(),
             tools,
             model: model.into(),
+            policy: Arc::new(window::DefaultContextPolicy::default()),
         }
+    }
+
+    /// Use a specific context policy.
+    pub fn with_policy(mut self, policy: Arc<dyn ContextPolicy>) -> Self {
+        self.policy = policy;
+        self
     }
 }
 
@@ -102,6 +123,7 @@ impl TurnConfig for StaticConfig {
             tools: Arc::clone(&self.tools),
             model: self.model.clone(),
             version: 0,
+            policy: Arc::clone(&self.policy),
         }
     }
 }
@@ -132,6 +154,11 @@ pub struct AgentOutcome {
     pub timing: TurnTiming,
     /// Configuration version the turn ran under.
     pub config_version: u64,
+    /// Compactions performed during this turn, in order.
+    ///
+    /// The caller persists these so a reloaded session matches what the model
+    /// actually saw.
+    pub compactions: Vec<Compaction>,
 }
 
 /// Drives one conversation.
@@ -141,6 +168,11 @@ pub struct Agent {
     messages: Vec<Message>,
     max_steps: usize,
     observer: Arc<dyn AgentObserver>,
+    /// Decides how a summary is written.
+    ///
+    /// The window and threshold come from the turn's settings instead, so a
+    /// change made in a settings panel lands on the next turn.
+    summarizer: Arc<dyn Summarizer>,
 }
 
 impl Agent {
@@ -152,6 +184,7 @@ impl Agent {
             messages,
             max_steps: 50,
             observer: Arc::new(SilentObserver),
+            summarizer: Arc::new(compaction::ModelSummarizer::default()),
         }
     }
 
@@ -181,6 +214,14 @@ impl Agent {
         self.observer = observer;
         self
     }
+
+
+    /// Replace the summarizer: how a compaction's summary is produced.
+    pub fn with_summarizer(mut self, summarizer: Arc<dyn Summarizer>) -> Self {
+        self.summarizer = summarizer;
+        self
+    }
+
 
     /// The conversation history.
     pub fn messages(&self) -> &[Message] {
@@ -213,13 +254,43 @@ impl Agent {
             new_messages: vec![user_message],
             timing: TurnTiming::default(),
             config_version: settings.version,
+            compactions: Vec::new(),
         };
 
         let schemas = settings.tools.schemas();
 
+        // What the provider last reported for the prompt. This is the only
+        // accurate size signal available: estimating from characters drifts
+        // badly once tool output is involved.
+        let mut last_prompt_tokens: Option<usize> = None;
+
         for step in 1..=self.max_steps {
             outcome.steps = step;
             self.observer.on_step(step);
+
+            // Compact before the request, not after a failure. A provider that
+            // rejects an oversized prompt has already cost the round trip.
+            if let Some(tokens) = last_prompt_tokens {
+                let window = settings.policy.window(&settings.model);
+                if settings.policy.should_compact(tokens, window) {
+                    let client = self.summary_client(&settings.model);
+                    match self.compact(&client, window, settings.policy.as_ref()).await {
+                        Ok(Some(record)) => {
+                            outcome.compactions.push(record);
+                            // The prompt just changed size; the old measurement
+                            // no longer describes it.
+                            last_prompt_tokens = None;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            // A failed summary must not end the turn: the
+                            // conversation can still continue, and the next step
+                            // will try again.
+                            eprintln!("[compaction] failed: {error:#}");
+                        }
+                    }
+                }
+            }
 
             let request = self.build_request(&settings.system_prompt);
             // The route may name a different model than the client was built
@@ -264,6 +335,12 @@ impl Agent {
             outcome.usage.input += step_usage.input;
             outcome.usage.output += step_usage.output;
             outcome.usage.cached += step_usage.cached;
+
+            // Remember the prompt size the provider just reported, so the next
+            // step can decide whether history needs reducing.
+            if step_usage.input > 0 {
+                last_prompt_tokens = Some(step_usage.input as usize);
+            }
 
             let indexed: Vec<(usize, PartialCallView)> = calls
                 .iter()
@@ -324,6 +401,44 @@ impl Agent {
             self.max_steps
         );
         Ok(outcome)
+    }
+
+    /// The client to use for summarization.
+    ///
+    /// A summarizer may name its own model — summaries are a good place to spend
+    /// less — and otherwise the session's model is used.
+    fn summary_client(&self, session_model: &str) -> LlmClient {
+        match self.summarizer.model() {
+            Some(model) if !model.trim().is_empty() => self.client.with_model(model),
+            _ => self.client.with_model(session_model),
+        }
+    }
+
+    /// Reduce the history: summarize the oldest messages and stand them in.
+    ///
+    /// Returns the record when a compaction happened, so the caller can persist
+    /// it. `None` means there was nothing that could safely be removed.
+    async fn compact(
+        &mut self,
+        client: &LlmClient,
+        window: ContextWindow,
+        policy: &dyn ContextPolicy,
+    ) -> Result<Option<Compaction>> {
+        let Some(plan) = compaction::plan(&self.messages, policy.keep_recent()) else {
+            return Ok(None);
+        };
+
+        self.observer.on_compaction_start(plan.summarize, window);
+        let history = &self.messages[..plan.summarize];
+        let summary = compaction::summarize(client, self.summarizer.as_ref(), history).await?;
+
+        self.messages = compaction::apply(&self.messages, plan, &summary);
+        let record = Compaction {
+            replaced: plan.summarize,
+            summary,
+        };
+        self.observer.on_compaction(&record);
+        Ok(Some(record))
     }
 
     /// Build the request history: system prompt first, then the conversation.
@@ -394,6 +509,7 @@ mod tests {
                     tools: Arc::clone(&self.tools),
                     model: "m".into(),
                     version: n,
+                    policy: Arc::new(window::DefaultContextPolicy::default()),
                 }
             }
         }

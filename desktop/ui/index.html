@@ -247,6 +247,27 @@
         Leave empty to connect directly. A value here is the <em>only</em> proxy used:
         the system HTTP_PROXY / HTTPS_PROXY variables are ignored, because a proxy set
         for another tool would otherwise reroute model traffic and fail with a TLS error.
+        for another tool would otherwise reroute model traffic and fail with a TLS error.
+      </div>
+      <label class="field">
+        <span class="cap">Context window (tokens)</span>
+        <input id="set-window" placeholder="auto" spellcheck="false">
+      </label>
+      <div class="row">
+        <label class="field" style="flex:1">
+          <span class="cap">Compact at %</span>
+          <input id="set-percent" placeholder="75" spellcheck="false">
+        </label>
+        <label class="field" style="flex:1">
+          <span class="cap">Keep recent</span>
+          <input id="set-keep" placeholder="8" spellcheck="false">
+        </label>
+      </div>
+      <div class="hint tight">
+        Empty window means auto: the provider\u2019s own number if it reports one,
+        a built-in table for well-known models, otherwise a conservative 32k.
+        When the prompt passes the threshold, the oldest messages are summarized
+        and replaced \u2014 tool-call pairs are never split.
       </div>
       <label class="field">
         <span class="cap">Thinking effort</span>
@@ -328,6 +349,9 @@ const setApiKey = document.getElementById("set-api-key");
 const setModel = document.getElementById("set-model");
 const setEffort = document.getElementById("set-effort");
 const setProxy = document.getElementById("set-proxy");
+const setWindow = document.getElementById("set-window");
+const setPercent = document.getElementById("set-percent");
+const setKeep = document.getElementById("set-keep");
 const notConfigured = document.getElementById("not-configured");
 const settingsSaved = document.getElementById("settings-saved");
 const settingsPath = document.getElementById("settings-path");
@@ -575,6 +599,10 @@ function renderSettings(status) {
     setModel.value = status.model || "";
     setEffort.value = status.reasoning_effort || "";
     setProxy.value = status.proxy || "";
+    const ctx = status.context || {};
+    setWindow.value = ctx.configured_window ? String(ctx.configured_window) : "";
+    setPercent.value = String(ctx.threshold_percent || 75);
+    setKeep.value = String(ctx.keep_recent || 8);
     // The key is never sent back in full; an empty box means "unchanged".
     setApiKey.value = "";
     setApiKey.placeholder = status.api_key_masked
@@ -613,6 +641,9 @@ function renderStatus(status) {
     ["model", status.model],
     ["thinking", status.reasoning_effort || "(provider default)"],
     ["proxy", status.proxy || "(direct; env proxies ignored)"],
+    ["context", (status.context ? (status.context.window / 1000) + "k (" + status.context.window_source + ")" : "")],
+    ["prompt tok", status.context && status.context.last_prompt_tokens ? String(status.context.last_prompt_tokens) : "\u2014"],
+    ["compact at", (status.context ? status.context.threshold_percent + "%" : "")],
     ["cache", status.cache_policy],
     ["config v", String(status.config_version)],
     ["plugins", (status.plugins || []).join(", ") || "none"],
@@ -754,6 +785,12 @@ window.ngu = {
         stream.append(errorBlock(event.message));
         scrollToEnd();
         break;
+      case "compaction_start":
+        notice("Context is nearly full \u2014 summarizing " + event.messages + " older messages\u2026", false);
+        break;
+      case "compaction":
+        notice("Compacted " + event.replaced + " messages into a summary.\n\n" + event.summary, false);
+        break;
       case "step":
         // Steps surface through tool cards and the closing summary.
         break;
@@ -790,7 +827,7 @@ document.getElementById("new-session").addEventListener("click", () => {
 
 // ---------------------------------------------------------------- settings
 
-for (const field of [setBaseUrl, setApiKey, setModel, setEffort, setProxy]) {
+for (const field of [setBaseUrl, setApiKey, setModel, setEffort, setProxy, setWindow, setPercent, setKeep]) {
   field.addEventListener("input", () => { settingsDirty = true; });
 }
 
@@ -803,6 +840,9 @@ function saveSettings() {
     model: setModel.value.trim(),
     reasoning_effort: setEffort.value,
     proxy: setProxy.value.trim(),
+    context_window: parseInt(setWindow.value, 10) || 0,
+    compact_percent: parseInt(setPercent.value, 10) || 75,
+    compact_keep_recent: parseInt(setKeep.value, 10) || 8,
   };
   if (setApiKey.value.trim() !== "") {
     payload.api_key = setApiKey.value.trim();

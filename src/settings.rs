@@ -52,6 +52,27 @@ pub struct Settings {
     /// mentions nothing about proxies.
     #[serde(default)]
     pub proxy: String,
+    /// Context window in tokens.
+    ///
+    /// Empty means "work it out": the provider's own number when it reports one,
+    /// a built-in table for well-known models, otherwise a conservative floor.
+    /// Setting it explicitly always wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
+    /// Compact once this percentage of the window is in use.
+    #[serde(default = "default_compact_percent")]
+    pub compact_percent: u32,
+    /// Recent messages kept verbatim when compacting.
+    #[serde(default = "default_keep_recent")]
+    pub compact_keep_recent: usize,
+}
+
+fn default_compact_percent() -> u32 {
+    75
+}
+
+fn default_keep_recent() -> usize {
+    8
 }
 
 impl Settings {
@@ -81,6 +102,19 @@ impl Settings {
             DEFAULT_MODEL.to_string()
         } else {
             self.model.clone()
+        }
+    }
+
+    /// Build the context policy these settings describe.
+    ///
+    /// This is the built-in policy; a plugin that provides `context.policy`
+    /// replaces it at runtime without touching these settings.
+    pub fn context_policy(&self, provider_window: Option<usize>) -> crate::window::DefaultContextPolicy {
+        crate::window::DefaultContextPolicy {
+            configured: self.context_window.filter(|t| *t > 0),
+            threshold_percent: self.compact_percent,
+            keep_recent: self.compact_keep_recent.max(1),
+            provider_window: provider_window.filter(|t| *t > 0),
         }
     }
 
@@ -184,6 +218,12 @@ impl Settings {
             settings.proxy = value.trim().to_string();
         }
 
+        if let Ok(value) = std::env::var("NGU_CONTEXT_WINDOW") {
+            if let Ok(tokens) = value.trim().parse::<usize>() {
+                settings.context_window = Some(tokens);
+            }
+        }
+
         if settings.model.trim().is_empty() {
             settings.model = DEFAULT_MODEL.to_string();
         }
@@ -225,6 +265,9 @@ mod tests {
             model: "m".into(),
             reasoning_effort: String::new(),
             proxy: String::new(),
+            context_window: None,
+            compact_percent: 75,
+            compact_keep_recent: 8,
         };
         assert!(settings.is_configured());
         assert!(settings.missing().is_empty());
@@ -238,6 +281,9 @@ mod tests {
             model: String::new(),
             reasoning_effort: String::new(),
             proxy: String::new(),
+            context_window: None,
+            compact_percent: 75,
+            compact_keep_recent: 8,
         };
         assert_eq!(settings.model_or_default(), DEFAULT_MODEL);
     }
@@ -280,6 +326,9 @@ mod tests {
             model: "test-model".into(),
             reasoning_effort: "low".into(),
             proxy: String::new(),
+            context_window: None,
+            compact_percent: 75,
+            compact_keep_recent: 8,
         };
         let text = serde_json::to_string_pretty(&settings).unwrap();
         std::fs::write(&path, &text).unwrap();

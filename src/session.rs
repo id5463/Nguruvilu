@@ -88,6 +88,13 @@ pub trait SessionStore: Send + Sync {
     fn create(&self, session: &Session) -> Result<()>;
     /// Append messages to an existing session.
     fn append(&self, id: &str, messages: &[Message]) -> Result<()>;
+    /// Record that a leading run of messages was replaced by a summary.
+    ///
+    /// Defaulted to a no-op so a store that does not model compaction still
+    /// satisfies the trait; the JSONL store implements it.
+    fn append_compaction(&self, _id: &str, _compaction: &crate::compaction::Compaction) -> Result<()> {
+        Ok(())
+    }
     /// Load a session, or `None` when it does not exist.
     fn load(&self, id: &str) -> Result<Option<Session>>;
     /// List sessions, most recently updated first.
@@ -112,6 +119,12 @@ pub struct JsonlStore {
 enum JsonlLine {
     Header(SessionHeader),
     Message(Message),
+    /// A compaction: the leading run of messages is stood in for by a summary.
+    ///
+    /// Recorded as its own line rather than by rewriting the file, because the
+    /// store is append-only so that an interrupted write cannot corrupt it.
+    /// Rewriting history to compact it would give that up.
+    Compaction(crate::compaction::Compaction),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -178,6 +191,8 @@ impl JsonlStore {
             match serde_json::from_str::<JsonlLine>(&line) {
                 Ok(JsonlLine::Header(h)) => header = Some(h),
                 Ok(JsonlLine::Message(_)) => count += 1,
+                // A compaction line carries no message of its own.
+                Ok(JsonlLine::Compaction(_)) => {}
                 Err(_) => continue,
             }
         }
@@ -227,6 +242,23 @@ impl SessionStore for JsonlStore {
         Ok(())
     }
 
+    fn append_compaction(&self, id: &str, compaction: &crate::compaction::Compaction) -> Result<()> {
+        Self::validate_id(id)?;
+        let path = self.path_for(id);
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening {} for append", path.display()))?;
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&JsonlLine::Compaction(compaction.clone()))?
+        )?;
+        file.flush()?;
+        self.touch(id)?;
+        Ok(())
+    }
+
     fn load(&self, id: &str) -> Result<Option<Session>> {
         Self::validate_id(id)?;
         let path = self.path_for(id);
@@ -239,6 +271,7 @@ impl SessionStore for JsonlStore {
 
         let mut header: Option<SessionHeader> = None;
         let mut messages = Vec::new();
+        let mut compactions = Vec::new();
         for line in reader.lines() {
             let line = line?;
             if line.trim().is_empty() {
@@ -247,6 +280,7 @@ impl SessionStore for JsonlStore {
             match serde_json::from_str::<JsonlLine>(&line) {
                 Ok(JsonlLine::Header(h)) => header = Some(h),
                 Ok(JsonlLine::Message(m)) => messages.push(m),
+                Ok(JsonlLine::Compaction(c)) => compactions.push(c),
                 // A corrupt line is skipped rather than failing the load: an
                 // interrupted append must not cost the whole conversation.
                 Err(_) => continue,
@@ -256,6 +290,12 @@ impl SessionStore for JsonlStore {
         let Some(header) = header else {
             return Ok(None);
         };
+
+        // The file holds the original messages *and* the records that replaced
+        // them; reducing the two gives the history the model actually saw.
+        // Without this a reloaded session would replay messages that were
+        // compacted away, and diverge from the live conversation.
+        let messages = crate::compaction::replay(messages, &compactions);
 
         Ok(Some(Session {
             id: header.id,

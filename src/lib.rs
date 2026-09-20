@@ -21,6 +21,7 @@
 
 pub mod agent;
 pub mod assembly;
+pub mod compaction;
 pub mod context;
 pub mod dylib;
 pub mod git;
@@ -33,12 +34,14 @@ pub mod message;
 pub mod pack;
 pub mod plugin;
 pub mod session;
+pub mod window;
 pub mod settings;
 pub mod skills;
 pub mod tools;
 
 pub use agent::{Agent, AgentOutcome};
 pub use assembly::{Assembly, EntryKind, OnFailure, Plan, PlannedStep, Scope};
+pub use compaction::{Compaction, Summarizer};
 pub use context::{Injection, InjectionEngine, InjectionEntry, Position};
 pub use dylib::{DynamicPlugin, HostApi, PluginMeta, ToolSpec, ABI_VERSION};
 pub use git::{GitSnapshot, SnapshotRecord};
@@ -57,6 +60,7 @@ pub use plugin::{
     Plugin, PluginCtx, RealmId, RealmMap, ReloadEvent,
 };
 pub use settings::Settings;
+pub use window::{ContextPolicy, ContextWindow, WindowSource};
 pub use session::{Session, SessionStore};
 pub use skills::{Skill, SkillRegistry};
 pub use tools::{ToolDef, ToolRegistry};

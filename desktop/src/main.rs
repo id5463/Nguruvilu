@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
+use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::window::WindowBuilder;
 use wry::WebViewBuilder;
 
@@ -356,6 +356,20 @@ async fn dispatch(
             let model = command.get("model").and_then(|v| v.as_str()).unwrap_or("");
             let effort = command.get("reasoning_effort").and_then(|v| v.as_str()).unwrap_or("");
             let proxy = command.get("proxy").and_then(|v| v.as_str()).unwrap_or("");
+            let context_window = command
+                .get("context_window")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            let compact_percent = command
+                .get("compact_percent")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .unwrap_or(75);
+            let keep_recent = command
+                .get("compact_keep_recent")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(8);
 
             let outcome = {
                 let mut guard = state.lock().expect("state lock");
@@ -367,7 +381,16 @@ async fn dispatch(
                 } else {
                     api_key_field.to_string()
                 };
-                guard.save_settings(base_url, &api_key, model, effort, proxy)
+                guard.save_settings(
+                    base_url,
+                    &api_key,
+                    model,
+                    effort,
+                    proxy,
+                    context_window,
+                    compact_percent,
+                    keep_recent,
+                )
             };
 
             match outcome {

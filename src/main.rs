@@ -33,6 +33,7 @@ use nguruvilu::loader::Loader;
 use nguruvilu::plugin::{Kernel, Plugin as PluginTrait};
 use nguruvilu::session::{JsonlStore, Session, SessionStore};
 use nguruvilu::settings::Settings;
+use nguruvilu::window::{ContextPolicy, DefaultContextPolicy};
 use nguruvilu::skills::{register_skill_tool, SkillRegistry};
 use nguruvilu::tools::ToolRegistry;
 
@@ -238,6 +239,15 @@ enum ConfigAction {
         /// it and go direct.
         #[arg(long)]
         proxy: Option<String>,
+        /// Context window in tokens. Pass 0 to go back to automatic.
+        #[arg(long)]
+        context_window: Option<usize>,
+        /// Compact once this percentage of the window is in use.
+        #[arg(long)]
+        compact_percent: Option<u32>,
+        /// Recent messages kept verbatim when compacting.
+        #[arg(long)]
+        compact_keep_recent: Option<usize>,
     },
     /// Print the settings file path.
     Path,
@@ -307,6 +317,8 @@ struct CliConfig {
     runtime: Mutex<Runtime>,
     base_prompt: String,
     skills: Mutex<SkillRegistry>,
+    /// Context window, threshold, and how much survives a compaction.
+    policy: Mutex<Arc<dyn ContextPolicy>>,
 }
 
 impl TurnConfig for CliConfig {
@@ -325,6 +337,7 @@ impl TurnConfig for CliConfig {
             tools: snapshot.tools,
             model: snapshot.model_route.model,
             version: snapshot.version,
+            policy: Arc::clone(&self.policy.lock().expect("policy lock")),
         }
     }
 }
@@ -537,10 +550,16 @@ async fn run() -> Result<()> {
         ))?;
     }
 
+    // The context policy comes from settings, so `--context-window` and the
+    // settings file both land here. A provider-reported window would be folded
+    // in the same way once the catalog has been fetched.
+    let policy: Arc<dyn ContextPolicy> = Arc::new(settings.context_policy(None));
+
     let config: Arc<dyn TurnConfig> = Arc::new(CliConfig {
         runtime: Mutex::new(runtime),
         base_prompt,
         skills: Mutex::new(skills),
+        policy: Mutex::new(policy),
     });
 
     let snapshotter = if cli.git_snapshot {
@@ -605,6 +624,24 @@ async fn run() -> Result<()> {
 
             session.messages.extend(outcome.new_messages.clone());
             store.append(&session.id, &outcome.new_messages)?;
+
+            // Record compactions after the messages they replace, so a reload
+            // reduces to the same history the model saw.
+            for compaction in &outcome.compactions {
+                store.append_compaction(&session.id, compaction)?;
+                if !cli.quiet {
+                    eprintln!(
+                        "[compacted {} messages into a summary of {} chars]",
+                        compaction.replaced,
+                        compaction.summary.chars().count()
+                    );
+                }
+            }
+            // The live history must match what was recorded, or the next turn
+            // would send messages that are no longer part of the conversation.
+            if !outcome.compactions.is_empty() {
+                session.messages = agent.messages().to_vec();
+            }
 
             let snapshot = if let Some(git) = &snapshotter {
                 git.snapshot("after turn")?
@@ -1357,7 +1394,16 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             println!("{}", Settings::path().display());
             Ok(())
         }
-        Some(ConfigAction::Set { base_url, api_key, model, reasoning_effort, proxy }) => {
+        Some(ConfigAction::Set {
+            base_url,
+            api_key,
+            model,
+            reasoning_effort,
+            proxy,
+            context_window,
+            compact_percent,
+            compact_keep_recent,
+        }) => {
             let mut settings = Settings::load()?;
             if let Some(value) = base_url {
                 settings.base_url = value.trim().to_string();
@@ -1373,6 +1419,16 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             }
             if let Some(value) = proxy {
                 settings.proxy = value.trim().to_string();
+            }
+            if let Some(value) = context_window {
+                // Zero means "go back to working it out".
+                settings.context_window = if *value == 0 { None } else { Some(*value) };
+            }
+            if let Some(value) = compact_percent {
+                settings.compact_percent = (*value).min(100);
+            }
+            if let Some(value) = compact_keep_recent {
+                settings.compact_keep_recent = (*value).max(1);
             }
             settings.save()?;
 
@@ -1455,6 +1511,23 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
                 } else {
                     &effective.proxy
                 }
+            );
+            let window = effective
+                .context_policy(None)
+                .resolve(&effective.model_or_default());
+            println!(
+                "context:       {} tokens ({}){}",
+                window.tokens,
+                window.source.as_str(),
+                if window.source.is_guess() {
+                    "  <- a guess; set --context-window if you know better"
+                } else {
+                    ""
+                }
+            );
+            println!(
+                "compaction:    at {}% of the window, keeping {} recent messages",
+                effective.compact_percent, effective.compact_keep_recent
             );
             if !effective.is_configured() {
                 println!("\nnot configured — set it with:");

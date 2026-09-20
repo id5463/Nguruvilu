@@ -10,7 +10,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
@@ -21,6 +20,7 @@ use nguruvilu::llm::{LlmClient, LlmConfig};
 use nguruvilu::plugin::Kernel;
 use nguruvilu::session::{JsonlStore, Session, SessionStore};
 use nguruvilu::settings::Settings;
+use nguruvilu::window::ContextPolicy;
 use nguruvilu::skills::{register_skill_tool, SkillRegistry};
 
 use crate::sink::EventSink;
@@ -47,6 +47,10 @@ pub struct SharedConfig {
     pub base_prompt: String,
     /// Skill registry, scanned at boot.
     pub skills: Mutex<SkillRegistry>,
+    /// Context window, threshold, and how much survives a compaction.
+    /// Rebuilt whenever the settings panel saves, so a window change takes
+    /// effect on the next turn.
+    pub policy: Mutex<Arc<dyn ContextPolicy>>,
 }
 
 impl TurnConfig for SharedConfig {
@@ -63,6 +67,7 @@ impl TurnConfig for SharedConfig {
             tools: snapshot.tools,
             model: snapshot.model_route.model,
             version: snapshot.version,
+            policy: Arc::clone(&self.policy.lock().expect("policy lock")),
         }
     }
 }
@@ -83,6 +88,8 @@ pub struct AppState {
     pub busy: bool,
     /// Effective settings, as the settings panel should display them.
     pub settings: Settings,
+    /// Prompt tokens the provider last reported, for the context readout.
+    pub last_prompt_tokens: Option<usize>,
     /// The last failure, kept here rather than only in the page: a message
     /// drawn into the DOM vanishes the moment the transcript is re-rendered,
     /// which is exactly when a user switches sessions to look for it.
@@ -123,10 +130,12 @@ impl AppState {
             },
         });
 
+        let policy: Arc<dyn ContextPolicy> = Arc::new(settings.context_policy(None));
         let config = Arc::new(SharedConfig {
             runtime: Mutex::new(runtime),
             base_prompt: BASE_PROMPT.to_string(),
             skills: Mutex::new(skills),
+            policy: Mutex::new(policy),
         });
 
         let store = JsonlStore::open(sessions_root())?;
@@ -183,6 +192,7 @@ impl AppState {
             busy: false,
             settings,
             last_error: None,
+            last_prompt_tokens: None,
         })
     }
 
@@ -219,6 +229,14 @@ impl AppState {
             "api_key_masked": self.settings.masked_key(),
             "settings_path": Settings::path().display().to_string(),
             "last_error": self.last_error,
+            "context": {
+                "window": self.config.policy.lock().expect("policy lock").window(&self.route.model).tokens,
+                "window_source": self.config.policy.lock().expect("policy lock").window(&self.route.model).source.as_str(),
+                "threshold_percent": self.settings.compact_percent,
+                "keep_recent": self.settings.compact_keep_recent,
+                "configured_window": self.settings.context_window,
+                "last_prompt_tokens": self.last_prompt_tokens,
+            },
         })
     }
 
@@ -329,6 +347,9 @@ impl AppState {
         model: &str,
         reasoning_effort: &str,
         proxy: &str,
+        context_window: Option<usize>,
+        compact_percent: u32,
+        compact_keep_recent: usize,
     ) -> Result<()> {
         let settings = Settings {
             base_url: base_url.trim().to_string(),
@@ -336,9 +357,20 @@ impl AppState {
             model: model.trim().to_string(),
             reasoning_effort: reasoning_effort.trim().to_string(),
             proxy: proxy.trim().to_string(),
+            context_window: context_window.filter(|t| *t > 0),
+            compact_percent,
+            compact_keep_recent: compact_keep_recent.max(1),
         };
         settings.save()?;
         self.settings = settings;
+
+        // The context policy is derived from settings, so it has to be rebuilt
+        // here too — otherwise the panel would save a window that only takes
+        // effect after a restart.
+        {
+            let mut policy = self.config.policy.lock().expect("policy lock");
+            *policy = Arc::new(self.settings.context_policy(None));
+        }
 
         // The route is what a turn actually reads, so it has to move too.
         self.route.base_url = self.settings.base_url.clone();
@@ -520,6 +552,23 @@ impl AgentObserver for UiObserver {
     fn on_tool_end(&self, name: &str, ok: bool, result: &str) {
         self.emit(json!({ "ev": "tool_end", "name": name, "ok": ok, "result": result }));
     }
+
+    fn on_compaction_start(&self, messages: usize, window: nguruvilu::window::ContextWindow) {
+        self.emit(json!({
+            "ev": "compaction_start",
+            "messages": messages,
+            "window": window.tokens,
+            "window_source": window.source.as_str(),
+        }));
+    }
+
+    fn on_compaction(&self, compaction: &nguruvilu::compaction::Compaction) {
+        self.emit(json!({
+            "ev": "compaction",
+            "replaced": compaction.replaced,
+            "summary": compaction.summary,
+        }));
+    }
 }
 
 /// Run one turn, streaming progress to the page.
@@ -569,6 +618,22 @@ pub async fn run_turn(
             guard.session.messages.extend(outcome.new_messages.clone());
             if let Err(error) = guard.store.append(&guard.session.id, &outcome.new_messages) {
                 eprintln!("[store] append failed: {error:#}");
+            }
+
+            // Record compactions after the messages they replace, then adopt the
+            // agent's reduced history so the live session matches the file.
+            for compaction in &outcome.compactions {
+                if let Err(error) = guard.store.append_compaction(&guard.session.id, compaction) {
+                    eprintln!("[store] compaction append failed: {error:#}");
+                }
+                eprintln!(
+                    "[compacted {} messages into {} chars]",
+                    compaction.replaced,
+                    compaction.summary.chars().count()
+                );
+            }
+            if !outcome.compactions.is_empty() {
+                guard.session.messages = agent.messages().to_vec();
             }
 
             let payload = json!({
