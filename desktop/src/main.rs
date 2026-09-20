@@ -12,8 +12,10 @@
 //! * they meet at one seam: [`UserEvent::ToUi`] carries JSON to evaluate in the
 //!   page, and the webview's IPC handler carries commands the other way.
 
+mod sink;
 mod state;
 
+use std::io::BufRead;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -28,6 +30,7 @@ use nguruvilu::assembly::Assembly;
 use nguruvilu::ledger::default_ledger_path;
 use nguruvilu::loader::Loader;
 
+use sink::{EventSink, StdoutSink, WindowSink};
 use state::AppState;
 
 /// The interface, embedded at compile time.
@@ -39,21 +42,111 @@ pub enum UserEvent {
     ToUi(Value),
 }
 
+/// Command-line options the shell understands.
+struct Options {
+    /// Send this prompt as soon as the shell is ready.
+    prompt: Option<String>,
+    /// Run without a window, reading commands from stdin.
+    headless: bool,
+}
+
+fn options() -> Options {
+    let args: Vec<String> = std::env::args().collect();
+    let value_of = |flag: &str| -> Option<String> {
+        args.iter()
+            .position(|arg| arg == flag)
+            .and_then(|index| args.get(index + 1).cloned())
+    };
+    Options {
+        prompt: value_of("--prompt").or_else(|| value_of("-p")),
+        headless: args.iter().any(|arg| arg == "--headless"),
+    }
+}
+
 fn main() -> anyhow::Result<()> {
+    let options = options();
+    if options.headless {
+        return headless(options.prompt);
+    }
+    windowed(options.prompt)
+}
+
+/// Run without a window: JSON commands in on stdin, JSON events out on stdout.
+///
+/// This exists so the shell can be driven — by a script, by another agent, or by
+/// whoever is trying to work out why something behaves the way it does. It runs
+/// the same [`dispatch`] as the window, so it exercises the real path rather
+/// than a parallel one.
+///
+/// Commands are one JSON object per line, the same objects the page sends:
+///
+/// ```text
+/// {"cmd":"prompt","text":"say hi"}
+/// {"cmd":"list_packs"}
+/// {"cmd":"status"}
+/// ```
+///
+/// Events are one JSON object per line, the same objects the page receives.
+fn headless(startup_prompt: Option<String>) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    let state = Arc::new(Mutex::new(AppState::bootstrap()?));
+    let sink: Arc<dyn EventSink> = Arc::new(StdoutSink);
+
+    runtime.block_on(async {
+        // The windowed path starts from the page's "ready"; headless has no page,
+        // so the shell announces itself the same way.
+        dispatch(
+            Arc::clone(&state),
+            "{\"cmd\":\"ready\"}",
+            Arc::clone(&sink),
+            startup_prompt,
+        )
+        .await?;
+
+        // Reading stdin is blocking, so it runs off the async scheduler.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        std::thread::spawn(move || {
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                match line {
+                    Ok(line) => {
+                        if tx.send(line).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        while let Some(line) = rx.recv().await {
+            let line = line.trim().to_string();
+            if line.is_empty() {
+                continue;
+            }
+            if line == "exit" || line == "quit" {
+                break;
+            }
+            if let Err(error) =
+                dispatch(Arc::clone(&state), &line, Arc::clone(&sink), None).await
+            {
+                sink.emit(json!({ "ev": "error", "message": format!("{error:#}") }));
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+}
+
+/// Run with a window.
+fn windowed(startup_prompt: Option<String>) -> anyhow::Result<()> {
     // WebView2 takes its profile location from the environment. Setting it here
     // keeps the browser profile out of whatever directory the app was launched
     // from, which may be read-only.
     std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", state::data_directory());
 
-    // A prompt on the command line is sent as soon as the page is ready. It
-    // makes the window scriptable and gives the shell a smoke test that does
-    // not depend on someone watching the screen.
-    let startup_prompt: Option<String> = {
-        let args: Vec<String> = std::env::args().collect();
-        args.iter()
-            .position(|arg| arg == "--prompt" || arg == "-p")
-            .and_then(|index| args.get(index + 1).cloned())
-    };
     // EventLoopBuilder is how tao attaches a custom user event type.
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -65,6 +158,7 @@ fn main() -> anyhow::Result<()> {
         .build(&event_loop)?;
 
     let state = Arc::new(Mutex::new(AppState::bootstrap()?));
+    let sink: Arc<dyn EventSink> = Arc::new(WindowSink::new(proxy));
 
     // Agent turns are async; the window is not. The runtime lives for the whole
     // process, moved into the event loop closure so it is not dropped early.
@@ -75,8 +169,9 @@ fn main() -> anyhow::Result<()> {
 
     let webview = {
         let state = Arc::clone(&state);
-        let proxy = proxy.clone();
-                let startup_prompt = startup_prompt.clone();
+        let sink = Arc::clone(&sink);
+        let handle = handle.clone();
+        let startup_prompt = startup_prompt.clone();
         WebViewBuilder::new()
             // `with_html` serves the page from an opaque origin, where WebView2
             // refuses to run inline scripts — the page renders but stays inert.
@@ -113,7 +208,7 @@ fn main() -> anyhow::Result<()> {
                 };
 
                 let state = Arc::clone(&state);
-                let proxy = proxy.clone();
+                let sink = Arc::clone(&sink);
                 let startup_prompt = startup_prompt.clone();
                 // The handler is synchronous and must return quickly, so the
                 // work goes onto the runtime and answers arrive as events.
@@ -121,19 +216,19 @@ fn main() -> anyhow::Result<()> {
                     let outcome = if name.starts_with("pick_") {
                         match picked {
                             Some(path) => {
-                                dispatch_path(state, &name, path, proxy.clone()).await
+                                dispatch_path(state, &name, path, Arc::clone(&sink)).await
                             }
                             // Cancelling a dialog is not an error.
                             None => Ok(()),
                         }
                     } else {
-                        dispatch(state, &body, proxy.clone(), startup_prompt.clone()).await
+                        dispatch(state, &body, Arc::clone(&sink), startup_prompt.clone()).await
                     };
                     if let Err(error) = outcome {
-                        let _ = proxy.send_event(UserEvent::ToUi(json!({
+                        sink.emit(json!({
                             "ev": "error",
                             "message": format!("{error:#}"),
-                        })));
+                        }));
                     }
                 });
             })
@@ -164,7 +259,7 @@ fn main() -> anyhow::Result<()> {
 async fn dispatch(
     state: Arc<Mutex<AppState>>,
     body: &str,
-    proxy: EventLoopProxy<UserEvent>,
+    sink: Arc<dyn EventSink>,
     startup_prompt: Option<String>,
 ) -> anyhow::Result<()> {
     let command: Value = serde_json::from_str(body).unwrap_or(Value::Null);
@@ -183,9 +278,9 @@ async fn dispatch(
                 let guard = state.lock().expect("state lock");
                 (guard.sessions()?, guard.transcript(), guard.describe())
             };
-            emit(&proxy, json!({ "ev": "sessions", "list": sessions }));
-            emit(&proxy, json!({ "ev": "transcript", "entries": transcript }));
-            emit(&proxy, json!({ "ev": "status", "status": status }));
+            emit(&sink, json!({ "ev": "sessions", "list": sessions }));
+            emit(&sink, json!({ "ev": "transcript", "entries": transcript }));
+            emit(&sink, json!({ "ev": "status", "status": status }));
 
             // A prompt given on the command line runs once the page can show it.
 
@@ -194,11 +289,17 @@ async fn dispatch(
             // Failure is reported by the fetch itself and is not fatal.
             let configured = state.lock().expect("state lock").settings.is_configured();
             if configured {
-                let _ = fetch_models(Arc::clone(&state), proxy.clone()).await;
+                // Deliberately not awaited: fetching the catalog is a nicety, and
+                // making a slow endpoint delay the first turn would be a poor trade.
+                let models_state = Arc::clone(&state);
+                let models_sink = Arc::clone(&sink);
+                tokio::spawn(async move {
+                    let _ = fetch_models(models_state, models_sink).await;
+                });
             }
             if let Some(text) = startup_prompt {
-                emit(&proxy, json!({ "ev": "turn_start", "text": text }));
-                state::run_turn(state, text, proxy.clone()).await?;
+                emit(&sink, json!({ "ev": "turn_start", "text": text }));
+                state::run_turn(state, text, Arc::clone(&sink)).await?;
             }
         }
 
@@ -212,8 +313,8 @@ async fn dispatch(
             if text.is_empty() {
                 return Ok(());
             }
-            emit(&proxy, json!({ "ev": "turn_start", "text": text }));
-            state::run_turn(state, text, proxy.clone()).await?;
+            emit(&sink, json!({ "ev": "turn_start", "text": text }));
+            state::run_turn(state, text, Arc::clone(&sink)).await?;
         }
 
         "new_session" | "open_session" | "delete_session" => {
@@ -232,9 +333,9 @@ async fn dispatch(
                 }
                 (guard.sessions()?, guard.transcript(), guard.describe())
             };
-            emit(&proxy, json!({ "ev": "sessions", "list": sessions }));
-            emit(&proxy, json!({ "ev": "transcript", "entries": transcript }));
-            emit(&proxy, json!({ "ev": "status", "status": status }));
+            emit(&sink, json!({ "ev": "sessions", "list": sessions }));
+            emit(&sink, json!({ "ev": "transcript", "entries": transcript }));
+            emit(&sink, json!({ "ev": "status", "status": status }));
         }
 
         "set_model" => {
@@ -245,7 +346,7 @@ async fn dispatch(
                 guard.set_model(model, base_url)?;
                 guard.describe()
             };
-            emit(&proxy, json!({ "ev": "status", "status": status }));
+            emit(&sink, json!({ "ev": "status", "status": status }));
         }
 
         "save_settings" => {
@@ -254,6 +355,7 @@ async fn dispatch(
             let keep_key = command.get("keep_api_key").and_then(|v| v.as_bool()).unwrap_or(false);
             let model = command.get("model").and_then(|v| v.as_str()).unwrap_or("");
             let effort = command.get("reasoning_effort").and_then(|v| v.as_str()).unwrap_or("");
+            let proxy = command.get("proxy").and_then(|v| v.as_str()).unwrap_or("");
 
             let outcome = {
                 let mut guard = state.lock().expect("state lock");
@@ -265,19 +367,19 @@ async fn dispatch(
                 } else {
                     api_key_field.to_string()
                 };
-                guard.save_settings(base_url, &api_key, model, effort)
+                guard.save_settings(base_url, &api_key, model, effort, proxy)
             };
 
             match outcome {
                 Ok(()) => {
                     eprintln!("[settings] saved to {}", nguruvilu::settings::Settings::path().display());
                     let status = state.lock().expect("state lock").describe();
-                    emit(&proxy, json!({ "ev": "status", "status": status }));
-                    emit(&proxy, json!({ "ev": "settings_saved" }));
+                    emit(&sink, json!({ "ev": "status", "status": status }));
+                    emit(&sink, json!({ "ev": "settings_saved" }));
                 }
                 Err(error) => {
                     emit(
-                        &proxy,
+                        &sink,
                         json!({ "ev": "error", "message": format!("saving settings: {error:#}") }),
                     );
                 }
@@ -285,25 +387,25 @@ async fn dispatch(
         }
 
         "fetch_models" => {
-            fetch_models(state, proxy.clone()).await?;
+            fetch_models(state, Arc::clone(&sink)).await?;
         }
 
         "list_packs" => {
-            refresh_packs(&state, &proxy);
+            refresh_packs(&state, &sink);
         }
 
         "apply_pack" => {
             let path = command.get("path").and_then(|v| v.as_str()).unwrap_or("");
             if path.is_empty() {
-                emit(&proxy, json!({ "ev": "error", "message": "apply_pack needs a path" }));
+                emit(&sink, json!({ "ev": "error", "message": "apply_pack needs a path" }));
             } else {
-                apply_pack(state, PathBuf::from(path), proxy.clone()).await?;
+                apply_pack(state, PathBuf::from(path), Arc::clone(&sink)).await?;
             }
         }
 
         "status" => {
             let status = state.lock().expect("state lock").describe();
-            emit(&proxy, json!({ "ev": "status", "status": status }));
+            emit(&sink, json!({ "ev": "status", "status": status }));
         }
 
 
@@ -312,12 +414,12 @@ async fn dispatch(
 
 
         "" => {
-            emit(&proxy, json!({ "ev": "error", "message": "empty command" }));
+            emit(&sink, json!({ "ev": "error", "message": "empty command" }));
         }
 
         other => {
             emit(
-                &proxy,
+                &sink,
                 json!({ "ev": "error", "message": format!("unknown command '{other}'") }),
             );
         }
@@ -331,7 +433,7 @@ async fn dispatch_path(
     state: Arc<Mutex<AppState>>,
     name: &str,
     path: PathBuf,
-    proxy: EventLoopProxy<UserEvent>,
+    sink: Arc<dyn EventSink>,
 ) -> anyhow::Result<()> {
     match name {
         "pick_install" => {
@@ -342,10 +444,10 @@ async fn dispatch_path(
                 guard.verify_pack(&path)
             };
             match verified {
-                Ok(report) => emit(&proxy, json!({ "ev": "pack_verified", "report": report })),
+                Ok(report) => emit(&sink, json!({ "ev": "pack_verified", "report": report })),
                 Err(error) => {
                     emit(
-                        &proxy,
+                        &sink,
                         json!({ "ev": "error", "message": format!("{}: {error:#}", path.display()) }),
                     );
                     return Ok(());
@@ -359,24 +461,24 @@ async fn dispatch_path(
             match installed {
                 Ok(info) => {
                     eprintln!("[pack] installed {} {}", info["name"], info["version"]);
-                    emit(&proxy, json!({ "ev": "pack_installed", "pack": info }));
+                    emit(&sink, json!({ "ev": "pack_installed", "pack": info }));
                 }
                 Err(error) => emit(
-                    &proxy,
+                    &sink,
                     json!({ "ev": "error", "message": format!("installing {}: {error:#}", path.display()) }),
                 ),
             }
-            refresh_packs(&state, &proxy);
+            refresh_packs(&state, &sink);
         }
 
         "pick_verify" => {
             let result = { state.lock().expect("state lock").verify_pack(&path) };
             match result {
                 Ok(report) => emit(
-                    &proxy,
+                    &sink,
                     json!({ "ev": "pack_verified", "report": report, "path": path.display().to_string() }),
                 ),
-                Err(error) => emit(&proxy, json!({ "ev": "error", "message": format!("{error:#}") })),
+                Err(error) => emit(&sink, json!({ "ev": "error", "message": format!("{error:#}") })),
             }
         }
 
@@ -385,10 +487,10 @@ async fn dispatch_path(
             match result {
                 Ok(info) => {
                     eprintln!("[pack] built {}", info["archive"]);
-                    emit(&proxy, json!({ "ev": "pack_built", "pack": info }));
+                    emit(&sink, json!({ "ev": "pack_built", "pack": info }));
                 }
                 Err(error) => emit(
-                    &proxy,
+                    &sink,
                     json!({ "ev": "error", "message": format!("packing {}: {error:#}", path.display()) }),
                 ),
             }
@@ -396,7 +498,7 @@ async fn dispatch_path(
 
         other => {
             emit(
-                &proxy,
+                &sink,
                 json!({ "ev": "error", "message": format!("unknown picker command '{other}'") }),
             );
         }
@@ -405,11 +507,11 @@ async fn dispatch_path(
 }
 
 /// Push the installed-pack list to the page.
-fn refresh_packs(state: &Arc<Mutex<AppState>>, proxy: &EventLoopProxy<UserEvent>) {
+fn refresh_packs(state: &Arc<Mutex<AppState>>, sink: &Arc<dyn EventSink>) {
     match state.lock().expect("state lock").packs() {
-        Ok(list) => emit(proxy, json!({ "ev": "packs", "list": list })),
+        Ok(list) => emit(sink, json!({ "ev": "packs", "list": list })),
         Err(error) => emit(
-            proxy,
+            sink,
             json!({ "ev": "error", "message": format!("listing packs: {error:#}") }),
         ),
     }
@@ -419,7 +521,7 @@ fn refresh_packs(state: &Arc<Mutex<AppState>>, proxy: &EventLoopProxy<UserEvent>
 async fn apply_pack(
     state: Arc<Mutex<AppState>>,
     assembly: PathBuf,
-    proxy: EventLoopProxy<UserEvent>,
+    sink: Arc<dyn EventSink>,
 ) -> anyhow::Result<()> {
     // Parse before taking the kernel: a malformed manifest must not be able to
     // strand it, leaving the app with no tools at all.
@@ -457,7 +559,7 @@ async fn apply_pack(
         assembly.display()
     );
     emit(
-        &proxy,
+        &sink,
         json!({
             "ev": "pack_applied",
             "loaded": report.loaded,
@@ -465,7 +567,7 @@ async fn apply_pack(
             "skipped": report.skipped.iter().map(|s| json!({"id": s.id, "reason": s.reason})).collect::<Vec<_>>(),
         }),
     );
-    emit(&proxy, json!({ "ev": "status", "status": status }));
+    emit(&sink, json!({ "ev": "status", "status": status }));
     Ok(())
 }
 
@@ -475,7 +577,7 @@ async fn apply_pack(
 /// gateway can front dozens of models and its list changes without notice.
 async fn fetch_models(
     state: Arc<Mutex<AppState>>,
-    proxy: EventLoopProxy<UserEvent>,
+    sink: Arc<dyn EventSink>,
 ) -> anyhow::Result<()> {
     let client = {
         let guard = state.lock().expect("state lock");
@@ -486,7 +588,7 @@ async fn fetch_models(
         Ok(models) => {
             eprintln!("[models] provider reported {} entries", models.len());
             emit(
-                &proxy,
+                &sink,
                 json!({
                     "ev": "models",
                     "list": models.iter().map(|model| json!({
@@ -499,7 +601,7 @@ async fn fetch_models(
             );
         }
         Err(error) => emit(
-            &proxy,
+            &sink,
             json!({ "ev": "error", "message": format!("listing models: {error:#}") }),
         ),
     }
@@ -518,6 +620,6 @@ fn platform_tag() -> &'static str {
 }
 
 /// Send one event to the page.
-fn emit(proxy: &EventLoopProxy<UserEvent>, value: Value) {
-    let _ = proxy.send_event(UserEvent::ToUi(value));
+fn emit(sink: &Arc<dyn EventSink>, value: Value) {
+    sink.emit(value);
 }

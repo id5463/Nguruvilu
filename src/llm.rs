@@ -36,6 +36,8 @@ pub struct LlmConfig {
     /// answer from 137 output tokens to 69, so it is worth exposing rather than
     /// leaving every request at the provider default.
     pub reasoning_effort: Option<String>,
+    /// Proxy for all requests; empty means direct.
+    pub proxy: String,
     /// Request timeout in seconds.
     pub timeout_secs: u64,
 }
@@ -50,6 +52,7 @@ impl LlmConfig {
             temperature: None,
             max_tokens: None,
             reasoning_effort: None,
+            proxy: String::new(),
             timeout_secs: 300,
         }
     }
@@ -108,12 +111,29 @@ pub struct LlmClient {
 impl LlmClient {
     /// Build a client. `http` should be reused across requests so connections
     /// are pooled (a hard performance requirement: no per-request handshakes).
+    ///
+    /// Proxy handling is explicit, never inherited. `reqwest` reads
+    /// `HTTP_PROXY`/`HTTPS_PROXY` from the environment by default, which means a
+    /// variable set for some unrelated tool silently reroutes the model traffic
+    /// — and a proxy that cannot reach the endpoint fails with a TLS handshake
+    /// error that says nothing about proxies. Here an empty `proxy` disables
+    /// proxying outright, and a set one is used deliberately.
     pub fn new(config: LlmConfig) -> Result<Self> {
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .build()
-            .context("building HTTP client")?;
+            .pool_idle_timeout(std::time::Duration::from_secs(90));
+
+        builder = match config.proxy.trim() {
+            proxy if !proxy.is_empty() => {
+                let proxy = reqwest::Proxy::all(proxy)
+                    .with_context(|| format!("invalid proxy URL {proxy:?}"))?;
+                builder.proxy(proxy)
+            }
+            // No proxy configured: do not pick one up from the environment.
+            _ => builder.no_proxy(),
+        };
+
+        let http = builder.build().context("building HTTP client")?;
         Ok(Self { http, config })
     }
 

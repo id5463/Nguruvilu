@@ -240,6 +240,15 @@
       </label>
       <datalist id="model-options"></datalist>
       <label class="field">
+        <span class="cap">Proxy (optional)</span>
+        <input id="set-proxy" placeholder="http://127.0.0.1:7890" spellcheck="false">
+      </label>
+      <div class="hint tight">
+        Leave empty to connect directly. A value here is the <em>only</em> proxy used:
+        the system HTTP_PROXY / HTTPS_PROXY variables are ignored, because a proxy set
+        for another tool would otherwise reroute model traffic and fail with a TLS error.
+      </div>
+      <label class="field">
         <span class="cap">Thinking effort</span>
         <select id="set-effort">
           <option value="">provider default</option>
@@ -318,6 +327,7 @@ const setBaseUrl = document.getElementById("set-base-url");
 const setApiKey = document.getElementById("set-api-key");
 const setModel = document.getElementById("set-model");
 const setEffort = document.getElementById("set-effort");
+const setProxy = document.getElementById("set-proxy");
 const notConfigured = document.getElementById("not-configured");
 const settingsSaved = document.getElementById("settings-saved");
 const settingsPath = document.getElementById("settings-path");
@@ -401,12 +411,31 @@ function startAssistantTurn() {
   scrollToEnd();
 }
 
-function appendAssistantText(delta) {
+// The shell already batches deltas; this merges whatever still lands inside one
+// animation frame, so the DOM is touched once per repaint rather than once per
+// event. Without it, a fast answer still renders in visible steps.
+let pendingText = "";
+let frameScheduled = false;
+
+function flushPendingText() {
+  const text = pendingText;
+  pendingText = "";
+  if (!text) return;
   if (!live) startAssistantTurn();
   live.caret.remove();
-  live.body.append(document.createTextNode(delta));
+  live.body.append(document.createTextNode(text));
   live.body.append(live.caret);
   scrollToEnd();
+}
+
+function appendAssistantText(delta) {
+  pendingText += delta;
+  if (frameScheduled) return;
+  frameScheduled = true;
+  requestAnimationFrame(() => {
+    frameScheduled = false;
+    flushPendingText();
+  });
 }
 
 function appendToolCall(name, args) {
@@ -545,6 +574,7 @@ function renderSettings(status) {
     setBaseUrl.value = status.base_url || "";
     setModel.value = status.model || "";
     setEffort.value = status.reasoning_effort || "";
+    setProxy.value = status.proxy || "";
     // The key is never sent back in full; an empty box means "unchanged".
     setApiKey.value = "";
     setApiKey.placeholder = status.api_key_masked
@@ -582,6 +612,7 @@ function renderStatus(status) {
     ["key", status.api_key_masked || "(not set)"],
     ["model", status.model],
     ["thinking", status.reasoning_effort || "(provider default)"],
+    ["proxy", status.proxy || "(direct; env proxies ignored)"],
     ["cache", status.cache_policy],
     ["config v", String(status.config_version)],
     ["plugins", (status.plugins || []).join(", ") || "none"],
@@ -705,6 +736,8 @@ window.ngu = {
         appendToolResult(event.ok, event.result);
         break;
       case "turn_end":
+        // Flush before closing the turn, or the last frame of text is lost.
+        flushPendingText();
         endAssistantTurn();
         setBusy(false);
         document.getElementById("timing").textContent =
@@ -757,7 +790,7 @@ document.getElementById("new-session").addEventListener("click", () => {
 
 // ---------------------------------------------------------------- settings
 
-for (const field of [setBaseUrl, setApiKey, setModel, setEffort]) {
+for (const field of [setBaseUrl, setApiKey, setModel, setEffort, setProxy]) {
   field.addEventListener("input", () => { settingsDirty = true; });
 }
 
@@ -769,6 +802,7 @@ function saveSettings() {
     base_url: setBaseUrl.value.trim(),
     model: setModel.value.trim(),
     reasoning_effort: setEffort.value,
+    proxy: setProxy.value.trim(),
   };
   if (setApiKey.value.trim() !== "") {
     payload.api_key = setApiKey.value.trim();

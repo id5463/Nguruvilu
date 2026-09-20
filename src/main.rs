@@ -234,6 +234,10 @@ enum ConfigAction {
         /// Reasoning effort: none, minimal, low, medium, high, xhigh, or max.
         #[arg(long)]
         reasoning_effort: Option<String>,
+        /// Proxy URL, e.g. http://127.0.0.1:7890. Pass an empty string to clear
+        /// it and go direct.
+        #[arg(long)]
+        proxy: Option<String>,
     },
     /// Print the settings file path.
     Path,
@@ -394,7 +398,7 @@ async fn run() -> Result<()> {
         }
         Some(Command::Models) => {
             require_key(&api_key)?;
-            let client = LlmClient::new(LlmConfig::new(base_url, api_key, model))?;
+            let client = client(&base_url, &api_key, &model, &settings)?;
             let mut ids = client.list_models().await?;
             ids.sort();
             if cli.json {
@@ -440,7 +444,7 @@ async fn run() -> Result<()> {
 
     require_key(&api_key)?;
 
-    let client = LlmClient::new(LlmConfig::new(base_url.clone(), api_key, model.clone()))?;
+    let client = client(&base_url, &api_key, &model, &settings)?;
 
     // The kernel owns the tool table; skills add one tool to it.
     let mut kernel = Kernel::new();
@@ -1353,7 +1357,7 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             println!("{}", Settings::path().display());
             Ok(())
         }
-        Some(ConfigAction::Set { base_url, api_key, model, reasoning_effort }) => {
+        Some(ConfigAction::Set { base_url, api_key, model, reasoning_effort, proxy }) => {
             let mut settings = Settings::load()?;
             if let Some(value) = base_url {
                 settings.base_url = value.trim().to_string();
@@ -1366,6 +1370,9 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             }
             if let Some(value) = reasoning_effort {
                 settings.reasoning_effort = value.trim().to_string();
+            }
+            if let Some(value) = proxy {
+                settings.proxy = value.trim().to_string();
             }
             settings.save()?;
 
@@ -1441,6 +1448,14 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
                     &effective.reasoning_effort
                 }
             );
+            println!(
+                "proxy:         {}",
+                if effective.proxy.trim().is_empty() {
+                    "(direct; HTTP_PROXY/HTTPS_PROXY ignored)"
+                } else {
+                    &effective.proxy
+                }
+            );
             if !effective.is_configured() {
                 println!("\nnot configured — set it with:");
                 println!("  ngu config set --base-url https://your-host/v1 --api-key sk-...");
@@ -1459,4 +1474,16 @@ fn require_key(api_key: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Build a model client, applying the configured proxy.
+///
+/// The proxy is explicit: when it is empty, the process's `HTTP_PROXY` and
+/// `HTTPS_PROXY` are deliberately ignored. Picking those up silently is how a
+/// proxy set for another tool reroutes model traffic and fails with a TLS
+/// handshake error that never mentions proxies.
+fn client(base_url: &str, api_key: &str, model: &str, settings: &Settings) -> Result<LlmClient> {
+    let mut config = LlmConfig::new(base_url, api_key, model);
+    config.proxy = settings.proxy.clone();
+    LlmClient::new(config).context("building the model client")
 }

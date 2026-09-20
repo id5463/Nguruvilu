@@ -43,6 +43,15 @@ pub struct Settings {
     /// real endpoint, `minimal` cut one answer from 137 output tokens to 69.
     #[serde(default)]
     pub reasoning_effort: String,
+    /// Proxy for all requests, e.g. `http://127.0.0.1:7890`.
+    ///
+    /// Empty means direct, and — more importantly — it means the process's
+    /// `HTTP_PROXY`/`HTTPS_PROXY` variables are ignored. Leaving those to be
+    /// picked up implicitly is how a proxy configured for some other tool
+    /// silently reroutes model traffic and produces a `tls handshake eof` that
+    /// mentions nothing about proxies.
+    #[serde(default)]
+    pub proxy: String,
 }
 
 impl Settings {
@@ -168,6 +177,13 @@ impl Settings {
             }
         }
 
+        // `NGU_PROXY` is read, but `HTTP_PROXY`/`HTTPS_PROXY` deliberately are
+        // not: those are set for other tools and rerouting model traffic through
+        // an unreachable proxy yields an error that never mentions proxies.
+        if let Ok(value) = std::env::var("NGU_PROXY") {
+            settings.proxy = value.trim().to_string();
+        }
+
         if settings.model.trim().is_empty() {
             settings.model = DEFAULT_MODEL.to_string();
         }
@@ -208,6 +224,7 @@ mod tests {
             api_key: "sk-test".into(),
             model: "m".into(),
             reasoning_effort: String::new(),
+            proxy: String::new(),
         };
         assert!(settings.is_configured());
         assert!(settings.missing().is_empty());
@@ -220,6 +237,7 @@ mod tests {
             api_key: "sk-test".into(),
             model: String::new(),
             reasoning_effort: String::new(),
+            proxy: String::new(),
         };
         assert_eq!(settings.model_or_default(), DEFAULT_MODEL);
     }
@@ -261,6 +279,7 @@ mod tests {
             api_key: "sk-round-trip".into(),
             model: "test-model".into(),
             reasoning_effort: "low".into(),
+            proxy: String::new(),
         };
         let text = serde_json::to_string_pretty(&settings).unwrap();
         std::fs::write(&path, &text).unwrap();

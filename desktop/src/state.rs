@@ -6,14 +6,14 @@
 //!
 //! Threading: the window and the webview live on the tao event loop thread,
 //! while agent turns run on a tokio runtime. They meet at one seam — a
-//! [`EventLoopProxy`] carrying JSON to evaluate in the page.
+//! [`EventSink`] — the page in window mode, stdout in headless mode.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
-use tao::event_loop::EventLoopProxy;
 
 use nguruvilu::agent::{Agent, AgentObserver, TurnConfig, TurnSettings};
 use nguruvilu::hotreload::{Change, ChangePayload, ModelRoute, Runtime};
@@ -23,7 +23,7 @@ use nguruvilu::session::{JsonlStore, Session, SessionStore};
 use nguruvilu::settings::Settings;
 use nguruvilu::skills::{register_skill_tool, SkillRegistry};
 
-use crate::UserEvent;
+use crate::sink::EventSink;
 
 /// Default model when neither `NGU_MODEL` nor the environment supplies one.
 pub const DEFAULT_MODEL: &str = "deepseek-v4.1-flash";
@@ -197,6 +197,7 @@ impl AppState {
             "messages": self.session.messages.len(),
             "model": snapshot.model_route.model,
             "reasoning_effort": self.settings.reasoning_effort,
+            "proxy": self.settings.proxy,
             "base_url": snapshot.model_route.base_url,
             "cache_policy": format!("{:?}", snapshot.cache_policy),
             "config_version": snapshot.version,
@@ -327,12 +328,14 @@ impl AppState {
         api_key: &str,
         model: &str,
         reasoning_effort: &str,
+        proxy: &str,
     ) -> Result<()> {
         let settings = Settings {
             base_url: base_url.trim().to_string(),
             api_key: api_key.trim().to_string(),
             model: model.trim().to_string(),
             reasoning_effort: reasoning_effort.trim().to_string(),
+            proxy: proxy.trim().to_string(),
         };
         settings.save()?;
         self.settings = settings;
@@ -440,6 +443,9 @@ impl AppState {
         if !effort.is_empty() && effort != "default" {
             config.reasoning_effort = Some(effort.to_string());
         }
+        // Empty means direct, and means the process's own proxy variables stay
+        // out of the way.
+        config.proxy = self.settings.proxy.clone();
         LlmClient::new(config).context("building the model client")
     }
 }
@@ -468,20 +474,27 @@ pub fn data_directory() -> PathBuf {
 }
 
 /// Streams loop progress into the page.
+///
+/// Text is forwarded the moment it arrives. An earlier version batched deltas
+/// into a 25 ms window to save IPC round trips, but measurement showed that was
+/// backwards: the endpoint already delivers ~5 characters per delta, often
+/// several at once, so an extra window only merged those bursts into larger,
+/// more visible lumps. The page coalesces within a frame anyway, which is where
+/// redundant DOM work actually gets avoided.
 pub struct UiObserver {
-    proxy: EventLoopProxy<UserEvent>,
+    sink: Arc<dyn EventSink>,
 }
 
 impl UiObserver {
     /// Build an observer that pushes events to the window.
-    pub fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
-        Self { proxy }
+    pub fn new(sink: Arc<dyn EventSink>) -> Self {
+        Self { sink }
     }
 
     fn emit(&self, event: Value) {
         // The page is the only consumer; a closed window just means the send
         // fails, which is not an error worth surfacing.
-        let _ = self.proxy.send_event(UserEvent::ToUi(event));
+        self.sink.emit(event);
     }
 }
 
@@ -491,7 +504,9 @@ impl AgentObserver for UiObserver {
     }
 
     fn on_text(&self, delta: &str) {
-        self.emit(json!({ "ev": "text", "delta": delta }));
+        if !delta.is_empty() {
+            self.emit(json!({ "ev": "text", "delta": delta }));
+        }
     }
 
     fn on_reasoning(&self, delta: &str) {
@@ -514,7 +529,7 @@ impl AgentObserver for UiObserver {
 pub async fn run_turn(
     state: Arc<Mutex<AppState>>,
     text: String,
-    proxy: EventLoopProxy<UserEvent>,
+    sink: Arc<dyn EventSink>,
 ) -> Result<()> {
     let (client, config, messages) = {
         let mut guard = state.lock().expect("state lock");
@@ -525,10 +540,10 @@ pub async fn run_turn(
         (guard.client()?, Arc::clone(&guard.config), guard.session.messages.clone())
     };
 
-    let observer = Arc::new(UiObserver::new(proxy.clone()));
+    let observer = Arc::new(UiObserver::new(Arc::clone(&sink)));
     let mut agent = Agent::new(client, config, messages)
         .with_max_steps(50)
-        .with_observer(observer);
+        .with_observer(Arc::clone(&observer) as Arc<dyn AgentObserver>);
 
     let result = agent.run(&text).await;
 
@@ -573,15 +588,15 @@ pub async fn run_turn(
                 "session": guard.session.id,
                 "messages": guard.session.messages.len(),
             });
-            let _ = proxy.send_event(UserEvent::ToUi(payload));
+            sink.emit(payload);
         }
         Err(error) => {
             let message = format!("{error:#}");
             guard.last_error = Some(message.clone());
-            let _ = proxy.send_event(UserEvent::ToUi(json!({
+            sink.emit(json!({
                 "ev": "error",
                 "message": message,
-            })));
+            }));
         }
     }
     Ok(())
