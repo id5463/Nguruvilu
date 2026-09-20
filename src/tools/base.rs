@@ -81,7 +81,7 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<()> {
             json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "File path (absolute, or relative to the working directory)" },
+                    "path": { "type": "string", "description": "File path: absolute (C:\\\\dir\\\\file or /c/dir/file), or relative to the working directory" },
                     "start_line": { "type": "integer", "description": "First line to return, 1-based. Defaults to 1." },
                     "end_line": { "type": "integer", "description": "Last line to return, inclusive. Defaults to start_line + 199." }
                 },
@@ -100,7 +100,7 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<()> {
             json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "File path" },
+                    "path": { "type": "string", "description": "File path: absolute (C:\\\\dir\\\\file or /c/dir/file), or relative to the working directory" },
                     "content": { "type": "string", "description": "Full file contents" }
                 },
                 "required": ["path", "content"]
@@ -119,7 +119,7 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<()> {
             json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "File path" },
+                    "path": { "type": "string", "description": "File path: absolute (C:\\\\dir\\\\file or /c/dir/file), or relative to the working directory" },
                     "old_str": { "type": "string", "description": "Exact text to replace; must occur exactly once" },
                     "new_str": { "type": "string", "description": "Replacement text" }
                 },
@@ -160,13 +160,57 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<()> {
 }
 
 /// Resolve a caller-supplied path against the process working directory.
+///
+/// On Windows this also accepts the POSIX form a shell reports. Git Bash mounts
+/// drives as `/c/...`, `/i/...`, and `pwd` prints exactly that — so a model that
+/// reads the working directory from `bash` and then hands the same string to
+/// `read` or `write` is holding a path these tools would otherwise resolve
+/// relative to the working directory, quietly landing the file somewhere else.
+/// That happened in practice: a model wrote to `I:/i/tmp-test/x` intending
+/// `I:\tmp-test\x`, could not find the file afterwards, and concluded the write
+/// tool was lying.
+///
+/// The translation applies only on Windows, where `/i/...` cannot be a real
+/// absolute path. On Unix a leading `/i` is a genuine directory and is left
+/// alone.
 fn resolve_path(raw: &str) -> PathBuf {
     let path = Path::new(raw);
     if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(path)
+        return path.to_path_buf();
     }
+
+    #[cfg(windows)]
+    if let Some(drive) = posix_drive_path(raw) {
+        return drive;
+    }
+
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(path)
+}
+
+/// Translate `/c/Users/x` into `C:\Users\x`, when that is what it means.
+///
+/// Only a single leading letter followed by a separator is treated as a drive
+/// mount, which is exactly the Git Bash convention.
+#[cfg(windows)]
+fn posix_drive_path(raw: &str) -> Option<PathBuf> {
+    let rest = raw.strip_prefix('/')?;
+    let mut chars = rest.chars();
+    let letter = chars.next()?;
+    if !letter.is_ascii_alphabetic() {
+        return None;
+    }
+    let after = chars.as_str();
+    // `/c` alone, or `/c/...`; `/code/...` is a real relative directory name.
+    let tail = match after.strip_prefix('/') {
+        Some(tail) => tail,
+        None if after.is_empty() => "",
+        None => return None,
+    };
+    Some(PathBuf::from(format!(
+        "{}:\\{}",
+        letter.to_ascii_uppercase(),
+        tail.replace('/', "\\")
+    )))
 }
 
 async fn read_tool(args: Value) -> Result<String> {
@@ -659,5 +703,51 @@ mod image_tests {
         let uri = crate::message::data_uri("image/png", &[1, 2, 3]);
         assert!(uri.starts_with("data:image/png;base64,"));
         assert!(uri.ends_with("AQID"), "{uri}");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn a_shell_style_drive_path_is_translated() {
+        // What `pwd` prints in Git Bash, and what a model then hands back.
+        assert_eq!(
+            posix_drive_path("/i/tmp-test/x.txt"),
+            Some(PathBuf::from("I:\\tmp-test\\x.txt"))
+        );
+        assert_eq!(
+            posix_drive_path("/c/Users/a/Desktop/a.txt"),
+            Some(PathBuf::from("C:\\Users\\a\\Desktop\\a.txt"))
+        );
+        assert_eq!(posix_drive_path("/i"), Some(PathBuf::from("I:\\")));
+    }
+
+    #[test]
+    fn an_ordinary_relative_name_is_not_mistaken_for_a_drive() {
+        // `/code/x` is a real directory name, not drive `C:`.
+        assert_eq!(posix_drive_path("/code/x"), None);
+        assert_eq!(posix_drive_path("/tmp/x"), None);
+        assert_eq!(posix_drive_path("relative/x"), None);
+        assert_eq!(posix_drive_path(""), None);
+    }
+
+    #[test]
+    fn resolve_path_handles_every_form_a_model_might_use() {
+        // Windows absolute.
+        assert_eq!(
+            resolve_path("I:\\tmp-test\\a.txt"),
+            PathBuf::from("I:\\tmp-test\\a.txt")
+        );
+        // Git Bash absolute, which is what `pwd` shows.
+        assert_eq!(
+            resolve_path("/i/tmp-test/a.txt"),
+            PathBuf::from("I:\\tmp-test\\a.txt")
+        );
+        // Relative stays relative to the working directory.
+        let relative = resolve_path("a.txt");
+        assert!(relative.ends_with("a.txt"));
+        assert!(relative.is_absolute(), "joined onto the working directory");
     }
 }

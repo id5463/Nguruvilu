@@ -31,7 +31,13 @@ pub enum WindowSource {
     /// Reported by the provider's model catalog.
     Provider,
     /// Matched a built-in table entry.
-    Known,
+    /// Matched a built-in table entry.
+    ///
+    /// Not a provider statement and not verified against one: the table is a
+    /// conservative estimate written by hand. Reported separately from
+    /// `Assumed` only because a table hit is a better guess than the floor,
+    /// not because it is a fact.
+    Table,
     /// Nothing matched; a conservative floor was used.
     Assumed,
 }
@@ -42,7 +48,7 @@ impl WindowSource {
         match self {
             WindowSource::Configured => "configured",
             WindowSource::Provider => "provider",
-            WindowSource::Known => "known",
+            WindowSource::Table => "table (estimate, not from the provider)",
             WindowSource::Assumed => "assumed",
         }
     }
@@ -166,7 +172,7 @@ impl DefaultContextPolicy {
             return ContextWindow::new(tokens, WindowSource::Provider);
         }
         if let Some(tokens) = known_window(model) {
-            return ContextWindow::new(tokens, WindowSource::Known);
+            return ContextWindow::new(tokens, WindowSource::Table);
         }
         ContextWindow::new(ASSUMED_WINDOW, WindowSource::Assumed)
     }
@@ -249,7 +255,7 @@ mod tests {
         let policy = DefaultContextPolicy::default();
         let window = policy.window("claude-opus-5");
         assert_eq!(window.tokens, 200_000);
-        assert_eq!(window.source, WindowSource::Known);
+        assert_eq!(window.source, WindowSource::Table);
     }
 
     #[test]
@@ -280,7 +286,7 @@ mod tests {
             configured: Some(0),
             ..Default::default()
         };
-        assert_eq!(policy.window("claude-opus-5").source, WindowSource::Known);
+        assert_eq!(policy.window("claude-opus-5").source, WindowSource::Table);
     }
 
     #[test]
@@ -289,7 +295,7 @@ mod tests {
             threshold_percent: 75,
             ..Default::default()
         };
-        let window = ContextWindow::new(100_000, WindowSource::Known);
+        let window = ContextWindow::new(100_000, WindowSource::Table);
 
         assert!(!policy.should_compact(74_000, window));
         assert!(policy.should_compact(75_000, window));
@@ -299,7 +305,7 @@ mod tests {
     #[test]
     fn compaction_does_not_trigger_without_a_measurement() {
         let policy = DefaultContextPolicy::default();
-        let window = ContextWindow::new(100_000, WindowSource::Known);
+        let window = ContextWindow::new(100_000, WindowSource::Table);
         assert!(!policy.should_compact(0, window));
     }
 
@@ -309,7 +315,7 @@ mod tests {
             threshold_percent: 500,
             ..Default::default()
         };
-        let window = ContextWindow::new(1000, WindowSource::Known);
+        let window = ContextWindow::new(1000, WindowSource::Table);
         assert!(policy.should_compact(1000, window));
         assert!(!policy.should_compact(999, window));
     }
