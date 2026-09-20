@@ -280,6 +280,10 @@ impl AppState {
                         "name": c.name,
                         "arguments": c.arguments,
                     })).collect::<Vec<_>>(),
+                    "images": message.images.iter().map(|i| json!({
+                        "url": i.url,
+                        "label": i.label,
+                    })).collect::<Vec<_>>(),
                 })
             })
             .collect::<Vec<_>>();

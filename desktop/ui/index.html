@@ -160,6 +160,12 @@
   }
   .tool-result.bad { border-color: #4a2b2b; color: #e0a9a9; }
   .err-entry {
+  .attached { margin: 6px 0 10px; }
+  .attached img {
+    max-width: 100%; max-height: 320px; border-radius: 6px;
+    border: 1px solid var(--line); display: block;
+  }
+  .attached .cap { font-size: 10px; color: var(--dim); margin-top: 3px; display: block; }
     background: #2a1a1a; border: 1px solid #5a2b2b; color: #f0b0b0;
     border-radius: 6px; padding: 10px 12px; margin-bottom: 16px;
     font-size: 12px; white-space: pre-wrap; word-break: break-word;
@@ -429,6 +435,7 @@ function renderEntry(entry) {
     turn.append(el("div", "tool-call", "\u2192 " + call.name + " " + call.arguments));
   }
   if (entry.text) turn.append(el("div", "body", entry.text));
+  for (const image of entry.images || []) appendImage(turn, image);
   stream.append(turn);
 }
 
@@ -437,6 +444,20 @@ function errorBlock(text) {
   box.append(el("span", "cap", "request failed"));
   box.append(document.createTextNode(text));
   return box;
+}
+
+/// Show an image the model was given.
+///
+/// Rendering it is the point: the user should see exactly what the model saw,
+/// not merely be told that an image exists.
+function appendImage(container, image) {
+  const box = el("div", "attached");
+  const img = document.createElement("img");
+  img.src = image.url;
+  img.alt = image.label || "attached image";
+  box.append(img);
+  if (image.label) box.append(el("span", "cap", image.label));
+  container.append(box);
 }
 
 function startAssistantTurn() {

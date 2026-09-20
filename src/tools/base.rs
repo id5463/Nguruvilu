@@ -34,6 +34,43 @@ const MAX_BASH_OUTPUT: usize = 30_000;
 /// Default `bash` timeout.
 const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
 
+/// Largest image the kernel will attach without warning.
+///
+/// Providers cap what they accept, and a silently rejected request is worse
+/// than a warning the model can pass on to the user.
+const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Read width and height from an image header.
+///
+/// Deliberately minimal: only the formats the kernel recognises, and only the
+/// header. Dimensions are a courtesy to the model, not a reason to decode a
+/// multi-megabyte image.
+fn image_dimensions(bytes: &[u8], mime: &str) -> Option<(u32, u32)> {
+    match mime {
+        // PNG: IHDR always begins at byte 16.
+        "image/png" if bytes.len() >= 24 => {
+            let w = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+            let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+            Some((w, h))
+        }
+        // GIF: little-endian, immediately after the signature.
+        "image/gif" if bytes.len() >= 10 => {
+            let w = u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u32;
+            let h = u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u32;
+            Some((w, h))
+        }
+        // BMP: little-endian, at a fixed offset. Height may be negative for a
+        // top-down bitmap, so take the magnitude.
+        "image/bmp" if bytes.len() >= 26 => {
+            let w = i32::from_le_bytes(bytes[18..22].try_into().ok()?);
+            let h = i32::from_le_bytes(bytes[22..26].try_into().ok()?);
+            Some((w.unsigned_abs(), h.unsigned_abs()))
+        }
+        // JPEG and WebP need real parsing; not worth it for a courtesy.
+        _ => None,
+    }
+}
+
 /// Register all four base tools under the `kernel` owner.
 pub fn register_all(registry: &mut ToolRegistry) -> Result<()> {
     registry.register(
@@ -51,7 +88,7 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<()> {
                 "required": ["path"]
             }),
             "kernel",
-            |args| Box::pin(read_tool(args)) as ToolFuture,
+            |args| Box::pin(read_any(args)) as ToolFuture,
         ),
         ConflictPolicy::Error,
     )?;
@@ -69,7 +106,7 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<()> {
                 "required": ["path", "content"]
             }),
             "kernel",
-            |args| Box::pin(write_tool(args)) as ToolFuture,
+            |args| Box::pin(async move { write_tool(args).await.map(Into::into) }) as ToolFuture,
         ),
         ConflictPolicy::Error,
     )?;
@@ -89,7 +126,7 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<()> {
                 "required": ["path", "old_str", "new_str"]
             }),
             "kernel",
-            |args| Box::pin(edit_tool(args)) as ToolFuture,
+            |args| Box::pin(async move { edit_tool(args).await.map(Into::into) }) as ToolFuture,
         ),
         ConflictPolicy::Error,
     )?;
@@ -114,7 +151,7 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<()> {
                 "required": ["command"]
             }),
             "kernel",
-            |args| Box::pin(bash_tool(args)) as ToolFuture,
+            |args| Box::pin(async move { bash_tool(args).await.map(Into::into) }) as ToolFuture,
         ),
         ConflictPolicy::Error,
     )?;
@@ -133,15 +170,65 @@ fn resolve_path(raw: &str) -> PathBuf {
 }
 
 async fn read_tool(args: Value) -> Result<String> {
+    read_any(args).await.map(|output| output.text)
+}
+
+/// Read a file, attaching it as an image when it is one.
+///
+/// Text is read as lines. An image cannot be read as lines at all — decoding it
+/// as UTF-8 fails outright — so it is attached instead and the model is told
+/// what was attached. Anything else binary is reported as such rather than
+/// handed to the model as mojibake.
+async fn read_any(args: Value) -> Result<crate::tools::ToolOutput> {
     let raw_path = args
         .get("path")
         .and_then(|p| p.as_str())
         .ok_or_else(|| anyhow!("missing required argument: path"))?;
     let path = resolve_path(raw_path);
 
-    let content = tokio::fs::read_to_string(&path)
+    let bytes = tokio::fs::read(&path)
         .await
         .with_context(|| format!("reading {}", path.display()))?;
+
+    // An image is attached rather than decoded. The check is on the bytes, not
+    // the name: a file called .png that is not one should be reported, not sent
+    // to a provider as a broken image.
+    if let Some(mime) = crate::message::image_mime(&bytes, &path.display().to_string()) {
+        let (width, height) = image_dimensions(&bytes, mime).unwrap_or((0, 0));
+        let size = bytes.len();
+        let dimensions = if width > 0 {
+            format!(", {width}x{height}")
+        } else {
+            String::new()
+        };
+
+        let mut text = format!(
+            "{} is an image ({mime}{dimensions}, {} bytes). It is attached below; \
+             describe what you see rather than trying to read it as text.",
+            path.display(),
+            size
+        );
+
+        // A huge image is worth flagging: providers cap what they will accept.
+        if size > MAX_IMAGE_BYTES {
+            text.push_str(&format!(
+                "\nWarning: this image is {} MB, which many providers reject.",
+                size / (1024 * 1024)
+            ));
+        }
+
+        let image = crate::message::ImageAttachment::url(crate::message::data_uri(mime, &bytes))
+            .labelled(format!("{} ({mime})", path.display()));
+        return Ok(crate::tools::ToolOutput::text(text).with_image(image));
+    }
+
+    // Not an image: it must be text to be useful.
+    let content = String::from_utf8(bytes).map_err(|_| {
+        anyhow!(
+            "{} is binary and not a recognised image format; read cannot show it",
+            path.display()
+        )
+    })?;
 
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
@@ -154,13 +241,14 @@ async fn read_tool(args: Value) -> Result<String> {
     let end = end.min(start + MAX_READ_WINDOW - 1).min(total.max(1));
 
     if total == 0 {
-        return Ok(format!("{} (empty file)", path.display()));
+        return Ok(format!("{} (empty file)", path.display()).into());
     }
     if start > total {
         return Ok(format!(
             "{} has {total} lines; start_line {start} is past the end",
             path.display()
-        ));
+        )
+        .into());
     }
 
     let width = end.to_string().len();
@@ -177,7 +265,7 @@ async fn read_tool(args: Value) -> Result<String> {
             end + 1
         ));
     }
-    Ok(out)
+    Ok(out.into())
 }
 
 async fn write_tool(args: Value) -> Result<String> {
@@ -488,4 +576,88 @@ fn truncate_output(text: &str, max: usize) -> String {
     let start: String = text.chars().take(head).collect();
     let end: String = text.chars().rev().take(tail).collect::<String>().chars().rev().collect();
     format!("{start}\n… ({} bytes omitted) …\n{end}", text.len() - head - tail)
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+    use crate::message::image_mime;
+    use serde_json::json;
+
+    /// A minimal valid 2x1 PNG, so the magic-byte path is exercised for real.
+    fn tiny_png() -> Vec<u8> {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend_from_slice(&[0, 0, 0, 13]);
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&2u32.to_be_bytes()); // width
+        bytes.extend_from_slice(&1u32.to_be_bytes()); // height
+        bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+        bytes
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ngu-img-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    #[tokio::test]
+    async fn reading_an_image_attaches_it_instead_of_failing() {
+        let path = scratch("pic.png");
+        std::fs::write(&path, tiny_png()).unwrap();
+
+        let output = read_any(json!({ "path": path })).await.expect("read succeeds");
+
+        assert_eq!(output.images.len(), 1, "the image is attached");
+        let image = &output.images[0];
+        assert!(image.url.starts_with("data:image/png;base64,"), "{}", image.url);
+        assert!(output.text.contains("image/png"));
+        assert!(output.text.contains("2x1"), "dimensions are reported: {}", output.text);
+    }
+
+    #[tokio::test]
+    async fn a_png_reports_its_real_dimensions() {
+        assert_eq!(image_dimensions(&tiny_png(), "image/png"), Some((2, 1)));
+    }
+
+    #[tokio::test]
+    async fn text_files_still_read_as_text_with_no_attachment() {
+        let path = scratch("note.txt");
+        std::fs::write(&path, "alpha\nbeta\n").unwrap();
+
+        let output = read_any(json!({ "path": path })).await.expect("read succeeds");
+        assert!(output.images.is_empty(), "a text file attaches nothing");
+        assert!(output.text.contains("alpha"));
+        assert!(output.text.contains("beta"));
+    }
+
+    #[tokio::test]
+    async fn binary_that_is_not_an_image_is_refused_clearly() {
+        let path = scratch("blob.bin");
+        std::fs::write(&path, [0x00u8, 0x01, 0x02, 0xFF, 0xFE]).unwrap();
+
+        let error = read_any(json!({ "path": path })).await.expect_err("refused");
+        let text = format!("{error:#}");
+        assert!(text.contains("binary"), "{text}");
+        assert!(text.contains("not a recognised image format"), "{text}");
+    }
+
+    #[test]
+    fn formats_are_detected_by_magic_bytes_not_by_name() {
+        // A file named .png that is not one must not be sent as a broken image.
+        assert_eq!(image_mime(b"not a png at all", "picture.png"), None);
+        assert_eq!(image_mime(&[0xFF, 0xD8, 0xFF, 0xE0], "x.jpg"), Some("image/jpeg"));
+        assert_eq!(image_mime(b"GIF89a....", "x.gif"), Some("image/gif"));
+        assert_eq!(image_mime(b"BM......", "x.bmp"), Some("image/bmp"));
+        assert_eq!(image_mime(b"RIFF....WEBPVP8 ", "x.webp"), Some("image/webp"));
+        // SVG has no magic bytes, so the extension is the only signal.
+        assert_eq!(image_mime(b"<svg/>", "x.svg"), Some("image/svg+xml"));
+    }
+
+    #[test]
+    fn a_data_uri_carries_the_bytes() {
+        let uri = crate::message::data_uri("image/png", &[1, 2, 3]);
+        assert!(uri.starts_with("data:image/png;base64,"));
+        assert!(uri.ends_with("AQID"), "{uri}");
+    }
 }

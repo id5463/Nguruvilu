@@ -18,8 +18,54 @@ use serde_json::{json, Value};
 
 pub mod base;
 
+/// What a tool produced.
+///
+/// Text is what the model reads. Images cannot travel in a tool message — the
+/// OpenAI format restricts that content to text — so the loop collects them and
+/// attaches them to a user message placed after the tool results.
+#[derive(Debug, Clone, Default)]
+pub struct ToolOutput {
+    /// Text the model reads.
+    pub text: String,
+    /// Images the model should see.
+    pub images: Vec<crate::message::ImageAttachment>,
+}
+
+impl ToolOutput {
+    /// Text only.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+
+    /// Attach an image.
+    pub fn with_image(mut self, image: crate::message::ImageAttachment) -> Self {
+        self.images.push(image);
+        self
+    }
+
+    /// Whether this output carries anything for the model to look at.
+    pub fn has_images(&self) -> bool {
+        !self.images.is_empty()
+    }
+}
+
+impl From<String> for ToolOutput {
+    fn from(text: String) -> Self {
+        Self::text(text)
+    }
+}
+
+impl From<&str> for ToolOutput {
+    fn from(text: &str) -> Self {
+        Self::text(text)
+    }
+}
+
 /// Boxed future returned by a tool handler.
-pub type ToolFuture = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
+pub type ToolFuture = Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send>>;
 
 /// A tool implementation.
 pub type ToolHandler = Arc<dyn Fn(Value) -> ToolFuture + Send + Sync>;
@@ -192,7 +238,7 @@ impl ToolRegistry {
     }
 
     /// Execute a tool by name with raw JSON arguments.
-    pub async fn execute(&self, name: &str, arguments: &str) -> Result<String> {
+    pub async fn execute(&self, name: &str, arguments: &str) -> Result<ToolOutput> {
         let def = self
             .tools
             .get(name)

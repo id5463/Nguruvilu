@@ -323,7 +323,7 @@ impl Loader {
                 move |args| {
                     let client = Arc::clone(&client_ref);
                     let name = remote_name.clone();
-                    Box::pin(async move { client.call(&name, args).await }) as ToolFuture
+                    Box::pin(async move { client.call(&name, args).await.map(Into::into) }) as ToolFuture
                 },
             );
 

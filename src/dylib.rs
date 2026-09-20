@@ -419,9 +419,12 @@ impl DynamicPlugin {
                 Box::pin(async move {
                     // `ngu_call` is a synchronous C function; running it on the
                     // async scheduler would block a worker for its duration.
-                    tokio::task::spawn_blocking(move || call_plugin(call, free, &plugin, &tool, args))
-                        .await
-                        .map_err(|e| anyhow!("plugin call task failed: {e}"))?
+                    let result = tokio::task::spawn_blocking(move || {
+                        call_plugin(call, free, &plugin, &tool, args)
+                    })
+                    .await
+                    .map_err(|e| anyhow!("plugin call task failed: {e}"))??;
+                    Ok(crate::tools::ToolOutput::text(result))
                 }) as ToolFuture
             },
         ))

@@ -467,7 +467,25 @@ pub fn to_wire(message: &Message) -> Value {
             }
         }
         _ => {
-            obj["content"] = json!(message.text());
+            if message.images.is_empty() {
+                obj["content"] = json!(message.text());
+            } else {
+                // An image forces the content to become an array of parts; the
+                // provider reads a plain string and a part list differently.
+                let mut parts: Vec<Value> = Vec::with_capacity(message.images.len() + 1);
+                let text = message.text();
+                if !text.is_empty() {
+                    parts.push(json!({ "type": "text", "text": text }));
+                }
+                for image in &message.images {
+                    let mut url = json!({ "url": image.url });
+                    if let Some(detail) = &image.detail {
+                        url["detail"] = json!(detail);
+                    }
+                    parts.push(json!({ "type": "image_url", "image_url": url }));
+                }
+                obj["content"] = json!(parts);
+            }
         }
     }
 
@@ -617,7 +635,6 @@ fn truncate(text: &str, max: usize) -> String {
 mod body_tests {
     use super::*;
     use serde_json::json;
-    use std::sync::Arc;
 
     fn client_with(effort: Option<&str>, extra: serde_json::Map<String, serde_json::Value>) -> LlmClient {
         let mut config = LlmConfig::new("http://localhost:1/v1", "k", "test-model");

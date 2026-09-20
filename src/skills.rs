@@ -307,7 +307,7 @@ pub fn register_skill_tool(tools: &mut ToolRegistry, skills: Arc<SkillRegistry>)
             "kernel",
             move |args| {
                 let skills = Arc::clone(&skills);
-                Box::pin(async move { skill_tool(skills, args).await }) as ToolFuture
+                Box::pin(async move { skill_tool(skills, args).await.map(Into::into) }) as ToolFuture
             },
         ),
         ConflictPolicy::Error,
@@ -474,13 +474,13 @@ mod tests {
         register_skill_tool(&mut tools, Arc::clone(&registry)).unwrap();
 
         let listed = tools.execute("skill", &json!({ "action": "list" }).to_string()).await.unwrap();
-        assert!(listed.contains("pdf-tools"));
+        assert!(listed.text.contains("pdf-tools"));
 
         let loaded = tools
             .execute("skill", &json!({ "action": "load", "id": "pdf-tools" }).to_string())
             .await
             .unwrap();
-        assert!(loaded.contains("Run pdftotext first"));
+        assert!(loaded.text.contains("Run pdftotext first"));
 
         let missing = tools
             .execute("skill", &json!({ "action": "load", "id": "nope" }).to_string())

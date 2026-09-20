@@ -388,7 +388,7 @@ impl Agent {
 
             // Dispatch every call concurrently, then restore call order.
             let tools_started = Instant::now();
-            let mut set: JoinSet<(usize, ToolCall, Result<String>)> = JoinSet::new();
+            let mut set: JoinSet<(usize, ToolCall, Result<crate::tools::ToolOutput>)> = JoinSet::new();
             for (position, call) in tool_calls.iter().enumerate() {
                 let registry = Arc::clone(&settings.tools);
                 let call = call.clone();
@@ -399,7 +399,7 @@ impl Agent {
                 });
             }
 
-            let mut results: Vec<Option<(ToolCall, Result<String>)>> =
+            let mut results: Vec<Option<(ToolCall, Result<crate::tools::ToolOutput>)>> =
                 (0..tool_calls.len()).map(|_| None).collect();
             while let Some(joined) = set.join_next().await {
                 let (position, call, result) = joined?;
@@ -407,15 +407,40 @@ impl Agent {
             }
             outcome.timing.tools_ms += tools_started.elapsed().as_millis();
 
+            // Images a tool produced cannot travel in its tool message: the
+            // format restricts that content to text. They are collected here and
+            // attached to one user message after all the tool results, which is
+            // the only place the format allows them.
+            let mut attached: Vec<(String, crate::message::ImageAttachment)> = Vec::new();
+
             for entry in results.into_iter().flatten() {
                 let (call, result) = entry;
                 outcome.tool_calls += 1;
                 let (ok, body) = match result {
-                    Ok(output) => (true, output),
+                    Ok(output) => {
+                        for image in output.images {
+                            attached.push((call.name.clone(), image));
+                        }
+                        (true, output.text)
+                    }
                     Err(error) => (false, format!("error: {error:#}")),
                 };
                 self.observer.on_tool_end(&call.name, ok, &body);
                 let message = Message::tool_result(call.id.clone(), call.name.clone(), body);
+                self.messages.push(message.clone());
+                outcome.new_messages.push(message);
+            }
+
+            if !attached.is_empty() {
+                let mut text = String::from("Image(s) produced by the tool call above:");
+                for (tool, image) in &attached {
+                    text.push_str(&format!(
+                        "\n- from {tool}: {}",
+                        image.label.as_deref().unwrap_or("image")
+                    ));
+                }
+                let message =
+                    Message::user_with_images(text, attached.into_iter().map(|(_, i)| i).collect());
                 self.messages.push(message.clone());
                 outcome.new_messages.push(message);
             }

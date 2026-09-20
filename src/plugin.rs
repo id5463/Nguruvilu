@@ -819,7 +819,7 @@ mod tests {
             "d",
             serde_json::json!({ "type": "object" }),
             "ignored-by-kernel",
-            |_| Box::pin(async { Ok(String::new()) }) as crate::tools::ToolFuture,
+            |_| Box::pin(async { Ok(crate::tools::ToolOutput::default()) }) as crate::tools::ToolFuture,
         )
     }
 
