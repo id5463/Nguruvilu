@@ -785,6 +785,14 @@ window.ngu = {
         stream.append(errorBlock(event.message));
         scrollToEnd();
         break;
+      case "injection":
+        // Silent unless something was actually placed: a standing rule firing on
+        // every request is not news.
+        if ((event.activated || []).length > 0) {
+          notice("Injected " + event.activated.join(", ") + " (" + event.budget_used + " tokens)" +
+                 ((event.relocated || []).length ? "  relocated: " + event.relocated.join(", ") : ""), false);
+        }
+        break;
       case "compaction_start":
         notice("Context is nearly full \u2014 summarizing " + event.messages + " older messages\u2026", false);
         break;

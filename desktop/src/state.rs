@@ -51,6 +51,8 @@ pub struct SharedConfig {
     /// Rebuilt whenever the settings panel saves, so a window change takes
     /// effect on the next turn.
     pub policy: Mutex<Arc<dyn ContextPolicy>>,
+    /// Extra fragments to place in each request.
+    pub injection: Arc<nguruvilu::context::InjectionEngine>,
 }
 
 impl TurnConfig for SharedConfig {
@@ -68,6 +70,8 @@ impl TurnConfig for SharedConfig {
             model: snapshot.model_route.model,
             version: snapshot.version,
             policy: Arc::clone(&self.policy.lock().expect("policy lock")),
+            injection: Arc::clone(&self.injection),
+            cache_policy: snapshot.cache_policy,
         }
     }
 }
@@ -136,6 +140,7 @@ impl AppState {
             base_prompt: BASE_PROMPT.to_string(),
             skills: Mutex::new(skills),
             policy: Mutex::new(policy),
+            injection: Arc::new(nguruvilu::context::InjectionEngine::load_default()),
         });
 
         let store = JsonlStore::open(sessions_root())?;
@@ -559,6 +564,18 @@ impl AgentObserver for UiObserver {
             "messages": messages,
             "window": window.tokens,
             "window_source": window.source.as_str(),
+        }));
+    }
+
+    fn on_injection(&self, injection: &nguruvilu::context::Injection) {
+        if injection.is_empty() {
+            return;
+        }
+        self.emit(json!({
+            "ev": "injection",
+            "activated": injection.activated,
+            "relocated": injection.relocated,
+            "budget_used": injection.budget_used,
         }));
     }
 

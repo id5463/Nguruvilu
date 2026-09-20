@@ -38,6 +38,46 @@ pub enum Position {
     AtDepth(usize),
 }
 
+/// Where an entry goes, as written in a configuration file.
+///
+/// A plain enum with a separate `depth` field, rather than the engine's own
+/// [`Position`], because a settings file has to be writable by hand:
+/// `"position": "at-depth", "depth": 3` is a line someone can type, while the
+/// derived form of a newtype variant (`{"at-depth": 3}`) is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PositionKind {
+    /// The prompt prefix. Changing this invalidates the cached prefix.
+    Prefix,
+    /// Appended after the conversation.
+    #[default]
+    HistoryTail,
+    /// Inserted `depth` messages back from the end of the history.
+    AtDepth,
+}
+
+impl PositionKind {
+    /// A short label for display.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PositionKind::Prefix => "prefix",
+            PositionKind::HistoryTail => "history-tail",
+            PositionKind::AtDepth => "at-depth",
+        }
+    }
+
+    /// Resolve to the engine's position, using `depth` for `AtDepth`.
+    pub fn resolve(self, depth: Option<usize>) -> Position {
+        match self {
+            PositionKind::Prefix => Position::Prefix,
+            PositionKind::HistoryTail => Position::HistoryTail,
+            // A depth of zero would mean "after the last message", which the
+            // tail position already covers; one is the nearest useful point.
+            PositionKind::AtDepth => Position::AtDepth(depth.unwrap_or(1).max(1)),
+        }
+    }
+}
+
 /// One injectable fragment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InjectionEntry {
@@ -52,8 +92,11 @@ pub struct InjectionEntry {
     #[serde(default)]
     pub triggers: Vec<String>,
     /// Where to place it.
-    #[serde(default = "default_position")]
-    pub position: Position,
+    #[serde(default)]
+    pub position: PositionKind,
+    /// Messages back from the end, for `position: at-depth`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<usize>,
     /// Role to inject under, for history positions.
     #[serde(default = "default_role")]
     pub role: Role,
@@ -101,7 +144,8 @@ impl InjectionEntry {
             content: content.into(),
             constant: true,
             triggers: Vec::new(),
-            position: Position::HistoryTail,
+            position: PositionKind::HistoryTail,
+            depth: None,
             role: Role::System,
             order: 0,
             group: None,
@@ -127,8 +171,15 @@ impl InjectionEntry {
     }
 
     /// Place this entry at a position.
-    pub fn at(mut self, position: Position) -> Self {
+    pub fn at(mut self, position: PositionKind) -> Self {
         self.position = position;
+        self
+    }
+
+    /// Place this entry a number of messages back from the end.
+    pub fn at_depth(mut self, depth: usize) -> Self {
+        self.position = PositionKind::AtDepth;
+        self.depth = Some(depth);
         self
     }
 
@@ -248,6 +299,64 @@ impl InjectionEngine {
         Self::default()
     }
 
+    /// Where injection entries are read from.
+    ///
+    /// `$NGU_HOME/injections.json` when set, else `<home>/.nguruvilu/injections.json`.
+    pub fn default_path() -> std::path::PathBuf {
+        if let Ok(home) = std::env::var("NGU_HOME") {
+            if !home.trim().is_empty() {
+                return std::path::PathBuf::from(home).join("injections.json");
+            }
+        }
+        crate::settings::home_dir()
+            .join(".nguruvilu")
+            .join("injections.json")
+    }
+
+    /// Read entries from a file.
+    ///
+    /// The file is this struct's own serialized form, so it carries the budget
+    /// settings alongside the entries.
+    pub fn from_file(path: &std::path::Path) -> anyhow::Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| anyhow::anyhow!("reading {}: {error}", path.display()))?;
+        let engine: Self = serde_json::from_str(&text)
+            .map_err(|error| anyhow::anyhow!("parsing {}: {error}", path.display()))?;
+        Ok(engine)
+    }
+
+    /// Load the default file, treating "no file" as "no entries".
+    ///
+    /// A missing file is the normal case for someone who has never written one,
+    /// so it is not an error. A *malformed* file is reported rather than
+    /// swallowed: silently ignoring it would leave standing rules quietly
+    /// unapplied, which is the worst of both outcomes.
+    pub fn load_default() -> Self {
+        let path = Self::default_path();
+        if !path.is_file() {
+            return Self::new();
+        }
+        match Self::from_file(&path) {
+            Ok(engine) => engine,
+            Err(error) => {
+                eprintln!("[injections] {error:#}");
+                Self::new()
+            }
+        }
+    }
+
+    /// Write the engine to a file, creating its directory.
+    pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| anyhow::anyhow!("creating {}: {error}", parent.display()))?;
+        }
+        let text = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, format!("{text}\n"))
+            .map_err(|error| anyhow::anyhow!("writing {}: {error}", path.display()))?;
+        Ok(())
+    }
+
     /// Add an entry.
     pub fn add(&mut self, entry: InjectionEntry) {
         self.entries.push(entry);
@@ -349,7 +458,8 @@ impl InjectionEngine {
                     continue;
                 }
 
-                let (position, relocated) = self.resolve_position(&entry.position, policy);
+                let preferred = entry.position.resolve(entry.depth);
+                let (position, relocated) = self.resolve_position(&preferred, policy);
 
                 match position {
                     Position::Prefix => result.prefix.push(entry.content.clone()),
@@ -642,9 +752,9 @@ mod tests {
     #[test]
     fn position_decides_where_a_fragment_lands() {
         let mut engine = InjectionEngine::new();
-        engine.add(InjectionEntry::constant("p", "prefix text").at(Position::Prefix));
-        engine.add(InjectionEntry::constant("t", "tail text").at(Position::HistoryTail));
-        engine.add(InjectionEntry::constant("d", "deep text").at(Position::AtDepth(3)));
+        engine.add(InjectionEntry::constant("p", "prefix text").at(PositionKind::Prefix));
+        engine.add(InjectionEntry::constant("t", "tail text").at(PositionKind::HistoryTail));
+        engine.add(InjectionEntry::constant("d", "deep text").at_depth(3));
 
         let injection = engine.inject(&conversation(&["hi"]), 100_000, CachePolicy::Balanced);
         assert_eq!(injection.prefix, vec!["prefix text"]);
@@ -657,7 +767,7 @@ mod tests {
     #[test]
     fn cache_first_relocates_prefix_injections_instead_of_dropping_them() {
         let mut engine = InjectionEngine::new();
-        engine.add(InjectionEntry::constant("p", "prefix text").at(Position::Prefix));
+        engine.add(InjectionEntry::constant("p", "prefix text").at(PositionKind::Prefix));
 
         let injection = engine.inject(&conversation(&["hi"]), 100_000, CachePolicy::CacheFirst);
 
@@ -672,7 +782,7 @@ mod tests {
     #[test]
     fn freshness_leaves_the_prefix_alone() {
         let mut engine = InjectionEngine::new();
-        engine.add(InjectionEntry::constant("p", "prefix text").at(Position::Prefix));
+        engine.add(InjectionEntry::constant("p", "prefix text").at(PositionKind::Prefix));
 
         let injection = engine.inject(&conversation(&["hi"]), 100_000, CachePolicy::Freshness);
         assert_eq!(injection.prefix, vec!["prefix text"]);

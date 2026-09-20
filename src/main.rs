@@ -214,6 +214,12 @@ enum Command {
         action: Option<ConfigAction>,
     },
     /// Print the runtime's policy table and effective configuration.
+    /// Show the injection entries and what they would match.
+    Injections {
+        /// Show which entries would activate for this text.
+        #[arg(long)]
+        r#for: Option<String>,
+    },
     Runtime,
 }
 
@@ -319,6 +325,8 @@ struct CliConfig {
     skills: Mutex<SkillRegistry>,
     /// Context window, threshold, and how much survives a compaction.
     policy: Mutex<Arc<dyn ContextPolicy>>,
+    /// Extra fragments to place in each request.
+    injection: Arc<nguruvilu::context::InjectionEngine>,
 }
 
 impl TurnConfig for CliConfig {
@@ -338,6 +346,8 @@ impl TurnConfig for CliConfig {
             model: snapshot.model_route.model,
             version: snapshot.version,
             policy: Arc::clone(&self.policy.lock().expect("policy lock")),
+            injection: Arc::clone(&self.injection),
+            cache_policy: runtime.snapshot().cache_policy,
         }
     }
 }
@@ -444,6 +454,9 @@ async fn run() -> Result<()> {
         Some(Command::Verify { file }) => return verify_command(file, cli.json),
         Some(Command::Plugin { action }) => return plugin_command(action, cli.json),
         Some(Command::Config { action }) => return config_command(action.as_ref(), cli.json),
+        Some(Command::Injections { r#for }) => {
+            return show_injections(r#for.as_deref(), cli.json)
+        }
         Some(Command::Runtime) => {
             return show_runtime(&model, &base_url, cache_policy, &skills, cli.json)
         }
@@ -560,6 +573,7 @@ async fn run() -> Result<()> {
         base_prompt,
         skills: Mutex::new(skills),
         policy: Mutex::new(policy),
+        injection: Arc::new(nguruvilu::context::InjectionEngine::load_default()),
     });
 
     let snapshotter = if cli.git_snapshot {
@@ -1538,6 +1552,86 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Show the injection entries, and optionally what a piece of text activates.
+fn show_injections(for_text: Option<&str>, as_json: bool) -> Result<()> {
+    let path = nguruvilu::context::InjectionEngine::default_path();
+    let engine = nguruvilu::context::InjectionEngine::load_default();
+
+    // What would activate for the given text, if any.
+    let activated: Vec<String> = match for_text {
+        Some(text) => {
+            let probe = vec![nguruvilu::message::Message::user(text)];
+            engine
+                .inject(&probe, 128_000, nguruvilu::hotreload::CachePolicy::Balanced)
+                .activated
+        }
+        None => Vec::new(),
+    };
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "path": path.display().to_string(),
+                "exists": path.is_file(),
+                "budget_percent": engine.budget_percent,
+                "budget_cap": engine.budget_cap,
+                "max_recursion": engine.max_recursion,
+                "entries": engine.entries.iter().map(|entry| serde_json::json!({
+                    "id": entry.id,
+                    "constant": entry.constant,
+                    "triggers": entry.triggers,
+                    "position": format!("{:?}", entry.position),
+                    "depth": entry.depth,
+                    "order": entry.order,
+                    "group": entry.group,
+                    "ignore_budget": entry.ignore_budget,
+                    "enabled": entry.enabled,
+                })).collect::<Vec<_>>(),
+                "activated": activated,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("file: {}", path.display());
+    if !path.is_file() {
+        println!("(no file yet — write one to add standing rules or triggered hints)");
+        return Ok(());
+    }
+    println!(
+        "budget: {}% of the window{}, up to {} recursion passes",
+        engine.budget_percent,
+        match engine.budget_cap {
+            Some(cap) => format!(" capped at {cap} tokens"),
+            None => String::new(),
+        },
+        engine.max_recursion
+    );
+    println!("entries: {}", engine.len());
+    for entry in &engine.entries {
+        let when = if entry.constant {
+            "always".to_string()
+        } else if entry.triggers.is_empty() {
+            "never (no triggers)".to_string()
+        } else {
+            format!("on {}", entry.triggers.join(", "))
+        };
+        let where_to = match entry.position {
+            nguruvilu::context::PositionKind::AtDepth => {
+                format!("at-depth {}", entry.depth.unwrap_or(1))
+            }
+            other => other.as_str().to_string(),
+        };
+        let mark = if activated.contains(&entry.id) { " *" } else { "  " };
+        println!("{mark} {:<20} {:<28} {when}", entry.id, where_to);
+    }
+    if for_text.is_some() {
+        println!("\n* = activates for the given text");
+    }
+    Ok(())
 }
 
 fn require_key(api_key: &str) -> Result<()> {

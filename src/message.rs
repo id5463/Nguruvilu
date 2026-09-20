@@ -69,6 +69,20 @@ pub struct Message {
 }
 
 impl Message {
+    /// A message of the given role carrying only text.
+    ///
+    /// Used for injected fragments, whose role is a placement decision rather
+    /// than a statement about who said something.
+    pub fn of_role(role: Role, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: Some(content.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
     /// A user message.
     pub fn user(text: impl Into<String>) -> Self {
         Self { role: Role::User, content: Some(text.into()), tool_calls: Vec::new(), tool_call_id: None, name: None }
