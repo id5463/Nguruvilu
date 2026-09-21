@@ -274,6 +274,11 @@ async fn dispatch(
         "ready" => {
             // Proof that the page loaded, ran its script, and the IPC path works.
             eprintln!("[ui] page ready; pushing initial state");
+
+            // Load every installed pack before the first paint. A pack the user
+            // installed but cannot see is a pack they will install again.
+            load_installed_packs(Arc::clone(&state), Arc::clone(&sink)).await;
+
             let (sessions, transcript, status) = {
                 let guard = state.lock().expect("state lock");
                 (guard.sessions()?, guard.transcript(), guard.describe())
@@ -518,10 +523,9 @@ async fn dispatch_path(
                 }
             }
 
-            let installed = {
-                let mut guard = state.lock().expect("state lock");
-                guard.install_pack(&path)
-            };
+            // No lock held: installing fetches, and the shell must stay
+            // readable while it does.
+            let installed = state::install_pack(&path).await;
             match installed {
                 Ok(info) => {
                     eprintln!("[pack] installed {} {}", info["name"], info["version"]);
@@ -582,6 +586,40 @@ fn refresh_packs(state: &Arc<Mutex<AppState>>, sink: &Arc<dyn EventSink>) {
 }
 
 /// Load an installed pack's plugins, MCP servers, and skills into the kernel.
+/// Load every installed pack, in name order.
+///
+/// A pack is a thing the user chose to install, so it loads without being asked
+/// again. Failures are reported and do not stop the others: one pack with a
+/// bad manifest must not leave the shell with no appearance at all.
+async fn load_installed_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
+    let dir = nguruvilu::pack::default_packs_dir();
+    let packs = match nguruvilu::pack::installed(&dir) {
+        Ok(packs) => packs,
+        Err(error) => {
+            eprintln!("[pack] cannot list {}: {error:#}", dir.display());
+            return;
+        }
+    };
+
+    for pack in packs {
+        let Some(assembly) = pack.assembly.clone() else {
+            continue;
+        };
+        let name = format!("{}-{}", pack.manifest.name, pack.manifest.version_id);
+        match apply_pack(Arc::clone(&state), assembly, Arc::clone(&sink)).await {
+            Ok(()) => eprintln!("[pack] loaded {name}"),
+            Err(error) => {
+                eprintln!("[pack] {name} failed: {error:#}");
+                emit(
+                    &sink,
+                    json!({ "ev": "error", "message": format!("pack {name}: {error:#}") }),
+                );
+            }
+        }
+    }
+}
+
+/// Apply a pack's assembly and content.
 async fn apply_pack(
     state: Arc<Mutex<AppState>>,
     assembly: PathBuf,
@@ -609,10 +647,36 @@ async fn apply_pack(
         .with_pack_dir(assembly.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")));
 
     let report = loader.apply(&plan).await?;
-    let kernel = loader.finish().await;
+    let mut kernel = loader.finish().await;
+
+    // Apply what the pack carries beyond its entries. Appearance lands on the
+    // kernel; the rest describes the session and is applied to the shell's
+    // settings, which the state owns.
+    let pack_dir = assembly
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let content = match nguruvilu::pack::read_manifest(&pack_dir) {
+        Ok(manifest) => {
+            let content = nguruvilu::content::apply(&mut kernel, &pack_dir, &manifest)?;
+            for line in content.summary() {
+                eprintln!("[pack] content: {line}");
+            }
+            Some(content)
+        }
+        Err(error) => {
+            // An assembly with no manifest beside it is still loadable — it is
+            // the offline shape from before packs had manifests.
+            eprintln!("[pack] no manifest beside the assembly ({error:#})");
+            None
+        }
+    };
 
     let status = {
         let mut guard = state.lock().expect("state lock");
+        if let Some(content) = content {
+            guard.adopt_pack_content(content);
+        }
         guard.restore_kernel(kernel)?;
         guard.describe()
     };

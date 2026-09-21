@@ -107,7 +107,7 @@ pub struct SharedConfig {
     /// effect on the next turn.
     pub policy: Arc<Mutex<Arc<dyn ContextPolicy>>>,
     /// Extra fragments to place in each request.
-    pub injection: Arc<nguruvilu::context::InjectionEngine>,
+    pub injection: Mutex<Arc<nguruvilu::context::InjectionEngine>>,
 }
 
 impl TurnConfig for SharedConfig {
@@ -125,7 +125,7 @@ impl TurnConfig for SharedConfig {
             model: snapshot.model_route.model,
             version: snapshot.version,
             policy: Arc::clone(&self.policy.lock().expect("policy lock")),
-            injection: Arc::clone(&self.injection),
+            injection: Arc::clone(&self.injection.lock().expect("injection lock")),
             cache_policy: snapshot.cache_policy,
         }
     }
@@ -215,7 +215,7 @@ impl AppState {
             base_prompt: BASE_PROMPT.to_string(),
             skills,
             policy,
-            injection: Arc::new(nguruvilu::context::InjectionEngine::load_default()),
+            injection: Mutex::new(Arc::new(nguruvilu::context::InjectionEngine::load_default())),
         });
 
         let store = JsonlStore::open(sessions_root())?;
@@ -474,6 +474,76 @@ impl AppState {
         Ok(())
     }
 
+    /// Adopt what a pack carried: persona, route, context policy, rules.
+    ///
+    /// A pack's settings replace the standing ones — the pack is the unit the
+    /// user chose, so it decides. The next turn reads them.
+    pub fn adopt_pack_content(&mut self, content: nguruvilu::content::PackContent) {
+        if let Some(models) = &content.models {
+            if let Some(url) = &models.base_url {
+                self.settings.base_url = url.clone();
+            }
+            if let Some(name) = &models.model {
+                self.settings.model = name.clone();
+            }
+            if let Some(effort) = &models.reasoning_effort {
+                self.settings.reasoning_effort = effort.clone();
+            }
+            if let Some(proxy) = &models.proxy {
+                self.settings.proxy = proxy.clone();
+            }
+            if let Some(ceiling) = &models.max_output_tokens {
+                self.settings.max_output_tokens = nguruvilu::size::parse_size(ceiling).ok();
+            }
+            for (key, value) in &models.extra_body {
+                self.settings.extra_body.insert(key.clone(), value.clone());
+            }
+            // The key itself is never in a pack; only the name of the variable
+            // holding it.
+            if let Some(var) = &models.api_key_env {
+                if let Ok(value) = std::env::var(var) {
+                    if !value.trim().is_empty() {
+                        self.settings.api_key = value;
+                    }
+                }
+            }
+        }
+
+        if let Some(context) = &content.context {
+            if let Some(window) = &context.window {
+                self.settings.context_window = nguruvilu::size::parse_size(window).ok();
+            }
+            if let Some(percent) = context.compact_percent {
+                self.settings.compact_percent = percent.min(100);
+            }
+            if let Some(keep) = context.compact_keep_recent {
+                self.settings.compact_keep_recent = keep.max(1);
+            }
+        }
+
+        // The context policy is rebuilt from the settings that just changed, so
+        // a pack's window takes effect on the next turn rather than the next
+        // launch.
+        if let Ok(mut policy) = self.config.policy.lock() {
+            *policy = std::sync::Arc::new(self.settings.context_policy(None));
+        }
+
+        if let Some(soul) = content.soul {
+            if let Ok(mut runtime) = self.config.runtime.lock() {
+                let _ = runtime.apply(nguruvilu::hotreload::Change::session(
+                    "pack",
+                    nguruvilu::hotreload::ChangePayload::Persona(soul),
+                ));
+            }
+        }
+
+        if let Some(rules) = content.injections {
+            if let Ok(mut injection) = self.config.injection.lock() {
+                *injection = std::sync::Arc::new(rules);
+            }
+        }
+    }
+
     /// Installed packs.
     pub fn packs(&self) -> Result<Value> {
         let dir = nguruvilu::pack::default_packs_dir();
@@ -484,7 +554,16 @@ impl AppState {
                 "name": pack.manifest.name,
                 "version": pack.manifest.version_id,
                 "license": pack.manifest.license,
-                "summary": pack.manifest.summary,
+                // What the pack fetches, and what it carries itself.
+                "skills": pack.manifest.skills.len(),
+                "plugins": pack.manifest.plugins.len(),
+                "content": nguruvilu::pack::CONTENT_FILES
+                    .iter()
+                    .filter(|(field, _)| pack.manifest.content_file(field).is_some())
+                    .map(|(_, file)| (*file).to_string())
+                    .collect::<Vec<_>>(),
+                "accepts": pack.manifest.dependencies.nguruvilu,
+                "compatible": pack.manifest.accepts_kernel(nguruvilu::pack::kernel_version()),
                 "path": pack.path.display().to_string(),
                 "assembly": pack.assembly.as_ref().map(|p| p.display().to_string()),
             })).collect::<Vec<_>>(),
@@ -492,16 +571,6 @@ impl AppState {
     }
 
     /// Install an archive and report what landed.
-    pub fn install_pack(&mut self, archive: &Path) -> Result<Value> {
-        let dir = nguruvilu::pack::default_packs_dir();
-        let placed = nguruvilu::pack::install(archive, &dir)?;
-        Ok(json!({
-            "name": placed.manifest.name,
-            "version": placed.manifest.version_id,
-            "path": placed.path.display().to_string(),
-            "assembly": placed.assembly.as_ref().map(|p| p.display().to_string()),
-        }))
-    }
 
     /// Build an archive from a pack directory.
     pub fn pack_dir(&self, dir: &Path, out: Option<&Path>) -> Result<Value> {
@@ -778,4 +847,20 @@ pub async fn run_turn(
         }
     }
     Ok(())
+}
+
+/// Install an archive and report what landed.
+///
+/// A free function rather than a method: installing fetches, and holding the
+/// shell's state lock across an await would stall every other reader for the
+/// length of a download.
+pub async fn install_pack(archive: &Path) -> Result<Value> {
+    let dir = nguruvilu::pack::default_packs_dir();
+    let placed = nguruvilu::pack::install(archive, &dir).await?;
+    Ok(json!({
+        "name": placed.manifest.name,
+        "version": placed.manifest.version_id,
+        "path": placed.path.display().to_string(),
+        "assembly": placed.assembly.as_ref().map(|p| p.display().to_string()),
+    }))
 }

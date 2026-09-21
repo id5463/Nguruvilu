@@ -163,6 +163,14 @@ fn install_appearance(
         return Ok(());
     }
 
+    // An `activeTheme` naming a theme that is not in the file would otherwise
+    // fall back to the first, which is a different theme than the author asked
+    // for and looks like it worked.
+    let choice_problems = look.problems();
+    if !choice_problems.is_empty() {
+        anyhow::bail!("pack '{pack_name}': {}", choice_problems.join("; "));
+    }
+
     // A theme naming a token the interface does not have is a theme that
     // quietly does nothing, so it is reported rather than dropped.
     for theme in &look.themes {
@@ -192,7 +200,10 @@ fn install_appearance(
             _ctx: &crate::plugin::PluginCtx,
         ) -> Result<crate::plugin::Contributions> {
             let mut contributions = crate::plugin::Contributions::new();
-            for theme in &self.look.themes {
+            // Variants, not layers: exactly one theme is in force. Applying
+            // every theme in the file would let the last win and hide the
+            // choice the author offered.
+            if let Some(theme) = self.look.active() {
                 contributions = contributions.theme(theme.clone());
             }
             for panel in &self.look.panels {
@@ -329,28 +340,74 @@ mod tests {
     }
 
     #[test]
-    fn several_themes_compose_in_order() {
-        let dir = scratch("several");
+    fn a_pack_offering_several_themes_applies_the_chosen_one() {
+        // Variants, not layers. Applying all of them would let the last win and
+        // hide the choice the author offered.
+        let dir = scratch("variants");
         let mut manifest = PackManifest::new("look", "1.0.0");
         manifest.look = Some("look.json".into());
         write_manifest(&dir, &manifest).unwrap();
 
-        let mut look = LookFile::default();
+        let mut look = LookFile {
+            active_theme: Some("light".into()),
+            ..Default::default()
+        };
         look.themes.push(
             crate::theme::Theme::new("light")
                 .set("--bg", "#ffffff")
                 .set("--text", "#000000"),
         );
         look.themes
-            .push(crate::theme::Theme::new("accent").set("--accent", "#ff0000"));
+            .push(crate::theme::Theme::new("dark").set("--bg", "#000000"));
         std::fs::write(dir.join("look.json"), serde_json::to_string(&look).unwrap()).unwrap();
 
         let mut kernel = crate::plugin::Kernel::new();
         apply(&mut kernel, &dir, &manifest).unwrap();
 
         let resolved = kernel.resolved_theme();
-        assert_eq!(resolved.tokens["--bg"], "#ffffff");
-        assert_eq!(resolved.tokens["--accent"], "#ff0000");
+        assert_eq!(resolved.tokens["--bg"], "#ffffff", "the chosen one");
+        assert_eq!(resolved.name, "light", "and only it");
+    }
+
+    #[test]
+    fn an_absent_choice_takes_the_first_theme() {
+        let dir = scratch("first");
+        let mut manifest = PackManifest::new("look", "1.0.0");
+        manifest.look = Some("look.json".into());
+        write_manifest(&dir, &manifest).unwrap();
+
+        let mut look = LookFile::default();
+        look.themes
+            .push(crate::theme::Theme::new("first").set("--bg", "#111111"));
+        look.themes
+            .push(crate::theme::Theme::new("second").set("--bg", "#222222"));
+        std::fs::write(dir.join("look.json"), serde_json::to_string(&look).unwrap()).unwrap();
+
+        let mut kernel = crate::plugin::Kernel::new();
+        apply(&mut kernel, &dir, &manifest).unwrap();
+        assert_eq!(kernel.resolved_theme().tokens["--bg"], "#111111");
+    }
+
+    #[test]
+    fn choosing_a_theme_that_is_not_in_the_file_is_refused_by_name() {
+        let dir = scratch("bad-choice");
+        let mut manifest = PackManifest::new("look", "1.0.0");
+        manifest.look = Some("look.json".into());
+        write_manifest(&dir, &manifest).unwrap();
+
+        let mut look = LookFile {
+            active_theme: Some("nope".into()),
+            ..Default::default()
+        };
+        look.themes
+            .push(crate::theme::Theme::new("light").set("--bg", "#ffffff"));
+        std::fs::write(dir.join("look.json"), serde_json::to_string(&look).unwrap()).unwrap();
+
+        let mut kernel = crate::plugin::Kernel::new();
+        let error = apply(&mut kernel, &dir, &manifest).expect_err("must refuse");
+        let text = format!("{error:#}");
+        assert!(text.contains("nope"), "{text}");
+        assert!(text.contains("light"), "it should list the real ones: {text}");
     }
 
     #[test]

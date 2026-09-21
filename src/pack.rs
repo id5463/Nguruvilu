@@ -491,6 +491,37 @@ pub struct McpServerDecl {
     pub scope: Option<String>,
 }
 
+impl LookFile {
+    /// The theme in force: the named one, else the first.
+    ///
+    /// An ctiveTheme naming a theme that is not in the file is reported by
+    /// [LookFile::problems] rather than silently falling back.
+    pub fn active(&self) -> Option<&crate::theme::Theme> {
+        match &self.active_theme {
+            Some(name) => self.themes.iter().find(|theme| &theme.name == name),
+            None => self.themes.first(),
+        }
+    }
+
+    /// Problems that would make the appearance file misleading.
+    pub fn problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if let Some(name) = &self.active_theme {
+            if !self.themes.iter().any(|theme| &theme.name == name) {
+                problems.push(format!(
+                    "activeTheme names '{name}', which is not one of: {}",
+                    self.themes
+                        .iter()
+                        .map(|t| t.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        problems
+    }
+}
+
 fn default_transport() -> String {
     "stdio".into()
 }
@@ -499,9 +530,16 @@ fn default_transport() -> String {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LookFile {
-    /// Theme layers.
+    /// Themes this pack offers.
+    ///
+    /// Variants, not layers: a pack that ships a light and a dark theme means
+    /// the reader picks one. Applying them all would let the last win and hide
+    /// the choice.
     #[serde(default)]
     pub themes: Vec<crate::theme::Theme>,
+    /// Which of them is in force. Absent means the first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_theme: Option<String>,
     /// Interface panels.
     #[serde(default)]
     pub panels: Vec<crate::ui::UiPanel>,
