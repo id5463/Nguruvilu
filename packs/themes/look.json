@@ -1,0 +1,33 @@
+{
+  "themes": [
+    {
+      "name": "light",
+      "tokens": {
+        "--bg": "#ffffff",
+        "--panel": "#f4f6f9",
+        "--line": "#d9dee6",
+        "--text": "#1a1f26",
+        "--dim": "#667080",
+        "--accent": "#1a6fd4",
+        "--ok": "#1a7f4b",
+        "--bad": "#c0392b",
+        "--warn": "#8a6100"
+      }
+    },
+    {
+      "name": "solarized",
+      "tokens": {
+        "--bg": "#002b36",
+        "--panel": "#073642",
+        "--line": "#0d4a56",
+        "--text": "#93a1a1",
+        "--dim": "#657b83",
+        "--accent": "#268bd2",
+        "--ok": "#859900",
+        "--bad": "#dc322f",
+        "--warn": "#b58900"
+      }
+    }
+  ],
+  "panels": []
+}

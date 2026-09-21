@@ -443,7 +443,7 @@ async fn run() -> Result<()> {
     // Precedence: command-line flag, then stored settings, then environment.
     // `Settings::resolve` already folds the environment in, so a machine-level
     // variable still wins over the file.
-    let settings = Settings::resolve();
+    let mut settings = Settings::resolve();
     let base_url = cli
         .base_url
         .clone()
@@ -503,7 +503,7 @@ async fn run() -> Result<()> {
             return snapshot_command(&cli, action, commit.as_deref(), *limit, cli.json)
         }
         Some(Command::Pack { dir, out }) => return pack_command(dir, out.as_ref(), cli.json),
-        Some(Command::Install { file, into }) => return install_command(file, into.as_ref(), cli.json),
+        Some(Command::Install { file, into }) => return install_command(file, into.as_ref(), cli.json).await,
         Some(Command::Packs) => return list_packs(cli.json),
         Some(Command::Verify { file }) => return verify_command(file, cli.json),
         Some(Command::Plugin { action }) => return plugin_command(action, cli.json),
@@ -536,6 +536,7 @@ async fn run() -> Result<()> {
 
     // An assembly manifest loads before the session starts, so its plugins,
     // MCP servers, and skills are in place for the first turn.
+    let mut pack_content: Option<nguruvilu::content::PackContent> = None;
     if let Some(file) = &cli.assembly {
         let platform = platform_tag();
         let assembly = Assembly::from_file(file)?;
@@ -571,6 +572,17 @@ async fn run() -> Result<()> {
 
         // Take the kernel back; the loader stops any MCP servers it started.
         kernel = loader.finish().await;
+
+        // Apply what the pack carries beyond its entries. Appearance lands on
+        // the kernel now; the rest describes this session, and is applied below
+        // once the settings it overrides exist.
+        let pack_dir = file
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        if let Ok(manifest) = nguruvilu::pack::read_manifest(&pack_dir) {
+            pack_content = Some(nguruvilu::content::apply(&mut kernel, &pack_dir, &manifest)?);
+        }
     }
 
     let tools = Arc::new(kernel.tools().clone());
@@ -625,6 +637,61 @@ async fn run() -> Result<()> {
     // The context policy comes from settings, so `--context-window` and the
     // settings file both land here. A provider-reported window would be folded
     // in the same way once the catalog has been fetched.
+    // Apply what the pack carried. A pack's settings replace the standing ones:
+    // the pack is the unit the user chose, so it decides.
+    let mut injection = Arc::new(nguruvilu::context::InjectionEngine::load_default());
+    if let Some(content) = pack_content {
+        for line in content.summary() {
+            eprintln!("pack content: {line}");
+        }
+        if let Some(soul) = content.soul {
+            runtime.apply(Change::session("pack", ChangePayload::Persona(soul)))?;
+        }
+        if let Some(models) = &content.models {
+            if let Some(url) = &models.base_url {
+                settings.base_url = url.clone();
+            }
+            if let Some(name) = &models.model {
+                settings.model = name.clone();
+            }
+            if let Some(effort) = &models.reasoning_effort {
+                settings.reasoning_effort = effort.clone();
+            }
+            if let Some(proxy) = &models.proxy {
+                settings.proxy = proxy.clone();
+            }
+            if let Some(ceiling) = &models.max_output_tokens {
+                settings.max_output_tokens = Some(nguruvilu::size::parse_size(ceiling)?);
+            }
+            for (key, value) in &models.extra_body {
+                settings.extra_body.insert(key.clone(), value.clone());
+            }
+            // The key itself is never in a pack; only the name of the
+            // variable holding it.
+            if let Some(var) = &models.api_key_env {
+                if let Ok(value) = std::env::var(var) {
+                    if !value.trim().is_empty() {
+                        settings.api_key = value;
+                    }
+                }
+            }
+        }
+        if let Some(context) = &content.context {
+            if let Some(window) = &context.window {
+                settings.context_window = Some(nguruvilu::size::parse_size(window)?);
+            }
+            if let Some(percent) = context.compact_percent {
+                settings.compact_percent = percent.min(100);
+            }
+            if let Some(keep) = context.compact_keep_recent {
+                settings.compact_keep_recent = keep.max(1);
+            }
+        }
+        if let Some(rules) = content.injections {
+            injection = Arc::new(rules);
+        }
+    }
+
     let policy: Arc<dyn ContextPolicy> = Arc::new(settings.context_policy(None));
 
     let runtime = Arc::new(Mutex::new(runtime));
@@ -1271,9 +1338,9 @@ fn pack_command(dir: &PathBuf, out: Option<&PathBuf>, as_json: bool) -> Result<(
     Ok(())
 }
 
-fn install_command(file: &PathBuf, into: Option<&PathBuf>, as_json: bool) -> Result<()> {
+async fn install_command(file: &PathBuf, into: Option<&PathBuf>, as_json: bool) -> Result<()> {
     let packs_dir = into.cloned().unwrap_or_else(nguruvilu::pack::default_packs_dir);
-    let placed = nguruvilu::pack::install(file, &packs_dir)?;
+    let placed = nguruvilu::pack::install(file, &packs_dir).await?;
 
     if as_json {
         println!(
@@ -1352,7 +1419,7 @@ fn verify_command(file: &PathBuf, as_json: bool) -> Result<()> {
                     "version": report.manifest.version_id,
                     "license": report.manifest.license,
                     "kernel_version": report.manifest.kernel_version,
-                    "requires": report.manifest.dependencies.kernel,
+                    "requires": report.manifest.dependencies.nguruvilu,
                 },
                 "files": report.contents.files.len(),
                 "has_assembly": report.contents.has_assembly,
@@ -1369,9 +1436,9 @@ fn verify_command(file: &PathBuf, as_json: bool) -> Result<()> {
         report.manifest.license,
         report.manifest.kernel_version
     );
-    if let Some(range) = &report.manifest.dependencies.kernel {
-        println!("requires kernel {range}");
-    }
+    println!("requires nguruvilu {}", report.manifest.dependencies.nguruvilu);
+
+
     println!("{} files", report.contents.files.len());
     if report.warnings.is_empty() {
         println!("no problems found");

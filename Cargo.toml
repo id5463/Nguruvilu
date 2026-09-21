@@ -28,6 +28,7 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 zip = "2"
 base64 = "0.22"
+sha2 = "0.10"
 libloading = "0.8"
 sha1 = "0.10"
 

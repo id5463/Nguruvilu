@@ -115,8 +115,8 @@ pub type Disposer = Box<dyn FnOnce() + Send>;
 pub struct Contributions {
     /// Interface panels this plugin contributes.
     pub ui: Vec<crate::ui::UiPanel>,
-    /// Theme layer this plugin contributes.
-    pub theme: Option<crate::theme::Theme>,
+    /// Theme layers this plugin contributes.
+    pub themes: Vec<crate::theme::Theme>,
     /// Services this plugin provides, by name.
     pub services: Vec<(String, Arc<dyn Any + Send + Sync>)>,
     /// Tools this plugin registers.
@@ -145,10 +145,11 @@ impl Contributions {
 
     /// Contribute a theme layer.
     ///
-    /// One layer per plugin: a plugin that wants to change several tokens sets
-    /// them all on one `Theme`, and layers compose across plugins.
+    /// A plugin may contribute several: a pack ships a light and a dark
+    /// variant, and which one is active is the reader's choice, not the
+    /// author's.
     pub fn theme(mut self, theme: crate::theme::Theme) -> Self {
-        self.theme = Some(theme);
+        self.themes.push(theme);
         self
     }
 
@@ -271,8 +272,8 @@ pub struct Fiber {
     pub error: Option<String>,
     /// Interface panels this fiber contributes.
     pub ui: Vec<crate::ui::UiPanel>,
-    /// Theme layer this fiber contributes.
-    pub theme: Option<crate::theme::Theme>,
+    /// Theme layers this fiber contributes.
+    pub themes: Vec<crate::theme::Theme>,
     effects: Vec<Disposer>,
     epoch: Epoch,
 }
@@ -531,7 +532,7 @@ impl Kernel {
             .fibers
             .values()
             .filter(|fiber| fiber.state == FiberState::Active)
-            .filter_map(|fiber| fiber.theme.as_ref())
+            .flat_map(|fiber| fiber.themes.iter())
             .collect();
         // Sorted by name so the layering is deterministic: a map's iteration
         // order is not, and two plugins setting the same token must resolve the
@@ -586,7 +587,7 @@ impl Kernel {
                 state: FiberState::Pending,
                 error: None,
                 ui: Vec::new(),
-                theme: None,
+                themes: Vec::new(),
                 effects: Vec::new(),
                 epoch: Epoch::Inactive,
             },
@@ -817,7 +818,7 @@ impl Kernel {
         self.fiber_tools.insert(id, registered_tools);
         if let Some(fiber) = self.fibers.get_mut(&id) {
             fiber.ui = contributions.ui;
-            fiber.theme = contributions.theme;
+            fiber.themes = contributions.themes;
             fiber.effects = contributions.effects;
             fiber.epoch = desired;
             fiber.state = FiberState::Active;

@@ -72,7 +72,7 @@ async fn run(args: Value) -> Result<ToolOutput> {
         "build" => build(path, args.get("out").and_then(|o| o.as_str())),
         "verify" => verify(path),
         "list" => list(),
-        "install" => install(path),
+        "install" => install(path).await,
         "apply" => apply(path),
         other => Err(anyhow!(
             "unknown action '{other}'; expected build, verify, list, install, or apply"
@@ -136,9 +136,10 @@ fn verify(path: Option<&str>) -> Result<ToolOutput> {
         report.contents.files.len(),
         if report.contents.has_assembly { "present" } else { "absent" }
     );
-    if let Some(range) = &report.manifest.dependencies.kernel {
-        text.push_str(&format!("\nrequires kernel {range}"));
-    }
+    text.push_str(&format!(
+        "\nrequires nguruvilu {}",
+        report.manifest.dependencies.nguruvilu
+    ));
     for warning in &report.warnings {
         text.push_str(&format!("\nwarning: {warning}"));
     }
@@ -174,7 +175,7 @@ fn list() -> Result<ToolOutput> {
     Ok(ToolOutput::text(text))
 }
 
-fn install(path: Option<&str>) -> Result<ToolOutput> {
+async fn install(path: Option<&str>) -> Result<ToolOutput> {
     let path = path.ok_or_else(|| anyhow!("install needs a path: the .dshpack archive"))?;
     let archive = PathBuf::from(path);
 
@@ -185,6 +186,7 @@ fn install(path: Option<&str>) -> Result<ToolOutput> {
     let source = FilesystemSource::default_root();
     let placed = source
         .install(&archive)
+        .await
         .with_context(|| format!("installing {}", archive.display()))?;
 
     let mut text = format!(

@@ -15,11 +15,17 @@
 //! inspect, plan — works from a directory and needs no source at all, so those
 //! are left out.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use anyhow::{Context, Result};
 
 use crate::pack::{InstalledPack, PackManifest};
+
+/// Boxed future returned by [PackSource::install].
+pub type InstallFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<InstalledPack>> + Send + 'a>>;
 
 /// Where packs are found and installed.
 pub trait PackSource: Send + Sync {
@@ -35,7 +41,7 @@ pub trait PackSource: Send + Sync {
     fn list(&self) -> Result<Vec<InstalledPack>>;
 
     /// Install an archive, replacing any existing copy of the same version.
-    fn install(&self, archive: &Path) -> Result<InstalledPack>;
+    fn install<'a>(&'a self, archive: &'a Path) -> InstallFuture<'a>;
 
     /// Locate an installed pack by name, newest version first when several exist.
     fn find(&self, name: &str) -> Result<Option<InstalledPack>>;
@@ -75,8 +81,8 @@ impl PackSource for FilesystemSource {
         crate::pack::installed(&self.root)
     }
 
-    fn install(&self, archive: &Path) -> Result<InstalledPack> {
-        crate::pack::install(archive, &self.root)
+    fn install<'a>(&'a self, archive: &'a Path) -> InstallFuture<'a> {
+        Box::pin(async move { crate::pack::install(archive, &self.root).await })
     }
 
     fn find(&self, name: &str) -> Result<Option<InstalledPack>> {
@@ -159,8 +165,8 @@ mod tests {
         assert!(source.root().is_some());
     }
 
-    #[test]
-    fn installing_then_listing_through_the_source_works() {
+    #[tokio::test]
+    async fn installing_then_listing_through_the_source_works() {
         let dir = scratch("install");
         let archive = archive(&dir, "demo", "1.0.0");
         let packs = dir.join("packs");
@@ -168,7 +174,7 @@ mod tests {
         let source = FilesystemSource::new(&packs);
         assert!(source.list().unwrap().is_empty());
 
-        let placed = source.install(&archive).unwrap();
+        let placed = source.install(&archive).await.unwrap();
         assert_eq!(placed.manifest.name, "demo");
 
         let listed = source.list().unwrap();
@@ -176,14 +182,14 @@ mod tests {
         assert_eq!(listed[0].manifest.version_id, "1.0.0");
     }
 
-    #[test]
-    fn find_returns_the_newest_version() {
+    #[tokio::test]
+    async fn find_returns_the_newest_version() {
         let dir = scratch("find");
         let packs = dir.join("packs");
         let source = FilesystemSource::new(&packs);
 
         for version in ["1.0.0", "2.0.0", "1.5.0"] {
-            source.install(&archive(&dir, "multi", version)).unwrap();
+            source.install(&archive(&dir, "multi", version)).await.unwrap();
         }
 
         let found = source.find("multi").unwrap().expect("found");
@@ -191,12 +197,12 @@ mod tests {
         assert!(source.find("absent").unwrap().is_none());
     }
 
-    #[test]
-    fn removing_a_pack_works() {
+    #[tokio::test]
+    async fn removing_a_pack_works() {
         let dir = scratch("remove");
         let packs = dir.join("packs");
         let source = FilesystemSource::new(&packs);
-        let placed = source.install(&archive(&dir, "gone", "1.0.0")).unwrap();
+        let placed = source.install(&archive(&dir, "gone", "1.0.0")).await.unwrap();
 
         assert_eq!(source.list().unwrap().len(), 1);
         source.remove(&placed.path).unwrap();

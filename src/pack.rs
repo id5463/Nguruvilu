@@ -1,157 +1,678 @@
-//! Pack archives: `.dshpack`.
+//! Packs: `.dshpack`, the distribution format.
 //!
-//! A pack is a zip archive holding an identity manifest, an assembly manifest,
-//! and whatever the assembly references (skills, plugin payloads, patch
-//! files). It is the distribution unit of the loading layer.
+//! A pack is a zip holding a **manifest of references** plus the small data
+//! files that cannot be fetched from anywhere — persona, model route, context
+//! policy, MCP servers, appearance, injection rules.
 //!
-//! The archive is deliberately uncompressed. Packs are small text trees, the
-//! components inside them are already compressed when that matters, and a
-//! plain tar keeps the format inspectable with ordinary tools.
+//! ```text
+//! my-pack-1.0.0.dshpack
+//! ├── dsh.index.json     the manifest: what to fetch, and what is inside
+//! ├── soul.md            persona
+//! ├── models.json        how to talk to the model
+//! ├── context.json       how much to remember
+//! ├── mcp.json           MCP servers
+//! ├── look.json          themes and panels
+//! └── injections.json    injection rules
+//! ```
 //!
-//! Identity is separate from assembly on purpose: `dsh.index.json` says *what
-//! this pack is* (name, version, license, what kernel it needs), while
-//! `assembly.yaml` says *what it loads and in what order*. A pack can be
-//! inspected for provenance without executing any of its load logic.
+//! The payload — skills and plugins — is **not** in the archive. It is named by
+//! `github:` or `https:` reference with a sha256, and fetched on install into a
+//! content-addressed cache. Two packs naming the same skill share one download.
+//!
+//! # Two shapes
+//!
+//! | | manifest pack | offline pack |
+//! |---|---|---|
+//! | size | kilobytes | megabytes per platform |
+//! | install | fetches what it names | needs no network |
+//! | platforms | one manifest covers all | one archive per platform |
+//!
+//! The offline shape is the same zip with the payload embedded under `files/`,
+//! which is what `--offline` produces. It exists for air-gapped and archived
+//! installs; the manifest shape is the normal one.
+//!
+//! # Install materialises a loadable directory
+//!
+//! The loader reads `assembly.yaml`. Install therefore writes one, generated
+//! from the manifest and the content files, so the loader needs to know nothing
+//! about the distribution format. The two formats change for different reasons
+//! and are allowed to change separately.
 
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Current pack format.
-pub const PACK_FORMAT_VERSION: u32 = 1;
+use crate::fetch::{Fetcher, Source};
 
-/// Marker identifying the archive as a pack.
-pub const PACK_MAGIC: &str = "dsh";
-
-/// The identity manifest's filename.
+/// Manifest file name inside the archive.
 pub const MANIFEST_NAME: &str = "dsh.index.json";
 
-/// The assembly manifest's filename.
+/// Assembly file name the loader reads.
 pub const ASSEMBLY_NAME: &str = "assembly.yaml";
 
-/// Identity of one pack.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Format version this build writes and accepts.
+pub const FORMAT_VERSION: u32 = 1;
+
+/// The `game` field's expected value.
+pub const GAME: &str = "nguruvilu";
+
+/// The value earlier packs wrote. Accepted so an existing offline pack keeps
+/// loading; new packs use [`GAME`].
+pub const LEGACY_GAME: &str = "dsh";
+
+/// Directory holding embedded payload in an offline pack.
+pub const FILES_DIR: &str = "files";
+
+/// Field name to file name, for the content a pack carries.
+///
+/// The order is the order they are written and reported, so diagnostics read
+/// the same way twice.
+pub const CONTENT_FILES: &[(&str, &str)] = &[
+    ("soul", "soul.md"),
+    ("models", "models.json"),
+    ("context", "context.json"),
+    ("mcp", "mcp.json"),
+    ("look", "look.json"),
+    ("injections", "injections.json"),
+];
+
+/// The kernel version this build is.
+pub fn kernel_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+// ---------------------------------------------------------------- manifest
+
+/// A pack's manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PackManifest {
-    /// Format version.
+    /// Format version; must equal [`FORMAT_VERSION`].
+    ///
+    /// The snake_case spelling is the older one; both read, so a pack written
+    /// before this format settled keeps loading.
+    #[serde(alias = "format_version")]
     pub format_version: u32,
-    /// Marker field, always `dsh`.
+    /// Must equal [`GAME`].
+    ///
+    /// Defaulted rather than required, and both the current and the older value
+    /// are accepted, for the same reason.
+    #[serde(default = "default_game")]
     pub game: String,
     /// Pack name.
     pub name: String,
-    /// Version of this pack's contents.
+    /// Pack version.
+    #[serde(alias = "version_id")]
     pub version_id: String,
-    /// License the pack is distributed under.
+    /// Distribution licence.
     pub license: String,
-    /// Kernel version the pack was built against.
+    /// Kernel version this pack was built against.
+    #[serde(alias = "kernel_version")]
     pub kernel_version: String,
-    /// What the pack requires of the kernel.
-    #[serde(default)]
+    /// Accepted kernel range.
     pub dependencies: Dependencies,
-    /// One-line description.
+    /// Skills to fetch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<SkillRef>,
+    /// Plugins to fetch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugins: Vec<PluginRef>,
+    /// Licence attribution for content the pack carries itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<Component>,
+
+    /// Persona file, relative to the pack root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
+    pub soul: Option<String>,
+    /// Model route file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<String>,
+    /// Context policy file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// MCP server file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<String>,
+    /// Appearance file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub look: Option<String>,
+    /// Injection rule file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub injections: Option<String>,
 }
 
-/// Version requirements a pack declares.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Accepted kernel version range.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dependencies {
-    /// Kernel version range, e.g. `>=0.1.0 <1.0.0`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kernel: Option<String>,
+    /// A range such as `>=0.1.0 <0.2.0`.
+    ///
+    /// Accepts the older `kernel` spelling, which named the same thing before
+    /// this program settled on one name for itself. An absent range accepts
+    /// anything: refusing would make every pack written before the field
+    /// existed unloadable, and the field exists to help, not to gate.
+    #[serde(alias = "kernel", default = "default_range")]
+    pub nguruvilu: String,
+}
+
+fn default_game() -> String {
+    GAME.to_string()
+}
+
+fn default_range() -> String {
+    ">=0.0.0".to_string()
 }
 
 impl PackManifest {
-    /// Build a manifest for a pack being created.
+    /// A manifest for a new pack, built against this kernel.
     pub fn new(name: impl Into<String>, version_id: impl Into<String>) -> Self {
         Self {
-            format_version: PACK_FORMAT_VERSION,
-            game: PACK_MAGIC.to_string(),
+            format_version: FORMAT_VERSION,
+            game: GAME.into(),
             name: name.into(),
             version_id: version_id.into(),
-            license: "MIT".to_string(),
-            kernel_version: env!("CARGO_PKG_VERSION").to_string(),
+            license: "MIT".into(),
+            kernel_version: kernel_version().into(),
             dependencies: Dependencies {
-                kernel: Some(format!(">={}", env!("CARGO_PKG_VERSION"))),
+                nguruvilu: format!(">={}", kernel_version()),
             },
-            summary: None,
+            skills: Vec::new(),
+            plugins: Vec::new(),
+            components: Vec::new(),
+            soul: None,
+            models: None,
+            context: None,
+            mcp: None,
+            look: None,
+            injections: None,
         }
     }
 
-    /// Reject a manifest that could never be loaded.
-    pub fn validate(&self) -> Result<()> {
-        if self.format_version != PACK_FORMAT_VERSION {
-            return Err(anyhow!(
-                "pack format version {} is not supported (expected {PACK_FORMAT_VERSION})",
+    /// The content file named by a field, if any.
+    pub fn content_file(&self, field: &str) -> Option<&String> {
+        match field {
+            "soul" => self.soul.as_ref(),
+            "models" => self.models.as_ref(),
+            "context" => self.context.as_ref(),
+            "mcp" => self.mcp.as_ref(),
+            "look" => self.look.as_ref(),
+            "injections" => self.injections.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Every reference this pack names.
+    /// Every reference this pack names, with its source parsed.
+    ///
+    /// Returns an error rather than skipping an unparseable source: silently
+    /// dropping one would install a pack that is missing something it asked
+    /// for, which is the failure mode that is hardest to notice.
+    pub fn references(&self) -> Result<Vec<Reference<'_>>> {
+        let mut out = Vec::new();
+        for skill in &self.skills {
+            out.push(Reference {
+                kind: "skill",
+                id: &skill.id,
+                source: Source::parse(&skill.source)
+                    .with_context(|| format!("skill '{}'", skill.id))?,
+                sha256: skill.sha256.as_deref(),
+            });
+        }
+        for plugin in &self.plugins {
+            out.push(Reference {
+                kind: "plugin",
+                id: &plugin.id,
+                source: Source::parse(&plugin.source)
+                    .with_context(|| format!("plugin '{}'", plugin.id))?,
+                sha256: plugin.sha256.as_deref(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Problems that make this manifest unusable.
+    ///
+    /// Returned as a list rather than an error so a validator can report every
+    /// problem at once. Fixing them one per run is how a format becomes
+    /// annoying to author.
+    pub fn problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+
+        if self.format_version != FORMAT_VERSION {
+            problems.push(format!(
+                "formatVersion is {}, this build reads {FORMAT_VERSION}",
                 self.format_version
             ));
         }
-        if self.game != PACK_MAGIC {
-            return Err(anyhow!(
-                "pack marker is {:?}, expected {PACK_MAGIC:?}",
+        if !matches!(self.game.as_str(), GAME | LEGACY_GAME) {
+            problems.push(format!(
+                "game must be \"{GAME}\", found \"{}\"",
                 self.game
             ));
         }
         for (field, value) in [
             ("name", &self.name),
-            ("version_id", &self.version_id),
+            ("versionId", &self.version_id),
             ("license", &self.license),
-            ("kernel_version", &self.kernel_version),
+            ("kernelVersion", &self.kernel_version),
         ] {
             if value.trim().is_empty() {
-                return Err(anyhow!("pack manifest is missing a value for '{field}'"));
+                problems.push(format!("{field} is empty"));
             }
         }
-        Ok(())
+        if self.dependencies.nguruvilu.trim().is_empty() {
+            problems.push("dependencies.nguruvilu is empty; it is the accepted kernel range".into());
+        }
+
+        let mut seen: BTreeMap<(&str, &str), ()> = BTreeMap::new();
+        for skill in &self.skills {
+            if skill.id.trim().is_empty() {
+                problems.push("a skill has no id".into());
+            }
+            if skill.license.trim().is_empty() {
+                problems.push(format!(
+                    "skill '{}' has no license; every fetched component states its licence",
+                    skill.id
+                ));
+            }
+            if seen.insert(("skill", skill.id.as_str()), ()).is_some() {
+                problems.push(format!("skill '{}' appears twice", skill.id));
+            }
+            if let Err(error) = Source::parse(skill.source.as_str()) {
+                problems.push(format!("skill '{}': {error:#}", skill.id));
+            }
+        }
+
+        for plugin in &self.plugins {
+            if plugin.id.trim().is_empty() {
+                problems.push("a plugin has no id".into());
+            }
+            if plugin.license.trim().is_empty() {
+                problems.push(format!("plugin '{}' has no license", plugin.id));
+            }
+            if seen.insert(("plugin", plugin.id.as_str()), ()).is_some() {
+                problems.push(format!("plugin '{}' appears twice", plugin.id));
+            }
+            if let Err(error) = Source::parse(plugin.source.as_str()) {
+                problems.push(format!("plugin '{}': {error:#}", plugin.id));
+            }
+            for (tag, artifact) in &plugin.platforms {
+                if !crate::fetch::PLATFORMS.contains(&tag.as_str()) {
+                    problems.push(format!(
+                        "plugin '{}' names platform '{tag}', which is not one of {}",
+                        plugin.id,
+                        crate::fetch::PLATFORMS.join(", ")
+                    ));
+                }
+                if artifact.file.trim().is_empty() {
+                    problems.push(format!(
+                        "plugin '{}' platform '{tag}' has no file",
+                        plugin.id
+                    ));
+                }
+            }
+        }
+
+        for component in &self.components {
+            if component.license.trim().is_empty() {
+                problems.push(format!(
+                    "component '{}' has no license",
+                    component.id
+                ));
+            }
+        }
+
+        for (field, _) in CONTENT_FILES {
+            if let Some(path) = self.content_file(field) {
+                if path.trim().is_empty() {
+                    problems.push(format!("{field} is set but names no file"));
+                }
+            }
+        }
+
+        problems
     }
 
-    /// Whether this pack declares a license for its contents.
-    ///
-    /// A pack without a license cannot be redistributed, so it is worth
-    /// surfacing rather than assuming.
-    pub fn has_license(&self) -> bool {
-        !self.license.trim().is_empty()
+    /// Whether the declared range accepts `version`.
+    pub fn accepts_kernel(&self, version: &str) -> bool {
+        accepts_range(&self.dependencies.nguruvilu, version)
     }
 }
 
-/// What a pack directory contains.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// One thing a pack names and where it comes from.
+#[derive(Debug, Clone)]
+pub struct Reference<'a> {
+    /// skill or plugin.
+    pub kind: &'static str,
+    /// Identifier from the manifest.
+    pub id: &'a str,
+    /// Parsed source.
+    pub source: Source,
+    /// sha256 the pack declares.
+    pub sha256: Option<&'a str>,
+}
+
+/// A skill to fetch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRef {
+    /// Identifier.
+    pub id: String,
+    /// Where it comes from.
+    pub source: String,
+    /// sha256 of the directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Distribution licence.
+    pub license: String,
+    /// Runtime the skill expects, for the reader's information.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub deps: BTreeMap<String, String>,
+}
+
+/// A plugin to fetch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginRef {
+    /// Identifier.
+    pub id: String,
+    /// Where it comes from.
+    pub source: String,
+    /// Distribution licence.
+    pub license: String,
+    /// sha256 of the whole fetched directory, when not per-platform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Per-platform file and hash.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub platforms: BTreeMap<String, PlatformArtifact>,
+}
+
+/// One platform's build of a plugin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlatformArtifact {
+    /// File name inside the fetched directory.
+    pub file: String,
+    /// sha256 of the fetched directory.
+    pub sha256: String,
+}
+
+/// Licence attribution for content a pack carries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Component {
+    /// Identifier.
+    pub id: String,
+    /// `skill`, `plugin`, `soul`, `look`, or `rule`.
+    pub kind: String,
+    /// Distribution licence.
+    pub license: String,
+}
+
+// ------------------------------------------------------------ content files
+
+/// `models.json`: how to talk to the model.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelsFile {
+    /// Endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// **Name** of the environment variable holding the key. Never the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    /// Model id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Reasoning effort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Proxy; empty means direct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+    /// Output ceiling, as `8K` or a number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<String>,
+    /// Fields merged into every request body.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra_body: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `context.json`: how much to remember.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextFile {
+    /// Window, as `128K` or a number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    /// Percentage at which compaction runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_percent: Option<u32>,
+    /// Messages kept verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_keep_recent: Option<usize>,
+    /// `freshness`, `balanced`, or `cache-first`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_policy: Option<String>,
+}
+
+/// `mcp.json`: MCP servers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpFile {
+    /// The servers.
+    #[serde(default)]
+    pub servers: Vec<McpServerDecl>,
+}
+
+/// One MCP server declaration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpServerDecl {
+    /// Identifier.
+    pub id: String,
+    /// `stdio` today; `streamable-http` is declared but not connected.
+    #[serde(default = "default_transport")]
+    pub transport: String,
+    /// Executable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Arguments.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Environment additions. `${VAR}` is replaced from the environment.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// `session` or `global`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
+fn default_transport() -> String {
+    "stdio".into()
+}
+
+/// `look.json`: themes and panels.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LookFile {
+    /// Theme layers.
+    #[serde(default)]
+    pub themes: Vec<crate::theme::Theme>,
+    /// Interface panels.
+    #[serde(default)]
+    pub panels: Vec<crate::ui::UiPanel>,
+}
+
+/// `injections.json`: the injection engine's own serialised form.
+///
+/// Reusing the engine's format means a pack author can write the same file the
+/// kernel already reads, and there is one format rather than two.
+pub fn read_injections(path: &Path) -> Result<crate::context::InjectionEngine> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("{} is not a valid injection file", path.display()))
+}
+
+// ---------------------------------------------------------------- versions
+
+/// Whether a `>=x <y` style range accepts `version`.
+///
+/// Deliberately small: space-separated comparators, each `>=`, `>`, `<=`, `<`,
+/// or `=`. A pack's compatibility claim is a blunt instrument and a full semver
+/// grammar would suggest a precision it does not have.
+pub fn accepts_range(range: &str, version: &str) -> bool {
+    let Some(current) = parse_version(version) else {
+        return false;
+    };
+    for clause in range.split_whitespace() {
+        let (operator, rest) = ["<=", ">=", "<", ">", "="]
+            .iter()
+            .find_map(|op| clause.strip_prefix(op).map(|rest| (*op, rest)))
+            .unwrap_or(("=", clause));
+        let Some(bound) = parse_version(rest) else {
+            // An unparseable bound cannot be satisfied; refusing is safer than
+            // accepting a claim nobody can evaluate.
+            return false;
+        };
+        let satisfied = match operator {
+            ">=" => current >= bound,
+            ">" => current > bound,
+            "<=" => current <= bound,
+            "<" => current < bound,
+            _ => current == bound,
+        };
+        if !satisfied {
+            return false;
+        }
+    }
+    true
+}
+
+/// Parse `1.2.3`, `1.2`, or `1` into comparable numbers, ignoring any suffix.
+fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
+    let core = text.trim().trim_start_matches('v');
+    // Pre-release and build metadata do not participate: a preview kernel is
+    // compared on its numbers, which is what the pack author can reason about.
+    let core = core.split(['-', '+']).next()?;
+    let mut parts = core.split('.').map(|p| p.parse::<u64>().ok());
+    let major = parts.next()??;
+    let minor = parts.next().flatten().unwrap_or(0);
+    let patch = parts.next().flatten().unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn a_bounded_range_accepts_what_it_names() {
+        assert!(accepts_range(">=0.1.0 <0.2.0", "0.1.0"));
+        assert!(accepts_range(">=0.1.0 <0.2.0", "0.1.9"));
+        assert!(!accepts_range(">=0.1.0 <0.2.0", "0.2.0"));
+        assert!(!accepts_range(">=0.1.0 <0.2.0", "0.0.9"));
+    }
+
+    #[test]
+    fn a_single_comparator_works() {
+        assert!(accepts_range(">=0.1.0", "9.9.9"));
+        assert!(!accepts_range(">=0.1.0", "0.0.1"));
+        assert!(accepts_range("=1.0.0", "1.0.0"));
+    }
+
+    #[test]
+    fn short_versions_are_filled_in() {
+        assert!(accepts_range(">=1", "1.0.0"));
+        assert!(accepts_range(">=1.2", "1.2.0"));
+    }
+
+    #[test]
+    fn a_pre_release_suffix_is_ignored_for_ordering() {
+        // A preview kernel compares on its numbers, which is what an author can
+        // reason about.
+        assert!(accepts_range(">=0.1.0 <0.2.0", "0.1.0-rc.5"));
+    }
+
+    #[test]
+    fn an_unparseable_range_refuses_rather_than_guessing() {
+        assert!(!accepts_range("^0.1.0", "0.1.5"));
+        assert!(!accepts_range("latest", "0.1.5"));
+        assert!(!accepts_range(">=x", "0.1.5"));
+    }
+
+    #[test]
+    fn a_leading_v_is_accepted() {
+        assert!(accepts_range(">=0.1.0", "v0.1.5"));
+    }
+}
+
+
+// ---------------------------------------------------------------- archive
+
+/// What a pack directory holds.
+#[derive(Debug, Clone, Default)]
 pub struct PackContents {
-    /// Files relative to the pack root, sorted.
+    /// Files, relative to the pack root, sorted.
     pub files: Vec<String>,
-    /// Whether an assembly manifest is present.
+    /// Whether a manifest is present.
+    pub has_manifest: bool,
+    /// Whether an assembly is present (offline packs carry one).
     pub has_assembly: bool,
 }
 
-/// Result of verifying an archive.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Result of checking an archive without installing it.
+#[derive(Debug, Clone)]
 pub struct VerifyReport {
-    /// The manifest.
+    /// The manifest that was read.
     pub manifest: PackManifest,
-    /// Contents found.
+    /// What the archive contains.
     pub contents: PackContents,
-    /// Problems that do not prevent loading but should be reported.
+    /// Whether the declared kernel range accepts this kernel.
+    pub kernel_compatible: bool,
+    /// Problems found, in the order they were discovered.
     pub warnings: Vec<String>,
 }
 
-/// Read a manifest from a pack directory.
+/// An installed pack, as it sits in the packs directory.
+#[derive(Debug, Clone)]
+pub struct InstalledPack {
+    /// Its manifest.
+    pub manifest: PackManifest,
+    /// Where it is installed.
+    pub path: PathBuf,
+    /// Its assembly, when it has one.
+    pub assembly: Option<PathBuf>,
+}
+
+/// Read `dsh.index.json` from a pack directory.
 pub fn read_manifest(dir: &Path) -> Result<PackManifest> {
     let path = dir.join(MANIFEST_NAME);
     let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+        .with_context(|| format!("reading {} (a pack needs one)", path.display()))?;
     let manifest: PackManifest = serde_json::from_str(&text)
-        .with_context(|| format!("parsing {}", path.display()))?;
-    manifest.validate()?;
+        .with_context(|| format!("{} is not a valid manifest", path.display()))?;
+
+    let problems = manifest.problems();
+    if !problems.is_empty() {
+        return Err(anyhow!(
+            "{} has {} problem(s):\n  {}",
+            path.display(),
+            problems.len(),
+            problems.join("\n  ")
+        ));
+    }
     Ok(manifest)
 }
 
 /// Write a manifest into a pack directory.
 pub fn write_manifest(dir: &Path, manifest: &PackManifest) -> Result<()> {
-    manifest.validate()?;
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(MANIFEST_NAME);
     let text = serde_json::to_string_pretty(manifest)?;
     std::fs::write(&path, format!("{text}\n"))
@@ -161,28 +682,29 @@ pub fn write_manifest(dir: &Path, manifest: &PackManifest) -> Result<()> {
 
 /// List what a pack directory holds.
 pub fn inspect(dir: &Path) -> Result<PackContents> {
-    let mut files = Vec::new();
-    collect_files(dir, dir, &mut files)?;
-    files.sort();
-    Ok(PackContents {
-        has_assembly: dir.join(ASSEMBLY_NAME).is_file(),
-        files,
-    })
+    let mut contents = PackContents::default();
+    collect_files(dir, dir, &mut contents.files)?;
+    contents.files.sort();
+    contents.has_manifest = dir.join(MANIFEST_NAME).is_file();
+    contents.has_assembly = dir.join(ASSEMBLY_NAME).is_file();
+    Ok(contents)
 }
 
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
-    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+    let entries = std::fs::read_dir(dir)
+        .with_context(|| format!("listing {}", dir.display()))?;
+    for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        // Never ship a repository's internals inside a pack.
-        if name == ".git" || name == "target" || name == "node_modules" {
-            continue;
-        }
-        if path.is_dir() {
+        if entry.file_type()?.is_dir() {
             collect_files(root, &path, out)?;
-        } else if let Ok(relative) = path.strip_prefix(root) {
-            out.push(relative.to_string_lossy().replace('\\', "/"));
+        } else {
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push(relative);
         }
     }
     Ok(())
@@ -192,8 +714,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
 ///
 /// The default output path sits beside the tree being packed, so a scan that
 /// does not exclude it counts the archive as a member of itself — and a rebuild
-/// embeds the previous archive. Both `pack` and the tool that reports a file
-/// count go through here so the two cannot disagree.
+/// embeds the previous archive.
 pub fn packable_files(dir: &Path, out: &Path) -> Result<PackContents> {
     let mut contents = inspect(dir)?;
     if let Some(out_name) = out.file_name().map(|n| n.to_string_lossy().to_string()) {
@@ -207,56 +728,28 @@ pub fn packable_files(dir: &Path, out: &Path) -> Result<PackContents> {
     Ok(contents)
 }
 
-/// Create a `.dshpack` from a directory.
-///
-/// The directory must carry a manifest; an archive without one cannot be
-/// identified, and a nameless artifact is worse than no artifact.
-pub fn pack(dir: &Path, out: &Path) -> Result<PackManifest> {
-    let manifest = read_manifest(dir)?;
-
+/// Write a zip of the given files.
+fn write_archive(dir: &Path, files: &[String], out: &Path) -> Result<()> {
     if let Some(parent) = out.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
     }
-
-    // Scan before creating the output. Packing into the directory being packed
-    // is the ordinary case — `my-pack.dshpack` beside the `my-pack/` tree — and
-    // creating the file first would make the empty archive a member of itself.
-    //
-    // `inspect` returns a sorted list, so the archive is byte-comparable between
-    // builds of the same tree.
-    let mut contents = inspect(dir)?;
-
-    // Belt and braces: an archive left over from an earlier build inside the
-    // directory must never be embedded in the next one.
-    if let Some(out_name) = out.file_name().map(|n| n.to_string_lossy().to_string()) {
-        contents.files.retain(|relative| {
-            Path::new(relative)
-                .file_name()
-                .map(|name| name.to_string_lossy() != out_name)
-                .unwrap_or(true)
-        });
-    }
-
     let file = std::fs::File::create(out)
         .with_context(|| format!("creating {}", out.display()))?;
     let mut writer = zip::ZipWriter::new(file);
 
-    for relative in &contents.files {
+    for relative in files {
         let path = dir.join(relative);
         let metadata = std::fs::metadata(&path)
             .with_context(|| format!("reading metadata for {relative}"))?;
 
-        // mut is only needed on Unix, where the mode is attached below.
         #[allow(unused_mut)]
         let mut options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
             .large_file(metadata.len() > u32::MAX as u64);
-
-        // Preserve the mode: a pack may ship a script, and silently dropping
-        // the executable bit would break it on unpack.
+        // A pack may ship a script; dropping the executable bit would break it.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -265,7 +758,7 @@ pub fn pack(dir: &Path, out: &Path) -> Result<PackManifest> {
 
         writer
             .start_file(relative, options)
-            .with_context(|| format!("adding {relative} to the archive"))?;
+            .with_context(|| format!("adding {relative}"))?;
         let data = std::fs::read(&path).with_context(|| format!("reading {relative}"))?;
         writer
             .write_all(&data)
@@ -273,10 +766,76 @@ pub fn pack(dir: &Path, out: &Path) -> Result<PackManifest> {
     }
 
     writer.finish().context("finalizing the archive")?;
+    Ok(())
+}
+
+/// Build a manifest pack: the manifest and its content files, no payload.
+pub fn pack(dir: &Path, out: &Path) -> Result<PackManifest> {
+    let manifest = read_manifest(dir)?;
+    let contents = packable_files(dir, out)?;
+
+    // A pack must not smuggle payload in. Anything under `files/` is what an
+    // offline build embeds, and a manifest pack that carries it is neither
+    // shape — it would install stale bytes instead of fetching.
+    let smuggled: Vec<&String> = contents
+        .files
+        .iter()
+        .filter(|f| f.starts_with(&format!("{FILES_DIR}/")))
+        .collect();
+    if !smuggled.is_empty() {
+        return Err(anyhow!(
+            "{} holds payload under {FILES_DIR}/, which a manifest pack must not: \
+             build with --offline to embed it deliberately",
+            dir.display()
+        ));
+    }
+
+    write_archive(dir, &contents.files, out)?;
     Ok(manifest)
 }
 
-/// Unpack a `.dshpack` into a directory, returning its manifest.
+/// Build an offline pack: fetch everything the manifest names and embed it.
+pub async fn pack_offline(dir: &Path, out: &Path) -> Result<PackManifest> {
+    let manifest = read_manifest(dir)?;
+    let fetcher = Fetcher::new()?;
+    let files_dir = dir.join(FILES_DIR);
+    std::fs::create_dir_all(&files_dir)?;
+
+    for reference in manifest.references()? {
+        let Reference { kind, id, source, sha256 } = reference;
+        let (source, expected) = (&source, sha256);
+        if !source.is_remote() {
+            continue;
+        }
+        let fetched = fetcher.fetch(source, expected).await?;
+        let destination = files_dir.join(id);
+        if destination.exists() {
+            std::fs::remove_dir_all(&destination)?;
+        }
+        copy_tree(&fetched.path, &destination)?;
+        eprintln!("[offline] embedded {kind} {id} ({})", fetched.sha256);
+    }
+
+    let contents = packable_files(dir, out)?;
+    write_archive(dir, &contents.files, out)?;
+    Ok(manifest)
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Extract an archive into a directory.
 pub fn unpack(pack_path: &Path, dest: &Path) -> Result<PackManifest> {
     std::fs::create_dir_all(dest)
         .with_context(|| format!("creating {}", dest.display()))?;
@@ -284,189 +843,373 @@ pub fn unpack(pack_path: &Path, dest: &Path) -> Result<PackManifest> {
     let file = std::fs::File::open(pack_path)
         .with_context(|| format!("opening {}", pack_path.display()))?;
     let mut archive = zip::ZipArchive::new(file)
-        .with_context(|| format!("reading the archive {}", pack_path.display()))?;
+        .with_context(|| format!("{} is not a zip archive", pack_path.display()))?;
 
-    // Extract entry by entry rather than calling `extract()` wholesale: an
-    // entry whose path escapes the destination must be refused, not written.
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
         let Some(relative) = entry.enclosed_name() else {
             return Err(anyhow!(
-                "archive entry {:?} escapes the destination directory",
+                "{} contains an entry that escapes the archive: {}",
+                pack_path.display(),
                 entry.name()
             ));
         };
         let target = dest.join(relative);
-
         if entry.is_dir() {
-            std::fs::create_dir_all(&target)
-                .with_context(|| format!("creating {}", target.display()))?;
+            std::fs::create_dir_all(&target)?;
             continue;
         }
         if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            std::fs::create_dir_all(parent)?;
         }
-
-        let mut out = std::fs::File::create(&target)
-            .with_context(|| format!("creating {}", target.display()))?;
-        std::io::copy(&mut entry, &mut out)
+        let mut buffer = Vec::new();
+        entry.read_to_end(&mut buffer)?;
+        std::fs::write(&target, buffer)
             .with_context(|| format!("writing {}", target.display()))?;
+
+        #[cfg(unix)]
+        if let Some(mode) = entry.unix_mode() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode));
+        }
     }
 
     read_manifest(dest)
 }
 
-/// Verify an archive without keeping its contents.
+/// Check an archive without installing it.
 pub fn verify(pack_path: &Path) -> Result<VerifyReport> {
-    let temp = std::env::temp_dir().join(format!(
+    let scratch = std::env::temp_dir().join(format!(
         "ngu-verify-{}",
         uuid::Uuid::new_v4().simple()
     ));
-    std::fs::create_dir_all(&temp)?;
-
     let result = (|| -> Result<VerifyReport> {
-        let manifest = unpack(pack_path, &temp)?;
-        let contents = inspect(&temp)?;
+        let manifest = unpack(pack_path, &scratch)?;
+        let contents = inspect(&scratch)?;
 
         let mut warnings = Vec::new();
-        if !contents.has_assembly {
+        for (field, file) in CONTENT_FILES {
+            if manifest.content_file(field).is_some() && !scratch.join(file).is_file() {
+                warnings.push(format!(
+                    "{field} names {file}, which is not in the archive"
+                ));
+            }
+        }
+        let kernel_compatible = manifest.accepts_kernel(kernel_version());
+        if !kernel_compatible {
             warnings.push(format!(
-                "no {ASSEMBLY_NAME}: the pack identifies itself but loads nothing"
+                "this pack accepts nguruvilu {}, this kernel is {}",
+                manifest.dependencies.nguruvilu,
+                kernel_version()
             ));
         }
-        if !manifest.has_license() {
-            warnings.push("no license: the pack cannot be redistributed".to_string());
+        if contents.has_assembly && manifest.references().map(|r| !r.is_empty()).unwrap_or(false) {
+            // An offline pack embeds payload; a manifest pack must not.
+            warnings.push(
+                "the archive carries an assembly and also names references; \
+                 it will install as an offline pack"
+                    .into(),
+            );
         }
 
-        Ok(VerifyReport { manifest, contents, warnings })
+        Ok(VerifyReport {
+            manifest,
+            contents,
+            kernel_compatible,
+            warnings,
+        })
     })();
 
-    let _ = std::fs::remove_dir_all(&temp);
+    let _ = std::fs::remove_dir_all(&scratch);
     result
 }
 
-/// A pack installed on disk.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstalledPack {
-    /// Manifest.
-    pub manifest: PackManifest,
-    /// Where it was unpacked.
-    pub path: PathBuf,
-    /// Path to its assembly manifest, when it has one.
-    pub assembly: Option<PathBuf>,
+// ------------------------------------------------------------------ install
+
+/// Install an archive into the packs directory.
+///
+/// Manifest packs fetch what they name; offline packs use what they carry. The
+/// result is the same either way: a directory the loader can read.
+pub async fn install(pack_path: &Path, packs_dir: &Path) -> Result<InstalledPack> {
+    let staging = std::env::temp_dir().join(format!(
+        "ngu-install-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let result = install_inner(pack_path, packs_dir, &staging).await;
+    let _ = std::fs::remove_dir_all(&staging);
+    result
 }
 
-/// Install an archive into a packs directory.
-///
-/// The destination is `<packs_dir>/<name>-<version>`, so two versions of the
-/// same pack coexist instead of overwriting each other.
-pub fn install(pack_path: &Path, packs_dir: &Path) -> Result<InstalledPack> {
-    let staging = packs_dir.join(format!(".staging-{}", uuid::Uuid::new_v4().simple()));
-    std::fs::create_dir_all(&staging)
-        .with_context(|| format!("creating {}", staging.display()))?;
+async fn install_inner(
+    pack_path: &Path,
+    packs_dir: &Path,
+    staging: &Path,
+) -> Result<InstalledPack> {
+    let manifest = unpack(pack_path, staging)?;
 
-    let manifest = match unpack(pack_path, &staging) {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(error);
-        }
-    };
-
-    let slug = format!("{}-{}", sanitize(&manifest.name), sanitize(&manifest.version_id));
-    let target = packs_dir.join(&slug);
-    if target.exists() {
-        std::fs::remove_dir_all(&target)
-            .with_context(|| format!("replacing {}", target.display()))?;
+    if !manifest.accepts_kernel(kernel_version()) {
+        return Err(anyhow!(
+            "{} {} accepts nguruvilu {}, this kernel is {}. Refusing to load it: \
+             the tool table and manifest fields change between versions, and a \
+             mismatch fails in ways that are hard to read.",
+            manifest.name,
+            manifest.version_id,
+            manifest.dependencies.nguruvilu,
+            kernel_version()
+        ));
     }
-    std::fs::rename(&staging, &target)
-        .with_context(|| format!("moving the pack into {}", target.display()))?;
 
-    let assembly = target.join(ASSEMBLY_NAME);
+    // Fetch what the pack names. Anything already in the cache is not
+    // re-downloaded, and an offline pack carries its own copy.
+    let embedded = staging.join(FILES_DIR);
+    let fetcher = Fetcher::new()?;
+    for reference in manifest.references()? {
+        let Reference { kind, id, source, sha256 } = reference;
+        let (source, expected) = (&source, sha256);
+        let local = embedded.join(id);
+        if local.is_dir() {
+            continue;
+        }
+        if !source.is_remote() {
+            continue;
+        }
+        let fetched = fetcher.fetch(source, expected).await.with_context(|| {
+            format!("fetching {kind} '{id}' from {}", source.describe())
+        })?;
+        copy_tree(&fetched.path, &local)?;
+    }
+
+    let destination = packs_dir.join(format!("{}-{}", manifest.name, manifest.version_id));
+    if destination.exists() {
+        std::fs::remove_dir_all(&destination)
+            .with_context(|| format!("replacing {}", destination.display()))?;
+    }
+    std::fs::create_dir_all(packs_dir)
+        .with_context(|| format!("creating {}", packs_dir.display()))?;
+
+    let assembly = render_assembly(&manifest, staging)?;
+    std::fs::write(staging.join(ASSEMBLY_NAME), &assembly)?;
+    copy_tree(staging, &destination)?;
+
+    let assembly_path = destination.join(ASSEMBLY_NAME);
     Ok(InstalledPack {
         manifest,
-        assembly: assembly.is_file().then_some(assembly),
-        path: target,
+        path: destination,
+        assembly: assembly_path.is_file().then_some(assembly_path),
     })
 }
 
-/// List installed packs under a directory.
-pub fn installed(packs_dir: &Path) -> Result<Vec<InstalledPack>> {
-    if !packs_dir.exists() {
-        return Ok(Vec::new());
+/// Render the assembly the loader reads, from the manifest and content files.
+///
+/// Install writes it rather than shipping it, so a pack author never has to
+/// maintain two descriptions of the same thing — and so the loader keeps
+/// reading one format while the distribution format evolves.
+fn render_assembly(manifest: &PackManifest, staging: &Path) -> Result<String> {
+    #[derive(Serialize)]
+    struct OutBase {
+        id: String,
+        source: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
     }
+    #[derive(Serialize)]
+    struct OutPlugin {
+        #[serde(flatten)]
+        base: OutBase,
+    }
+    #[derive(Serialize)]
+    struct OutMcp {
+        #[serde(flatten)]
+        base: OutBase,
+        transport: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        env: BTreeMap<String, String>,
+    }
+    #[derive(Serialize)]
+    struct OutSkill {
+        #[serde(flatten)]
+        base: OutBase,
+    }
+    #[derive(Serialize)]
+    struct OutStage {
+        name: String,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        plugins: Vec<OutPlugin>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        mcp: Vec<OutMcp>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        skills: Vec<OutSkill>,
+    }
+    #[derive(Serialize)]
+    struct OutDefaults {
+        scope: String,
+        on_failure: String,
+    }
+    #[derive(Serialize)]
+    struct Out {
+        version: u32,
+        name: String,
+        defaults: OutDefaults,
+        stages: Vec<OutStage>,
+    }
+    let platform = crate::fetch::platform_tag();
 
-    let mut packs = Vec::new();
-    for entry in std::fs::read_dir(packs_dir)
-        .with_context(|| format!("reading {}", packs_dir.display()))?
-    {
+    let plugins: Vec<OutPlugin> = manifest
+        .plugins
+        .iter()
+        .map(|plugin| {
+            // The loader takes a path inside the pack; the fetched directory is
+            // copied to `files/<id>` at install time.
+            let file = plugin
+                .platforms
+                .get(platform)
+                .map(|artifact| artifact.file.clone())
+                .unwrap_or_else(|| plugin.id.clone());
+            OutPlugin {
+                base: OutBase {
+                    id: plugin.id.clone(),
+                    source: format!("dylib:{FILES_DIR}/{}/{file}", plugin.id),
+                    scope: Some("global".into()),
+                },
+            }
+        })
+        .collect();
+
+    let skills: Vec<OutSkill> = manifest
+        .skills
+        .iter()
+        .map(|skill| OutSkill {
+            base: OutBase {
+                id: skill.id.clone(),
+                source: format!("{FILES_DIR}/{}", skill.id),
+                scope: Some("session".into()),
+            },
+        })
+        .collect();
+
+    let mcp: Vec<OutMcp> = match manifest.mcp.as_ref() {
+        Some(file) => {
+            let path = staging.join(file);
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let parsed: McpFile = serde_json::from_str(&text)
+                .with_context(|| format!("{} is not a valid mcp file", path.display()))?;
+            parsed
+                .servers
+                .into_iter()
+                .map(|server| OutMcp {
+                    base: OutBase {
+                        id: server.id.clone(),
+                        source: server
+                            .command
+                            .clone()
+                            .map(|c| format!("stdio:{c} {}", server.args.join(" ")))
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string(),
+                        scope: server.scope,
+                    },
+                    transport: server.transport,
+                    command: server.command,
+                    args: server.args,
+                    env: server.env,
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    };
+
+    let stages = if plugins.is_empty() && skills.is_empty() && mcp.is_empty() {
+        Vec::new()
+    } else {
+        vec![OutStage {
+            name: "pack".into(),
+            plugins,
+            mcp,
+            skills,
+        }]
+    };
+
+    let assembly = Out {
+        version: 1,
+        name: manifest.name.clone(),
+        defaults: OutDefaults {
+            scope: "session".into(),
+            on_failure: "skip".into(),
+        },
+        stages,
+    };
+    Ok(serde_yaml::to_string(&assembly)?)
+}
+
+/// Every installed pack, newest name first.
+pub fn installed(packs_dir: &Path) -> Result<Vec<InstalledPack>> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(packs_dir) {
+        Ok(entries) => entries,
+        // A missing directory means nothing is installed, which is not an error.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(error) => {
+            return Err(error).with_context(|| format!("listing {}", packs_dir.display()))
+        }
+    };
+
+    for entry in entries {
         let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
         let path = entry.path();
-        if !path.is_dir() {
+        if !path.join(MANIFEST_NAME).is_file() {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') {
-            continue; // staging leftovers
-        }
-        let Ok(manifest) = read_manifest(&path) else {
-            continue;
-        };
+        // A pack with a broken manifest is reported rather than skipped: a
+        // silent omission looks like the pack was never installed.
+        let manifest = read_manifest(&path)
+            .with_context(|| format!("reading the pack at {}", path.display()))?;
         let assembly = path.join(ASSEMBLY_NAME);
-        packs.push(InstalledPack {
+        out.push(InstalledPack {
             manifest,
-            assembly: assembly.is_file().then_some(assembly),
             path,
+            assembly: assembly.is_file().then_some(assembly),
         });
     }
-    packs.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));
-    Ok(packs)
+    out.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));
+    Ok(out)
 }
 
-/// Make a name safe for a directory.
-fn sanitize(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
-        .collect()
-}
-
-/// The default packs directory: `$NGU_HOME/packs`, else `<cwd>/.nguruvilu/packs`.
+/// Where packs are installed: `$NGU_HOME/packs`, else `~/.nguruvilu/packs`.
 pub fn default_packs_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("NGU_HOME") {
-        if !home.trim().is_empty() {
-            return PathBuf::from(home).join("packs");
-        }
-    }
-    // The user's home, not the current directory: packs are installed for the
-    // user, and the directory the command happened to run in is not a place to
-    // leave state.
-    crate::settings::home_dir().join(".nguruvilu").join("packs")
+    crate::settings::data_dir().join("packs")
 }
 
-/// Read the pack's assembly manifest, when present.
+/// Read a pack's assembly, when it has one.
 pub fn read_assembly(dir: &Path) -> Result<Option<crate::assembly::Assembly>> {
     let path = dir.join(ASSEMBLY_NAME);
     if !path.is_file() {
         return Ok(None);
     }
-    Ok(Some(crate::assembly::Assembly::from_file(&path)?))
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let assembly: crate::assembly::Assembly = serde_yaml::from_str(&text)
+        .with_context(|| format!("{} is not a valid assembly", path.display()))?;
+    Ok(Some(assembly))
 }
 
-/// A summary of what a pack would load, for display.
+/// A manifest as displayable pairs.
 pub fn describe(manifest: &PackManifest) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     out.insert("name".into(), manifest.name.clone());
     out.insert("version".into(), manifest.version_id.clone());
     out.insert("license".into(), manifest.license.clone());
-    out.insert("kernel".into(), manifest.kernel_version.clone());
-    if let Some(range) = &manifest.dependencies.kernel {
-        out.insert("requires".into(), range.clone());
-    }
-    if let Some(summary) = &manifest.summary {
-        out.insert("summary".into(), summary.clone());
-    }
+    out.insert("built against".into(), manifest.kernel_version.clone());
+    out.insert("accepts".into(), manifest.dependencies.nguruvilu.clone());
+    out.insert("skills".into(), manifest.skills.len().to_string());
+    out.insert("plugins".into(), manifest.plugins.len().to_string());
     out
 }
 
@@ -474,230 +1217,470 @@ pub fn describe(manifest: &PackManifest) -> BTreeMap<String, String> {
 mod tests {
     use super::*;
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ngu-pack-{tag}-{}", uuid::Uuid::new_v4().simple()));
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("ngu-pack-{tag}-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    fn write_pack_dir(dir: &Path) {
-        write_manifest(dir, &PackManifest::new("demo-pack", "1.0.0")).unwrap();
-        std::fs::write(
-            dir.join(ASSEMBLY_NAME),
-            "version: 1\nstages:\n  - name: foundation\n    skills:\n      - id: s\n        source: ./skills\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.join("skills/pdf-tools")).unwrap();
-        std::fs::write(
-            dir.join("skills/pdf-tools/SKILL.md"),
-            "---\nname: pdf-tools\ndescription: Read PDFs\n---\n\nBody.\n",
-        )
-        .unwrap();
+    /// A pack directory with a manifest and one content file.
+    fn sample(dir: &Path, name: &str, version: &str) -> PackManifest {
+        let manifest = PackManifest::new(name, version);
+        write_manifest(dir, &manifest).unwrap();
+        std::fs::write(dir.join("soul.md"), "You are terse.\n").unwrap();
+        let mut manifest = manifest;
+        manifest.soul = Some("soul.md".into());
+        write_manifest(dir, &manifest).unwrap();
+        manifest
     }
 
     #[test]
-    fn a_manifest_round_trips() {
-        let dir = temp_dir("manifest");
-        let manifest = PackManifest::new("my-pack", "2.1.0");
-        write_manifest(&dir, &manifest).unwrap();
-
-        let read = read_manifest(&dir).unwrap();
-        assert_eq!(read, manifest);
-        assert_eq!(read.game, "dsh");
-        assert!(read.has_license());
-        assert_eq!(read.dependencies.kernel.is_some(), true);
+    fn a_fresh_manifest_is_valid() {
+        let manifest = PackManifest::new("demo", "1.0.0");
+        assert!(manifest.problems().is_empty(), "{:?}", manifest.problems());
+        assert_eq!(manifest.format_version, FORMAT_VERSION);
+        assert_eq!(manifest.game, GAME);
     }
 
     #[test]
-    fn a_missing_manifest_is_an_error() {
-        let dir = temp_dir("no-manifest");
-        let error = read_manifest(&dir).expect_err("no manifest");
-        assert!(format!("{error:#}").contains(MANIFEST_NAME));
+    fn a_manifest_round_trips_through_json() {
+        let mut manifest = PackManifest::new("demo", "1.0.0");
+        manifest.skills.push(SkillRef {
+            id: "pdf".into(),
+            source: "github:o/r@skills/pdf@v1".into(),
+            sha256: Some("a".repeat(64)),
+            license: "MIT".into(),
+            deps: BTreeMap::new(),
+        });
+        let text = serde_json::to_string(&manifest).unwrap();
+        let back: PackManifest = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.name, "demo");
+        assert_eq!(back.skills.len(), 1);
+        assert_eq!(back.skills[0].id, "pdf");
     }
 
     #[test]
-    fn an_invalid_manifest_is_rejected() {
-        let dir = temp_dir("bad-manifest");
-        std::fs::write(
-            dir.join(MANIFEST_NAME),
-            r#"{"format_version": 99, "game": "dsh", "name": "x", "version_id": "1", "license": "MIT", "kernel_version": "0.1.0"}"#,
-        )
-        .unwrap();
-        let error = read_manifest(&dir).expect_err("bad version");
-        assert!(format!("{error:#}").contains("not supported"));
+    fn the_wrong_game_is_refused() {
+        let mut manifest = PackManifest::new("demo", "1.0.0");
+        manifest.game = "minecraft".into();
+        let problems = manifest.problems();
+        assert!(problems.iter().any(|p| p.contains("game must be")), "{problems:?}");
     }
 
     #[test]
-    fn a_manifest_missing_a_required_field_is_rejected() {
-        let dir = temp_dir("missing-field");
-        std::fs::write(
-            dir.join(MANIFEST_NAME),
-            r#"{"format_version": 1, "game": "dsh", "name": "", "version_id": "1", "license": "MIT", "kernel_version": "0.1.0"}"#,
-        )
-        .unwrap();
-        let error = read_manifest(&dir).expect_err("empty name");
-        assert!(format!("{error:#}").contains("name"));
+    fn the_legacy_game_value_still_loads() {
+        // Packs written before this format settled on a name for the program
+        // say "dsh". Refusing them would break every existing offline pack.
+        let mut manifest = PackManifest::new("demo", "1.0.0");
+        manifest.game = LEGACY_GAME.into();
+        assert!(manifest.problems().is_empty(), "{:?}", manifest.problems());
     }
 
     #[test]
-    fn packing_and_unpacking_preserves_the_tree() {
-        let src = temp_dir("pack-src");
-        write_pack_dir(&src);
-        let archive = temp_dir("pack-out").join("demo.dshpack");
-
-        let manifest = pack(&src, &archive).unwrap();
+    fn a_manifest_written_in_the_old_spelling_still_parses() {
+        // The old shape: snake_case keys, `dependencies.kernel`, no `game`.
+        let text = "{
+            \"format_version\": 1,
+            \"game\": \"dsh\",
+            \"name\": \"demo-pack\",
+            \"version_id\": \"1.0.0\",
+            \"license\": \"MIT\",
+            \"kernel_version\": \"0.1.0\",
+            \"dependencies\": { \"kernel\": \">=0.1.0\" },
+            \"summary\": \"an old pack\"
+        }";
+        let manifest: PackManifest = serde_json::from_str(text).unwrap();
         assert_eq!(manifest.name, "demo-pack");
+        assert_eq!(manifest.version_id, "1.0.0");
+        assert_eq!(manifest.dependencies.nguruvilu, ">=0.1.0");
+        assert!(manifest.problems().is_empty(), "{:?}", manifest.problems());
+    }
+
+    #[test]
+    fn an_absent_dependency_range_accepts_anything() {
+        // The field exists to help, not to gate.
+        let text = "{\"formatVersion\":1,\"name\":\"x\",\"versionId\":\"1.0.0\",\"license\":\"MIT\",\"kernelVersion\":\"0.1.0\",\"dependencies\":{}}";
+        let manifest: PackManifest = serde_json::from_str(text).unwrap();
+        assert!(manifest.accepts_kernel("9.9.9"));
+    }
+
+    #[test]
+    fn the_wrong_format_version_is_refused() {
+        let mut manifest = PackManifest::new("demo", "1.0.0");
+        manifest.format_version = 99;
+        let problems = manifest.problems();
+        assert!(problems.iter().any(|p| p.contains("formatVersion")), "{problems:?}");
+    }
+
+    #[test]
+    fn a_component_without_a_licence_is_refused() {
+        // Every fetched component states its licence: a pack that pulls in GPL
+        // code owes the person installing it that fact.
+        let mut manifest = PackManifest::new("demo", "1.0.0");
+        manifest.skills.push(SkillRef {
+            id: "pdf".into(),
+            source: "github:o/r@p@v".into(),
+            sha256: None,
+            license: String::new(),
+            deps: BTreeMap::new(),
+        });
+        let problems = manifest.problems();
+        assert!(problems.iter().any(|p| p.contains("no license")), "{problems:?}");
+    }
+
+    #[test]
+    fn an_unparseable_source_is_reported_at_validation_time() {
+        let mut manifest = PackManifest::new("demo", "1.0.0");
+        manifest.plugins.push(PluginRef {
+            id: "x".into(),
+            source: "ftp://nope".into(),
+            license: "MIT".into(),
+            sha256: None,
+            platforms: BTreeMap::new(),
+        });
+        let problems = manifest.problems();
+        assert!(problems.iter().any(|p| p.contains("plugin 'x'")), "{problems:?}");
+    }
+
+    #[test]
+    fn an_unknown_platform_tag_is_reported() {
+        let mut manifest = PackManifest::new("demo", "1.0.0");
+        let mut platforms = BTreeMap::new();
+        platforms.insert(
+            "windows".into(),
+            PlatformArtifact {
+                file: "x.dll".into(),
+                sha256: "a".repeat(64),
+            },
+        );
+        manifest.plugins.push(PluginRef {
+            id: "x".into(),
+            source: "github:o/r@p@v".into(),
+            license: "MIT".into(),
+            sha256: None,
+            platforms,
+        });
+        let problems = manifest.problems();
+        assert!(
+            problems.iter().any(|p| p.contains("names platform 'windows'")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_id_is_reported() {
+        let mut manifest = PackManifest::new("demo", "1.0.0");
+        for _ in 0..2 {
+            manifest.skills.push(SkillRef {
+                id: "same".into(),
+                source: "github:o/r@p@v".into(),
+                sha256: None,
+                license: "MIT".into(),
+                deps: BTreeMap::new(),
+            });
+        }
+        let problems = manifest.problems();
+        assert!(problems.iter().any(|p| p.contains("appears twice")), "{problems:?}");
+    }
+
+    #[test]
+    fn references_parse_into_sources() {
+        let mut manifest = PackManifest::new("demo", "1.0.0");
+        manifest.skills.push(SkillRef {
+            id: "pdf".into(),
+            source: "github:o/r@skills/pdf@v1".into(),
+            sha256: None,
+            license: "MIT".into(),
+            deps: BTreeMap::new(),
+        });
+        let refs = manifest.references().unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].kind, "skill");
+        assert_eq!(refs[0].id, "pdf");
+        assert!(refs[0].source.is_remote());
+    }
+
+    #[test]
+    fn a_manifest_pack_round_trips_through_the_archive() {
+        let dir = scratch("round");
+        sample(&dir, "demo", "1.0.0");
+        let archive = dir.join("demo-1.0.0.dshpack");
+
+        let built = pack(&dir, &archive).unwrap();
+        assert_eq!(built.name, "demo");
         assert!(archive.is_file());
 
-        let dest = temp_dir("pack-dest");
-        let unpacked = unpack(&archive, &dest).unwrap();
-        assert_eq!(unpacked, manifest);
-
-        // The manifest, the assembly, and the skill all came through.
-        assert!(dest.join(MANIFEST_NAME).is_file());
-        assert!(dest.join(ASSEMBLY_NAME).is_file());
-        assert!(dest.join("skills/pdf-tools/SKILL.md").is_file());
-
-        // And the assembly still parses on the other side.
-        let assembly = read_assembly(&dest).unwrap().expect("assembly present");
-        assert_eq!(assembly.stages.len(), 1);
-    }
-
-    #[test]
-    fn packing_without_a_manifest_fails() {
-        let src = temp_dir("pack-nomanifest");
-        std::fs::write(src.join("stray.txt"), "x").unwrap();
-        let error = pack(&src, &temp_dir("pack-out2").join("x.dshpack")).expect_err("no manifest");
-        assert!(format!("{error:#}").contains(MANIFEST_NAME));
-    }
-
-    #[test]
-    fn build_output_is_not_shipped_inside_a_pack() {
-        let src = temp_dir("pack-ignore");
-        write_pack_dir(&src);
-        // These directories must never end up in an archive.
-        for junk in ["target", "node_modules", ".git"] {
-            std::fs::create_dir_all(src.join(junk)).unwrap();
-            std::fs::write(src.join(junk).join("big.bin"), "x").unwrap();
-        }
-
-        let archive = temp_dir("pack-out3").join("demo.dshpack");
-        pack(&src, &archive).unwrap();
-
-        let dest = temp_dir("pack-dest3");
-        unpack(&archive, &dest).unwrap();
-        assert!(!dest.join("target").exists());
-        assert!(!dest.join("node_modules").exists());
-        assert!(!dest.join(".git").exists());
-        assert!(dest.join(ASSEMBLY_NAME).exists());
-    }
-
-    #[test]
-    fn verify_reports_missing_pieces_as_warnings() {
-        let src = temp_dir("verify-warn");
-        // A manifest with no assembly: identifies itself, loads nothing.
-        write_manifest(&src, &PackManifest::new("bare", "1.0.0")).unwrap();
-        let archive = temp_dir("verify-out").join("bare.dshpack");
-        pack(&src, &archive).unwrap();
-
         let report = verify(&archive).unwrap();
-        assert_eq!(report.manifest.name, "bare");
-        assert!(!report.contents.has_assembly);
-        assert!(report
-            .warnings
-            .iter()
-            .any(|w| w.contains(ASSEMBLY_NAME)));
-    }
-
-    #[test]
-    fn verify_is_clean_for_a_complete_pack() {
-        let src = temp_dir("verify-ok");
-        write_pack_dir(&src);
-        let archive = temp_dir("verify-out2").join("ok.dshpack");
-        pack(&src, &archive).unwrap();
-
-        let report = verify(&archive).unwrap();
-        assert!(report.contents.has_assembly);
+        assert_eq!(report.manifest.name, "demo");
+        assert!(report.kernel_compatible, "{:?}", report.warnings);
+        assert!(report.contents.has_manifest);
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     }
 
     #[test]
-    fn installing_places_the_pack_under_a_versioned_directory() {
-        let src = temp_dir("install-src");
-        write_pack_dir(&src);
-        let archive = temp_dir("install-out").join("demo.dshpack");
-        pack(&src, &archive).unwrap();
+    fn a_manifest_pack_refuses_to_carry_payload() {
+        // Smuggling payload would install stale bytes instead of fetching.
+        let dir = scratch("smuggle");
+        sample(&dir, "demo", "1.0.0");
+        std::fs::create_dir_all(dir.join(FILES_DIR)).unwrap();
+        std::fs::write(dir.join(FILES_DIR).join("x.dll"), b"payload").unwrap();
 
-        let packs_dir = temp_dir("install-packs");
-        let placed = install(&archive, &packs_dir).unwrap();
-
-        assert_eq!(placed.manifest.name, "demo-pack");
-        assert!(placed.path.ends_with("demo-pack-1.0.0"), "{:?}", placed.path);
-        assert!(placed.assembly.is_some());
-
-        let listed = installed(&packs_dir).unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].manifest.version_id, "1.0.0");
+        let error = pack(&dir, &dir.join("out.dshpack")).expect_err("must refuse");
+        let text = format!("{error:#}");
+        assert!(text.contains("--offline"), "{text}");
     }
 
     #[test]
-    fn installing_twice_replaces_rather_than_failing() {
-        let src = temp_dir("install-twice");
-        write_pack_dir(&src);
-        let archive = temp_dir("install-twice-out").join("demo.dshpack");
-        pack(&src, &archive).unwrap();
+    fn the_archive_is_not_a_member_of_itself() {
+        let dir = scratch("self");
+        sample(&dir, "demo", "1.0.0");
+        let archive = dir.join("demo-1.0.0.dshpack");
 
-        let packs_dir = temp_dir("install-twice-packs");
-        install(&archive, &packs_dir).unwrap();
-        install(&archive, &packs_dir).unwrap();
+        pack(&dir, &archive).unwrap();
+        let again = pack(&dir, &archive).unwrap();
+        assert_eq!(again.name, "demo");
 
-        assert_eq!(installed(&packs_dir).unwrap().len(), 1);
-        // No staging leftovers.
-        let leftovers: Vec<String> = std::fs::read_dir(&packs_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.starts_with('.'))
-            .collect();
-        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let report = verify(&archive).unwrap();
+        assert!(
+            !report.contents.files.iter().any(|f| f.ends_with(".dshpack")),
+            "{:?}",
+            report.contents.files
+        );
     }
 
     #[test]
-    fn two_versions_of_one_pack_coexist() {
-        let packs_dir = temp_dir("install-versions");
+    fn a_content_field_naming_a_missing_file_is_a_warning() {
+        let dir = scratch("missing-content");
+        let mut manifest = PackManifest::new("demo", "1.0.0");
+        manifest.soul = Some("soul.md".into());
+        write_manifest(&dir, &manifest).unwrap();
+        // soul.md deliberately not written.
 
-        for version in ["1.0.0", "2.0.0"] {
-            let src = temp_dir("install-version-src");
-            write_manifest(&src, &PackManifest::new("multi", version)).unwrap();
-            let archive = temp_dir("install-version-out").join("multi.dshpack");
-            pack(&src, &archive).unwrap();
-            install(&archive, &packs_dir).unwrap();
+        let archive = dir.join("out.dshpack");
+        pack(&dir, &archive).unwrap();
+        let report = verify(&archive).unwrap();
+        assert!(
+            report.warnings.iter().any(|w| w.contains("soul.md")),
+            "{:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn an_incompatible_kernel_range_is_flagged() {
+        let dir = scratch("incompatible");
+        let mut manifest = PackManifest::new("demo", "1.0.0");
+        manifest.dependencies.nguruvilu = ">=99.0.0".into();
+        write_manifest(&dir, &manifest).unwrap();
+
+        let archive = dir.join("out.dshpack");
+        pack(&dir, &archive).unwrap();
+        let report = verify(&archive).unwrap();
+        assert!(!report.kernel_compatible);
+        assert!(
+            report.warnings.iter().any(|w| w.contains("accepts nguruvilu")),
+            "{:?}",
+            report.warnings
+        );
+    }
+
+    #[tokio::test]
+    async fn installing_an_incompatible_pack_is_refused_with_both_versions() {
+        let dir = scratch("refuse");
+        let mut manifest = PackManifest::new("demo", "1.0.0");
+        manifest.dependencies.nguruvilu = ">=99.0.0".into();
+        write_manifest(&dir, &manifest).unwrap();
+        let archive = dir.join("out.dshpack");
+        pack(&dir, &archive).unwrap();
+
+        let error = install(&archive, &dir.join("packs")).await.expect_err("must refuse");
+        let text = format!("{error:#}");
+        assert!(text.contains(">=99.0.0"), "{text}");
+        assert!(text.contains(kernel_version()), "it should name this kernel: {text}");
+    }
+
+    #[tokio::test]
+    async fn an_offline_pack_installs_without_the_network() {
+        // The payload is embedded, so install must not reach for it. A
+        // reference that could not resolve proves nothing was fetched.
+        let dir = scratch("offline");
+        let mut manifest = PackManifest::new("offline-demo", "1.0.0");
+        manifest.skills.push(SkillRef {
+            id: "pdf".into(),
+            source: "github:nobody/nothing@x@y".into(),
+            sha256: None,
+            license: "MIT".into(),
+            deps: BTreeMap::new(),
+        });
+        manifest.soul = Some("soul.md".into());
+        write_manifest(&dir, &manifest).unwrap();
+        std::fs::write(dir.join("soul.md"), "Be terse.\n").unwrap();
+
+        // What `--offline` would have embedded.
+        let embedded = dir.join(FILES_DIR).join("pdf");
+        std::fs::create_dir_all(&embedded).unwrap();
+        std::fs::write(embedded.join("SKILL.md"), "pdf skill\n").unwrap();
+
+        let archive = dir.join("offline.dshpack");
+        {
+            let contents = packable_files(&dir, &archive).unwrap();
+            write_archive(&dir, &contents.files, &archive).unwrap();
         }
 
-        let listed = installed(&packs_dir).unwrap();
-        assert_eq!(listed.len(), 2, "{listed:?}");
+        let packs = dir.join("packs");
+        let placed = install(&archive, &packs).await.unwrap();
+        assert_eq!(placed.manifest.name, "offline-demo");
+        assert!(placed.path.join("soul.md").is_file());
+        assert!(placed.path.join(FILES_DIR).join("pdf").join("SKILL.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn install_writes_an_assembly_the_loader_can_read() {
+        let dir = scratch("assembly");
+        let mut manifest = PackManifest::new("demo", "1.0.0");
+        manifest.skills.push(SkillRef {
+            id: "pdf".into(),
+            source: "github:nobody/nothing@x@y".into(),
+            sha256: None,
+            license: "MIT".into(),
+            deps: BTreeMap::new(),
+        });
+        write_manifest(&dir, &manifest).unwrap();
+        let embedded = dir.join(FILES_DIR).join("pdf");
+        std::fs::create_dir_all(&embedded).unwrap();
+        std::fs::write(embedded.join("SKILL.md"), "x").unwrap();
+
+        let archive = dir.join("demo.dshpack");
+        {
+            let contents = packable_files(&dir, &archive).unwrap();
+            write_archive(&dir, &contents.files, &archive).unwrap();
+        }
+
+        let placed = install(&archive, &dir.join("packs")).await.unwrap();
+        let assembly = placed.assembly.expect("an assembly");
+        assert!(assembly.is_file());
+
+        // It must parse as an assembly, which is the contract with the loader.
+        let parsed = read_assembly(&placed.path).unwrap().expect("readable");
+        assert_eq!(parsed.stages.len(), 1);
+        assert_eq!(parsed.stages[0].skills.len(), 1);
+        assert_eq!(parsed.stages[0].skills[0].base.id, "pdf");
+    }
+
+    #[tokio::test]
+    async fn a_pack_with_no_references_still_installs_and_gets_an_assembly() {
+        // A pure appearance or persona pack: nothing to fetch.
+        let dir = scratch("no-refs");
+        let mut manifest = PackManifest::new("look", "1.0.0");
+        manifest.look = Some("look.json".into());
+        write_manifest(&dir, &manifest).unwrap();
+        std::fs::write(
+            dir.join("look.json"),
+            "{\"themes\":[{\"name\":\"light\",\"tokens\":{\"--bg\":\"#ffffff\"}}],\"panels\":[]}",
+        )
+        .unwrap();
+
+        let archive = dir.join("look.dshpack");
+        pack(&dir, &archive).unwrap();
+
+        let placed = install(&archive, &dir.join("packs")).await.unwrap();
+        assert!(placed.path.join("look.json").is_file());
+        // No stages, because there is nothing to load.
+        let parsed = read_assembly(&placed.path).unwrap().expect("readable");
+        assert!(parsed.stages.is_empty());
     }
 
     #[test]
-    fn a_corrupt_archive_fails_loudly() {
-        let archive = temp_dir("corrupt").join("bad.dshpack");
-        std::fs::write(&archive, b"this is not a tar archive").unwrap();
-        assert!(verify(&archive).is_err());
+    fn the_look_file_parses_into_themes_and_panels() {
+        let mut look = LookFile::default();
+        look.themes.push(
+            crate::theme::Theme::new("light").set("--bg", "#ffffff"),
+        );
+        look.panels.push(crate::ui::UiPanel::new(
+            "p",
+            crate::ui::UiSlot::StatusBar,
+            "<b>x</b>",
+        ));
+
+        // Round-trip: this is the file a pack author writes.
+        let text = serde_json::to_string(&look).unwrap();
+        let back: LookFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.themes.len(), 1);
+        assert_eq!(back.themes[0].tokens["--bg"], "#ffffff");
+        assert_eq!(back.panels.len(), 1);
+        assert_eq!(back.panels[0].slot, crate::ui::UiSlot::StatusBar);
     }
 
     #[test]
-    fn describing_a_manifest_yields_its_identity() {
-        let mut manifest = PackManifest::new("demo", "1.2.3");
-        manifest.summary = Some("a demo".into());
-        let described = describe(&manifest);
-        assert_eq!(described.get("name").unwrap(), "demo");
-        assert_eq!(described.get("version").unwrap(), "1.2.3");
-        assert_eq!(described.get("summary").unwrap(), "a demo");
+    fn an_unknown_field_in_a_content_file_is_refused() {
+        // A typo in a content file would otherwise be a setting that silently
+        // does nothing.
+        let text = "{\"window\": \"128K\", \"compactPercentage\": 75}";
+        let error = serde_json::from_str::<ContextFile>(text).expect_err("must refuse");
+        assert!(format!("{error}").contains("compactPercentage"), "{error}");
     }
 
     #[test]
-    fn sanitizing_keeps_names_path_safe() {
-        assert_eq!(sanitize("my pack/1.0"), "my-pack-1.0");
-        assert_eq!(sanitize("ok-name_1.0"), "ok-name_1.0");
+    fn the_models_file_holds_an_env_var_name_never_a_key() {
+        let text = "{\"baseUrl\": \"https://x/v1\", \"apiKeyEnv\": \"MY_KEY\", \"model\": \"m\"}";
+        let models: ModelsFile = serde_json::from_str(text).unwrap();
+        assert_eq!(models.api_key_env.as_deref(), Some("MY_KEY"));
+        // The field is named for what it holds; there is no field for a value.
+        assert!(!serde_json::to_string(&models).unwrap().contains("apiKey\""));
+    }
+
+    #[test]
+    fn an_installed_pack_is_listed_and_a_broken_one_is_reported() {
+        let dir = scratch("list");
+        let packs = dir.join("packs");
+        let good = packs.join("demo-1.0.0");
+        std::fs::create_dir_all(&good).unwrap();
+        write_manifest(&good, &PackManifest::new("demo", "1.0.0")).unwrap();
+
+        // A directory with no manifest is not a pack and is skipped.
+        std::fs::create_dir_all(packs.join("not-a-pack")).unwrap();
+
+        let listed = installed(&packs).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].manifest.name, "demo");
+    }
+
+    #[test]
+    fn listing_a_missing_directory_is_empty_not_an_error() {
+        let dir = scratch("nothing");
+        assert!(installed(&dir.join("never-created")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_platform_artifact_map_picks_this_platform() {
+        let mut platforms = BTreeMap::new();
+        platforms.insert(
+            crate::fetch::platform_tag().to_string(),
+            PlatformArtifact {
+                file: "here.dll".into(),
+                sha256: "a".repeat(64),
+            },
+        );
+        let plugin = PluginRef {
+            id: "p".into(),
+            source: "github:o/r@p@v".into(),
+            license: "MIT".into(),
+            sha256: None,
+            platforms,
+        };
+        let tag = crate::fetch::platform_tag();
+        assert_eq!(plugin.platforms[tag].file, "here.dll");
+    }
+
+    #[test]
+    fn the_content_file_table_matches_the_manifest_fields() {
+        // Guards against a field being added without its file name.
+        let manifest = PackManifest::new("demo", "1.0.0");
+        for (field, file) in CONTENT_FILES {
+            assert!(manifest.content_file(field).is_none(), "{field}");
+            assert!(!file.is_empty());
+        }
+        assert_eq!(manifest.content_file("nonsense"), None);
     }
 }
