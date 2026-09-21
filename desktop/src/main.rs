@@ -281,6 +281,9 @@ async fn dispatch(
             emit(&sink, json!({ "ev": "sessions", "list": sessions }));
             emit(&sink, json!({ "ev": "transcript", "entries": transcript }));
             emit(&sink, json!({ "ev": "status", "status": status }));
+            // Plugin panels and the theme they imply, pushed with the rest of
+            // the initial state so the page never paints the wrong palette.
+            emit_panels(&state, &sink);
 
             // A prompt given on the command line runs once the page can show it.
 
@@ -430,6 +433,34 @@ async fn dispatch(
             } else {
                 apply_pack(state, PathBuf::from(path), Arc::clone(&sink)).await?;
             }
+        }
+
+        "unload_plugin" => {
+            let name = command
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let removed = {
+                let mut guard = state.lock().expect("state lock");
+                let ids: Vec<u64> = guard
+                    .kernel
+                    .fibers()
+                    .iter()
+                    .filter(|fiber| fiber.plugin == name)
+                    .map(|fiber| fiber.id)
+                    .collect();
+                let count = ids.len();
+                for id in ids {
+                    if let Err(error) = guard.kernel.unload(id) {
+                        eprintln!("[unload] {name}: {error:#}");
+                    }
+                }
+                count
+            };
+            sink.emit(json!({ "ev": "notice", "text": format!("Unloaded {removed} instance(s) of {name}") }));
+            // The panels and theme just changed, so the page has to be told.
+            emit_panels(&state, &sink);
         }
 
         "ui_panels" => {
@@ -654,11 +685,14 @@ fn platform_tag() -> &'static str {
 
 /// Send the panels plugins contributed.
 fn emit_panels(state: &Arc<Mutex<AppState>>, sink: &Arc<dyn EventSink>) {
-    let panels = {
+    let (panels, theme) = {
         let guard = state.lock().expect("state lock");
-        guard.kernel.ui_panels()
+        (guard.kernel.ui_panels(), guard.kernel.resolved_theme())
     };
     sink.emit(json!({ "ev": "ui_panels", "panels": panels }));
+    // The theme travels with the panels: both are plugin contributions, and
+    // sending them together means the page never applies one without the other.
+    sink.emit(json!({ "ev": "theme", "tokens": theme.tokens, "name": theme.name }));
 }
 
 /// Send one event to the page.

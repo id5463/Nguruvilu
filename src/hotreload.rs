@@ -46,6 +46,9 @@ pub struct ModelRoute {
     /// Reasoning effort for this route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Proxy for requests on this route; empty means direct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
 }
 
 impl Default for ModelRoute {
@@ -58,6 +61,7 @@ impl Default for ModelRoute {
             temperature: None,
             max_tokens: None,
             reasoning_effort: None,
+            proxy: None,
         }
     }
 }
@@ -908,6 +912,7 @@ mod tests {
                     temperature: Some(0.2),
                     max_tokens: Some(4096),
                     reasoning_effort: None,
+            proxy: None,
                 }),
             ))
             .unwrap();

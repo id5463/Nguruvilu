@@ -481,6 +481,20 @@ function errorBlock(text) {
 /// fragment, the update happens when something changed anyway, and a diff would
 /// be a second rendering path to keep correct. Scripts run once per panel after
 /// its fragment is in the document, so they can find the elements they added.
+/// Apply the token set plugins contributed.
+///
+/// Every token the interface knows is set explicitly, so removing a theme
+/// restores the built-in value rather than leaving the previous theme's colour
+/// behind — a variable that is set and never cleared is how a theme becomes
+/// impossible to turn off.
+function applyTheme(event) {
+  const root = document.documentElement;
+  for (const [token, value] of Object.entries(event.tokens || {})) {
+    root.style.setProperty(token, value);
+  }
+  document.body.dataset.theme = event.name || "builtin";
+}
+
 function renderSlots(panels) {
   for (const slot of ["sidebar-top", "sidebar-bottom", "details-top", "details-bottom", "status-bar", "above-composer"]) {
     const container = document.getElementById("slot-" + slot);
@@ -852,6 +866,9 @@ function setBusy(value) {
 window.ngu = {
   receive(event) {
     switch (event.ev) {
+      case "theme":
+        applyTheme(event);
+        break;
       case "ui_panels":
         renderSlots(event.panels);
         break;

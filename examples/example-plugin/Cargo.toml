@@ -1,0 +1,15 @@
+[package]
+name = "ngu-example-plugin"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Worked example: a plugin that contributes a tool, a theme, a panel, and a subagent."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+nguruvilu = { path = "../.." }
+anyhow = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros"] }

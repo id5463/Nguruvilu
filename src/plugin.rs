@@ -115,6 +115,8 @@ pub type Disposer = Box<dyn FnOnce() + Send>;
 pub struct Contributions {
     /// Interface panels this plugin contributes.
     pub ui: Vec<crate::ui::UiPanel>,
+    /// Theme layer this plugin contributes.
+    pub theme: Option<crate::theme::Theme>,
     /// Services this plugin provides, by name.
     pub services: Vec<(String, Arc<dyn Any + Send + Sync>)>,
     /// Tools this plugin registers.
@@ -138,6 +140,21 @@ impl Contributions {
     /// Add a tool.
     pub fn tool(mut self, def: ToolDef) -> Self {
         self.tools.push(def);
+        self
+    }
+
+    /// Contribute a theme layer.
+    ///
+    /// One layer per plugin: a plugin that wants to change several tokens sets
+    /// them all on one `Theme`, and layers compose across plugins.
+    pub fn theme(mut self, theme: crate::theme::Theme) -> Self {
+        self.theme = Some(theme);
+        self
+    }
+
+    /// Contribute an interface panel.
+    pub fn ui(mut self, panel: crate::ui::UiPanel) -> Self {
+        self.ui.push(panel);
         self
     }
 
@@ -254,6 +271,8 @@ pub struct Fiber {
     pub error: Option<String>,
     /// Interface panels this fiber contributes.
     pub ui: Vec<crate::ui::UiPanel>,
+    /// Theme layer this fiber contributes.
+    pub theme: Option<crate::theme::Theme>,
     effects: Vec<Disposer>,
     epoch: Epoch,
 }
@@ -502,6 +521,27 @@ impl Kernel {
         }
         registry.panels().into_iter().cloned().collect()
     }
+    /// The effective theme: every active plugin's layer applied in order.
+    ///
+    /// Resolved here rather than in the shell, so the page receives one token
+    /// set and does not have to know how many plugins produced it.
+    pub fn resolved_theme(&self) -> crate::theme::Theme {
+        let mut registry = crate::theme::ThemeRegistry::new();
+        let mut layers: Vec<&crate::theme::Theme> = self
+            .fibers
+            .values()
+            .filter(|fiber| fiber.state == FiberState::Active)
+            .filter_map(|fiber| fiber.theme.as_ref())
+            .collect();
+        // Sorted by name so the layering is deterministic: a map's iteration
+        // order is not, and two plugins setting the same token must resolve the
+        // same way on every run.
+        layers.sort_by(|a, b| a.name.cmp(&b.name));
+        for layer in layers {
+            registry.add(layer.clone());
+        }
+        registry.resolve()
+    }
 
     /// Register a plugin definition without loading an instance.
     pub fn define(&mut self, plugin: Arc<dyn Plugin>) {
@@ -546,6 +586,7 @@ impl Kernel {
                 state: FiberState::Pending,
                 error: None,
                 ui: Vec::new(),
+                theme: None,
                 effects: Vec::new(),
                 epoch: Epoch::Inactive,
             },
@@ -776,6 +817,7 @@ impl Kernel {
         self.fiber_tools.insert(id, registered_tools);
         if let Some(fiber) = self.fibers.get_mut(&id) {
             fiber.ui = contributions.ui;
+            fiber.theme = contributions.theme;
             fiber.effects = contributions.effects;
             fiber.epoch = desired;
             fiber.state = FiberState::Active;

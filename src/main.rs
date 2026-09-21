@@ -323,19 +323,70 @@ impl AgentObserver for PrettyObserver {
 /// because it belongs to the CLI's view of the prompt rather than to the
 /// runtime's state.
 struct CliConfig {
-    runtime: Mutex<Runtime>,
+    runtime: Arc<Mutex<Runtime>>,
     base_prompt: String,
-    skills: Mutex<SkillRegistry>,
+    skills: Arc<Mutex<SkillRegistry>>,
     /// Context window, threshold, and how much survives a compaction.
-    policy: Mutex<Arc<dyn ContextPolicy>>,
+    policy: Arc<Mutex<Arc<dyn ContextPolicy>>>,
     /// Extra fragments to place in each request.
     injection: Arc<nguruvilu::context::InjectionEngine>,
 }
 
+/// The session's route, published so a plugin can build a subagent on it.
+///
+/// Reads through to the same `Runtime` the turn uses, so a plugin sees the
+/// model and proxy in force now rather than the ones at startup.
+struct CliModelAccess {
+    runtime: Arc<Mutex<Runtime>>,
+    skills: Arc<Mutex<SkillRegistry>>,
+    base_prompt: String,
+    policy: Arc<Mutex<Arc<dyn ContextPolicy>>>,
+}
+
+impl nguruvilu::model::ModelAccess for CliModelAccess {
+    fn route(&self) -> nguruvilu::hotreload::ModelRoute {
+        self.runtime.lock().expect("runtime lock").snapshot().model_route
+    }
+
+    fn client(&self) -> anyhow::Result<LlmClient> {
+        self.client_for(&self.route().model)
+    }
+
+    fn client_for(&self, model: &str) -> anyhow::Result<LlmClient> {
+        let route = self.route();
+        let mut config = nguruvilu::llm::LlmConfig::new(route.base_url, route.api_key, model);
+        config.proxy = route.proxy.clone().unwrap_or_default();
+        config.reasoning_effort = route.reasoning_effort.clone();
+        config.max_tokens = route.max_tokens;
+        Ok(LlmClient::new(config)?)
+    }
+
+    fn tools(&self) -> Arc<nguruvilu::tools::ToolRegistry> {
+        self.runtime.lock().expect("runtime lock").snapshot().tools
+    }
+
+    fn system_prompt(&self) -> String {
+        let mut prompt = self
+            .runtime
+            .lock()
+            .expect("runtime lock")
+            .snapshot()
+            .system_prompt(&self.base_prompt);
+        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&catalog);
+        }
+        prompt
+    }
+
+    fn context_policy(&self) -> Arc<dyn ContextPolicy> {
+        Arc::clone(&self.policy.lock().expect("policy lock"))
+    }
+}
+
 impl TurnConfig for CliConfig {
     fn settings(&self) -> TurnSettings {
-        let runtime = self.runtime.lock().expect("runtime lock");
-        let snapshot = runtime.snapshot();
+        let snapshot = self.runtime.lock().expect("runtime lock").snapshot();
         let mut system_prompt = snapshot.system_prompt(&self.base_prompt);
 
         if let Some(catalog) = self.skills.lock().expect("skills lock").catalog() {
@@ -350,7 +401,7 @@ impl TurnConfig for CliConfig {
             version: snapshot.version,
             policy: Arc::clone(&self.policy.lock().expect("policy lock")),
             injection: Arc::clone(&self.injection),
-            cache_policy: runtime.snapshot().cache_policy,
+            cache_policy: snapshot.cache_policy,
         }
     }
 }
@@ -544,6 +595,9 @@ async fn run() -> Result<()> {
             } else {
                 Some(effective_effort.clone())
             },
+            // Published so a subagent plugin builds clients on this route
+            // rather than keeping its own copy of the proxy setting.
+            proxy: Some(settings.proxy.clone()),
         })
         .with_skill_roots(
             skills
@@ -573,11 +627,27 @@ async fn run() -> Result<()> {
     // in the same way once the catalog has been fetched.
     let policy: Arc<dyn ContextPolicy> = Arc::new(settings.context_policy(None));
 
+    let runtime = Arc::new(Mutex::new(runtime));
+    let skills = Arc::new(Mutex::new(skills));
+    let policy = Arc::new(Mutex::new(policy));
+
+    // Published before anything can ask for it: a plugin loaded from a pack
+    // needs the service to exist already.
+    nguruvilu::model::install(
+        &mut kernel,
+        Arc::new(CliModelAccess {
+            runtime: Arc::clone(&runtime),
+            skills: Arc::clone(&skills),
+            base_prompt: base_prompt.clone(),
+            policy: Arc::clone(&policy),
+        }),
+    )?;
+
     let config: Arc<dyn TurnConfig> = Arc::new(CliConfig {
-        runtime: Mutex::new(runtime),
+        runtime: Arc::clone(&runtime),
         base_prompt,
-        skills: Mutex::new(skills),
-        policy: Mutex::new(policy),
+        skills: Arc::clone(&skills),
+        policy: Arc::clone(&policy),
         injection: Arc::new(nguruvilu::context::InjectionEngine::load_default()),
     });
 

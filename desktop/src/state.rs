@@ -36,21 +36,76 @@ pub const BASE_PROMPT: &str = "You are a coding agent. Use the tools to inspect 
 files and to run commands. Prefer `read` over shelling out to view files, and `edit` for \
 surgical changes. Keep answers short and concrete.";
 
+/// The session's route, published so a plugin can build a subagent on it.
+///
+/// Reads through to the same `Runtime` the turn uses, so a plugin sees the
+/// model and proxy in force now rather than the ones at startup.
+struct DesktopModelAccess {
+    runtime: Arc<Mutex<Runtime>>,
+    skills: Arc<Mutex<SkillRegistry>>,
+    base_prompt: String,
+    policy: Arc<Mutex<Arc<dyn ContextPolicy>>>,
+}
+
+impl nguruvilu::model::ModelAccess for DesktopModelAccess {
+    fn route(&self) -> nguruvilu::hotreload::ModelRoute {
+        self.runtime.lock().expect("runtime lock").snapshot().model_route
+    }
+
+    fn client(&self) -> Result<LlmClient> {
+        self.client_for(&self.route().model)
+    }
+
+    fn client_for(&self, model: &str) -> Result<LlmClient> {
+        let route = self.route();
+        let mut config = LlmConfig::new(route.base_url, route.api_key, model);
+        config.proxy = route.proxy.clone().unwrap_or_default();
+        config.reasoning_effort = route.reasoning_effort.clone();
+        config.max_tokens = route.max_tokens;
+        Ok(LlmClient::new(config)?)
+    }
+
+    fn tools(&self) -> Arc<nguruvilu::tools::ToolRegistry> {
+        self.runtime.lock().expect("runtime lock").snapshot().tools
+    }
+
+    fn system_prompt(&self) -> String {
+        let mut prompt = self
+            .runtime
+            .lock()
+            .expect("runtime lock")
+            .snapshot()
+            .system_prompt(&self.base_prompt);
+        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&catalog);
+        }
+        prompt
+    }
+
+    fn context_policy(&self) -> Arc<dyn ContextPolicy> {
+        Arc::clone(&self.policy.lock().expect("policy lock"))
+    }
+}
+
 /// State the agent loop reads at the start of each turn.
 ///
 /// This is the desktop shell's [`TurnConfig`]: it composes the runtime's persona
 /// and route with the skill catalog, exactly as the CLI does.
 pub struct SharedConfig {
     /// The hot-reload runtime owning persona, route, and the tool table.
-    pub runtime: Mutex<Runtime>,
+    ///
+    /// Shared with the published model service, so a plugin sees the route in
+    /// force now rather than the one at startup.
+    pub runtime: Arc<Mutex<Runtime>>,
     /// Base system prompt.
     pub base_prompt: String,
     /// Skill registry, scanned at boot.
-    pub skills: Mutex<SkillRegistry>,
+    pub skills: Arc<Mutex<SkillRegistry>>,
     /// Context window, threshold, and how much survives a compaction.
     /// Rebuilt whenever the settings panel saves, so a window change takes
     /// effect on the next turn.
-    pub policy: Mutex<Arc<dyn ContextPolicy>>,
+    pub policy: Arc<Mutex<Arc<dyn ContextPolicy>>>,
     /// Extra fragments to place in each request.
     pub injection: Arc<nguruvilu::context::InjectionEngine>,
 }
@@ -134,14 +189,32 @@ impl AppState {
             } else {
                 Some(settings.reasoning_effort.clone())
             },
+            proxy: Some(settings.proxy.clone()),
         });
 
         let policy: Arc<dyn ContextPolicy> = Arc::new(settings.context_policy(None));
+
+        let runtime = Arc::new(Mutex::new(runtime));
+        let skills = Arc::new(Mutex::new(skills));
+        let policy = Arc::new(Mutex::new(policy));
+
+        // Published before any pack loads, so a plugin that wants to spawn a
+        // subagent finds the service already there.
+        nguruvilu::model::install(
+            &mut kernel,
+            Arc::new(DesktopModelAccess {
+                runtime: Arc::clone(&runtime),
+                skills: Arc::clone(&skills),
+                base_prompt: BASE_PROMPT.to_string(),
+                policy: Arc::clone(&policy),
+            }),
+        )?;
+
         let config = Arc::new(SharedConfig {
-            runtime: Mutex::new(runtime),
+            runtime,
             base_prompt: BASE_PROMPT.to_string(),
-            skills: Mutex::new(skills),
-            policy: Mutex::new(policy),
+            skills,
+            policy,
             injection: Arc::new(nguruvilu::context::InjectionEngine::load_default()),
         });
 
@@ -195,6 +268,7 @@ impl AppState {
                 } else {
                     Some(settings.reasoning_effort.clone())
                 },
+                proxy: Some(settings.proxy.clone()),
             },
             busy: false,
             settings,
