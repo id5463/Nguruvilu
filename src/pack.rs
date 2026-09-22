@@ -232,6 +232,40 @@ impl PackManifest {
         Ok(out)
     }
 
+    /// Record a fetched hash against the reference it belongs to.
+    ///
+    /// Used by pack --pin, which fetches each reference so an install can
+    /// find it in the cache instead of downloading it again.
+    pub fn set_hash(&mut self, kind: &str, id: &str, sha256: &str) -> Result<()> {
+        match kind {
+            "skill" => {
+                let entry = self
+                    .skills
+                    .iter_mut()
+                    .find(|skill| skill.id == id)
+                    .ok_or_else(|| anyhow!("no skill '{id}'"))?;
+                entry.sha256 = Some(sha256.to_string());
+            }
+            "plugin" => {
+                let entry = self
+                    .plugins
+                    .iter_mut()
+                    .find(|plugin| plugin.id == id)
+                    .ok_or_else(|| anyhow!("no plugin '{id}'"))?;
+                // A per-platform pack pins the artifact for this platform;
+                // the others are pinned when built on them.
+                let tag = crate::fetch::platform_tag();
+                if let Some(artifact) = entry.platforms.get_mut(tag) {
+                    artifact.sha256 = sha256.to_string();
+                } else {
+                    entry.sha256 = Some(sha256.to_string());
+                }
+            }
+            other => return Err(anyhow!("cannot pin a '{other}'")),
+        }
+        Ok(())
+    }
+
     /// Problems that make this manifest unusable.
     ///
     /// Returned as a list rather than an error so a validator can report every
@@ -748,21 +782,20 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
     Ok(())
 }
 
-/// The files a pack would contain, excluding the archive being written.
+/// The files a pack would contain, excluding any archive.
 ///
 /// The default output path sits beside the tree being packed, so a scan that
-/// does not exclude it counts the archive as a member of itself — and a rebuild
-/// embeds the previous archive.
+/// does not exclude it counts the archive as a member of itself. Every
+/// `.dshpack` is excluded, not only the one being written: an archive left over
+/// from an earlier build is still an archive, and embedding one is always wrong
+/// — it ships a stale pack inside a fresh one, and the build after that embeds
+/// both.
 pub fn packable_files(dir: &Path, out: &Path) -> Result<PackContents> {
+    let _ = out;
     let mut contents = inspect(dir)?;
-    if let Some(out_name) = out.file_name().map(|n| n.to_string_lossy().to_string()) {
-        contents.files.retain(|relative| {
-            Path::new(relative)
-                .file_name()
-                .map(|name| name.to_string_lossy() != out_name)
-                .unwrap_or(true)
-        });
-    }
+    contents
+        .files
+        .retain(|relative| !relative.to_ascii_lowercase().ends_with(".dshpack"));
     Ok(contents)
 }
 
@@ -1721,4 +1754,44 @@ mod tests {
         }
         assert_eq!(manifest.content_file("nonsense"), None);
     }
+
+    #[test]
+    fn an_archive_never_contains_an_archive() {
+        // A leftover archive from an earlier build is still an archive, and
+        // embedding one ships a stale pack inside a fresh one.
+        let dir = scratch("no-nesting");
+        sample(&dir, "demo", "1.0.0");
+        std::fs::write(dir.join("stale-0.9.0.dshpack"), b"an old archive").unwrap();
+
+        let archive = dir.join("demo-1.0.0.dshpack");
+        pack(&dir, &archive).unwrap();
+
+        let report = verify(&archive).unwrap();
+        assert!(
+            !report.contents.files.iter().any(|f| f.ends_with(".dshpack")),
+            "{:?}",
+            report.contents.files
+        );
+        assert!(report.contents.files.iter().any(|f| f == "soul.md"));
+
+    #[test]
+    fn an_archive_never_contains_an_archive() {
+        // A leftover archive from an earlier build is still an archive, and
+        // embedding one ships a stale pack inside a fresh one.
+        let dir = scratch("no-nesting");
+        sample(&dir, "demo", "1.0.0");
+        std::fs::write(dir.join("stale-0.9.0.dshpack"), b"an old archive").unwrap();
+
+        let archive = dir.join("demo-1.0.0.dshpack");
+        pack(&dir, &archive).unwrap();
+
+        let report = verify(&archive).unwrap();
+        assert!(
+            !report.contents.files.iter().any(|f| f.ends_with(".dshpack")),
+            "{:?}",
+            report.contents.files
+        );
+        assert!(report.contents.files.iter().any(|f| f == "soul.md"));
+    }
+}
 }

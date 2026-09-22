@@ -187,6 +187,17 @@ enum Command {
         /// Output archive path. Defaults to <name>-<version>.dshpack.
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// Fetch every reference and write its hash into the manifest.
+        ///
+        /// Without a hash an install cannot use the cache — there is nothing to
+        /// look the content up by — so every install re-downloads. Pinning also
+        /// makes the pack reproducible: the bytes are fixed rather than
+        /// whatever the branch happens to hold today.
+        #[arg(long)]
+        pin: bool,
+        /// Embed the referenced content, for an air-gapped install.
+        #[arg(long)]
+        offline: bool,
     },
     /// Install a `.dshpack` archive.
     Install {
@@ -502,7 +513,9 @@ async fn run() -> Result<()> {
         Some(Command::Snapshot { action, commit, limit }) => {
             return snapshot_command(&cli, action, commit.as_deref(), *limit, cli.json)
         }
-        Some(Command::Pack { dir, out }) => return pack_command(dir, out.as_ref(), cli.json),
+        Some(Command::Pack { dir, out, pin, offline }) => {
+            return pack_command(dir, out.as_ref(), *pin, *offline, cli.json).await
+        }
         Some(Command::Install { file, into }) => return install_command(file, into.as_ref(), cli.json).await,
         Some(Command::Packs) => return list_packs(cli.json),
         Some(Command::Verify { file }) => return verify_command(file, cli.json),
@@ -1300,15 +1313,69 @@ fn show_runtime(
     Ok(())
 }
 
-fn pack_command(dir: &PathBuf, out: Option<&PathBuf>, as_json: bool) -> Result<()> {
-    let manifest = nguruvilu::pack::read_manifest(dir)?;
+async fn pack_command(
+    dir: &PathBuf,
+    out: Option<&PathBuf>,
+    pin: bool,
+    offline: bool,
+    as_json: bool,
+) -> Result<()> {
+    let mut manifest = nguruvilu::pack::read_manifest(dir)?;
     let archive = match out {
         Some(path) => path.clone(),
         None => PathBuf::from(format!("{}-{}.dshpack", manifest.name, manifest.version_id)),
     };
 
-    let packed = nguruvilu::pack::pack(dir, &archive)?;
-    let contents = nguruvilu::pack::inspect(dir)?;
+    if pin {
+        let fetcher = nguruvilu::fetch::Fetcher::new()?;
+        // Collected first: pinning mutates the manifest, so the borrow that
+        // produced these references cannot still be live.
+        let todo: Vec<(String, String, nguruvilu::fetch::Source, Option<String>)> = manifest
+            .references()?
+            .into_iter()
+            .filter(|reference| reference.source.is_remote())
+            .map(|reference| {
+                (
+                    reference.kind.to_string(),
+                    reference.id.to_string(),
+                    reference.source.clone(),
+                    reference.sha256.map(str::to_string),
+                )
+            })
+            .collect();
+
+        let mut pinned = 0;
+        for (kind, id, source, expected) in todo {
+            let fetched = fetcher
+                .fetch(&source, expected.as_deref())
+                .await
+                .with_context(|| format!("pinning {kind} '{id}'"))?;
+            manifest.set_hash(&kind, &id, &fetched.sha256)?;
+            pinned += 1;
+            if !as_json {
+                eprintln!(
+                    "pinned {kind} {id} → {}",
+                    &fetched.sha256[..12.min(fetched.sha256.len())]
+                );
+            }
+        }
+        // Written back so the directory and the archive agree; a pinned pack
+        // that only existed inside the archive would be re-pinned on every
+        // build, which is the opposite of pinning.
+        nguruvilu::pack::write_manifest(dir, &manifest)?;
+        if !as_json && pinned == 0 {
+            eprintln!("nothing to pin: every reference is local or built in");
+        }
+    }
+
+    let packed = if offline {
+        nguruvilu::pack::pack_offline(dir, &archive).await?
+    } else {
+        nguruvilu::pack::pack(dir, &archive)?
+    };
+    // The same exclusion the archive used, so the count is what was packed
+    // rather than what happens to be in the directory.
+    let contents = nguruvilu::pack::packable_files(dir, &archive)?;
 
     if as_json {
         println!(
