@@ -698,7 +698,7 @@ function renderModels(list) {
   );
 }
 
-/// Render the installed packs, each with its own Apply action.
+/// Render the installed packs, each with its own Apply and Remove actions.
 function renderPacks(list) {
   packList.replaceChildren();
   const packs = (list && list.packs) || [];
@@ -723,14 +723,27 @@ function renderPacks(list) {
       });
       head.append(apply);
     }
+
+    // Removing is the other half of installing. Without it the only way out is
+    // to find the packs directory by hand.
+    const remove = el("button", "small", "Remove");
+    remove.title = "Delete this pack from disk";
+    remove.addEventListener("click", () => {
+      if (!confirm("Remove " + pack.name + " " + pack.version + "?\n\n" + pack.path)) return;
+      toShell({ cmd: "uninstall_pack", name: pack.name, version: pack.version });
+    });
+    head.append(remove);
     box.append(head);
 
     const meta = [
       pack.license || "no license",
       pack.assembly ? "assembly yes" : "no assembly",
-    ].join(" \u00b7 ");
-    box.append(el("div", "pack-meta", meta));
-    if (pack.summary) box.append(el("div", "pack-meta", pack.summary));
+    ];
+    if (pack.skills) meta.push(pack.skills + " skill(s)");
+    if (pack.plugins) meta.push(pack.plugins + " plugin(s)");
+    if (pack.content && pack.content.length) meta.push(pack.content.join(", "));
+    if (pack.compatible === false) meta.push("INCOMPATIBLE with this kernel");
+    box.append(el("div", "pack-meta", meta.join(" \u00b7 ")));
     packList.append(box);
   }
 }

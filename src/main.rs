@@ -30,6 +30,7 @@ use nguruvilu::hotreload::{
 use nguruvilu::ledger::default_ledger_path;
 use nguruvilu::llm::{LlmClient, LlmConfig};
 use nguruvilu::loader::Loader;
+use nguruvilu::source::PackSource;
 use nguruvilu::plugin::{Kernel, Plugin as PluginTrait};
 use nguruvilu::session::{JsonlStore, Session, SessionStore};
 use nguruvilu::settings::Settings;
@@ -209,6 +210,17 @@ enum Command {
     },
     /// List installed packs.
     Packs,
+    /// Remove an installed pack.
+    Uninstall {
+        /// Pack name, or `name@version` to remove one of several.
+        name: String,
+        /// Remove every installed version of that name.
+        #[arg(long)]
+        all: bool,
+        /// Directory to remove from.
+        #[arg(long)]
+        into: Option<PathBuf>,
+    },
     /// Verify a `.dshpack` archive without installing it.
     Verify {
         /// Archive to verify.
@@ -518,6 +530,9 @@ async fn run() -> Result<()> {
         }
         Some(Command::Install { file, into }) => return install_command(file, into.as_ref(), cli.json).await,
         Some(Command::Packs) => return list_packs(cli.json),
+        Some(Command::Uninstall { name, all, into }) => {
+            return uninstall_command(name, *all, into.as_ref(), cli.json)
+        }
         Some(Command::Verify { file }) => return verify_command(file, cli.json),
         Some(Command::Plugin { action }) => return plugin_command(action, cli.json),
         Some(Command::Config { action }) => return config_command(action.as_ref(), cli.json),
@@ -1469,6 +1484,98 @@ fn list_packs(as_json: bool) -> Result<()> {
             pack.manifest.license,
             if pack.assembly.is_some() { "yes" } else { "no" }
         );
+    }
+    Ok(())
+}
+
+/// Remove an installed pack.
+///
+/// Named rather than pathed: the user knows which pack they installed, and
+/// asking them to find the directory is asking them to know how install
+/// arranges things. `name@version` picks one when several are installed.
+fn uninstall_command(
+    name: &str,
+    all: bool,
+    into: Option<&PathBuf>,
+    as_json: bool,
+) -> Result<()> {
+    let root = into
+        .cloned()
+        .unwrap_or_else(nguruvilu::pack::default_packs_dir);
+    let source = nguruvilu::source::FilesystemSource::new(&root);
+
+    let (wanted_name, wanted_version) = match name.split_once('@') {
+        Some((pack, version)) => (pack, Some(version)),
+        None => (name, None),
+    };
+
+    let matches: Vec<nguruvilu::pack::InstalledPack> = source
+        .list()?
+        .into_iter()
+        .filter(|pack| pack.manifest.name == wanted_name)
+        .filter(|pack| match wanted_version {
+            Some(version) => pack.manifest.version_id == version,
+            None => true,
+        })
+        .collect();
+
+    if matches.is_empty() {
+        // Naming what is installed turns a dead end into a next step.
+        let installed = source.list()?;
+        let names: Vec<String> = installed
+            .iter()
+            .map(|pack| format!("{}@{}", pack.manifest.name, pack.manifest.version_id))
+            .collect();
+        anyhow::bail!(
+            "no installed pack matches '{name}'.{}",
+            if names.is_empty() {
+                format!(" Nothing is installed in {}.", root.display())
+            } else {
+                format!(" Installed: {}", names.join(", "))
+            }
+        );
+    }
+
+    // Removing several versions at once is what `--all` is for; without it,
+    // ask rather than guessing which one was meant.
+    if matches.len() > 1 && !all {
+        let versions: Vec<String> = matches
+            .iter()
+            .map(|pack| pack.manifest.version_id.clone())
+            .collect();
+        anyhow::bail!(
+            "'{wanted_name}' has {} versions installed: {}. \
+             Name one as '{wanted_name}@<version>', or pass --all.",
+            versions.len(),
+            versions.join(", ")
+        );
+    }
+
+    let mut removed = Vec::new();
+    for pack in &matches {
+        source.remove(&pack.path)?;
+        removed.push(format!(
+            "{}@{}",
+            pack.manifest.name, pack.manifest.version_id
+        ));
+    }
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "removed": removed,
+                "dir": root.display().to_string(),
+            }))?
+        );
+    } else {
+        for entry in &removed {
+            println!("removed {entry}");
+        }
+        // A running session loaded the pack at startup; saying so is the
+        // difference between "it did not work" and "restart to see it".
+        println!("Restart any running session to drop what it loaded.");
     }
     Ok(())
 }

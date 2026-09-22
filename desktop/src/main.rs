@@ -468,6 +468,39 @@ async fn dispatch(
             emit_panels(&state, &sink);
         }
 
+        "uninstall_pack" => {
+            let name = command
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let version = command
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let target = match &version {
+                Some(version) => format!("{name}@{version}"),
+                None => name.clone(),
+            };
+            match remove_pack(&target) {
+                Ok(()) => {
+                    sink.emit(json!({ "ev": "notice", "text": format!("Removed {target}") }));
+                    // The shell loaded the pack at startup, so the panels and
+                    // theme it contributed are still live. Say what to do about
+                    // it rather than leaving a removed pack on screen.
+                    sink.emit(json!({
+                        "ev": "notice",
+                        "text": "Restart the app to drop what it loaded.",
+                    }));
+                }
+                Err(error) => emit(
+                    &sink,
+                    json!({ "ev": "error", "message": format!("removing {target}: {error:#}") }),
+                ),
+            }
+            refresh_packs(&state, &sink);
+        }
+
         "ui_panels" => {
             emit_panels(&state, &sink);
         }
@@ -745,6 +778,37 @@ fn platform_tag() -> &'static str {
     } else {
         "linux"
     }
+}
+
+/// Remove an installed pack by `name` or `name@version`.
+fn remove_pack(target: &str) -> anyhow::Result<()> {
+    use nguruvilu::source::PackSource;
+
+    let root = nguruvilu::pack::default_packs_dir();
+    let source = nguruvilu::source::FilesystemSource::new(&root);
+
+    let (name, version) = match target.split_once('@') {
+        Some((name, version)) => (name, Some(version)),
+        None => (target, None),
+    };
+
+    let matches: Vec<nguruvilu::pack::InstalledPack> = source
+        .list()?
+        .into_iter()
+        .filter(|pack| pack.manifest.name == name)
+        .filter(|pack| match version {
+            Some(version) => pack.manifest.version_id == version,
+            None => true,
+        })
+        .collect();
+
+    if matches.is_empty() {
+        anyhow::bail!("no installed pack matches '{target}'");
+    }
+    for pack in &matches {
+        source.remove(&pack.path)?;
+    }
+    Ok(())
 }
 
 /// Send the panels plugins contributed.
