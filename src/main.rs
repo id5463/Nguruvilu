@@ -1398,6 +1398,12 @@ async fn pack_command(
         }
     }
 
+    for warning in manifest.warnings() {
+        if !as_json {
+            eprintln!("warning: {warning}");
+        }
+    }
+
     let packed = if offline {
         nguruvilu::pack::pack_offline(dir, &archive).await?
     } else {

@@ -126,22 +126,22 @@ pub struct PackManifest {
 
     /// Persona file, relative to the pack root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub soul: Option<String>,
+    pub soul: Option<ContentRef>,
     /// Model route file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub models: Option<String>,
+    pub models: Option<ContentRef>,
     /// Context policy file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<String>,
+    pub context: Option<ContentRef>,
     /// MCP server file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mcp: Option<String>,
+    pub mcp: Option<ContentRef>,
     /// Appearance file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub look: Option<String>,
+    pub look: Option<ContentRef>,
     /// Injection rule file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub injections: Option<String>,
+    pub injections: Option<ContentRef>,
 }
 
 /// Accepted kernel version range.
@@ -164,6 +164,88 @@ fn default_game() -> String {
 fn default_range() -> String {
     ">=0.0.0".to_string()
 }
+
+    /// Where one content file comes from.
+///
+/// Either carried in the pack or fetched, and the author chooses. A persona or
+/// a context policy is small and belongs in the pack; a user interface is not —
+/// one can carry a rendering engine — and fetching it keeps the pack small
+/// enough to send.
+///
+/// A bare string is the carried form, so the common case stays one line:
+///
+/// ```jsonc
+/// "soul": "soul.md",
+/// "ui": { "path": "index.html", "source": "github:owner/ui@dist@v1.0.0" }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ContentRef {
+    /// A path inside the pack.
+    Carried(String),
+    /// A path inside a fetched directory.
+    Fetched {
+        /// Path inside the fetched directory.
+        path: String,
+        /// Where the directory comes from.
+        source: String,
+        /// sha256 of the fetched directory.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sha256: Option<String>,
+    },
+}
+
+impl From<&str> for ContentRef {
+    fn from(path: &str) -> Self {
+        ContentRef::Carried(path.to_string())
+    }
+}
+
+impl From<String> for ContentRef {
+    fn from(path: String) -> Self {
+        ContentRef::Carried(path)
+    }
+}
+
+impl ContentRef {
+    /// A path inside the pack.
+    pub fn carried(path: impl Into<String>) -> Self {
+        ContentRef::Carried(path.into())
+    }
+
+    /// The file within whichever directory holds it.
+    pub fn path(&self) -> &str {
+        match self {
+            ContentRef::Carried(path) => path,
+            ContentRef::Fetched { path, .. } => path,
+        }
+    }
+
+    /// The source to fetch from, when it is not carried.
+    pub fn source(&self) -> Option<&str> {
+        match self {
+            ContentRef::Carried(_) => None,
+            ContentRef::Fetched { source, .. } => Some(source),
+        }
+    }
+
+    /// The declared hash, when it is fetched.
+    pub fn sha256(&self) -> Option<&str> {
+        match self {
+            ContentRef::Carried(_) => None,
+            ContentRef::Fetched { sha256, .. } => sha256.as_deref(),
+        }
+    }
+
+    /// A one-line description, for diagnostics.
+    pub fn describe(&self) -> String {
+        match self {
+            ContentRef::Carried(path) => path.clone(),
+            ContentRef::Fetched { path, source, .. } => format!("{source} → {path}"),
+        }
+    }
+}
+
 
 impl PackManifest {
     /// A manifest for a new pack, built against this kernel.
@@ -191,7 +273,7 @@ impl PackManifest {
     }
 
     /// The content file named by a field, if any.
-    pub fn content_file(&self, field: &str) -> Option<&String> {
+    pub fn content_file(&self, field: &str) -> Option<&ContentRef> {
         match field {
             "soul" => self.soul.as_ref(),
             "models" => self.models.as_ref(),
@@ -232,6 +314,23 @@ impl PackManifest {
         Ok(out)
     }
 
+    /// Point a content field at a new location.
+    ///
+    /// Used by install: content that arrived over the wire is rewritten to the
+    /// path it was placed at, so the installed pack is self-contained and
+    /// nothing downstream needs to know where it came from.
+    pub fn set_content(&mut self, field: &str, reference: ContentRef) {
+        match field {
+            "soul" => self.soul = Some(reference),
+            "models" => self.models = Some(reference),
+            "context" => self.context = Some(reference),
+            "mcp" => self.mcp = Some(reference),
+            "look" => self.look = Some(reference),
+            "injections" => self.injections = Some(reference),
+            _ => {}
+        }
+    }
+
     /// Record a fetched hash against the reference it belongs to.
     ///
     /// Used by pack --pin, which fetches each reference so an install can
@@ -266,7 +365,41 @@ impl PackManifest {
         Ok(())
     }
 
-    /// Problems that make this manifest unusable.
+    /// Things that do not block an install but that an author should know.
+    ///
+    /// Separate from [`PackManifest::problems`] because these are judgement
+    /// calls rather than mistakes: a pack under development legitimately
+    /// references a branch, and refusing to build it would make the format
+    /// annoying to work with. A pack being published does not.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        // A remote reference with no hash is floating: it fetches whatever the
+        // ref points at today. A tag is not a pin — tags move — so the hash is
+        // the only thing that fixes the bytes. `ngu pack --pin` records it.
+        for reference in self.references().unwrap_or_default() {
+            if !reference.source.is_remote() || reference.sha256.is_some() {
+                continue;
+            }
+            let detail = match &reference.source {
+                Source::Github { git_ref, .. } if git_ref == "HEAD" => {
+                    "it names no ref and no sha256, so it follows the default branch".to_string()
+                }
+                Source::Github { git_ref, .. } => format!(
+                    "ref '{git_ref}' can move and there is no sha256, so the content is not fixed"
+                ),
+                _ => "there is no sha256, so the content is not fixed".to_string(),
+            };
+            warnings.push(format!(
+                "{} '{}' is not pinned: {detail}. Run `ngu pack --pin` to record the hash.",
+                reference.kind, reference.id
+            ));
+        }
+
+        warnings
+    }
+
+/// Problems that make this manifest unusable.
     ///
     /// Returned as a list rather than an error so a validator can report every
     /// problem at once. Fixing them one per run is how a format becomes
@@ -359,9 +492,16 @@ impl PackManifest {
         }
 
         for (field, _) in CONTENT_FILES {
-            if let Some(path) = self.content_file(field) {
-                if path.trim().is_empty() {
+            if let Some(reference) = self.content_file(field) {
+                if reference.path().trim().is_empty() {
                     problems.push(format!("{field} is set but names no file"));
+                }
+                // A fetched content file needs a source that parses, for the
+                // same reason a skill does.
+                if let Some(source) = reference.source() {
+                    if let Err(error) = Source::parse(source) {
+                        problems.push(format!("{field}: {error:#}"));
+                    }
                 }
             }
         }
@@ -961,11 +1101,21 @@ pub fn verify(pack_path: &Path) -> Result<VerifyReport> {
         let manifest = unpack(pack_path, &scratch)?;
         let contents = inspect(&scratch)?;
 
-        let mut warnings = Vec::new();
-        for (field, file) in CONTENT_FILES {
-            if manifest.content_file(field).is_some() && !scratch.join(file).is_file() {
+        // What the author should know, first: an unpinned reference is the
+        // most consequential thing an archive can hide.
+        let mut warnings = manifest.warnings();
+        for (field, _) in CONTENT_FILES {
+            let Some(reference) = manifest.content_file(field) else {
+                continue;
+            };
+            // A fetched file is not in the archive; it arrives at install.
+            if reference.source().is_some() {
+                continue;
+            }
+            if !scratch.join(reference.path()).is_file() {
                 warnings.push(format!(
-                    "{field} names {file}, which is not in the archive"
+                    "{field} names {}, which is not in the archive",
+                    reference.path()
                 ));
             }
         }
@@ -1051,6 +1201,36 @@ async fn install_inner(
             format!("fetching {kind} '{id}' from {}", source.describe())
         })?;
         copy_tree(&fetched.path, &local)?;
+    }
+
+    // Fetch content that lives elsewhere, then rewrite the manifest so the
+    // installed pack is self-contained: everything downstream reads a path
+    // inside it, and nothing needs to know the content arrived over the wire.
+    let mut manifest = manifest;
+    let mut rewritten = false;
+    for (field, _) in CONTENT_FILES {
+        let Some(reference) = manifest.content_file(field).cloned() else {
+            continue;
+        };
+        let Some(source) = reference.source() else {
+            continue;
+        };
+        let parsed = Source::parse(source)
+            .with_context(|| format!("{field} source"))?;
+        let fetched = fetcher
+            .fetch(&parsed, reference.sha256())
+            .await
+            .with_context(|| format!("fetching {field} from {source}"))?;
+        let local = staging.join(FILES_DIR).join(field);
+        copy_tree(&fetched.path, &local)?;
+        manifest.set_content(
+            field,
+            ContentRef::carried(format!("{FILES_DIR}/{field}/{}", reference.path())),
+        );
+        rewritten = true;
+    }
+    if rewritten {
+        write_manifest(staging, &manifest)?;
     }
 
     let destination = packs_dir.join(format!("{}-{}", manifest.name, manifest.version_id));
@@ -1167,7 +1347,7 @@ fn render_assembly(manifest: &PackManifest, staging: &Path) -> Result<String> {
 
     let mcp: Vec<OutMcp> = match manifest.mcp.as_ref() {
         Some(file) => {
-            let path = staging.join(file);
+            let path = staging.join(file.path());
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let parsed: McpFile = serde_json::from_str(&text)
@@ -1797,4 +1977,92 @@ mod tests {
         assert!(report.contents.files.iter().any(|f| f == "soul.md"));
     }
 }
+
+    #[test]
+    fn an_unpinned_reference_is_a_warning_not_a_problem() {
+        // A pack under development legitimately points at a branch; a pack
+        // being published does not, and the difference is worth saying out loud.
+        let mut manifest = PackManifest::new("demo", "1.0.0");
+        manifest.skills.push(SkillRef {
+            id: "floating".into(),
+            source: "github:owner/repo@skills/x@main".into(),
+            sha256: None,
+            license: "MIT".into(),
+            deps: BTreeMap::new(),
+        });
+
+        assert!(manifest.problems().is_empty(), "it still builds");
+        let warnings = manifest.warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("not pinned"), "{}", warnings[0]);
+        assert!(warnings[0].contains("--pin"), "it should say the fix: {}", warnings[0]);
+    }
+
+    #[test]
+    fn a_reference_with_no_ref_at_all_says_it_follows_the_default_branch() {
+        let mut manifest = PackManifest::new("demo", "1.0.0");
+        manifest.plugins.push(PluginRef {
+            id: "x".into(),
+            source: "github:owner/repo@bin".into(),
+            license: "MIT".into(),
+            sha256: None,
+            platforms: BTreeMap::new(),
+        });
+        let warnings = manifest.warnings();
+        assert!(
+            warnings[0].contains("default branch"),
+            "{}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn a_pinned_reference_warns_about_nothing() {
+        let mut manifest = PackManifest::new("demo", "1.0.0");
+        manifest.skills.push(SkillRef {
+            id: "fixed".into(),
+            source: "github:owner/repo@skills/x@main".into(),
+            sha256: Some("a".repeat(64)),
+            license: "MIT".into(),
+            deps: BTreeMap::new(),
+        });
+        assert!(manifest.warnings().is_empty());
+    }
+
+    #[test]
+    fn a_local_reference_is_not_reported_as_floating() {
+        // Nothing to pin: the content is already inside the pack.
+        let mut manifest = PackManifest::new("demo", "1.0.0");
+        manifest.plugins.push(PluginRef {
+            id: "local".into(),
+            source: "dylib:files/x.dll".into(),
+            license: "MIT".into(),
+            sha256: None,
+            platforms: BTreeMap::new(),
+        });
+        assert!(manifest.warnings().is_empty());
+    }
+
+    #[test]
+    fn verify_reports_the_warning_it_found() {
+        let dir = scratch("unpinned");
+        let mut manifest = PackManifest::new("demo", "1.0.0");
+        manifest.skills.push(SkillRef {
+            id: "floating".into(),
+            source: "github:owner/repo@skills/x@main".into(),
+            sha256: None,
+            license: "MIT".into(),
+            deps: BTreeMap::new(),
+        });
+        write_manifest(&dir, &manifest).unwrap();
+
+        let archive = dir.join("out.dshpack");
+        pack(&dir, &archive).unwrap();
+        let report = verify(&archive).unwrap();
+        assert!(
+            report.warnings.iter().any(|w| w.contains("not pinned")),
+            "{:?}",
+            report.warnings
+        );
+    }
 }

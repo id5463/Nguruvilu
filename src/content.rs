@@ -96,7 +96,7 @@ pub fn apply(
     let mut content = PackContent::default();
 
     if let Some(file) = &manifest.soul {
-        let path = dir.join(file);
+        let path = dir.join(file.path());
         content.soul = Some(
             std::fs::read_to_string(&path)
                 .with_context(|| format!("reading the persona from {}", path.display()))?,
@@ -104,7 +104,7 @@ pub fn apply(
     }
 
     if let Some(file) = &manifest.models {
-        let path = dir.join(file);
+        let path = dir.join(file.path());
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         content.models = Some(
@@ -114,7 +114,7 @@ pub fn apply(
     }
 
     if let Some(file) = &manifest.context {
-        let path = dir.join(file);
+        let path = dir.join(file.path());
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         content.context = Some(
@@ -124,11 +124,11 @@ pub fn apply(
     }
 
     if let Some(file) = &manifest.injections {
-        content.injections = Some(crate::pack::read_injections(&dir.join(file))?);
+        content.injections = Some(crate::pack::read_injections(&dir.join(file.path()))?);
     }
 
     if let Some(file) = &manifest.mcp {
-        let path = dir.join(file);
+        let path = dir.join(file.path());
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         content.mcp = Some(
@@ -138,7 +138,7 @@ pub fn apply(
     }
 
     if let Some(file) = &manifest.look {
-        let path = dir.join(file);
+        let path = dir.join(file.path());
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         let look: LookFile = serde_json::from_str(&text)
