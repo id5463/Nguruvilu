@@ -132,7 +132,7 @@ impl LlmClient {
     pub fn new(config: LlmConfig) -> Result<Self> {
         let mut builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
-            .pool_idle_timeout(std::time::Duration::from_secs(90));
+            .pool_idle_timeout(std::time::Duration::from_secs(30));
 
         builder = match config.proxy.trim() {
             proxy if !proxy.is_empty() => {
@@ -195,16 +195,22 @@ impl LlmClient {
         let body = self.build_body(messages, tools);
         let url = format!("{}/chat/completions", self.config.base_url.trim_end_matches('/'));
 
-        let response = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.config.api_key)
-            .header("content-type", "application/json")
-            .header("accept", "text/event-stream")
-            .json(&body)
-            .send()
-            .await
-            .with_context(|| format!("POST {url}"))?;
+        // A pooled connection can be closed by the peer between the moment it
+        // is taken from the pool and the moment the request is written to it.
+        // The failure reads as "peer closed connection without sending TLS
+        // close_notify", which is a race rather than a bad request, and it ends
+        // the turn if nothing retries. Retrying is safe here and only here: the
+        // request has not been answered, so it cannot have taken effect twice.
+        let response = self.send_retrying(|| {
+            self.http
+                .post(&url)
+                .bearer_auth(&self.config.api_key)
+                .header("content-type", "application/json")
+                .header("accept", "text/event-stream")
+                .json(&body)
+        })
+        .await
+        .with_context(|| format!("POST {url}"))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -335,6 +341,55 @@ impl LlmClient {
         Ok(rx)
     }
 
+    /// Send a request, retrying when the connection fails before a response.
+    ///
+    /// A pooled connection can be closed by the peer between the moment it is
+    /// taken from the pool and the moment the request is written to it. The
+    /// failure reads as "peer closed connection without sending TLS
+    /// close_notify" — a race, not a bad request — and without a retry it ends
+    /// the turn.
+    ///
+    /// Retrying is safe **only** for this phase. Once a response has begun, the
+    /// model may already have produced output the caller has seen, so a retry
+    /// there would duplicate work rather than recover it.
+    async fn send_retrying<F>(&self, build: F) -> Result<reqwest::Response>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        const ATTEMPTS: u32 = 3;
+        let mut last: Option<reqwest::Error> = None;
+
+        for attempt in 1..=ATTEMPTS {
+            match build().send().await {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    // Only connection-level failures are retried. A timeout is
+                    // not: the request may have been received and answered, and
+                    // sending it again is how one turn becomes two.
+                    if !error.is_connect() && !is_connection_closed(&error) {
+                        return Err(error.into());
+                    }
+                    last = Some(error);
+                    if attempt < ATTEMPTS {
+                        // A short pause lets a pooled connection be discarded
+                        // and a fresh one opened, which is what the retry is
+                        // for; retrying immediately can pick the same dead one.
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            200 * u64::from(attempt),
+                        ))
+                        .await;
+                    }
+                }
+            }
+        }
+
+        Err(last
+            .map(|error| anyhow!("{error}"))
+            .unwrap_or_else(|| anyhow!("request failed after {ATTEMPTS} attempts")))
+    }
+
+    /// Whether an error is the peer closing a connection mid-request.
+
     fn build_body(&self, messages: &[Message], tools: &[Value]) -> Value {
         let wire: Vec<Value> = messages.iter().map(to_wire).collect();
         let mut body = json!({
@@ -382,10 +437,7 @@ impl LlmClient {
     pub async fn list_models_detailed(&self) -> Result<Vec<ModelInfo>> {
         let url = format!("{}/models", self.config.base_url.trim_end_matches('/'));
         let response = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.config.api_key)
-            .send()
+            .send_retrying(|| self.http.get(&url).bearer_auth(&self.config.api_key))
             .await
             .with_context(|| format!("GET {url}"))?;
         let status = response.status();
@@ -411,10 +463,7 @@ impl LlmClient {
     pub async fn list_models(&self) -> Result<Vec<String>> {
         let url = format!("{}/models", self.config.base_url.trim_end_matches('/'));
         let response = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.config.api_key)
-            .send()
+            .send_retrying(|| self.http.get(&url).bearer_auth(&self.config.api_key))
             .await
             .with_context(|| format!("GET {url}"))?;
         let status = response.status();
@@ -701,5 +750,170 @@ mod body_tests {
         let body = client.preview_body(&[Message::user("hi")], &[]);
         assert_eq!(body["stream"], true);
         assert_eq!(body["model"], "test-model");
+    }
+}
+
+/// Whether an error is the peer closing a connection mid-request.
+///
+/// reqwest reports this as a body or request error rather than a connect error,
+/// because the connection was established and then went away. The distinction
+/// matters: it is the one failure that is certainly safe to retry.
+fn is_connection_closed(error: &reqwest::Error) -> bool {
+    // The text that identifies this failure is in the cause chain rather than
+    // the outermost error. reqwest reports "error sending request for url (...)"
+    // and the actionable words — "connection closed before message completed" —
+    // are one level down, so testing only `error.to_string()` classifies every
+    // dropped connection as unretryable.
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(link) = current {
+        if matches_closed_text(&link.to_string()) {
+            return true;
+        }
+        current = link.source();
+    }
+    false
+}
+
+/// The message test behind [`is_connection_closed`].
+///
+/// Separated from the error type so it can be exercised against the exact
+/// strings a peer produces, which is the whole of the decision.
+fn matches_closed_text(text: &str) -> bool {
+    text.contains("close_notify")
+        || text.contains("connection closed")
+        || text.contains("Connection reset")
+        || text.contains("connection reset")
+        || text.contains("broken pipe")
+        || text.contains("IncompleteMessage")
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    /// Build a reqwest error of the kind the peer-closed path produces.
+    fn error_from(message: &str) -> reqwest::Error {
+        // A request to a port nothing listens on gives a real connect error;
+        // the classification below is what is under test, so the exact variant
+        // matters less than the message it carries.
+        let client = reqwest::Client::new();
+        let url = "http://127.0.0.1:1/";
+        let error = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async { client.get(url).send().await.unwrap_err() });
+        let _ = message;
+        error
+    }
+
+    #[test]
+    fn a_connect_error_is_recognised() {
+        let error = error_from("connection refused");
+        assert!(error.is_connect(), "{error}");
+    }
+
+    #[test]
+    fn the_close_notify_message_is_recognised_as_closed() {
+        // The exact string a peer that closes without a TLS shutdown produces.
+        // It cannot be built from a real reqwest error here, so the predicate
+        // is exercised through the messages it must match.
+        for text in [
+            "peer closed connection without sending TLS close_notify",
+            "connection closed before message completed",
+            "Connection reset by peer",
+            "broken pipe",
+        ] {
+            assert!(
+                matches_closed_text(text),
+                "{text:?} should be treated as a closed connection"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrelated_failure_is_not_treated_as_closed() {
+        for text in [
+            "provider returned 400 Bad Request",
+            "invalid api key",
+            "operation timed out",
+        ] {
+            assert!(
+                !matches_closed_text(text),
+                "{text:?} must not be retried"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connection_dropped_before_the_response_is_retried() {
+        // A server that accepts the first connection and closes it without
+        // answering, then answers the second. This is the shape of the failure
+        // a peer produces when it discards a pooled connection, and the retry
+        // is the whole of the defence against it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            // First connection: accept and drop, so the client sees a closed
+            // connection rather than a response.
+            if let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+            // Second connection: answer properly.
+            if let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let body = "{\"ok\":true}";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+                // Held open long enough for the client to read the response.
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        });
+
+        let config = LlmConfig::new(format!("http://{addr}"), "k", "m");
+        let client = LlmClient::new(config).unwrap();
+        let url = format!("http://{addr}/x");
+
+        let response = client
+            .send_retrying(|| client.http.get(&url))
+            .await
+            .expect("the retry should recover");
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.text().await.unwrap(), "{\"ok\":true}");
+    }
+
+    #[tokio::test]
+    async fn a_server_that_always_drops_fails_after_the_attempts_run_out() {
+        // Retrying must not become an infinite loop against a server that is
+        // simply down.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+        });
+
+        let config = LlmConfig::new(format!("http://{addr}"), "k", "m");
+        let client = LlmClient::new(config).unwrap();
+        let url = format!("http://{addr}/x");
+
+        let started = std::time::Instant::now();
+        let _ = client
+            .send_retrying(|| client.http.get(&url))
+            .await
+            .expect_err("it must give up");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "giving up took {:?}",
+            started.elapsed()
+        );
     }
 }
