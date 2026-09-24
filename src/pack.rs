@@ -470,6 +470,9 @@ pub struct ModelsFile {
     /// Output ceiling, as `8K` or a number.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<String>,
+    /// How requests are sent: timeouts, pooling, retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<crate::network::NetworkSettings>,
     /// Fields merged into every request body.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub extra_body: serde_json::Map<String, serde_json::Value>,

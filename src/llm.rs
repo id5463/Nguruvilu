@@ -41,7 +41,12 @@ pub struct LlmConfig {
     /// Proxy for all requests; empty means direct.
     pub proxy: String,
     /// Request timeout in seconds.
+    ///
+    /// Kept for callers that set it directly; [LlmConfig::network] is what the
+    /// client actually uses, and it carries this value.
     pub timeout_secs: u64,
+    /// How the request is sent: timeouts, pooling, retries.
+    pub network: crate::network::NetworkSettings,
 }
 
 impl LlmConfig {
@@ -56,6 +61,7 @@ impl LlmConfig {
             reasoning_effort: None,
             proxy: String::new(),
             timeout_secs: 300,
+            network: crate::network::NetworkSettings::default(),
         }
     }
 }
@@ -130,9 +136,17 @@ impl LlmClient {
     /// error that says nothing about proxies. Here an empty `proxy` disables
     /// proxying outright, and a set one is used deliberately.
     pub fn new(config: LlmConfig) -> Result<Self> {
+        // The network settings are the source of truth; `timeout_secs` is kept
+        // in step so a caller reading it back sees what the client will use.
+        let mut config = config;
+        config.timeout_secs = config.network.request_timeout_secs;
+
         let mut builder = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(config.timeout_secs))
-            .pool_idle_timeout(std::time::Duration::from_secs(30));
+            .timeout(config.network.request_timeout())
+            // A connection kept longer than the provider keeps its own is a
+            // connection the provider has already closed, handed back out on the
+            // next request. Below their timeout, not above it.
+            .pool_idle_timeout(config.network.pool_idle_timeout());
 
         builder = match config.proxy.trim() {
             proxy if !proxy.is_empty() => {
@@ -356,10 +370,10 @@ impl LlmClient {
     where
         F: Fn() -> reqwest::RequestBuilder,
     {
-        const ATTEMPTS: u32 = 3;
+        let attempts = self.config.network.retry_attempts;
         let mut last: Option<reqwest::Error> = None;
 
-        for attempt in 1..=ATTEMPTS {
+        for attempt in 1..=attempts {
             match build().send().await {
                 Ok(response) => return Ok(response),
                 Err(error) => {
@@ -370,14 +384,13 @@ impl LlmClient {
                         return Err(error.into());
                     }
                     last = Some(error);
-                    if attempt < ATTEMPTS {
-                        // A short pause lets a pooled connection be discarded
-                        // and a fresh one opened, which is what the retry is
-                        // for; retrying immediately can pick the same dead one.
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            200 * u64::from(attempt),
-                        ))
-                        .await;
+                    if attempt < attempts {
+                        // A pause lets a pooled connection be discarded and a
+                        // fresh one opened, which is what the retry is for;
+                        // retrying immediately can pick the same dead one. The
+                        // delay doubles, so a provider that is overloaded is not
+                        // hit three more times at the worst moment.
+                        tokio::time::sleep(self.config.network.backoff(attempt)).await;
                     }
                 }
             }
@@ -385,7 +398,7 @@ impl LlmClient {
 
         Err(last
             .map(|error| anyhow!("{error}"))
-            .unwrap_or_else(|| anyhow!("request failed after {ATTEMPTS} attempts")))
+            .unwrap_or_else(|| anyhow!("request failed after {attempts} attempts")))
     }
 
     /// Whether an error is the peer closing a connection mid-request.

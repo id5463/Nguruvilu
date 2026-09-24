@@ -290,6 +290,12 @@ impl AppState {
             "reasoning_effort": self.settings.reasoning_effort,
             "proxy": self.settings.proxy,
             "max_output_tokens": self.settings.max_output_tokens.map(nguruvilu::size::format_size),
+            "network": json!({
+                "request_timeout_secs": self.settings.network.request_timeout_secs,
+                "pool_idle_timeout_secs": self.settings.network.pool_idle_timeout_secs,
+                "retry_attempts": self.settings.network.retry_attempts,
+                "retry_backoff_ms": self.settings.network.retry_backoff_ms,
+            }),
             "base_url": snapshot.model_route.base_url,
             "cache_policy": format!("{:?}", snapshot.cache_policy),
             "config_version": snapshot.version,
@@ -448,6 +454,7 @@ impl AppState {
             compact_percent,
             compact_keep_recent: compact_keep_recent.max(1),
             max_output_tokens: max_output_tokens.filter(|t| *t > 0),
+            network: self.settings.network.clone(),
             extra_body: self.settings.extra_body.clone(),
         };
         settings.save()?;
@@ -506,6 +513,12 @@ impl AppState {
                         self.settings.api_key = value;
                     }
                 }
+            }
+        }
+
+        if let Some(models) = &content.models {
+            if let Some(network) = &models.network {
+                self.settings.network = network.clone();
             }
         }
 

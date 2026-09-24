@@ -33,6 +33,7 @@ pub mod llm;
 pub mod loader;
 pub mod mcp;
 pub mod message;
+pub mod network;
 pub mod pack;
 pub mod model;
 pub mod plugin;
@@ -64,6 +65,7 @@ pub use llm::{LlmClient, LlmConfig, LlmEvent};
 pub use loader::{LoadReport, Loader, Outcome};
 pub use mcp::{McpClient, McpSpec, McpTool};
 pub use message::{Message, Role, ToolCall};
+pub use network::{NetworkPolicy, NetworkSettings};
 pub use pack::{InstalledPack, PackManifest, VerifyReport};
 pub use plugin::{
     Action, Contributions, Decision, FiberState, Kernel, PermissionProvider, PermissionStack,

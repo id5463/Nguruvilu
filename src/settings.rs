@@ -74,6 +74,13 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<usize>,
 
+    /// How requests are sent: timeouts, pooling, retries.
+    ///
+    /// A pack's `models.json` may set these, and a plugin publishing the
+    /// `network` service overrides both.
+    #[serde(default)]
+    pub network: crate::network::NetworkSettings,
+
     /// Extra fields merged into every request body.
     ///
     /// This is how a provider difference stays a settings change: an endpoint
@@ -303,6 +310,7 @@ mod tests {
             compact_percent: 75,
             compact_keep_recent: 8,
             max_output_tokens: None,
+            network: crate::network::NetworkSettings::default(),
             extra_body: serde_json::Map::new(),
         };
         assert!(settings.is_configured());
@@ -321,6 +329,7 @@ mod tests {
             compact_percent: 75,
             compact_keep_recent: 8,
             max_output_tokens: None,
+            network: crate::network::NetworkSettings::default(),
             extra_body: serde_json::Map::new(),
         };
         assert_eq!(settings.model_or_default(), DEFAULT_MODEL);
@@ -368,6 +377,7 @@ mod tests {
             compact_percent: 75,
             compact_keep_recent: 8,
             max_output_tokens: None,
+            network: crate::network::NetworkSettings::default(),
             extra_body: serde_json::Map::new(),
         };
         let text = serde_json::to_string_pretty(&settings).unwrap();

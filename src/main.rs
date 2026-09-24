@@ -280,6 +280,21 @@ enum ConfigAction {
         /// Output token ceiling: 8K, 32K, or a plain count. Pass 0 to clear.
         #[arg(long)]
         max_output_tokens: Option<String>,
+        /// Network tuning preset: default, reasoning, local, or flaky.
+        #[arg(long)]
+        network: Option<String>,
+        /// Whole-request timeout, in seconds.
+        #[arg(long)]
+        request_timeout: Option<u64>,
+        /// How long an idle connection is kept for reuse, in seconds.
+        #[arg(long)]
+        pool_idle_timeout: Option<u64>,
+        /// How many times a dropped connection is retried.
+        #[arg(long)]
+        retry_attempts: Option<u32>,
+        /// Milliseconds before the first retry; doubles each attempt.
+        #[arg(long)]
+        retry_backoff_ms: Option<u64>,
     },
     /// Print the settings file path.
     Path,
@@ -1758,6 +1773,11 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             compact_percent,
             compact_keep_recent,
             max_output_tokens,
+            network,
+            request_timeout,
+            pool_idle_timeout,
+            retry_attempts,
+            retry_backoff_ms,
         }) => {
             let mut settings = Settings::load()?;
             if let Some(value) = base_url {
@@ -1790,6 +1810,33 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             if let Some(value) = max_output_tokens {
                 let tokens = nguruvilu::size::parse_size(value)?;
                 settings.max_output_tokens = if tokens == 0 { None } else { Some(tokens) };
+            }
+            if let Some(name) = network {
+                settings.network = nguruvilu::network::NetworkSettings::preset(name)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "unknown network preset '{name}'; expected one of {}",
+                            nguruvilu::network::NetworkSettings::presets().join(", ")
+                        )
+                    })?;
+            }
+            if let Some(value) = request_timeout {
+                settings.network.request_timeout_secs = *value;
+            }
+            if let Some(value) = pool_idle_timeout {
+                settings.network.pool_idle_timeout_secs = *value;
+            }
+            if let Some(value) = retry_attempts {
+                settings.network.retry_attempts = *value;
+            }
+            if let Some(value) = retry_backoff_ms {
+                settings.network.retry_backoff_ms = *value;
+            }
+            // A value that would behave unlike its name is reported here rather
+            // than at the first failed request.
+            let network_problems = settings.network.problems();
+            if !network_problems.is_empty() {
+                anyhow::bail!("{}", network_problems.join("; "));
             }
             settings.save()?;
 
@@ -1889,6 +1936,13 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             println!(
                 "compaction:    at {}% of the window, keeping {} recent messages",
                 effective.compact_percent, effective.compact_keep_recent
+            );
+            println!(
+                "network:       request {}s, pool idle {}s, {} retry(ies) from {}ms",
+                effective.network.request_timeout_secs,
+                effective.network.pool_idle_timeout_secs,
+                effective.network.retry_attempts,
+                effective.network.retry_backoff_ms
             );
             println!(
                 "max output:    {}",
