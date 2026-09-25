@@ -17,7 +17,8 @@ mod state;
 
 use std::io::BufRead;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{json, Value};
 use tao::dpi::LogicalSize;
@@ -46,6 +47,9 @@ pub enum UserEvent {
 struct Options {
     /// Send this prompt as soon as the shell is ready.
     prompt: Option<String>,
+    /// Id of the interface to use. Defaults to the first installed pack that
+    /// declares one; without either, the built-in interface.
+    ui: Option<String>,
     /// Run without a window, reading commands from stdin.
     headless: bool,
 }
@@ -59,6 +63,7 @@ fn options() -> Options {
     };
     Options {
         prompt: value_of("--prompt").or_else(|| value_of("-p")),
+        ui: value_of("--ui"),
         headless: args.iter().any(|arg| arg == "--headless"),
     }
 }
@@ -68,7 +73,7 @@ fn main() -> anyhow::Result<()> {
     if options.headless {
         return headless(options.prompt);
     }
-    windowed(options.prompt)
+    windowed(options.prompt.clone(), options.ui.clone())
 }
 
 /// Run without a window: JSON commands in on stdin, JSON events out on stdout.
@@ -141,7 +146,7 @@ fn headless(startup_prompt: Option<String>) -> anyhow::Result<()> {
 }
 
 /// Run with a window.
-fn windowed(startup_prompt: Option<String>) -> anyhow::Result<()> {
+fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Result<()> {
     // WebView2 takes its profile location from the environment. Setting it here
     // keeps the browser profile out of whatever directory the app was launched
     // from, which may be read-only.
@@ -172,14 +177,32 @@ fn windowed(startup_prompt: Option<String>) -> anyhow::Result<()> {
         let sink = Arc::clone(&sink);
         let handle = handle.clone();
         let startup_prompt = startup_prompt.clone();
+        // Decided before the window exists: the page is loaded once, so an
+        // interface cannot be swapped in afterwards without a reload.
+        if let Some(directory) = resolve_active_ui(ui_id.as_deref()) {
+            set_active_ui(directory);
+        }
+
         WebViewBuilder::new()
             // `with_html` serves the page from an opaque origin, where WebView2
             // refuses to run inline scripts — the page renders but stays inert.
             // A custom protocol gives it a real origin, so its script runs.
-            .with_custom_protocol("ngu".into(), move |_id, _request| {
+            //
+            // The handler is a file server rather than a single page: an
+            // interface a pack brings is a directory of assets, and its own
+            // stylesheets, scripts, and images resolve as relative paths
+            // against it. Which directory is served is decided when a pack
+            // declares one; until then it is the built-in interface, so the
+            // window is never blank.
+            .with_custom_protocol("ngu".into(), move |_id, request| {
+                let path = request.uri().path().trim_start_matches('/').to_string();
+                let (body, mime) = serve_ui(&path);
                 wry::http::Response::builder()
-                    .header("Content-Type", "text/html; charset=utf-8")
-                    .body(std::borrow::Cow::Borrowed(UI_HTML.as_bytes()))
+                    .header("Content-Type", mime)
+                    // An interface is edited in place while being written, so a
+                    // cached copy is a stale one.
+                    .header("Cache-Control", "no-store")
+                    .body(std::borrow::Cow::Owned(body))
                     .expect("building the response")
             })
             .with_url("ngu://localhost/")
@@ -809,6 +832,138 @@ fn remove_pack(target: &str) -> anyhow::Result<()> {
         source.remove(&pack.path)?;
     }
     Ok(())
+}
+
+/// Find the interface to serve, before the window exists.
+///
+/// The page is loaded once when the window is created, so which interface it
+/// gets has to be decided first — switching afterwards would mean reloading.
+///
+/// `wanted` names one by id; without it, the first installed pack that declares
+/// an interface wins. The built-in is what a machine with no such pack gets,
+/// which is why nothing has to be configured for the program to work.
+fn resolve_active_ui(wanted: Option<&str>) -> Option<PathBuf> {
+    let packs = nguruvilu::pack::installed(&nguruvilu::pack::default_packs_dir()).ok()?;
+
+    for pack in &packs {
+        let Some(ui) = &pack.manifest.ui else {
+            continue;
+        };
+        if let Some(wanted) = wanted {
+            if ui.id != wanted {
+                continue;
+            }
+        }
+        // `entry` is relative to the installed pack, so its parent is the
+        // directory the assets live in.
+        let entry = pack.path.join(&ui.entry);
+        if !entry.is_file() {
+            eprintln!(
+                "[ui] {} declares interface '{}' but {} is not there",
+                pack.manifest.name,
+                ui.id,
+                entry.display()
+            );
+            continue;
+        }
+        let directory = entry.parent().map(PathBuf::from)?;
+        eprintln!("[ui] serving interface '{}' from {}", ui.id, directory.display());
+        return Some(directory);
+    }
+
+    if wanted.is_some() {
+        eprintln!(
+            "[ui] no installed pack declares interface '{}'; using the built-in one",
+            wanted.unwrap_or_default()
+        );
+    }
+    None
+}
+
+/// Where the served interface lives.
+///
+/// Set once when a pack declares one. A global rather than a parameter because
+/// the custom-protocol handler is a plain closure that the webview builder owns
+/// for the life of the window, and it must answer without knowing about state
+/// locks — a handler that blocks on the state mutex while the UI thread holds
+/// it would deadlock the window.
+static ACTIVE_UI: OnceLock<PathBuf> = OnceLock::new();
+
+/// Serve a path from the active interface directory, or the built-in page.
+///
+/// A path that is not there falls back to the entry file rather than 404: a
+/// single-page interface routes its own URLs, and a reload on one of those must
+/// still render the application.
+fn serve_ui(path: &str) -> (Vec<u8>, &'static str) {
+    let builtin = || (UI_HTML.as_bytes().to_vec(), "text/html; charset=utf-8");
+
+    let Some(root) = ACTIVE_UI.get() else {
+        return builtin();
+    };
+
+    // A path from a URL is untrusted input that becomes a filesystem path.
+    // Refusing anything but a plain relative descent is what keeps `..` from
+    // reaching outside the interface directory.
+    let requested = if path.is_empty() { "index.html" } else { path };
+    let candidate = if requested
+        .split('/')
+        .all(|part| !part.is_empty() && part != "." && part != "..")
+    {
+        root.join(requested)
+    } else {
+        root.join("index.html")
+    };
+
+    let file = if candidate.is_file() {
+        candidate
+    } else {
+        root.join("index.html")
+    };
+
+    match std::fs::read(&file) {
+        Ok(bytes) => (bytes, mime_for(&file)),
+        Err(error) => {
+            eprintln!("[ui] cannot read {}: {error}", file.display());
+            builtin()
+        }
+    }
+}
+
+/// A content type for the extensions an interface actually uses.
+fn mime_for(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "wasm" => "application/wasm",
+        "mp3" => "audio/mpeg",
+        "mp4" => "video/mp4",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Point the window at an interface directory.
+fn set_active_ui(dir: PathBuf) {
+    // First writer wins: the interface is chosen once, at startup, and a second
+    // call would silently serve a different directory than the page was loaded
+    // from.
+    if ACTIVE_UI.set(dir).is_ok() {
+        // nothing to do; the handler reads it on the next request
+    }
 }
 
 /// Send the panels plugins contributed.

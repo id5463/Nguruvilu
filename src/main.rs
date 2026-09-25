@@ -210,7 +210,8 @@ enum Command {
     },
     /// List installed packs.
     Packs,
-    /// Remove an installed pack.
+
+/// Remove an installed pack.
     Uninstall {
         /// Pack name, or `name@version` to remove one of several.
         name: String,
@@ -220,6 +221,15 @@ enum Command {
         /// Directory to remove from.
         #[arg(long)]
         into: Option<PathBuf>,
+    },
+    /// Write the built-in interface into a directory, to start a pack from.
+    ///
+    /// Without this, replacing the interface means rewriting every event
+    /// handler from nothing, which nobody does. The built-in one is the
+    /// worked example.
+    Ui {
+        /// Where to write it. Defaults to ./ui.
+        dir: Option<PathBuf>,
     },
     /// Verify a `.dshpack` archive without installing it.
     Verify {
@@ -548,6 +558,7 @@ async fn run() -> Result<()> {
         Some(Command::Uninstall { name, all, into }) => {
             return uninstall_command(name, *all, into.as_ref(), cli.json)
         }
+        Some(Command::Ui { dir }) => return ui_command(dir.as_ref(), cli.json),
         Some(Command::Verify { file }) => return verify_command(file, cli.json),
         Some(Command::Plugin { action }) => return plugin_command(action, cli.json),
         Some(Command::Config { action }) => return config_command(action.as_ref(), cli.json),
@@ -1499,6 +1510,48 @@ fn list_packs(as_json: bool) -> Result<()> {
             pack.manifest.license,
             if pack.assembly.is_some() { "yes" } else { "no" }
         );
+    }
+    Ok(())
+}
+
+/// Write a copy of the built-in interface to a directory.
+fn ui_command(dir: Option<&PathBuf>, as_json: bool) -> Result<()> {
+    let target = dir.cloned().unwrap_or_else(|| PathBuf::from("ui"));
+    std::fs::create_dir_all(&target)
+        .with_context(|| format!("creating {}", target.display()))?;
+
+    let page = target.join("index.html");
+    std::fs::write(&page, nguruvilu::ui::BUILTIN_HTML)
+        .with_context(|| format!("writing {}", page.display()))?;
+
+    // The declaration that makes the directory an interface, so `eject` gives
+    // something a pack can point at rather than a loose file.
+    let manifest = nguruvilu::pack::PackManifest {
+        ui: Some(nguruvilu::pack::UiDecl {
+            id: "my-ui".into(),
+            title: "我的界面".into(),
+            entry: "index.html".into(),
+            source: None,
+            sha256: None,
+        }),
+        ..nguruvilu::pack::PackManifest::new("my-ui", "1.0.0")
+    };
+    nguruvilu::pack::write_manifest(&target, &manifest)?;
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "dir": target.display().to_string(),
+                "entry": "index.html",
+                "bytes": nguruvilu::ui::BUILTIN_HTML.len(),
+            }))?
+        );
+    } else {
+        println!("wrote the built-in interface to {}", target.display());
+        println!("edit index.html, then `ngu pack {}`", target.display());
+        println!("the declaration in dsh.index.json points at it");
     }
     Ok(())
 }

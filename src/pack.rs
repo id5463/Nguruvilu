@@ -148,6 +148,9 @@ pub struct PackManifest {
     /// Injection rule file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub injections: Option<ContentRef>,
+    /// A user interface this pack brings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<UiDecl>,
 }
 
 /// Accepted kernel version range.
@@ -171,7 +174,55 @@ fn default_range() -> String {
     ">=0.0.0".to_string()
 }
 
-    /// Where one content file comes from.
+    /// A user interface a pack brings.
+///
+/// The interface is a whole client, not a panel inside the built-in one. It is
+/// plain web assets — the desktop shell is a web view — so a single set of
+/// files covers every platform, and it can be as large as it needs to be
+/// because it is fetched rather than carried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UiDecl {
+    /// Identifier, used to select it.
+    #[serde(default)]
+    pub id: String,
+    /// Title shown when choosing.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    /// The entry file within the interface directory.
+    #[serde(default = "default_entry")]
+    pub entry: String,
+    /// Where the interface comes from, when it is fetched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// sha256 of the fetched directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
+fn default_entry() -> String {
+    "index.html".into()
+}
+
+impl UiDecl {
+    /// A carried interface.
+    pub fn carried(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            title: String::new(),
+            entry: default_entry(),
+            source: None,
+            sha256: None,
+        }
+    }
+
+    /// Whether this interface is fetched rather than carried.
+    pub fn is_fetched(&self) -> bool {
+        self.source.is_some()
+    }
+}
+
+/// Where one content file comes from.
 ///
 /// Either carried in the pack or fetched, and the author chooses. A persona or
 /// a context policy is small and belongs in the pack; a user interface is not —
@@ -275,6 +326,7 @@ impl PackManifest {
             mcp: None,
             look: None,
             injections: None,
+            ui: None,
         }
     }
 
@@ -1294,6 +1346,28 @@ async fn install_inner(
             .await
             .with_context(|| format!("fetching mcp '{}' from {source}", server.id))?;
         copy_tree(&fetched.path, &staging.join(FILES_DIR).join("mcp").join(&server.id))?;
+    }
+
+    // A fetched interface lands under files/ui/, and the declaration is
+    // rewritten to point inside the pack so the shell reads one layout whether
+    // the interface arrived over the wire or was carried.
+    if let Some(ui) = manifest.ui.clone() {
+        if let Some(source) = &ui.source {
+            let parsed = Source::parse(source)
+                .with_context(|| format!("ui '{}' source", ui.id))?;
+            let fetched = fetcher
+                .fetch(&parsed, ui.sha256.as_deref())
+                .await
+                .with_context(|| format!("fetching ui '{}' from {source}", ui.id))?;
+            let local = staging.join(FILES_DIR).join("ui");
+            copy_tree(&fetched.path, &local)?;
+            let mut carried = ui.clone();
+            carried.source = None;
+            carried.sha256 = None;
+            carried.entry = format!("{FILES_DIR}/ui/{}", ui.entry.trim_start_matches('/'));
+            manifest.ui = Some(carried);
+            write_manifest(staging, &manifest)?;
+        }
     }
 
     let destination = packs_dir.join(format!("{}-{}", manifest.name, manifest.version_id));

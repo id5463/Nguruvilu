@@ -25,6 +25,13 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The built-in interface, as a string.
+///
+/// Written out by the eject command so a pack author has a worked example to
+/// start from rather than having to handle every event from nothing. It is the
+/// same string the desktop shell compiles in, so the two cannot drift.
+pub const BUILTIN_HTML: &str = include_str!("../desktop/ui/index.html");
+
 /// A place on screen a plugin may fill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
