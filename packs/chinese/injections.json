@@ -1,0 +1,20 @@
+{
+  "budget_percent": 10,
+  "scan": "user",
+  "entries": [
+    {
+      "id": "chinese-only",
+      "content": "用中文回答。代码、命令、路径、标识符保持原样不翻译。",
+      "constant": true,
+      "position": "prefix",
+      "order": 100
+    },
+    {
+      "id": "no-preamble",
+      "content": "不要用「好的」「我来帮你」这类开场白,直接给结果。",
+      "constant": true,
+      "position": "prefix",
+      "order": 90
+    }
+  ]
+}
