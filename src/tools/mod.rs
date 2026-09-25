@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 
 pub mod base;
 pub mod pack;
+pub mod search;
 
 /// What a tool produced.
 ///

@@ -81,6 +81,13 @@ pub struct Settings {
     #[serde(default)]
     pub network: crate::network::NetworkSettings,
 
+    /// Web search, when configured.
+    ///
+    /// Absent means no web_search tool is registered at all — a tool that
+    /// always fails is worse than one that is not there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<crate::tools::search::SearchSettings>,
+
     /// Extra fields merged into every request body.
     ///
     /// This is how a provider difference stays a settings change: an endpoint
@@ -236,6 +243,10 @@ impl Settings {
             settings.proxy = value.trim().to_string();
         }
 
+        if let Some(from_env) = crate::tools::search::from_env() {
+            settings.search = Some(from_env);
+        }
+
         if let Ok(value) = std::env::var("NGU_MAX_OUTPUT_TOKENS") {
             if let Ok(tokens) = crate::size::parse_size(&value) {
                 settings.max_output_tokens = Some(tokens);
@@ -311,6 +322,7 @@ mod tests {
             compact_keep_recent: 8,
             max_output_tokens: None,
             network: crate::network::NetworkSettings::default(),
+            search: None,
             extra_body: serde_json::Map::new(),
         };
         assert!(settings.is_configured());
@@ -330,6 +342,7 @@ mod tests {
             compact_keep_recent: 8,
             max_output_tokens: None,
             network: crate::network::NetworkSettings::default(),
+            search: None,
             extra_body: serde_json::Map::new(),
         };
         assert_eq!(settings.model_or_default(), DEFAULT_MODEL);
@@ -378,6 +391,7 @@ mod tests {
             compact_keep_recent: 8,
             max_output_tokens: None,
             network: crate::network::NetworkSettings::default(),
+            search: None,
             extra_body: serde_json::Map::new(),
         };
         let text = serde_json::to_string_pretty(&settings).unwrap();

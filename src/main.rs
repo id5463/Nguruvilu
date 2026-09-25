@@ -584,6 +584,14 @@ async fn run() -> Result<()> {
     let mut kernel = Kernel::new();
     // The agent can build and install packs itself.
     nguruvilu::tools::pack::register(kernel.tools_mut())?;
+    // Search appears only when a provider and key are configured. A tool
+    // that is present and fails on every call costs a turn every time a
+    // model tries it; absent, the model does not know it exists.
+    if let Some(search) = settings.search.clone() {
+        if nguruvilu::tools::search::register(kernel.tools_mut(), search)? {
+            eprintln!("[search] enabled");
+        }
+    }
     if !skills.is_empty() {
         register_skill_tool(kernel.tools_mut(), Arc::new(skills.clone()))?;
     }
