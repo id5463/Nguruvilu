@@ -874,11 +874,72 @@ function setBusy(value) {
   }
 }
 
-// ---------------------------------------------------------------- events
+// ------------------------------------------------------------- 公开接口
+//
+// 界面与内核之间只有这一层。任何界面 —— 内置的这个,或者某个包带来的 —— 都用
+// 它。内核不知道界面怎么画,界面也不需要知道内核怎么想。
+//
+// 事件按名字分发;`onAny` 收全部。命令原样送给壳。
 
-window.ngu = {
-  receive(event) {
-    switch (event.ev) {
+const handlers = new Map();   // 事件名 -> 处理函数
+const anyHandlers = [];       // 收全部的处理函数
+let latest = {};              // 最近一次状态快照,给 state() 用
+
+/// 订阅一个事件。返回取消订阅的函数。
+function on(name, handler) {
+  if (!handlers.has(name)) handlers.set(name, []);
+  handlers.get(name).push(handler);
+  return () => {
+    const list = handlers.get(name) || [];
+    const at = list.indexOf(handler);
+    if (at >= 0) list.splice(at, 1);
+  };
+}
+
+/// 订阅全部事件。参数是 (名字, 事件)。
+function onAny(handler) {
+  anyHandlers.push(handler);
+  return () => {
+    const at = anyHandlers.indexOf(handler);
+    if (at >= 0) anyHandlers.splice(at, 1);
+  };
+}
+
+/// 发一个命令给内核。
+function sendCommand(command) {
+  toShell(command);
+}
+/// 最近一次状态快照。第一次请求靠 `sendCommand({cmd:"status"})` 触发。
+function state() {
+  return latest;
+}
+
+/// 壳把事件送进来。内置界面自己也是通过 on/onAny 收的,没有私线。
+function receive(event) {
+  const name = event.ev;
+  if (name === "status") latest = event.status || {};
+  for (const handler of handlers.get(name) || []) {
+    try {
+      handler(event);
+    } catch (error) {
+      notice("界面处理 " + name + " 时出错: " + error.message, true);
+    }
+  }
+  for (const handler of anyHandlers) {
+    try {
+      handler(name, event);
+    } catch (error) {
+      notice("界面处理 " + name + " 时出错: " + error.message, true);
+    }
+  }
+}
+
+window.ngu = { on, onAny, send: sendCommand, state, receive };
+
+// 内置界面自己的事件处理。它走的是同一个总线 —— 没有私有通道,所以一个包带来
+// 的界面能做内置界面能做的任何事。
+onAny((name, event) => {
+  switch (name) {
       case "theme":
         applyTheme(event);
         break;
@@ -993,8 +1054,9 @@ window.ngu = {
         // Steps surface through tool cards and the closing summary.
         break;
     }
-  },
-};
+});
+
+ngu.send({ cmd: "ready" });
 
 // ---------------------------------------------------------------- composer
 
@@ -1070,8 +1132,7 @@ document.getElementById("btn-pack").addEventListener("click", () => toShell({ cm
 document.getElementById("btn-verify").addEventListener("click", () => toShell({ cmd: "pick_verify" }));
 
 // The page is loaded and listening; ask the shell for initial state.
-toShell({ cmd: "ready" });
-toShell({ cmd: "list_packs" });
+ngu.send({ cmd: "list_packs" });
 </script>
 </body>
 </html>
