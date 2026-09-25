@@ -860,21 +860,28 @@ mod retry_tests {
 
     #[tokio::test]
     async fn a_connection_dropped_before_the_response_is_retried() {
-        // A server that accepts the first connection and closes it without
-        // answering, then answers the second. This is the shape of the failure
-        // a peer produces when it discards a pooled connection, and the retry
-        // is the whole of the defence against it.
+        // A server that closes the first connection without answering and
+        // answers every one after. This is the shape of the failure a peer
+        // produces when it discards a pooled connection, and the retry is the
+        // whole of the defence against it.
+        //
+        // It keeps accepting rather than answering exactly the second: under a
+        // parallel test run the client may make its first attempt before the
+        // listener is ready, so counting connections makes the test depend on
+        // scheduling. Answering everything after the first does not.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
-            // First connection: accept and drop, so the client sees a closed
-            // connection rather than a response.
-            if let Ok((socket, _)) = listener.accept().await {
-                drop(socket);
-            }
-            // Second connection: answer properly.
-            if let Ok((mut socket, _)) = listener.accept().await {
+            let mut first = true;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                if first {
+                    first = false;
+                    // Closed without a response, which is what a reaped
+                    // connection looks like from the client's side.
+                    drop(socket);
+                    continue;
+                }
                 use tokio::io::AsyncWriteExt;
                 let body = "{\"ok\":true}";
                 let response = format!(
@@ -883,8 +890,9 @@ mod retry_tests {
                 );
                 let _ = socket.write_all(response.as_bytes()).await;
                 let _ = socket.flush().await;
-                // Held open long enough for the client to read the response.
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                // Held open until the client has read it; closing immediately
+                // can truncate the response instead of ending it cleanly.
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         });
 

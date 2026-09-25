@@ -482,6 +482,14 @@ impl PackManifest {
             }
         }
 
+        if let Some(reference) = self.content_file("mcp") {
+            if let Some(source) = reference.source() {
+                if let Err(error) = Source::parse(source) {
+                    problems.push(format!("mcp: {error:#}"));
+                }
+            }
+        }
+
         for component in &self.components {
             if component.license.trim().is_empty() {
                 problems.push(format!(
@@ -654,7 +662,21 @@ pub struct McpServerDecl {
     /// `stdio` today; `streamable-http` is declared but not connected.
     #[serde(default = "default_transport")]
     pub transport: String,
-    /// Executable.
+    /// Where the server comes from, when it is fetched rather than installed.
+    ///
+    /// Without this an MCP server can only be something already on the machine,
+    /// which in practice means an npm package run through `npx` — and far more
+    /// servers exist in git repositories than in npm. A source makes the
+    /// channel a declaration, so a server published anywhere can be used.
+    ///
+    /// A fetched server lands under `files/mcp/<id>/`, and `command` is
+    /// resolved inside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// sha256 of the fetched server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Executable. Relative to the fetched directory when there is a source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     /// Arguments.
@@ -1233,6 +1255,36 @@ async fn install_inner(
         write_manifest(staging, &manifest)?;
     }
 
+    // MCP servers named by a source are fetched alongside skills and plugins.
+    // A server only reachable through npx is a server the user has to install a
+    // runtime for.
+    let mcp_decls = match manifest.mcp.as_ref() {
+        Some(reference) => {
+            let path = staging.join(reference.path());
+            if path.is_file() {
+                let text = std::fs::read_to_string(&path)?;
+                serde_json::from_str::<McpFile>(&text)
+                    .with_context(|| format!("{} is not a valid mcp file", path.display()))?
+                    .servers
+            } else {
+                Vec::new()
+            }
+        }
+        None => Vec::new(),
+    };
+    for server in &mcp_decls {
+        let Some(source) = &server.source else {
+            continue;
+        };
+        let parsed = Source::parse(source)
+            .with_context(|| format!("mcp '{}' source", server.id))?;
+        let fetched = fetcher
+            .fetch(&parsed, server.sha256.as_deref())
+            .await
+            .with_context(|| format!("fetching mcp '{}' from {source}", server.id))?;
+        copy_tree(&fetched.path, &staging.join(FILES_DIR).join("mcp").join(&server.id))?;
+    }
+
     let destination = packs_dir.join(format!("{}-{}", manifest.name, manifest.version_id));
     if destination.exists() {
         std::fs::remove_dir_all(&destination)
@@ -1355,22 +1407,37 @@ fn render_assembly(manifest: &PackManifest, staging: &Path) -> Result<String> {
             parsed
                 .servers
                 .into_iter()
-                .map(|server| OutMcp {
-                    base: OutBase {
-                        id: server.id.clone(),
-                        source: server
-                            .command
-                            .clone()
-                            .map(|c| format!("stdio:{c} {}", server.args.join(" ")))
-                            .unwrap_or_default()
-                            .trim()
-                            .to_string(),
-                        scope: server.scope,
-                    },
-                    transport: server.transport,
-                    command: server.command,
-                    args: server.args,
-                    env: server.env,
+                .map(|server| {
+                    // A fetched server runs from where it landed, so the
+                    // command is resolved inside that directory. Without this
+                    // the loader would look for it on PATH.
+                    let command = match (&server.source, &server.command) {
+                        (Some(_), Some(command)) => Some(
+                            Path::new(FILES_DIR)
+                                .join("mcp")
+                                .join(&server.id)
+                                .join(command)
+                                .to_string_lossy()
+                                .replace('\\', "/"),
+                        ),
+                        (_, command) => command.clone(),
+                    };
+                    OutMcp {
+                        base: OutBase {
+                            id: server.id.clone(),
+                            source: command
+                                .clone()
+                                .map(|c| format!("stdio:{c} {}", server.args.join(" ")))
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string(),
+                            scope: server.scope,
+                        },
+                        transport: server.transport,
+                        command,
+                        args: server.args,
+                        env: server.env,
+                    }
                 })
                 .collect()
         }
@@ -1588,7 +1655,7 @@ mod tests {
         let mut manifest = PackManifest::new("demo", "1.0.0");
         manifest.plugins.push(PluginRef {
             id: "x".into(),
-            source: "ftp://nope".into(),
+            source: "no-colon-here".into(),
             license: "MIT".into(),
             sha256: None,
             platforms: BTreeMap::new(),
@@ -2064,5 +2131,41 @@ mod tests {
             "{:?}",
             report.warnings
         );
+    }
+
+    #[test]
+    fn an_mcp_server_naming_a_source_is_validated_like_any_other() {
+        // An MCP server that can only be an npm package is a server the user
+        // has to install a runtime for. A source makes the channel a
+        // declaration, so it has to parse.
+        let text = "{\"servers\":[{\"id\":\"fs\",\"source\":\"no-colon-here\"}]}";
+        let mcp: McpFile = serde_json::from_str(text).unwrap();
+        assert_eq!(mcp.servers[0].source.as_deref(), Some("no-colon-here"));
+
+        let mut manifest = PackManifest::new("demo", "1.0.0");
+        manifest.mcp = Some(ContentRef::carried("mcp.json"));
+        // The source lives in the file rather than the manifest, so the
+        // manifest alone cannot reject it; it is checked where the file is
+        // read.
+        assert!(manifest.problems().is_empty());
+    }
+
+    #[test]
+    fn a_fetched_mcp_server_records_its_source_and_hash() {
+        let text = "{\"servers\":[{\"id\":\"fs\",\"command\":\"mcp-fs\",\
+                     \"source\":\"github:owner/mcp@bin@v1\",\"sha256\":\"aa\"}]}";
+        let mcp: McpFile = serde_json::from_str(text).unwrap();
+        assert_eq!(mcp.servers[0].command.as_deref(), Some("mcp-fs"));
+        assert!(mcp.servers[0].source.is_some());
+        assert_eq!(mcp.servers[0].sha256.as_deref(), Some("aa"));
+    }
+
+    #[test]
+    fn an_mcp_server_without_a_source_round_trips_unchanged() {
+        // The npm-run form must keep working: most servers are still there.
+        let text = "{\"servers\":[{\"id\":\"fs\",\"command\":\"npx\",\"args\":[\"-y\",\"x\"]}]}";
+        let mcp: McpFile = serde_json::from_str(text).unwrap();
+        assert!(mcp.servers[0].source.is_none());
+        assert_eq!(mcp.servers[0].args.len(), 2);
     }
 }
