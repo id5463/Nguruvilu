@@ -1,0 +1,11 @@
+{
+  "servers": [
+    {
+      "id": "browser",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest", "--headless", "--isolated"],
+      "scope": "session"
+    }
+  ]
+}

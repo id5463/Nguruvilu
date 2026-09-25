@@ -88,9 +88,58 @@ pub struct McpClient {
 }
 
 impl McpClient {
-    /// Launch a server, complete the handshake, and fetch its tool list.
+    
+/// Resolve a command name to something the OS can actually launch.
+///
+/// On Windows `npx` is `npx.cmd`, and `Command::new` does not consult `PATHEXT`
+/// — so a pack that says `"command": "npx"` fails with "program not found" even
+/// though the command works in a shell. Every MCP server published as an npm
+/// package is launched that way, so this is the common case rather than an
+/// edge.
+///
+/// The lookup order is deliberate: an explicit `.exe` beats a `.cmd` shim,
+/// because a shim needs a shell to interpret it and a real executable does not.
+fn resolve_program(command: &str) -> std::path::PathBuf {
+    let path = std::path::Path::new(command);
+
+    // A path with a separator is the caller's business: they named a file.
+    if path.components().count() > 1 || path.extension().is_some() {
+        return path.to_path_buf();
+    }
+
+    #[cfg(windows)]
+    {
+        // `where` is the same lookup a shell does, so whatever works in a
+        // terminal works here.
+        if let Ok(output) = std::process::Command::new("where").arg(command).output() {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                let candidates: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+                // An `.exe` first: a `.cmd` needs a shell, and spawning one
+                // through `Command` without `cmd /c` would not run it.
+                if let Some(exe) = candidates.iter().find(|c| c.to_ascii_lowercase().ends_with(".exe")) {
+                    return std::path::PathBuf::from(exe);
+                }
+                if let Some(cmd) = candidates.iter().find(|c| {
+                    let lower = c.to_ascii_lowercase();
+                    lower.ends_with(".cmd") || lower.ends_with(".bat")
+                }) {
+                    return std::path::PathBuf::from(cmd);
+                }
+                if let Some(any) = candidates.first() {
+                    return std::path::PathBuf::from(any);
+                }
+            }
+        }
+    }
+
+    path.to_path_buf()
+}
+
+/// Launch a server, complete the handshake, and fetch its tool list.
     pub async fn connect(spec: &McpSpec) -> Result<Self> {
-        let mut command = Command::new(&spec.command);
+        let program = Self::resolve_program(&spec.command);
+        let mut command = Command::new(&program);
         command
             .args(&spec.args)
             .stdin(Stdio::piped())
