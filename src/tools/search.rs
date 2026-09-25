@@ -218,7 +218,16 @@ pub fn parse_response(dialect: Dialect, body: &Value) -> Vec<Hit> {
 }
 
 /// The tool name.
-pub const TOOL: &str = "web_search";
+///
+/// **Not `web_search`.** That name is reserved on the provider this was tested
+/// against: a *function* tool called `web_search` is silently dropped from the
+/// request, and the model then reports that it has no such tool. Everything
+/// else about it was correct — the tool registered, reached the tool table, and
+/// its schema was sent — and the only visible symptom was the model denying the
+/// tool existed, with no error anywhere to explain it.
+///
+/// So the name is `search_web`, and a test pins it.
+pub const TOOL: &str = "search_web";
 
 /// Register the tool, when search is configured.
 ///
@@ -550,5 +559,14 @@ mod tests {
         let mut absent = settings(Dialect::Tavily);
         absent.api_key = String::new();
         assert!(describe(&absent)["key"].contains("not registered"));
+    }
+
+    #[test]
+    fn the_tool_is_not_named_web_search() {
+        // A function tool called `web_search` is dropped by the provider this
+        // was tested against — the model then denies the tool exists, with no
+        // error anywhere. Renaming it was the fix, so the name is pinned.
+        assert_ne!(TOOL, "web_search");
+        assert_eq!(TOOL, "search_web");
     }
 }

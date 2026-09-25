@@ -305,6 +305,12 @@ enum ConfigAction {
         /// Milliseconds before the first retry; doubles each attempt.
         #[arg(long)]
         retry_backoff_ms: Option<u64>,
+        /// Search provider: tavily, brave, or exa.
+        #[arg(long)]
+        search_provider: Option<String>,
+        /// Search API key. The tool appears only when this is set.
+        #[arg(long)]
+        search_api_key: Option<String>,
     },
     /// Print the settings file path.
     Path,
@@ -1839,6 +1845,8 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             pool_idle_timeout,
             retry_attempts,
             retry_backoff_ms,
+            search_provider,
+            search_api_key,
         }) => {
             let mut settings = Settings::load()?;
             if let Some(value) = base_url {
@@ -1895,6 +1903,36 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             }
             // A value that would behave unlike its name is reported here rather
             // than at the first failed request.
+            if search_provider.is_some() || search_api_key.is_some() {
+                let mut search = settings
+                    .search
+                    .clone()
+                    .unwrap_or_else(|| nguruvilu::tools::search::SearchSettings {
+                        provider: nguruvilu::tools::search::Dialect::Tavily,
+                        api_key: String::new(),
+                        endpoint: None,
+                        max_results: 5,
+                    });
+                if let Some(name) = search_provider {
+                    search.provider = nguruvilu::tools::search::Dialect::parse(name).ok_or_else(
+                        || {
+                            anyhow!(
+                                "unknown search provider '{name}'; expected one of {}",
+                                nguruvilu::tools::search::Dialect::all()
+                                    .iter()
+                                    .map(|d| d.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        },
+                    )?;
+                }
+                if let Some(key) = search_api_key {
+                    search.api_key = key.clone();
+                }
+                settings.search = Some(search);
+            }
+
             let network_problems = settings.network.problems();
             if !network_problems.is_empty() {
                 anyhow::bail!("{}", network_problems.join("; "));

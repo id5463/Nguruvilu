@@ -172,6 +172,10 @@ impl AppState {
         let mut kernel = Kernel::new();
         // The agent can build and install packs itself.
         nguruvilu::tools::pack::register(kernel.tools_mut())?;
+        // Search appears only when a provider and key are configured.
+        if let Some(search) = settings.search.clone() {
+            let _ = nguruvilu::tools::search::register(kernel.tools_mut(), search)?;
+        }
         if !skills.is_empty() {
             register_skill_tool(kernel.tools_mut(), Arc::new(skills.clone()))?;
         }
@@ -455,6 +459,7 @@ impl AppState {
             compact_keep_recent: compact_keep_recent.max(1),
             max_output_tokens: max_output_tokens.filter(|t| *t > 0),
             network: self.settings.network.clone(),
+            search: self.settings.search.clone(),
             extra_body: self.settings.extra_body.clone(),
         };
         settings.save()?;
