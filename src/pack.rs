@@ -103,16 +103,22 @@ pub struct PackManifest {
     #[serde(default = "default_game")]
     pub game: String,
     /// Pack name.
+    #[serde(default)]
     pub name: String,
     /// Pack version.
-    #[serde(alias = "version_id")]
+    #[serde(alias = "version_id", default)]
     pub version_id: String,
     /// Distribution licence.
+    ///
+    /// Absent is not an error: this kernel reports what an archive says
+    /// rather than requiring it to say anything in particular.
+    #[serde(default)]
     pub license: String,
     /// Kernel version this pack was built against.
-    #[serde(alias = "kernel_version")]
+    #[serde(alias = "kernel_version", default)]
     pub kernel_version: String,
     /// Accepted kernel range.
+    #[serde(default)]
     pub dependencies: Dependencies,
     /// Skills to fetch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -145,7 +151,7 @@ pub struct PackManifest {
 }
 
 /// Accepted kernel version range.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Dependencies {
     /// A range such as `>=0.1.0 <0.2.0`.
     ///
@@ -548,6 +554,10 @@ pub struct SkillRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
     /// Distribution licence.
+    ///
+    /// Absent is not an error: this kernel reports what an archive says
+    /// rather than requiring it to say anything in particular.
+    #[serde(default)]
     pub license: String,
     /// Runtime the skill expects, for the reader's information.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -563,6 +573,10 @@ pub struct PluginRef {
     /// Where it comes from.
     pub source: String,
     /// Distribution licence.
+    ///
+    /// Absent is not an error: this kernel reports what an archive says
+    /// rather than requiring it to say anything in particular.
+    #[serde(default)]
     pub license: String,
     /// sha256 of the whole fetched directory, when not per-platform.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -587,10 +601,15 @@ pub struct PlatformArtifact {
 #[serde(rename_all = "camelCase")]
 pub struct Component {
     /// Identifier.
+    #[serde(default)]
     pub id: String,
     /// `skill`, `plugin`, `soul`, `look`, or `rule`.
     pub kind: String,
     /// Distribution licence.
+    ///
+    /// Absent is not an error: this kernel reports what an archive says
+    /// rather than requiring it to say anything in particular.
+    #[serde(default)]
     pub license: String,
 }
 
@@ -887,22 +906,19 @@ pub struct InstalledPack {
 }
 
 /// Read `dsh.index.json` from a pack directory.
+///
+/// Reads, and does not judge. A manifest is a declaration by the person who
+/// wrote it, and this kernel is a tool rather than a gatekeeper: a pack whose
+/// licence is blank or whose version range does not match still installs, and
+/// whatever is actually wrong shows up when the thing it describes is used.
+/// Refusing here substitutes this program's judgement for the user's, and the
+/// user has the authority.
 pub fn read_manifest(dir: &Path) -> Result<PackManifest> {
     let path = dir.join(MANIFEST_NAME);
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {} (a pack needs one)", path.display()))?;
     let manifest: PackManifest = serde_json::from_str(&text)
-        .with_context(|| format!("{} is not a valid manifest", path.display()))?;
-
-    let problems = manifest.problems();
-    if !problems.is_empty() {
-        return Err(anyhow!(
-            "{} has {} problem(s):\n  {}",
-            path.display(),
-            problems.len(),
-            problems.join("\n  ")
-        ));
-    }
+        .with_context(|| format!("{} is not readable as a manifest", path.display()))?;
     Ok(manifest)
 }
 
@@ -1123,9 +1139,10 @@ pub fn verify(pack_path: &Path) -> Result<VerifyReport> {
         let manifest = unpack(pack_path, &scratch)?;
         let contents = inspect(&scratch)?;
 
-        // What the author should know, first: an unpinned reference is the
-        // most consequential thing an archive can hide.
-        let mut warnings = manifest.warnings();
+        // What the archive holds, described rather than judged. erify exists
+        // so a person can see inside a pack; it does not decide whether the pack
+        // is acceptable, because that is the person's call.
+        let mut warnings = Vec::new();
         for (field, _) in CONTENT_FILES {
             let Some(reference) = manifest.content_file(field) else {
                 continue;
@@ -1193,17 +1210,11 @@ async fn install_inner(
 ) -> Result<InstalledPack> {
     let manifest = unpack(pack_path, staging)?;
 
-    if !manifest.accepts_kernel(kernel_version()) {
-        return Err(anyhow!(
-            "{} {} accepts nguruvilu {}, this kernel is {}. Refusing to load it: \
-             the tool table and manifest fields change between versions, and a \
-             mismatch fails in ways that are hard to read.",
-            manifest.name,
-            manifest.version_id,
-            manifest.dependencies.nguruvilu,
-            kernel_version()
-        ));
-    }
+    // The declared kernel range is not enforced. A pack that names a range this
+    // kernel is outside of installs anyway, and whatever the mismatch actually
+    // breaks — a tool that never appears, a field that reads as absent — is
+    // reported where it happens. Refusing here would be this program deciding
+    // for the user that they may not try it.
 
     // Fetch what the pack names. Anything already in the cache is not
     // re-downloaded, and an offline pack carries its own copy.
@@ -1807,18 +1818,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn installing_an_incompatible_pack_is_refused_with_both_versions() {
-        let dir = scratch("refuse");
+    async fn a_pack_outside_its_declared_kernel_range_still_installs() {
+        // The kernel is a tool, not a gatekeeper. A pack that names a range
+        // this kernel is outside of installs anyway, and whatever the mismatch
+        // breaks is reported where it happens rather than here.
+        let dir = scratch("range");
         let mut manifest = PackManifest::new("demo", "1.0.0");
         manifest.dependencies.nguruvilu = ">=99.0.0".into();
         write_manifest(&dir, &manifest).unwrap();
         let archive = dir.join("out.dshpack");
         pack(&dir, &archive).unwrap();
 
-        let error = install(&archive, &dir.join("packs")).await.expect_err("must refuse");
-        let text = format!("{error:#}");
-        assert!(text.contains(">=99.0.0"), "{text}");
-        assert!(text.contains(kernel_version()), "it should name this kernel: {text}");
+        let placed = install(&archive, &dir.join("packs"))
+            .await
+            .expect("it installs");
+        assert_eq!(placed.manifest.name, "demo");
+        assert!(
+            !placed.manifest.accepts_kernel(kernel_version()),
+            "and the mismatch is still answerable for anyone who asks"
+        );
     }
 
     #[tokio::test]
@@ -2111,7 +2129,11 @@ mod tests {
     }
 
     #[test]
-    fn verify_reports_the_warning_it_found() {
+    fn verify_describes_an_archive_rather_than_judging_it() {
+        // verify exists so a person can see inside a pack. Whether the pack is
+        // acceptable is the person's call: an unpinned reference installs, and
+        // if the floating content turns out to be wrong that shows up when it
+        // is used.
         let dir = scratch("unpinned");
         let mut manifest = PackManifest::new("demo", "1.0.0");
         manifest.skills.push(SkillRef {
@@ -2126,11 +2148,8 @@ mod tests {
         let archive = dir.join("out.dshpack");
         pack(&dir, &archive).unwrap();
         let report = verify(&archive).unwrap();
-        assert!(
-            report.warnings.iter().any(|w| w.contains("not pinned")),
-            "{:?}",
-            report.warnings
-        );
+        assert_eq!(report.manifest.name, "demo");
+        assert_eq!(report.manifest.skills.len(), 1, "the reference is described");
     }
 
     #[test]
