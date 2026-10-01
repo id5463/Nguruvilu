@@ -159,7 +159,7 @@ fn install_appearance(
     pack_name: &str,
     look: LookFile,
 ) -> Result<()> {
-    if look.themes.is_empty() && look.panels.is_empty() {
+    if look.themes.is_empty() && look.panels.is_empty() && look.strings.is_empty() {
         return Ok(());
     }
 
@@ -208,6 +208,11 @@ fn install_appearance(
             }
             for panel in &self.look.panels {
                 contributions = contributions.ui(panel.clone());
+            }
+            // Labels rather than colours: applied by the shell, which does not
+            // need to know which language they are in.
+            if !self.look.strings.is_empty() {
+                contributions = contributions.strings(self.look.strings.clone());
             }
             Ok(contributions)
         }
@@ -408,6 +413,32 @@ mod tests {
         let text = format!("{error:#}");
         assert!(text.contains("nope"), "{text}");
         assert!(text.contains("light"), "it should list the real ones: {text}");
+    }
+
+    #[test]
+    fn a_pack_that_only_brings_words_still_lands() {
+        // Themes and panels are not required: a pack whose whole contribution
+        // is a translation must install rather than be skipped as empty.
+        let dir = scratch("strings");
+        let mut manifest = PackManifest::new("zh", "1.0.0");
+        manifest.look = Some("look.json".into());
+        write_manifest(&dir, &manifest).unwrap();
+
+        let mut look = LookFile::default();
+        look.strings.insert("send".into(), "发送".into());
+        look.strings
+            .insert("placeholder:input".into(), "问点什么…".into());
+        std::fs::write(dir.join("look.json"), serde_json::to_string(&look).unwrap()).unwrap();
+
+        let mut kernel = crate::plugin::Kernel::new();
+        apply(&mut kernel, &dir, &manifest).unwrap();
+
+        let strings = kernel.resolved_strings();
+        assert_eq!(strings.get("send").map(String::as_str), Some("发送"));
+        assert_eq!(
+            strings.get("placeholder:input").map(String::as_str),
+            Some("问点什么…")
+        );
     }
 
     #[test]

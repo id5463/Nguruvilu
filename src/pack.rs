@@ -764,7 +764,7 @@ pub struct McpServerDecl {
 impl LookFile {
     /// The theme in force: the named one, else the first.
     ///
-    /// An ctiveTheme naming a theme that is not in the file is reported by
+    /// An `activeTheme` naming a theme that is not in the file is reported by
     /// [LookFile::problems] rather than silently falling back.
     pub fn active(&self) -> Option<&crate::theme::Theme> {
         match &self.active_theme {
@@ -813,6 +813,15 @@ pub struct LookFile {
     /// Interface panels.
     #[serde(default)]
     pub panels: Vec<crate::ui::UiPanel>,
+    /// Interface labels, by element id.
+    ///
+    /// Text the pack supplies for the shell's own elements, so a pack can put
+    /// the interface into a language without shipping a whole interface. Keys
+    /// the interface does not have are passed through untouched rather than
+    /// rejected: a label written for another interface is not an error, and
+    /// the no-gates rule applies to text as much as to anything else here.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub strings: BTreeMap<String, String>,
 }
 
 /// `injections.json`: the injection engine's own serialised form.
@@ -2015,6 +2024,7 @@ mod tests {
             crate::ui::UiSlot::StatusBar,
             "<b>x</b>",
         ));
+        look.strings.insert("send".into(), "发送".into());
 
         // Round-trip: this is the file a pack author writes.
         let text = serde_json::to_string(&look).unwrap();
@@ -2023,6 +2033,16 @@ mod tests {
         assert_eq!(back.themes[0].tokens["--bg"], "#ffffff");
         assert_eq!(back.panels.len(), 1);
         assert_eq!(back.panels[0].slot, crate::ui::UiSlot::StatusBar);
+        assert_eq!(back.strings.get("send").map(String::as_str), Some("发送"));
+    }
+
+    #[test]
+    fn a_look_file_written_before_labels_existed_still_reads() {
+        // The no-gates rule: a pack from before this field must keep working,
+        // not fail on a field it never heard of.
+        let written = r#"{"themes":[],"panels":[]}"#;
+        let back: LookFile = serde_json::from_str(written).unwrap();
+        assert!(back.strings.is_empty());
     }
 
     #[test]

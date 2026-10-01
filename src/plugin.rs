@@ -117,6 +117,11 @@ pub struct Contributions {
     pub ui: Vec<crate::ui::UiPanel>,
     /// Theme layers this plugin contributes.
     pub themes: Vec<crate::theme::Theme>,
+    /// Interface labels this plugin contributes, by element id.
+    ///
+    /// Text rather than colour: a pack that translates the shell says what each
+    /// element reads, and the shell applies it without knowing any language.
+    pub strings: std::collections::BTreeMap<String, String>,
     /// Services this plugin provides, by name.
     pub services: Vec<(String, Arc<dyn Any + Send + Sync>)>,
     /// Tools this plugin registers.
@@ -156,6 +161,15 @@ impl Contributions {
     /// Contribute an interface panel.
     pub fn ui(mut self, panel: crate::ui::UiPanel) -> Self {
         self.ui.push(panel);
+        self
+    }
+
+    /// Contribute interface labels.
+    ///
+    /// Merged rather than replaced, so a plugin may contribute two maps in one
+    /// `apply` and the later entries win over the earlier ones.
+    pub fn strings<I: IntoIterator<Item = (String, String)>>(mut self, map: I) -> Self {
+        self.strings.extend(map);
         self
     }
 
@@ -274,6 +288,8 @@ pub struct Fiber {
     pub ui: Vec<crate::ui::UiPanel>,
     /// Theme layers this fiber contributes.
     pub themes: Vec<crate::theme::Theme>,
+    /// Interface labels this fiber contributes, by element id.
+    pub strings: std::collections::BTreeMap<String, String>,
     effects: Vec<Disposer>,
     epoch: Epoch,
 }
@@ -544,6 +560,26 @@ impl Kernel {
         registry.resolve()
     }
 
+    /// The interface labels every active plugin contributes, merged.
+    ///
+    /// Resolved here for the same reason as the theme: the shell receives one
+    /// map rather than one per plugin, and a key set by two plugins resolves
+    /// the same way on every run — the later-loaded one wins, because a pack
+    /// installed after another is the more specific choice.
+    pub fn resolved_strings(&self) -> std::collections::BTreeMap<String, String> {
+        let mut fibers: Vec<&Fiber> = self
+            .fibers
+            .values()
+            .filter(|fiber| fiber.state == FiberState::Active)
+            .collect();
+        fibers.sort_by_key(|fiber| fiber.id);
+        let mut merged = std::collections::BTreeMap::new();
+        for fiber in fibers {
+            merged.extend(fiber.strings.clone());
+        }
+        merged
+    }
+
     /// Register a plugin definition without loading an instance.
     pub fn define(&mut self, plugin: Arc<dyn Plugin>) {
         self.plugins.insert(plugin.name().to_string(), plugin);
@@ -588,6 +624,7 @@ impl Kernel {
                 error: None,
                 ui: Vec::new(),
                 themes: Vec::new(),
+                strings: std::collections::BTreeMap::new(),
                 effects: Vec::new(),
                 epoch: Epoch::Inactive,
             },
@@ -819,6 +856,7 @@ impl Kernel {
         if let Some(fiber) = self.fibers.get_mut(&id) {
             fiber.ui = contributions.ui;
             fiber.themes = contributions.themes;
+            fiber.strings = contributions.strings;
             fiber.effects = contributions.effects;
             fiber.epoch = desired;
             fiber.state = FiberState::Active;
@@ -1214,5 +1252,38 @@ mod tests {
         let fiber = kernel.fiber(fiber).unwrap();
         assert_eq!(fiber.state, FiberState::Failed);
         assert!(fiber.error.as_deref().unwrap().contains("cannot start"));
+    }
+
+    #[test]
+    fn a_later_plugins_label_wins_and_unloading_puts_the_earlier_back() {
+        let mut kernel = Kernel::new();
+        kernel.define(Named::new("first", |_| {
+            Ok(Contributions::new().strings([("send".into(), "Send".into())]))
+        }));
+        kernel.define(Named::new("second", |_| {
+            Ok(Contributions::new().strings([
+                ("send".into(), "发送".into()),
+                ("save".into(), "保存".into()),
+            ]))
+        }));
+        kernel.load("first", RealmMap::new(), Value::Null).unwrap();
+        let second = kernel.load("second", RealmMap::new(), Value::Null).unwrap();
+
+        let strings = kernel.resolved_strings();
+        assert_eq!(
+            strings.get("send").map(String::as_str),
+            Some("发送"),
+            "the pack installed later decides"
+        );
+        assert_eq!(strings.get("save").map(String::as_str), Some("保存"));
+
+        kernel.unload(second).unwrap();
+        let strings = kernel.resolved_strings();
+        assert_eq!(
+            strings.get("send").map(String::as_str),
+            Some("Send"),
+            "unloading a pack must take its words with it"
+        );
+        assert!(!strings.contains_key("save"));
     }
 }

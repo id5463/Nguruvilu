@@ -495,6 +495,35 @@ function applyTheme(event) {
   document.body.dataset.theme = event.name || "builtin";
 }
 
+/// 应用一个包带来的界面文案。
+///
+/// 键是元素 id(改它的文字),或者 `placeholder:<id>`(改输入框的占位符)。
+/// 属于别的界面的键原样放过 —— 拿到一份不认识的键不是错误。
+///
+/// 每次先把上一次覆盖还原,再应用新的一份:卸载一个包时,它带来的字必须跟着
+/// 消失,否则界面上会留下一段谁也没在维护的话。
+let stringOriginals = [];
+function applyStrings(strings) {
+  for (const entry of stringOriginals) {
+    const el = document.getElementById(entry.id);
+    if (!el) continue;
+    if (entry.attr) el[entry.attr] = entry.value;
+    else el.textContent = entry.value;
+  }
+  stringOriginals = [];
+
+  for (const [key, text] of Object.entries(strings || {})) {
+    const sep = key.indexOf(":");
+    const attr = sep > 0 && key.slice(0, sep) === "placeholder" ? "placeholder" : null;
+    const id = attr ? key.slice(sep + 1) : key;
+    const target = document.getElementById(id);
+    if (!target) continue;
+    stringOriginals.push({ id, attr, value: attr ? target[attr] : target.textContent });
+    if (attr) target[attr] = text;
+    else target.textContent = text;
+  }
+}
+
 function renderSlots(panels) {
   for (const slot of ["sidebar-top", "sidebar-bottom", "details-top", "details-bottom", "status-bar", "above-composer"]) {
     const container = document.getElementById("slot-" + slot);
@@ -942,6 +971,9 @@ onAny((name, event) => {
   switch (name) {
       case "theme":
         applyTheme(event);
+        break;
+      case "strings":
+        applyStrings(event.strings);
         break;
       case "ui_panels":
         renderSlots(event.panels);

@@ -61,6 +61,7 @@
 
 | 事件 | 载荷 |
 |---|---|
+| `strings` | `{ strings: { "<元素id>": "文字", "placeholder:<id>": "占位符" } }` —— 包带来的界面文案,整份替换 |
 | `notice` | `{ text, bad? }` |
 | `error` | `{ message }` |
 

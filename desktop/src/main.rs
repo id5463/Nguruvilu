@@ -966,16 +966,23 @@ fn set_active_ui(dir: PathBuf) {
     }
 }
 
-/// Send the panels plugins contributed.
+/// Send the panels, theme, and labels plugins contributed.
 fn emit_panels(state: &Arc<Mutex<AppState>>, sink: &Arc<dyn EventSink>) {
-    let (panels, theme) = {
+    let (panels, theme, strings) = {
         let guard = state.lock().expect("state lock");
-        (guard.kernel.ui_panels(), guard.kernel.resolved_theme())
+        (
+            guard.kernel.ui_panels(),
+            guard.kernel.resolved_theme(),
+            guard.kernel.resolved_strings(),
+        )
     };
     sink.emit(json!({ "ev": "ui_panels", "panels": panels }));
-    // The theme travels with the panels: both are plugin contributions, and
-    // sending them together means the page never applies one without the other.
+    // The theme and the labels travel with the panels: all three are plugin
+    // contributions, and sending them together means the page never applies
+    // one without the others — a translated interface with the wrong palette,
+    // or the right palette with the previous pack's words.
     sink.emit(json!({ "ev": "theme", "tokens": theme.tokens, "name": theme.name }));
+    sink.emit(json!({ "ev": "strings", "strings": strings }));
 }
 
 /// Send one event to the page.

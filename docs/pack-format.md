@@ -195,11 +195,14 @@ my-pack-1.0.0.dshpack          ← zip
       "html": "<span id='clock'></span>",
       "script": "setInterval(() => { document.getElementById('clock').textContent = new Date().toLocaleTimeString() }, 1000)",
       "order": 0 }
-  ]
+  ],
+  // 界面文案:键是元素 id,或 `placeholder:<id>` 改输入框占位符。
+  // 认不出的键原样放过;卸载这个包时这些字会一并还原。
+  "strings": { "send": "发送", "placeholder:input": "问点什么…" }
 }
 ```
 
-**主题是数据,不需要插件** —— 这条让纯外观包变成零代码、全平台通用。
+**主题是数据,不需要插件** —— 这条让纯外观包变成零代码、全平台通用。文案同理:一个翻译包只有 `strings`,一样零代码。
 
 ### `injections.json` —— 注入规则
 

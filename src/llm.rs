@@ -850,7 +850,11 @@ mod retry_tests {
         // A request to a port nothing listens on gives a real connect error;
         // the classification below is what is under test, so the exact variant
         // matters less than the message it carries.
-        let client = reqwest::Client::new();
+        //
+        // `no_proxy`, or the machine's `HTTP_PROXY` would route this loopback
+        // address somewhere that answers — turning a refused connection into a
+        // successful response and making the test depend on the environment.
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let url = "http://127.0.0.1:1/";
         let error = tokio::runtime::Builder::new_current_thread()
             .enable_all()
