@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 pub mod base;
 pub mod pack;
 pub mod search;
+pub mod subagent;
 
 /// What a tool produced.
 ///

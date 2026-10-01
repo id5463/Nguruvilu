@@ -28,21 +28,14 @@ use nguruvilu::hotreload::{
     CachePolicy, Change, ChangeKind, ChangePayload, Consent, ModelRoute, Runtime,
 };
 use nguruvilu::ledger::default_ledger_path;
-use nguruvilu::llm::{LlmClient, LlmConfig};
+use nguruvilu::llm::LlmClient;
 use nguruvilu::loader::Loader;
 use nguruvilu::source::PackSource;
 use nguruvilu::plugin::{Kernel, Plugin as PluginTrait};
 use nguruvilu::session::{JsonlStore, Session, SessionStore};
 use nguruvilu::settings::Settings;
-use nguruvilu::window::{ContextPolicy, DefaultContextPolicy};
+use nguruvilu::window::ContextPolicy;
 use nguruvilu::skills::{register_skill_tool, SkillRegistry};
-use nguruvilu::tools::ToolRegistry;
-
-/// Default model when neither `--model` nor `NGU_MODEL` is set.
-const DEFAULT_MODEL: &str = "deepseek-v4.1-flash";
-
-/// Default API base when neither `--base-url` nor the environment supplies one.
-const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a coding agent. Your working directory is the \
 process working directory. Use the tools to inspect and change files, and to run commands. \
@@ -407,12 +400,10 @@ impl nguruvilu::model::ModelAccess for CliModelAccess {
     }
 
     fn client_for(&self, model: &str) -> anyhow::Result<LlmClient> {
-        let route = self.route();
-        let mut config = nguruvilu::llm::LlmConfig::new(route.base_url, route.api_key, model);
-        config.proxy = route.proxy.clone().unwrap_or_default();
-        config.reasoning_effort = route.reasoning_effort.clone();
-        config.max_tokens = route.max_tokens;
-        Ok(LlmClient::new(config)?)
+        // The route's own builder, so a subtask is sent with the same proxy,
+        // effort, output ceiling, extra fields, and connection behaviour the
+        // session itself is using right now.
+        self.route().client_for(model)
     }
 
     fn tools(&self) -> Arc<nguruvilu::tools::ToolRegistry> {
@@ -498,18 +489,10 @@ async fn run() -> Result<()> {
     // `Settings::resolve` already folds the environment in, so a machine-level
     // variable still wins over the file.
     let mut settings = Settings::resolve();
-    let base_url = cli
-        .base_url
-        .clone()
-        .unwrap_or_else(|| settings.base_url.clone());
     let api_key = cli
         .api_key
         .clone()
         .unwrap_or_else(|| settings.api_key.clone());
-    let model = cli
-        .model
-        .clone()
-        .unwrap_or_else(|| settings.model_or_default());
     let cache_policy = parse_cache_policy(&cli.cache_policy)?;
 
     // Skills are scanned once up front so every mode sees the same catalog.
@@ -529,7 +512,7 @@ async fn run() -> Result<()> {
         }
         Some(Command::Models) => {
             require_key(&api_key)?;
-            let client = client(&base_url, &api_key, &model, &settings)?;
+            let client = model_route(&cli, &settings, None).client()?;
             let mut ids = client.list_models().await?;
             ids.sort();
             if cli.json {
@@ -572,7 +555,8 @@ async fn run() -> Result<()> {
             return show_injections(r#for.as_deref(), cli.json)
         }
         Some(Command::Runtime) => {
-            return show_runtime(&model, &base_url, cache_policy, &skills, cli.json)
+            // Described below, once the kernel is assembled: the tool table
+            // and the published services do not exist until then.
         }
         None => {}
     }
@@ -582,9 +566,11 @@ async fn run() -> Result<()> {
             .with_context(|| format!("changing directory to {}", dir.display()))?;
     }
 
-    require_key(&api_key)?;
-
-    let client = client(&base_url, &api_key, &model, &settings)?;
+    // Describing the session that would run needs no key; running one does.
+    let describe_runtime = matches!(&cli.command, Some(Command::Runtime));
+    if !describe_runtime {
+        require_key(&api_key)?;
+    }
 
     // The kernel owns the tool table; skills add one tool to it.
     let mut kernel = Kernel::new();
@@ -655,30 +641,14 @@ async fn run() -> Result<()> {
 
     let tools = Arc::new(kernel.tools().clone());
 
-    // The flag wins over the stored setting.
-
-    let effective_effort = cli
-        .reasoning_effort
-        .clone()
-        .unwrap_or_else(|| settings.reasoning_effort.clone());
+    // One route for the session, built from the resolved settings: the flags
+    // win over the stored ones, and a plugin that published a network policy
+    // wins over both. It is rebuilt after the pack's content lands, because a
+    // pack may replace any of these values.
+    let route = model_route(&cli, &settings, Some(&kernel));
 
     let mut runtime = Runtime::new(Arc::clone(&tools))
-        .with_route(ModelRoute {
-            provider: "openai".into(),
-            base_url: base_url.clone(),
-            api_key: String::new(),
-            model: model.clone(),
-            temperature: None,
-            max_tokens: None,
-            reasoning_effort: if effective_effort.trim().is_empty() {
-                None
-            } else {
-                Some(effective_effort.clone())
-            },
-            // Published so a subagent plugin builds clients on this route
-            // rather than keeping its own copy of the proxy setting.
-            proxy: Some(settings.proxy.clone()),
-        })
+        .with_route(route)
         .with_skill_roots(
             skills
                 .roots()
@@ -708,6 +678,7 @@ async fn run() -> Result<()> {
     // Apply what the pack carried. A pack's settings replace the standing ones:
     // the pack is the unit the user chose, so it decides.
     let mut injection = Arc::new(nguruvilu::context::InjectionEngine::load_default());
+    let pack_ran = pack_content.is_some();
     if let Some(content) = pack_content {
         for line in content.summary() {
             eprintln!("pack content: {line}");
@@ -733,6 +704,11 @@ async fn run() -> Result<()> {
             }
             for (key, value) in &models.extra_body {
                 settings.extra_body.insert(key.clone(), value.clone());
+            }
+            // Connection behaviour travels with the rest: a pack that names a
+            // flaky provider should also be able to say how hard to retry it.
+            if let Some(network) = &models.network {
+                settings.network = network.clone();
             }
             // The key itself is never in a pack; only the name of the
             // variable holding it.
@@ -760,6 +736,25 @@ async fn run() -> Result<()> {
         }
     }
 
+    // A pack's numbers replace the standing ones, so the route is rebuilt from
+    // what the settings now say — and the client is built from that route
+    // rather than from the values captured before the pack loaded. This is
+    // also where a plugin's network policy is folded in: assembly plugins are
+    // loaded by now, and the built-in service below publishes the settings
+    // only when no plugin provided one.
+    let route = model_route(&cli, &settings, Some(&kernel));
+    if pack_ran {
+        runtime.apply(Change::session(
+            "pack",
+            ChangePayload::ModelRoute(route.clone()),
+        ))?;
+    }
+    // Published for plugins that want to read the numbers in force. A pack
+    // that brought its own provider keeps it: install() yields rather than
+    // failing the fiber over an occupied service.
+    nguruvilu::network::install(&mut kernel, settings.network.clone())?;
+    let client = route.client()?;
+
     let policy: Arc<dyn ContextPolicy> = Arc::new(settings.context_policy(None));
 
     let runtime = Arc::new(Mutex::new(runtime));
@@ -768,22 +763,43 @@ async fn run() -> Result<()> {
 
     // Published before anything can ask for it: a plugin loaded from a pack
     // needs the service to exist already.
-    nguruvilu::model::install(
-        &mut kernel,
-        Arc::new(CliModelAccess {
-            runtime: Arc::clone(&runtime),
-            skills: Arc::clone(&skills),
-            base_prompt: base_prompt.clone(),
-            policy: Arc::clone(&policy),
-        }),
-    )?;
+    let access: Arc<dyn nguruvilu::model::ModelAccess> = Arc::new(CliModelAccess {
+        runtime: Arc::clone(&runtime),
+        skills: Arc::clone(&skills),
+        base_prompt: base_prompt.clone(),
+        policy: Arc::clone(&policy),
+    });
+    nguruvilu::model::install(&mut kernel, Arc::clone(&access))?;
+
+    // The delegate tool reads the route and the tool table through the service
+    // above, so it registers against that shared access rather than its own
+    // copy of the settings. It belongs to the kernel's table, which the turn
+    // snapshotted before the service existed, so the kernel is adopted again
+    // afterwards — otherwise the session would never see the tool it just
+    // gained.
+    if nguruvilu::tools::subagent::register(kernel.tools_mut(), Arc::clone(&access))? {
+        eprintln!("[subagent] delegate enabled");
+        runtime
+            .lock()
+            .expect("runtime lock")
+            .adopt_kernel_tools(&kernel);
+    }
+
+    // `runtime` describes the session that would run, so it is answered from
+    // the assembled kernel: the tools a turn would actually see, the services
+    // a plugin could find, and the route in force after any pack loaded.
+    if describe_runtime {
+        let guard = runtime.lock().expect("runtime lock");
+        let skills = skills.lock().expect("skills lock");
+        return show_runtime(&route, &guard, cache_policy, &skills, cli.json, &kernel);
+    }
 
     let config: Arc<dyn TurnConfig> = Arc::new(CliConfig {
         runtime: Arc::clone(&runtime),
         base_prompt,
         skills: Arc::clone(&skills),
         policy: Arc::clone(&policy),
-        injection: Arc::new(nguruvilu::context::InjectionEngine::load_default()),
+        injection,
     });
 
     let snapshotter = if cli.git_snapshot {
@@ -802,13 +818,13 @@ async fn run() -> Result<()> {
 
     // Resolve the session: explicit id, else a fresh one.
     let mut session = if cli.new_session {
-        Session::new(Some(model.clone()))
+        Session::new(Some(route.model.clone()))
     } else if let Some(id) = &cli.session {
         store
             .load(id)?
             .ok_or_else(|| anyhow!("session not found: {id}"))?
     } else {
-        Session::new(Some(model.clone()))
+        Session::new(Some(route.model.clone()))
     };
     let is_new = !store.root().join(format!("{}.jsonl", session.id)).exists();
 
@@ -1304,15 +1320,28 @@ fn snapshot_command(
     }
 }
 
+/// Describe the session that would run.
+///
+/// Answered from the assembled kernel and the runtime a turn reads, so the
+/// tools and services reported here are the ones a model would actually be
+/// handed — a fresh table with only the base tools would describe a session
+/// that does not exist.
 fn show_runtime(
-    model: &str,
-    base_url: &str,
+    route: &ModelRoute,
+    runtime: &Runtime,
     cache_policy: CachePolicy,
     skills: &SkillRegistry,
     as_json: bool,
+    kernel: &Kernel,
 ) -> Result<()> {
-    let tools = Arc::new(ToolRegistry::with_base_tools()?);
-    let runtime = Runtime::new(tools);
+    let tools = kernel.tools().names();
+    let services: Vec<serde_json::Value> = kernel
+        .service_list()
+        .iter()
+        .map(|(name, realm, owner)| {
+            serde_json::json!({ "name": name, "realm": realm.to_string(), "owner": owner })
+        })
+        .collect();
 
     let policy: Vec<serde_json::Value> = runtime
         .policy_table()
@@ -1329,13 +1358,24 @@ fn show_runtime(
         })
         .collect();
 
+    let network = serde_json::json!({
+        "request_timeout_secs": route.network.request_timeout_secs,
+        "pool_idle_timeout_secs": route.network.pool_idle_timeout_secs,
+        "retry_attempts": route.network.retry_attempts,
+        "retry_backoff_ms": route.network.retry_backoff_ms,
+    });
+
     if as_json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "model": model,
-                "base_url": base_url,
+                "model": route.model,
+                "base_url": route.base_url,
+                "api_key": if route.api_key.is_empty() { "(not set)" } else { "(set)" },
                 "cache_policy": format!("{cache_policy:?}"),
+                "network": network,
+                "tools": tools,
+                "services": services,
                 "policy": policy,
                 "skill_roots": skills.roots().iter().map(|r| r.display().to_string()).collect::<Vec<_>>(),
                 "skill_count": skills.len(),
@@ -1345,9 +1385,35 @@ fn show_runtime(
         return Ok(());
     }
 
-    println!("model:        {model}");
-    println!("base url:     {base_url}");
+    println!("model:        {}", route.model);
+    println!("base url:     {}", route.base_url);
+    println!(
+        "api key:      {}",
+        if route.api_key.is_empty() { "(not set)" } else { "(set)" }
+    );
     println!("cache policy: {cache_policy:?}");
+    println!(
+        "network:      request {}s, pool idle {}s, {} retry(ies) from {}ms",
+        route.network.request_timeout_secs,
+        route.network.pool_idle_timeout_secs,
+        route.network.retry_attempts,
+        route.network.retry_backoff_ms,
+    );
+    println!("\ntools ({}):", tools.len());
+    println!("  {}", tools.join(", "));
+    println!("\nservices:");
+    if services.is_empty() {
+        println!("  (none)");
+    } else {
+        for service in &services {
+            println!(
+                "  {:<12} {} [{}]",
+                service["name"].as_str().unwrap_or(""),
+                service["owner"].as_str().unwrap_or(""),
+                service["realm"].as_str().unwrap_or(""),
+            );
+        }
+    }
     println!("\nconsent policy (global changes):");
     for entry in &policy {
         println!(
@@ -2150,25 +2216,40 @@ fn require_key(api_key: &str) -> Result<()> {
     Ok(())
 }
 
-/// Build a model client, applying the configured proxy.
+/// The route this session runs on, built from the resolved settings.
 ///
-/// The proxy is explicit: when it is empty, the process's `HTTP_PROXY` and
-/// `HTTPS_PROXY` are deliberately ignored. Picking those up silently is how a
-/// proxy set for another tool reroutes model traffic and fails with a TLS
-/// handshake error that never mentions proxies.
-fn client(base_url: &str, api_key: &str, model: &str, settings: &Settings) -> Result<LlmClient> {
-    let mut config = LlmConfig::new(base_url, api_key, model);
-    config.proxy = settings.proxy.clone();
-    // Reasoning effort is set here rather than only in the runtime route, so a
-    // one-off --reasoning-effort reaches the wire.
-    let effort = settings.reasoning_effort.trim();
-    if !effort.is_empty() && effort != "default" {
-        config.reasoning_effort = Some(effort.to_string());
+/// Command-line flags win over the stored settings, and a plugin that
+/// published a network policy wins over both: it is the more specific choice,
+/// made by the pack the user installed for this provider. Everything a client
+/// needs is on the route, so the session, a one-off command, and a subagent
+/// built later all read the same values.
+fn model_route(cli: &Cli, settings: &Settings, kernel: Option<&Kernel>) -> ModelRoute {
+    let mut route = ModelRoute::from_settings(settings);
+    // The proxy stays explicit: when it is empty, the process's `HTTP_PROXY`
+    // and `HTTPS_PROXY` are deliberately ignored. Picking those up silently is
+    // how a proxy set for another tool reroutes model traffic and fails with a
+    // TLS handshake error that never mentions proxies.
+    if let Some(url) = &cli.base_url {
+        route.base_url = url.clone();
     }
-    config.max_tokens = settings.max_output_tokens.map(|t| t as u32);
-    LlmClient::new(config)
-        .map(|client| {
-            client.with_shaper(nguruvilu::request::from_extra_fields(settings.extra_body.clone()))
-        })
-        .context("building the model client")
+    if let Some(key) = &cli.api_key {
+        route.api_key = key.clone();
+    }
+    if let Some(name) = &cli.model {
+        route.model = name.clone();
+    }
+    if let Some(effort) = &cli.reasoning_effort {
+        route.reasoning_effort = if effort.trim().is_empty() {
+            None
+        } else {
+            Some(effort.clone())
+        };
+    }
+    if let Some(kernel) = kernel {
+        let view = kernel.service_view(nguruvilu::plugin::RealmMap::new());
+        if let Some(network) = nguruvilu::network::NetworkHandle::from_view(&view) {
+            route.network = network;
+        }
+    }
+    route
 }

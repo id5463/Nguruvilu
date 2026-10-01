@@ -11,12 +11,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
 use nguruvilu::agent::{Agent, AgentObserver, TurnConfig, TurnSettings};
 use nguruvilu::hotreload::{Change, ChangePayload, ModelRoute, Runtime};
-use nguruvilu::llm::{LlmClient, LlmConfig};
+use nguruvilu::llm::LlmClient;
 use nguruvilu::plugin::Kernel;
 use nguruvilu::session::{JsonlStore, Session, SessionStore};
 use nguruvilu::settings::Settings;
@@ -24,12 +24,6 @@ use nguruvilu::window::ContextPolicy;
 use nguruvilu::skills::{register_skill_tool, SkillRegistry};
 
 use crate::sink::EventSink;
-
-/// Default model when neither `NGU_MODEL` nor the environment supplies one.
-pub const DEFAULT_MODEL: &str = "deepseek-v4.1-flash";
-
-/// Default API base.
-pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
 /// System prompt for the desktop shell.
 pub const BASE_PROMPT: &str = "You are a coding agent. Use the tools to inspect and change \
@@ -57,12 +51,10 @@ impl nguruvilu::model::ModelAccess for DesktopModelAccess {
     }
 
     fn client_for(&self, model: &str) -> Result<LlmClient> {
-        let route = self.route();
-        let mut config = LlmConfig::new(route.base_url, route.api_key, model);
-        config.proxy = route.proxy.clone().unwrap_or_default();
-        config.reasoning_effort = route.reasoning_effort.clone();
-        config.max_tokens = route.max_tokens;
-        Ok(LlmClient::new(config)?)
+        // The route's own builder, so a subtask is sent with the same proxy,
+        // effort, output ceiling, extra fields, and connection behaviour the
+        // session itself is using right now.
+        self.route().client_for(model)
     }
 
     fn tools(&self) -> Arc<nguruvilu::tools::ToolRegistry> {
@@ -161,8 +153,6 @@ impl AppState {
         // Settings, not raw environment variables: the shell has to be usable by
         // someone who has never set one, and changeable without a restart.
         let settings = Settings::resolve();
-        let base_url = settings.base_url.clone();
-        let api_key = settings.api_key.clone();
         let model = settings.model_or_default();
 
         // Skills are scanned once at boot; the catalog is part of the prompt.
@@ -181,20 +171,10 @@ impl AppState {
         }
 
         let tools = Arc::new(kernel.tools().clone());
-        let runtime = Runtime::new(tools).with_route(ModelRoute {
-            provider: "openai".into(),
-            base_url: base_url.clone(),
-            api_key: String::new(),
-            model: model.clone(),
-            temperature: None,
-            max_tokens: None,
-            reasoning_effort: if settings.reasoning_effort.trim().is_empty() {
-                None
-            } else {
-                Some(settings.reasoning_effort.clone())
-            },
-            proxy: Some(settings.proxy.clone()),
-        });
+        // One route from the settings, used both by the runtime a turn reads
+        // and by the state the panel edits, so the two cannot drift.
+        let route = ModelRoute::from_settings(&settings);
+        let runtime = Runtime::new(tools).with_route(route.clone());
 
         let policy: Arc<dyn ContextPolicy> = Arc::new(settings.context_policy(None));
 
@@ -204,15 +184,26 @@ impl AppState {
 
         // Published before any pack loads, so a plugin that wants to spawn a
         // subagent finds the service already there.
-        nguruvilu::model::install(
-            &mut kernel,
+        let access: Arc<dyn nguruvilu::model::ModelAccess> =
             Arc::new(DesktopModelAccess {
                 runtime: Arc::clone(&runtime),
                 skills: Arc::clone(&skills),
                 base_prompt: BASE_PROMPT.to_string(),
                 policy: Arc::clone(&policy),
-            }),
-        )?;
+            });
+        nguruvilu::model::install(&mut kernel, Arc::clone(&access))?;
+
+        // The delegate tool shares that access, so a subtask runs on the route
+        // and tool table the session is using. The runtime snapshotted the
+        // kernel's table before the service existed, so adopt it again —
+        // otherwise the session would never see the tool it just gained.
+        if nguruvilu::tools::subagent::register(kernel.tools_mut(), Arc::clone(&access))? {
+            eprintln!("[subagent] delegate enabled");
+            runtime
+                .lock()
+                .expect("runtime lock")
+                .adopt_kernel_tools(&kernel);
+        }
 
         let config = Arc::new(SharedConfig {
             runtime,
@@ -260,20 +251,7 @@ impl AppState {
             config,
             session,
             store,
-            route: ModelRoute {
-                provider: "openai".into(),
-                base_url,
-                api_key,
-                model,
-                temperature: None,
-                max_tokens: None,
-                reasoning_effort: if settings.reasoning_effort.trim().is_empty() {
-                    None
-                } else {
-                    Some(settings.reasoning_effort.clone())
-                },
-                proxy: Some(settings.proxy.clone()),
-            },
+            route,
             busy: false,
             settings,
             last_error: None,
@@ -473,10 +451,10 @@ impl AppState {
             *policy = Arc::new(self.settings.context_policy(None));
         }
 
-        // The route is what a turn actually reads, so it has to move too.
-        self.route.base_url = self.settings.base_url.clone();
-        self.route.api_key = self.settings.api_key.clone();
-        self.route.model = self.settings.model_or_default();
+        // The route is what a turn actually reads, so it is rebuilt from the
+        // settings that just changed — every field of it, not only the three
+        // the panel is most likely to have touched.
+        self.route = ModelRoute::from_settings(&self.settings);
 
         let mut runtime = self.config.runtime.lock().expect("runtime lock");
         runtime.apply(Change::session(
@@ -555,6 +533,17 @@ impl AppState {
             }
         }
 
+        // The pack's settings replace the standing ones, so the route is
+        // rebuilt and published with them: a pack that names another endpoint
+        // or another output ceiling decides the next turn, not the next launch.
+        self.route = ModelRoute::from_settings(&self.settings);
+        if let Ok(mut runtime) = self.config.runtime.lock() {
+            let _ = runtime.apply(nguruvilu::hotreload::Change::session(
+                "pack",
+                nguruvilu::hotreload::ChangePayload::ModelRoute(self.route.clone()),
+            ));
+        }
+
         if let Some(rules) = content.injections {
             if let Ok(mut injection) = self.config.injection.lock() {
                 *injection = std::sync::Arc::new(rules);
@@ -629,38 +618,38 @@ impl AppState {
     /// Put a kernel back and make its tools visible to the next turn.
     ///
     /// Applying a pack changes the tool table, and the runtime is what a turn
-    /// reads it from — so both have to move together.
+    /// reads it from — so both have to move together. The route moves with
+    /// them: by now the pack's plugins are loaded, so a network policy it
+    /// published is folded in, and the built-in service publishes the
+    /// settings only when no plugin provided one.
     pub fn restore_kernel(&mut self, kernel: Kernel) -> Result<()> {
         self.kernel = kernel;
+        let network = self.settings.network.clone();
+        nguruvilu::network::install(&mut self.kernel, network)?;
+
         let tools = Arc::new(self.kernel.tools().clone());
+        let mut route = ModelRoute::from_settings(&self.settings);
+        let view = self.kernel.service_view(nguruvilu::plugin::RealmMap::new());
+        if let Some(network) = nguruvilu::network::NetworkHandle::from_view(&view) {
+            route.network = network;
+        }
+        self.route = route;
+
         let mut runtime = self.config.runtime.lock().expect("runtime lock");
         runtime.set_tools(tools);
+        let _ = runtime.apply(Change::session(
+            self.session.id.clone(),
+            ChangePayload::ModelRoute(self.route.clone()),
+        ));
         Ok(())
     }
 
     /// A client for the current route.
+    ///
+    /// The route's own builder, so this and a subagent the model delegates to
+    /// send the same body on the same connection settings.
     pub fn client(&self) -> Result<LlmClient> {
-        let mut config = LlmConfig::new(
-            self.route.base_url.clone(),
-            self.route.api_key.clone(),
-            self.route.model.clone(),
-        );
-        // Reasoning effort is the main cost lever on a reasoning model, so it
-        // travels with every request rather than being chosen per call.
-        let effort = self.settings.reasoning_effort.trim();
-        if !effort.is_empty() && effort != "default" {
-            config.reasoning_effort = Some(effort.to_string());
-        }
-        // Empty means direct, and means the process's own proxy variables stay
-        // out of the way.
-        config.proxy = self.settings.proxy.clone();
-        LlmClient::new(config)
-            .map(|client| {
-                client.with_shaper(nguruvilu::request::from_extra_fields(
-                    self.settings.extra_body.clone(),
-                ))
-            })
-            .context("building the model client")
+        self.route.client()
     }
 }
 

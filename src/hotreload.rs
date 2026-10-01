@@ -49,6 +49,19 @@ pub struct ModelRoute {
     /// Proxy for requests on this route; empty means direct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
+    /// Extra request fields merged into the body.
+    ///
+    /// Carried on the route rather than read from the settings at call time so
+    /// that every client built on this route — the session's and a subagent's —
+    /// sends the same body.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra_body: serde_json::Map<String, serde_json::Value>,
+    /// How requests on this route are sent: timeouts, pooling, retries.
+    ///
+    /// The same reason as `extra_body`: connection behaviour that differs
+    /// between a session and its subagent is a difference the user never chose.
+    #[serde(default)]
+    pub network: crate::network::NetworkSettings,
 }
 
 impl Default for ModelRoute {
@@ -62,6 +75,8 @@ impl Default for ModelRoute {
             max_tokens: None,
             reasoning_effort: None,
             proxy: None,
+            extra_body: serde_json::Map::new(),
+            network: crate::network::NetworkSettings::default(),
         }
     }
 }
@@ -70,6 +85,60 @@ impl ModelRoute {
     /// Whether two routes differ in a way that changes the model endpoint.
     pub fn same_endpoint(&self, other: &Self) -> bool {
         self.base_url == other.base_url && self.model == other.model
+    }
+
+    /// The route these settings describe.
+    ///
+    /// One place where settings become a route, so a host cannot update one
+    /// field and forget another — which is how a session and its subagent come
+    /// to disagree about the proxy.
+    pub fn from_settings(settings: &crate::settings::Settings) -> Self {
+        let effort = settings.reasoning_effort.trim();
+        Self {
+            provider: "openai".into(),
+            base_url: settings.base_url.clone(),
+            api_key: settings.api_key.clone(),
+            model: settings.model_or_default(),
+            temperature: None,
+            max_tokens: settings.max_output_tokens.map(|tokens| tokens as u32),
+            reasoning_effort: if effort.is_empty() || effort == "default" {
+                None
+            } else {
+                Some(effort.to_string())
+            },
+            proxy: Some(settings.proxy.clone()),
+            extra_body: settings.extra_body.clone(),
+            network: settings.network.clone(),
+        }
+    }
+
+    /// The client this route describes.
+    pub fn client(&self) -> Result<crate::llm::LlmClient> {
+        let model = self.model.clone();
+        self.client_for(&model)
+    }
+
+    /// The client this route describes, on another model of the same route.
+    ///
+    /// The only builder, so a subagent inherits the endpoint, key, proxy,
+    /// effort, output ceiling, extra fields, and connection behaviour its
+    /// session runs under rather than a subset of them.
+    pub fn client_for(&self, model: &str) -> Result<crate::llm::LlmClient> {
+        let mut config =
+            crate::llm::LlmConfig::new(self.base_url.clone(), self.api_key.clone(), model);
+        config.proxy = self.proxy.clone().unwrap_or_default();
+        // `default` asks the provider for its own behaviour, so it is sent as
+        // no effort at all rather than as a value it would have to parse.
+        let effort = self.reasoning_effort.as_deref().unwrap_or_default().trim();
+        config.reasoning_effort = if effort.is_empty() || effort == "default" {
+            None
+        } else {
+            Some(effort.to_string())
+        };
+        config.max_tokens = self.max_tokens;
+        config.network = self.network.clone();
+        Ok(crate::llm::LlmClient::new(config)?
+            .with_shaper(crate::request::from_extra_fields(self.extra_body.clone())))
     }
 }
 
@@ -912,7 +981,8 @@ mod tests {
                     temperature: Some(0.2),
                     max_tokens: Some(4096),
                     reasoning_effort: None,
-            proxy: None,
+                    proxy: None,
+                    ..Default::default()
                 }),
             ))
             .unwrap();
@@ -921,5 +991,89 @@ mod tests {
         assert_eq!(route.model, "deepseek-v4.1-flash");
         assert_eq!(route.base_url, "https://api.example.com/v1");
         assert!(!route.same_endpoint(&ModelRoute::default()));
+    }
+
+    /// Settings that differ from every default, so nothing can pass by
+    /// agreeing with a default it never read.
+    fn distinctive_settings() -> crate::settings::Settings {
+        let mut settings = crate::settings::Settings::default();
+        settings.base_url = "https://api.example.com/v1".into();
+        settings.api_key = "sk-secret".into();
+        settings.model = "session-model".into();
+        settings.max_output_tokens = Some(4096);
+        settings.reasoning_effort = "high".into();
+        settings.proxy = "http://127.0.0.1:7890".into();
+        settings
+            .extra_body
+            .insert("thinking".into(), serde_json::json!({ "type": "enabled" }));
+        settings.network.retry_attempts = 5;
+        settings
+    }
+
+    #[test]
+    fn a_route_from_settings_carries_everything_a_client_needs() {
+        let route = ModelRoute::from_settings(&distinctive_settings());
+
+        assert_eq!(route.api_key, "sk-secret");
+        assert_eq!(route.max_tokens, Some(4096));
+        assert_eq!(route.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(route.network.retry_attempts, 5);
+        assert_eq!(route.extra_body["thinking"]["type"], "enabled");
+    }
+
+    #[test]
+    fn a_client_built_from_a_route_uses_that_routes_numbers() {
+        // Stored numbers that never reach the wire read the same in settings
+        // and behave differently on the network, so the claim is checked on
+        // the client rather than on the route.
+        let route = ModelRoute::from_settings(&distinctive_settings());
+        let client = route.client().unwrap();
+
+        assert_eq!(client.model(), "session-model");
+        assert_eq!(client.network().retry_attempts, 5);
+        let body = client.preview_body(&[crate::message::Message::user("hi")], &[]);
+        assert_eq!(body["thinking"]["type"], "enabled");
+    }
+
+    #[test]
+    fn a_subagents_client_differs_only_in_the_model() {
+        // A subtask that ran on different connection settings or without the
+        // session's extra fields would be a difference the user never chose.
+        let route = ModelRoute::from_settings(&distinctive_settings());
+        let parent = route.client().unwrap();
+        let child = route.client_for("cheaper-model").unwrap();
+
+        assert_eq!(child.model(), "cheaper-model");
+        assert_eq!(child.network(), parent.network());
+        assert_eq!(child.shaper_name(), parent.shaper_name());
+        let body = child.preview_body(&[crate::message::Message::user("hi")], &[]);
+        assert_eq!(body["thinking"]["type"], "enabled");
+    }
+
+    #[test]
+    fn a_route_written_before_the_new_fields_still_reads() {
+        // Change payloads are persisted; an older one must load with the
+        // defaults rather than refuse to deserialize.
+        let written = r#"{"provider":"openai","base_url":"https://api.example.com/v1","model":"m","api_key":"k"}"#;
+        let route: ModelRoute = serde_json::from_str(written).unwrap();
+
+        assert_eq!(route.api_key, "k");
+        assert_eq!(route.network, crate::network::NetworkSettings::default());
+        assert!(route.extra_body.is_empty());
+    }
+
+    #[test]
+    fn a_default_effort_is_sent_as_no_effort() {
+        // `default` asks the provider for its own behaviour, so sending it as
+        // a value would override exactly what the name promises.
+        let mut settings = crate::settings::Settings::default();
+        settings.reasoning_effort = "default".into();
+        assert_eq!(ModelRoute::from_settings(&settings).reasoning_effort, None);
+
+        let mut route = ModelRoute::default();
+        route.reasoning_effort = Some("default".into());
+        let client = route.client().unwrap();
+        let body = client.preview_body(&[crate::message::Message::user("hi")], &[]);
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
     }
 }

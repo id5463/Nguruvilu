@@ -75,7 +75,7 @@
   "max_output_tokens": "8K",
   "network": { "request_timeout_secs": 300, "pool_idle_timeout_secs": 30,
                "retry_attempts": 3, "retry_backoff_ms": 200 },
-  "tools": ["bash", "edit", "pack", "read", "write"]
+  "tools": ["bash", "delegate", "edit", "pack", "read", "write"]
 }
 ```
 

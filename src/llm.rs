@@ -185,6 +185,15 @@ impl LlmClient {
         self.shaper.name()
     }
 
+    /// The connection settings this client was built with.
+    ///
+    /// Exposed so a caller can prove that a route's numbers reached the wire:
+    /// a timeout or retry count that is stored but not applied reads the same
+    /// in settings and behaves differently on the network.
+    pub fn network(&self) -> &crate::network::NetworkSettings {
+        &self.config.network
+    }
+
     /// The request body this client would send, for inspection and tests.
     pub fn preview_body(&self, messages: &[Message], tools: &[Value]) -> Value {
         self.build_body(messages, tools)
@@ -798,6 +807,38 @@ fn matches_closed_text(text: &str) -> bool {
         || text.contains("connection reset")
         || text.contains("broken pipe")
         || text.contains("IncompleteMessage")
+        || os_error_is_connection_loss(text)
+}
+
+/// Whether the message carries an OS error code for a connection that went
+/// away.
+///
+/// Windows writes that sentence in the system language — "你的主机中的软件中止了
+/// 一个已建立的连接。(os error 10053)" on a Chinese machine — so no English
+/// phrase matches it there. The number after "os error" is the same on every
+/// machine, which is what makes the classification survive a translation.
+fn os_error_is_connection_loss(text: &str) -> bool {
+    const LOST: [u32; 5] = [
+        10053, // WSAECONNABORTED: the connection was aborted
+        10054, // WSAECONNRESET: the peer reset it
+        103,   // ECONNABORTED
+        104,   // ECONNRESET
+        32,    // EPIPE: writing to a socket the peer closed
+    ];
+
+    let mut rest = text;
+    while let Some(at) = rest.find("os error ") {
+        rest = &rest[at + "os error ".len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        // `take_while` stops at a non-digit, so "os error 10060" is read as
+        // 10060 rather than as 1006 with a trailing digit.
+        if let Ok(code) = digits.parse::<u32>() {
+            if LOST.contains(&code) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -856,6 +897,26 @@ mod retry_tests {
                 "{text:?} must not be retried"
             );
         }
+    }
+
+    #[test]
+    fn a_translated_connection_error_is_still_recognised() {
+        // On a Chinese Windows the sentence is translated and only the code is
+        // stable, so a machine that reads English and one that does not must
+        // classify the same failure the same way.
+        for text in [
+            "你的主机中的软件中止了一个已建立的连接。(os error 10053)",
+            "另一端强行关闭了一个现有的连接。(os error 10054)",
+            "Connection reset by peer (os error 10054)",
+        ] {
+            assert!(matches_closed_text(text), "{text:?} must be retried");
+        }
+        // A timeout is translated too, and it must stay unretryable: the
+        // request may already have been answered.
+        assert!(
+            !matches_closed_text("由于连接方在一段时间后没有反应...(os error 10060)"),
+            "a timed-out connection must not be retried"
+        );
     }
 
     #[tokio::test]
