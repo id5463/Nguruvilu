@@ -145,6 +145,18 @@ pub struct AppState {
     /// drawn into the DOM vanishes the moment the transcript is re-rendered,
     /// which is exactly when a user switches sessions to look for it.
     pub last_error: Option<String>,
+    /// Pack loads and unloads the agent asked for during a turn.
+    ///
+    /// The tool records what it wants while the turn owns the kernel; the
+    /// shell drains this between turns, which is the next moment the tool
+    /// table is read anyway.
+    pub pending: Arc<nguruvilu::tools::pack::PendingQueue>,
+    /// The MCP servers the app started.
+    ///
+    /// Kept here rather than only in the tool table so a server survives its
+    /// pack's reload, is stopped when the pack unloads, and is stopped for
+    /// good when the window closes.
+    pub mcp: Vec<Arc<nguruvilu::mcp::McpClient>>,
 }
 
 impl AppState {
@@ -160,8 +172,10 @@ impl AppState {
         let scan = skills.scan();
 
         let mut kernel = Kernel::new();
-        // The agent can build and install packs itself.
-        nguruvilu::tools::pack::register(kernel.tools_mut())?;
+        // The agent can build, install, load, and unload packs itself; the
+        // shell applies the load and unload between turns.
+        let pending = Arc::new(nguruvilu::tools::pack::PendingQueue::new());
+        nguruvilu::tools::pack::register_with(kernel.tools_mut(), Some(Arc::clone(&pending)))?;
         // Search appears only when a provider and key are configured.
         if let Some(search) = settings.search.clone() {
             let _ = nguruvilu::tools::search::register(kernel.tools_mut(), search)?;
@@ -256,6 +270,8 @@ impl AppState {
             settings,
             last_error: None,
             last_prompt_tokens: None,
+            pending,
+            mcp: Vec::new(),
         })
     }
 
@@ -573,6 +589,7 @@ impl AppState {
                 "compatible": pack.manifest.accepts_kernel(nguruvilu::pack::kernel_version()),
                 "path": pack.path.display().to_string(),
                 "assembly": pack.assembly.as_ref().map(|p| p.display().to_string()),
+                "loaded": pack.enabled,
             })).collect::<Vec<_>>(),
         }))
     }

@@ -727,7 +727,8 @@ function renderModels(list) {
   );
 }
 
-/// Render the installed packs, each with its own Apply and Remove actions.
+/// Render the installed packs, each with its own Apply, Load/Unload, and
+/// Delete actions.
 function renderPacks(list) {
   packList.replaceChildren();
   const packs = (list && list.packs) || [];
@@ -753,21 +754,33 @@ function renderPacks(list) {
       head.append(apply);
     }
 
-    // Removing is the other half of installing. Without it the only way out is
-    // to find the packs directory by hand.
-    const remove = el("button", "small", "Remove");
-    remove.title = "Delete this pack from disk";
-    remove.addEventListener("click", () => {
-      if (!confirm("Remove " + pack.name + " " + pack.version + "?\n\n" + pack.path)) return;
-      toShell({ cmd: "uninstall_pack", name: pack.name, version: pack.version });
+    // Load/unload is the ordinary control: it decides what conversations get,
+    // without touching the files. Delete is the one that removes them.
+    const toggle = el("button", "small", pack.loaded === false ? "Load" : "Unload");
+    toggle.title = pack.loaded === false
+      ? "Load this pack into conversations"
+      : "Unload: stop loading it, keep the files";
+    toggle.addEventListener("click", () => {
+      toShell(pack.loaded === false
+        ? { cmd: "load_pack", name: pack.name, version: pack.version }
+        : { cmd: "uninstall_pack", name: pack.name, version: pack.version });
     });
-    head.append(remove);
+    head.append(toggle);
+
+    const del = el("button", "small ghost", "Delete");
+    del.title = "Unload it, then delete the files";
+    del.addEventListener("click", () => {
+      if (!confirm("Delete " + pack.name + " " + pack.version + "?\n\nThe files are removed:\n" + pack.path)) return;
+      toShell({ cmd: "delete_pack", name: pack.name, version: pack.version });
+    });
+    head.append(del);
     box.append(head);
 
     const meta = [
       pack.license || "no license",
       pack.assembly ? "assembly yes" : "no assembly",
     ];
+    if (pack.loaded === false) meta.push("UNLOADED (files kept)");
     if (pack.skills) meta.push(pack.skills + " skill(s)");
     if (pack.plugins) meta.push(pack.plugins + " plugin(s)");
     if (pack.content && pack.content.length) meta.push(pack.content.join(", "));

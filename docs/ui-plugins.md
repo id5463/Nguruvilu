@@ -90,7 +90,7 @@
 | `new_session` / `open_session` / `delete_session` | — / `{ id }` / `{ id }` |
 | `save_settings` | 见下 |
 | `fetch_models` | — |
-| `list_packs` / `install_pack` / `uninstall_pack` / `apply_pack` | — / `{ path }` / `{ name, version? }` / `{ path }` |
+| `list_packs` / `install_pack` / `uninstall_pack` / `load_pack` / `delete_pack` / `apply_pack` | — / `{ path }` / `{ name, version? }` / `{ name, version? }` / `{ name, version? }` / `{ path }` |
 | `set_ui` | `{ id }` —— 换一个界面 |
 
 `save_settings`:

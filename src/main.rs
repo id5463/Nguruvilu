@@ -204,14 +204,17 @@ enum Command {
     /// List installed packs.
     Packs,
 
-/// Remove an installed pack.
+    /// Take an installed pack out of every conversation, keeping its files.
     Uninstall {
-        /// Pack name, or `name@version` to remove one of several.
+        /// Pack name, or `name@version` to pick one of several.
         name: String,
         /// Remove every installed version of that name.
         #[arg(long)]
         all: bool,
-        /// Directory to remove from.
+        /// Delete the files instead of only unloading them.
+        #[arg(long)]
+        delete: bool,
+        /// Directory to unload from (or delete from, with `--delete`).
         #[arg(long)]
         into: Option<PathBuf>,
     },
@@ -376,7 +379,10 @@ struct CliConfig {
     /// Context window, threshold, and how much survives a compaction.
     policy: Arc<Mutex<Arc<dyn ContextPolicy>>>,
     /// Extra fragments to place in each request.
-    injection: Arc<nguruvilu::context::InjectionEngine>,
+    ///
+    /// Behind a lock and shared with the pack host, so a pack hot-loaded
+    /// between turns replaces them for the next turn rather than the next run.
+    injection: Arc<Mutex<Arc<nguruvilu::context::InjectionEngine>>>,
 }
 
 /// The session's route, published so a plugin can build a subagent on it.
@@ -445,18 +451,37 @@ impl TurnConfig for CliConfig {
             model: snapshot.model_route.model,
             version: snapshot.version,
             policy: Arc::clone(&self.policy.lock().expect("policy lock")),
-            injection: Arc::clone(&self.injection),
+            injection: Arc::clone(&self.injection.lock().expect("injection lock")),
             cache_policy: snapshot.cache_policy,
         }
     }
 }
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = run().await {
-        eprintln!("ngu: {error:#}");
-        std::process::exit(1);
-    }
+/// Build the async runtime, run one session, and leave.
+///
+/// The runtime is deliberately **not** dropped: tearing it down waits on state
+/// a spawned MCP server left registered with it, and the process then never
+/// exits — after everything it had to say has already been printed. Everything
+/// the runtime owned that matters is stopped first (`stop_mcp` on the success
+/// path; `McpClient`'s own drop on every other path), so exiting without
+/// dropping it is the ending this process chooses rather than an oversight.
+fn main() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("ngu: starting the async runtime: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    let code = match runtime.block_on(run()) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("ngu: {error:#}");
+            1
+        }
+    };
+    std::process::exit(code);
 }
 
 fn platform_tag() -> &'static str {
@@ -544,8 +569,8 @@ async fn run() -> Result<()> {
         }
         Some(Command::Install { file, into }) => return install_command(file, into.as_ref(), cli.json).await,
         Some(Command::Packs) => return list_packs(cli.json),
-        Some(Command::Uninstall { name, all, into }) => {
-            return uninstall_command(name, *all, into.as_ref(), cli.json)
+        Some(Command::Uninstall { name, all, delete, into }) => {
+            return uninstall_command(name, *all, *delete, into.as_ref(), cli.json)
         }
         Some(Command::Ui { dir }) => return ui_command(dir.as_ref(), cli.json),
         Some(Command::Verify { file }) => return verify_command(file, cli.json),
@@ -574,8 +599,10 @@ async fn run() -> Result<()> {
 
     // The kernel owns the tool table; skills add one tool to it.
     let mut kernel = Kernel::new();
-    // The agent can build and install packs itself.
-    nguruvilu::tools::pack::register(kernel.tools_mut())?;
+    // The agent can build, install, load, and unload packs itself; the host
+    // applies the load and unload between turns.
+    let pending_packs = Arc::new(nguruvilu::tools::pack::PendingQueue::new());
+    nguruvilu::tools::pack::register_with(kernel.tools_mut(), Some(Arc::clone(&pending_packs)))?;
     // Search appears only when a provider and key are configured. A tool
     // that is present and fails on every call costs a turn every time a
     // model tries it; absent, the model does not know it exists.
@@ -590,7 +617,10 @@ async fn run() -> Result<()> {
 
     // An assembly manifest loads before the session starts, so its plugins,
     // MCP servers, and skills are in place for the first turn.
-    let mut pack_content: Option<nguruvilu::content::PackContent> = None;
+    let mut contents: Vec<nguruvilu::content::PackContent> = Vec::new();
+    // The MCP servers the session started, kept alive for as long as it runs
+    // and stopped on the way out — see `stop_mcp`.
+    let mut mcp_clients: Vec<Arc<nguruvilu::mcp::McpClient>> = Vec::new();
     if let Some(file) = &cli.assembly {
         let platform = platform_tag();
         let assembly = Assembly::from_file(file)?;
@@ -624,8 +654,14 @@ async fn run() -> Result<()> {
             eprintln!("skipped {}: {}", entry.id, entry.reason);
         }
 
-        // Take the kernel back; the loader stops any MCP servers it started.
-        kernel = loader.finish().await;
+        // Take the kernel back. The MCP servers it started stay up — their
+        // tools are in this kernel and are meant to be callable for as long as
+        // this conversation runs — and its skill roots join ours rather than
+        // replacing them.
+        let (loaded, pack_skills, servers) = loader.finish().await;
+        kernel = loaded;
+        mcp_clients.extend(servers);
+        nguruvilu::loader::merge_skills(&mut kernel, &mut skills, pack_skills)?;
 
         // Apply what the pack carries beyond its entries. Appearance lands on
         // the kernel now; the rest describes this session, and is applied below
@@ -635,7 +671,46 @@ async fn run() -> Result<()> {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
         if let Ok(manifest) = nguruvilu::pack::read_manifest(&pack_dir) {
-            pack_content = Some(nguruvilu::content::apply(&mut kernel, &pack_dir, &manifest)?);
+            contents.push(nguruvilu::content::apply(&mut kernel, &pack_dir, &manifest)?);
+        }
+    }
+
+    // Installed packs load the same way the window loads them: every enabled
+    // pack, in name order, so the command line and the desktop agree on what a
+    // conversation has. An unloaded pack keeps its files and is skipped — it
+    // can be brought back with `pack` action `load` without reinstalling.
+    for pack in nguruvilu::pack::installed(&nguruvilu::pack::default_packs_dir())? {
+        if !pack.enabled {
+            eprintln!("[pack] {} is unloaded; files kept", pack.manifest.name);
+            continue;
+        }
+        if let Some(assembly) = &pack.assembly {
+            let label = format!("{}-{}", pack.manifest.name, pack.manifest.version_id);
+            eprintln!("[pack] loading {label}");
+            let (pack_skills, report, servers) = nguruvilu::loader::load_pack(
+                &mut kernel,
+                &default_ledger_path(),
+                assembly,
+                &label,
+            )
+            .await?;
+            mcp_clients.extend(servers);
+            nguruvilu::loader::merge_skills(&mut kernel, &mut skills, pack_skills)?;
+            for entry in &report.loaded {
+                eprintln!("[pack] loaded {entry}");
+            }
+            for entry in &report.failed {
+                eprintln!("[pack] failed {}:{}: {}", entry.kind, entry.id, entry.error);
+            }
+        }
+        match nguruvilu::pack::read_manifest(&pack.path) {
+            Ok(manifest) => match nguruvilu::content::apply(&mut kernel, &pack.path, &manifest) {
+                Ok(content) => contents.push(content),
+                // Reported rather than fatal: one pack's content must not stop
+                // the session from starting.
+                Err(error) => eprintln!("[pack] {} content: {error:#}", pack.manifest.name),
+            },
+            Err(error) => eprintln!("[pack] {}: {error:#}", pack.manifest.name),
         }
     }
 
@@ -675,65 +750,16 @@ async fn run() -> Result<()> {
     // The context policy comes from settings, so `--context-window` and the
     // settings file both land here. A provider-reported window would be folded
     // in the same way once the catalog has been fetched.
-    // Apply what the pack carried. A pack's settings replace the standing ones:
-    // the pack is the unit the user chose, so it decides.
-    let mut injection = Arc::new(nguruvilu::context::InjectionEngine::load_default());
-    let pack_ran = pack_content.is_some();
-    if let Some(content) = pack_content {
-        for line in content.summary() {
-            eprintln!("pack content: {line}");
-        }
-        if let Some(soul) = content.soul {
-            runtime.apply(Change::session("pack", ChangePayload::Persona(soul)))?;
-        }
-        if let Some(models) = &content.models {
-            if let Some(url) = &models.base_url {
-                settings.base_url = url.clone();
-            }
-            if let Some(name) = &models.model {
-                settings.model = name.clone();
-            }
-            if let Some(effort) = &models.reasoning_effort {
-                settings.reasoning_effort = effort.clone();
-            }
-            if let Some(proxy) = &models.proxy {
-                settings.proxy = proxy.clone();
-            }
-            if let Some(ceiling) = &models.max_output_tokens {
-                settings.max_output_tokens = Some(nguruvilu::size::parse_size(ceiling)?);
-            }
-            for (key, value) in &models.extra_body {
-                settings.extra_body.insert(key.clone(), value.clone());
-            }
-            // Connection behaviour travels with the rest: a pack that names a
-            // flaky provider should also be able to say how hard to retry it.
-            if let Some(network) = &models.network {
-                settings.network = network.clone();
-            }
-            // The key itself is never in a pack; only the name of the
-            // variable holding it.
-            if let Some(var) = &models.api_key_env {
-                if let Ok(value) = std::env::var(var) {
-                    if !value.trim().is_empty() {
-                        settings.api_key = value;
-                    }
-                }
-            }
-        }
-        if let Some(context) = &content.context {
-            if let Some(window) = &context.window {
-                settings.context_window = Some(nguruvilu::size::parse_size(window)?);
-            }
-            if let Some(percent) = context.compact_percent {
-                settings.compact_percent = percent.min(100);
-            }
-            if let Some(keep) = context.compact_keep_recent {
-                settings.compact_keep_recent = keep.max(1);
-            }
-        }
-        if let Some(rules) = content.injections {
-            injection = Arc::new(rules);
-        }
+    //
+    // Each pack's content replaces the standing one: the pack is the unit the
+    // user chose, so it decides. They are folded in load order, so the last
+    // pack to speak is the one in force — the same rule the window follows.
+    let injection = Arc::new(Mutex::new(Arc::new(
+        nguruvilu::context::InjectionEngine::load_default(),
+    )));
+    let pack_ran = !contents.is_empty();
+    for content in contents {
+        adopt_content(content, &mut settings, &mut runtime, &injection)?;
     }
 
     // A pack's numbers replace the standing ones, so the route is rebuilt from
@@ -791,7 +817,11 @@ async fn run() -> Result<()> {
     if describe_runtime {
         let guard = runtime.lock().expect("runtime lock");
         let skills = skills.lock().expect("skills lock");
-        return show_runtime(&route, &guard, cache_policy, &skills, cli.json, &kernel);
+        let result = show_runtime(&route, &guard, cache_policy, &skills, cli.json, &kernel);
+        drop(skills);
+        drop(guard);
+        stop_mcp(&mcp_clients).await;
+        return result;
     }
 
     let config: Arc<dyn TurnConfig> = Arc::new(CliConfig {
@@ -799,7 +829,7 @@ async fn run() -> Result<()> {
         base_prompt,
         skills: Arc::clone(&skills),
         policy: Arc::clone(&policy),
-        injection,
+        injection: Arc::clone(&injection),
     });
 
     let snapshotter = if cli.git_snapshot {
@@ -905,6 +935,22 @@ async fn run() -> Result<()> {
                 session.messages = agent.messages().to_vec();
             }
 
+            // Apply any pack load or unload the turn asked for, before the
+            // report goes out: from here on the tool table is a different one,
+            // and this is the moment it is read again.
+            PackHost {
+                cli: &cli,
+                kernel: &mut kernel,
+                skills: &skills,
+                runtime: &runtime,
+                settings: &mut settings,
+                injection: &injection,
+                queue: &pending_packs,
+                mcp: &mut mcp_clients,
+            }
+            .drain()
+            .await?;
+
             let snapshot = if let Some(git) = &snapshotter {
                 git.snapshot("after turn")?
             } else {
@@ -957,11 +1003,42 @@ async fn run() -> Result<()> {
             }
         }
         None => {
-            interactive(client, config, session, &store, cli.max_steps, snapshotter).await?;
+            interactive(
+                client,
+                config,
+                session,
+                &store,
+                cli.max_steps,
+                snapshotter,
+                PackHost {
+                    cli: &cli,
+                    kernel: &mut kernel,
+                    skills: &skills,
+                    runtime: &runtime,
+                    settings: &mut settings,
+                    injection: &injection,
+                    queue: &pending_packs,
+                    mcp: &mut mcp_clients,
+                },
+            )
+            .await?;
         }
     }
 
+    stop_mcp(&mcp_clients).await;
     Ok(())
+}
+
+/// Stop every MCP server this session started.
+///
+/// Before the runtime tears down rather than at the moment loading finishes:
+/// a server still registered with a runtime that is shutting down is what
+/// keeps the process alive after everything it had to say has been printed.
+/// Loading keeps them running; this is the other half of that decision.
+async fn stop_mcp(clients: &[Arc<nguruvilu::mcp::McpClient>]) {
+    for client in clients {
+        client.shutdown().await;
+    }
 }
 
 async fn interactive(
@@ -971,6 +1048,7 @@ async fn interactive(
     store: &JsonlStore,
     max_steps: usize,
     snapshotter: Option<GitSnapshot>,
+    mut pack_host: PackHost<'_>,
 ) -> Result<()> {
     println!(
         "Nguruvilu {} — session {}",
@@ -1032,6 +1110,9 @@ async fn interactive(
                         eprintln!("[snapshot {}]\n", record.short());
                     }
                 }
+                // A pack the turn loaded or unloaded is applied here, between
+                // turns: the conversation keeps going, with a new tool table.
+                pack_host.drain().await?;
             }
             Err(error) => {
                 eprintln!("error: {error:#}\n");
@@ -1571,6 +1652,7 @@ fn list_packs(as_json: bool) -> Result<()> {
                     "license": p.manifest.license,
                     "path": p.path.display().to_string(),
                     "has_assembly": p.assembly.is_some(),
+                    "loaded": p.enabled,
                 })).collect::<Vec<_>>(),
             }))?
         );
@@ -1581,13 +1663,17 @@ fn list_packs(as_json: bool) -> Result<()> {
         println!("no packs installed in {}", packs_dir.display());
         return Ok(());
     }
-    println!("{:<24} {:<12} {:<10} {}", "name", "version", "license", "assembly");
+    println!(
+        "{:<24} {:<12} {:<10} {:<8} {}",
+        "name", "version", "license", "loaded", "assembly"
+    );
     for pack in packs {
         println!(
-            "{:<24} {:<12} {:<10} {}",
+            "{:<24} {:<12} {:<10} {:<8} {}",
             pack.manifest.name,
             pack.manifest.version_id,
             pack.manifest.license,
+            if pack.enabled { "yes" } else { "no" },
             if pack.assembly.is_some() { "yes" } else { "no" }
         );
     }
@@ -1636,7 +1722,13 @@ fn ui_command(dir: Option<&PathBuf>, as_json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Remove an installed pack.
+/// Take an installed pack out of every conversation, or delete its files.
+///
+/// Two different acts with one command on purpose: the ordinary one is
+/// *unload* — the pack stops being loaded into new conversations, and its
+/// files stay, so it can come back without downloading anything. `--delete` is
+/// the one that removes files, because deleting is not how you stop using
+/// something.
 ///
 /// Named rather than pathed: the user knows which pack they installed, and
 /// asking them to find the directory is asking them to know how install
@@ -1644,6 +1736,7 @@ fn ui_command(dir: Option<&PathBuf>, as_json: bool) -> Result<()> {
 fn uninstall_command(
     name: &str,
     all: bool,
+    delete: bool,
     into: Option<&PathBuf>,
     as_json: bool,
 ) -> Result<()> {
@@ -1684,8 +1777,8 @@ fn uninstall_command(
         );
     }
 
-    // Removing several versions at once is what `--all` is for; without it,
-    // ask rather than guessing which one was meant.
+    // Several versions at once is what `--all` is for; without it, ask rather
+    // than guessing which one was meant.
     if matches.len() > 1 && !all {
         let versions: Vec<String> = matches
             .iter()
@@ -1699,31 +1792,50 @@ fn uninstall_command(
         );
     }
 
-    let mut removed = Vec::new();
+    let mut affected = Vec::new();
     for pack in &matches {
-        source.remove(&pack.path)?;
-        removed.push(format!(
-            "{}@{}",
-            pack.manifest.name, pack.manifest.version_id
-        ));
+        let label = format!("{}@{}", pack.manifest.name, pack.manifest.version_id);
+        if delete {
+            source.remove(&pack.path)?;
+        } else {
+            nguruvilu::pack::set_enabled(&pack.path, false)?;
+        }
+        affected.push(label);
     }
 
     if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
+        let payload = if delete {
+            serde_json::json!({
                 "ok": true,
-                "removed": removed,
+                "removed": affected,
+                "files_kept": false,
                 "dir": root.display().to_string(),
-            }))?
-        );
-    } else {
-        for entry in &removed {
-            println!("removed {entry}");
+            })
+        } else {
+            serde_json::json!({
+                "ok": true,
+                "unloaded": affected,
+                "files_kept": true,
+                "dir": root.display().to_string(),
+            })
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else if delete {
+        for entry in &affected {
+            println!("deleted {entry}");
         }
-        // A running session loaded the pack at startup; saying so is the
-        // difference between "it did not work" and "restart to see it".
-        println!("Restart any running session to drop what it loaded.");
+        println!("Its files are gone; reinstall to use it again.");
+    } else {
+        for entry in &affected {
+            println!("unloaded {entry} (files kept)");
+        }
+        println!(
+            "New conversations will not load it. To bring it back: ngu install <archive>, \
+             or load it from inside a conversation with the pack tool."
+        );
+        println!(
+            "A session already running keeps what it loaded; ask it to unload, or restart it."
+        );
     }
     Ok(())
 }
@@ -2214,6 +2326,225 @@ fn require_key(api_key: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Fold one pack's content into this session.
+///
+/// Used at startup and again when a pack is hot-loaded between turns, so both
+/// paths apply exactly the same things: a pack's settings replace the standing
+/// ones, because the pack is the unit the user chose. The content's appearance
+/// part has already landed on the kernel by the time this runs — see
+/// [`nguruvilu::content::apply`].
+fn adopt_content(
+    content: nguruvilu::content::PackContent,
+    settings: &mut Settings,
+    runtime: &mut Runtime,
+    injection: &Arc<Mutex<Arc<nguruvilu::context::InjectionEngine>>>,
+) -> Result<()> {
+    for line in content.summary() {
+        eprintln!("pack content: {line}");
+    }
+    if let Some(soul) = content.soul {
+        runtime.apply(Change::session("pack", ChangePayload::Persona(soul)))?;
+    }
+    if let Some(models) = &content.models {
+        if let Some(url) = &models.base_url {
+            settings.base_url = url.clone();
+        }
+        if let Some(name) = &models.model {
+            settings.model = name.clone();
+        }
+        if let Some(effort) = &models.reasoning_effort {
+            settings.reasoning_effort = effort.clone();
+        }
+        if let Some(proxy) = &models.proxy {
+            settings.proxy = proxy.clone();
+        }
+        if let Some(ceiling) = &models.max_output_tokens {
+            settings.max_output_tokens = Some(nguruvilu::size::parse_size(ceiling)?);
+        }
+        for (key, value) in &models.extra_body {
+            settings.extra_body.insert(key.clone(), value.clone());
+        }
+        // Connection behaviour travels with the rest: a pack that names a
+        // flaky provider should also be able to say how hard to retry it.
+        if let Some(network) = &models.network {
+            settings.network = network.clone();
+        }
+        // The key itself is never in a pack; only the name of the variable
+        // holding it.
+        if let Some(var) = &models.api_key_env {
+            if let Ok(value) = std::env::var(var) {
+                if !value.trim().is_empty() {
+                    settings.api_key = value;
+                }
+            }
+        }
+    }
+    if let Some(context) = &content.context {
+        if let Some(window) = &context.window {
+            settings.context_window = Some(nguruvilu::size::parse_size(window)?);
+        }
+        if let Some(percent) = context.compact_percent {
+            settings.compact_percent = percent.min(100);
+        }
+        if let Some(keep) = context.compact_keep_recent {
+            settings.compact_keep_recent = keep.max(1);
+        }
+    }
+    if let Some(rules) = content.injections {
+        *injection
+            .lock()
+            .expect("injection lock") = Arc::new(rules);
+    }
+    Ok(())
+}
+
+/// Applies the pack load and unload a turn asked for.
+///
+/// The tool runs while the turn owns the kernel, so it records what it wants
+/// in a queue; this drains the queue between turns, which is the first moment
+/// the tool table is read again anyway. Nothing here restarts or pauses the
+/// conversation — it continues with a different table, and a tool that was
+/// unloaded answers "no tool named …" from then on.
+struct PackHost<'a> {
+    cli: &'a Cli,
+    kernel: &'a mut Kernel,
+    skills: &'a Arc<Mutex<SkillRegistry>>,
+    runtime: &'a Arc<Mutex<Runtime>>,
+    settings: &'a mut Settings,
+    injection: &'a Arc<Mutex<Arc<nguruvilu::context::InjectionEngine>>>,
+    queue: &'a nguruvilu::tools::pack::PendingQueue,
+    /// The session's MCP servers: joined when a pack loads, stopped when it
+    /// unloads, and stopped for good on the way out.
+    mcp: &'a mut Vec<Arc<nguruvilu::mcp::McpClient>>,
+}
+
+impl PackHost<'_> {
+    /// Apply every request recorded during the turn that just ended.
+    async fn drain(&mut self) -> Result<()> {
+        use nguruvilu::tools::pack::Pending;
+
+        let mut changed = false;
+        for action in self.queue.drain() {
+            let packs = nguruvilu::pack::installed(&nguruvilu::pack::default_packs_dir())?;
+            match action {
+                Pending::Unload(name) => {
+                    let mut found = false;
+                    for pack in packs.iter().filter(|pack| pack.manifest.name == name) {
+                        let label = format!("{}-{}", pack.manifest.name, pack.manifest.version_id);
+                        let report = {
+                            let mut guard = self.skills.lock().expect("skills lock");
+                            nguruvilu::loader::unload_pack(
+                                self.kernel,
+                                &mut *guard,
+                                &default_ledger_path(),
+                                &label,
+                                &pack.manifest.name,
+                            )?
+                        };
+                        found = true;
+                        changed = true;
+                        eprintln!(
+                            "[pack] unloaded {label}: {} plugin instance(s), {} mcp server(s), {} skill root(s)",
+                            report.plugins.len(),
+                            report.mcp.len(),
+                            report.skills.len()
+                        );
+                        for note in &report.notes {
+                            eprintln!("[pack] {note}");
+                        }
+                        // The tools are gone, so the servers they belonged to
+                        // have no reason to keep running.
+                        for client in self
+                            .mcp
+                            .iter()
+                            .filter(|client| report.mcp.iter().any(|id| id == client.server()))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                        {
+                            client.shutdown().await;
+                            self.mcp.retain(|kept| !Arc::ptr_eq(kept, &client));
+                        }
+                    }
+                    if !found {
+                        eprintln!("[pack] {name} is not installed; nothing was loaded to unload");
+                    }
+                }
+                Pending::Load(name) => {
+                    for pack in packs
+                        .iter()
+                        .filter(|pack| pack.manifest.name == name && pack.enabled)
+                    {
+                        let label = format!("{}-{}", pack.manifest.name, pack.manifest.version_id);
+                        if let Some(assembly) = &pack.assembly {
+                            let (pack_skills, report, servers) = nguruvilu::loader::load_pack(
+                                self.kernel,
+                                &default_ledger_path(),
+                                assembly,
+                                &label,
+                            )
+                            .await?;
+                            self.mcp.extend(servers);
+                            {
+                                let mut guard = self.skills.lock().expect("skills lock");
+                                nguruvilu::loader::merge_skills(
+                                    self.kernel,
+                                    &mut *guard,
+                                    pack_skills,
+                                )?;
+                            }
+                            eprintln!(
+                                "[pack] loaded {label}: {} entr(ies), {} failed",
+                                report.loaded.len(),
+                                report.failed.len()
+                            );
+                            changed = true;
+                        }
+                        match nguruvilu::pack::read_manifest(&pack.path) {
+                            Ok(manifest) => {
+                                match nguruvilu::content::apply(self.kernel, &pack.path, &manifest)
+                                {
+                                    Ok(content) => {
+                                        let mut guard =
+                                            self.runtime.lock().expect("runtime lock");
+                                        adopt_content(
+                                            content,
+                                            self.settings,
+                                            &mut *guard,
+                                            self.injection,
+                                        )?;
+                                    }
+                                    Err(error) => eprintln!(
+                                        "[pack] {} content: {error:#}",
+                                        pack.manifest.name
+                                    ),
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!("[pack] {}: {error:#}", pack.manifest.name)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if changed {
+            // The route may have moved with the pack's content, and the tool
+            // table certainly did; both are published together so the next
+            // turn reads one consistent view.
+            let route = model_route(self.cli, self.settings, Some(self.kernel));
+            let mut guard = self.runtime.lock().expect("runtime lock");
+            guard.apply(Change::session(
+                "pack",
+                ChangePayload::ModelRoute(route),
+            ))?;
+            guard.adopt_kernel_tools(self.kernel);
+            eprintln!("[pack] the next turn sees the new tool table");
+        }
+        Ok(())
+    }
 }
 
 /// The route this session runs on, built from the resolved settings.

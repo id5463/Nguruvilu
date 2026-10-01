@@ -11,7 +11,7 @@
 //! Nothing here reloads a plugin by hand: loading changes the service table,
 //! and [`Kernel::refresh`] propagates that along the dependency graph.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -473,18 +473,218 @@ impl Loader {
         }
     }
 
-    /// Take the kernel back, stopping any MCP servers this loader started.
-    pub async fn finish(mut self) -> Kernel {
-        self.shutdown().await;
-        self.kernel
+    /// Take the kernel back, handing over the skill roots this pack added and
+    /// the MCP servers it started.
+    ///
+    /// The MCP servers are deliberately **not** stopped here: their tools are
+    /// in this kernel and stay callable for as long as the conversation runs;
+    /// stopping them here killed every MCP tool the moment loading ended. The
+    /// caller keeps them — and stops them on the way out, because a server
+    /// still running when the runtime tears down is what kept the process alive
+    /// after everything it had to say was printed.
+    ///
+    /// The skills come back rather than staying inside the loader for the same
+    /// reason: the host owns the standing catalog, and a pack's roots join it
+    /// instead of replacing it.
+    pub async fn finish(self) -> (Kernel, SkillRegistry, Vec<Arc<McpClient>>) {
+        let Loader { kernel, skills, mcp_clients, .. } = self;
+        (kernel, skills, mcp_clients)
     }
 
     /// Stop every MCP server this loader started.
+    ///
+    /// For a preview that is about to exit, not for a session: see
+    /// [`Loader::finish`].
     pub async fn shutdown(&mut self) {
         for client in self.mcp_clients.drain(..) {
             client.shutdown().await;
         }
     }
+}
+
+/// What an unload took out of the kernel.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UnloadReport {
+    /// Plugin instances unloaded, by plugin name.
+    pub plugins: Vec<String>,
+    /// MCP servers whose tools were removed; the child stops with its last
+    /// handle.
+    pub mcp: Vec<String>,
+    /// Skill roots removed from the catalog.
+    pub skills: Vec<String>,
+    /// Anything that did not match, so an unload that did nothing says so
+    /// rather than looking like it worked.
+    pub notes: Vec<String>,
+}
+
+/// Unload everything one pack contributed, leaving its files where they are.
+///
+/// Unload and delete are different acts: this takes the pack *out of the
+/// conversation* — its tools stop being callable — and keeps the installed
+/// directory, so it can be loaded again without fetching anything.
+///
+/// `label` is the ledger's pack label (`name-version`); `name` is the
+/// manifest's name, which is what the appearance fiber is registered under.
+/// The ledger entries for the pack are removed as they are undone, so a later
+/// load sees them as new work rather than as something already in place.
+pub fn unload_pack(
+    kernel: &mut Kernel,
+    skills: &mut SkillRegistry,
+    ledger_path: &Path,
+    label: &str,
+    name: &str,
+) -> Result<UnloadReport> {
+    let mut ledger = Ledger::load(ledger_path)?;
+    let entries: Vec<LedgerEntry> = ledger
+        .entries
+        .iter()
+        .filter(|entry| entry.pack == label)
+        .cloned()
+        .collect();
+
+    let mut report = UnloadReport::default();
+
+    for entry in &entries {
+        match entry.kind.as_str() {
+            "plugin" => {
+                let plugin = plugin_name(&entry.source, &entry.id);
+                let ids: Vec<u64> = kernel
+                    .fibers()
+                    .iter()
+                    .filter(|fiber| fiber.plugin == plugin)
+                    .map(|fiber| fiber.id)
+                    .collect();
+                if ids.is_empty() {
+                    report
+                        .notes
+                        .push(format!("plugin '{plugin}' was not loaded here"));
+                }
+                for id in ids {
+                    kernel.unload(id)?;
+                    report.plugins.push(plugin.clone());
+                }
+                ledger.remove("plugin", &entry.id);
+            }
+            "mcp" => {
+                // An MCP server has no fiber: its tools are registered
+                // directly, so they are removed directly. With the loader's own
+                // handle already dropped, removing the last tool drops the last
+                // handle and the child process stops.
+                let owner = format!("mcp:{}", entry.id);
+                let tools: Vec<String> = kernel
+                    .tools()
+                    .names()
+                    .into_iter()
+                    .filter(|tool| kernel.tools().owner(tool).as_deref() == Some(owner.as_str()))
+                    .collect();
+                for tool in tools {
+                    kernel.tools_mut().unregister(&tool);
+                }
+                report.mcp.push(entry.id.clone());
+                ledger.remove("mcp", &entry.id);
+            }
+            "skill" => {
+                if let Some(path) = &entry.path {
+                    skills.remove_root(Path::new(path));
+                    report.skills.push(entry.id.clone());
+                }
+                ledger.remove("skill", &entry.id);
+            }
+            other => report
+                .notes
+                .push(format!("entry '{other}:{}' has no unload path", entry.id)),
+        }
+    }
+
+    // The appearance a pack's look.json installs is a fiber of its own,
+    // registered under the manifest name rather than the ledger label.
+    let appearance = format!("pack:{name}");
+    let ids: Vec<u64> = kernel
+        .fibers()
+        .iter()
+        .filter(|fiber| fiber.plugin == appearance)
+        .map(|fiber| fiber.id)
+        .collect();
+    for id in ids {
+        kernel.unload(id)?;
+        report.plugins.push(appearance.clone());
+    }
+
+    // The catalog tool holds a snapshot of the registry, so removing a root
+    // only reaches the model once the tool is rebuilt over what is left — and
+    // when nothing is left, no tool is the right answer rather than one that
+    // advertises an empty catalog.
+    kernel.tools_mut().unregister("skill");
+    skills.scan()?;
+    if !skills.is_empty() {
+        crate::skills::register_skill_tool(kernel.tools_mut(), std::sync::Arc::new(skills.clone()))?;
+    }
+
+    if entries.is_empty() && report.plugins.is_empty() {
+        report
+            .notes
+            .push(format!("nothing in the ledger came from '{label}'"));
+    }
+
+    ledger.save(ledger_path)?;
+    Ok(report)
+}
+
+/// Load one pack's assembly into a kernel, returning the roots it added.
+///
+/// Takes the kernel by reference and gives it back on **every** path, including
+/// a failure: a load that loses the kernel would leave the session with no
+/// tools at all, which is far worse than a pack that failed to load. The
+/// skills come back rather than being merged here so the caller never holds
+/// its catalog across the awaits in this function; hand them straight to
+/// [`merge_skills`].
+pub async fn load_pack(
+    kernel: &mut Kernel,
+    ledger_path: &Path,
+    assembly: &Path,
+    label: &str,
+) -> Result<(SkillRegistry, LoadReport, Vec<Arc<McpClient>>)> {
+    let pack_dir = assembly
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let taken = std::mem::replace(kernel, Kernel::new());
+    let mut loader = Loader::new(taken, ledger_path.to_path_buf(), label).with_pack_dir(&pack_dir);
+
+    let loaded = async {
+        let document = crate::assembly::Assembly::from_file(assembly)?;
+        let plan = document.plan(crate::fetch::platform_tag())?;
+        loader.apply(&plan).await
+    }
+    .await;
+
+    let (returned, pack_skills, servers) = loader.finish().await;
+    *kernel = returned;
+    let report = loaded?;
+    Ok((pack_skills, report, servers))
+}
+
+/// Merge a pack's skill roots into the standing catalog and rebuild the tool.
+///
+/// The `skill` tool holds a snapshot of the registry, so a root that arrives
+/// or leaves only reaches the model once the tool is registered over what is
+/// there now. Without this, a pack's skills would *replace* the host's instead
+/// of joining them.
+pub fn merge_skills(
+    kernel: &mut Kernel,
+    host: &mut SkillRegistry,
+    pack: SkillRegistry,
+) -> Result<()> {
+    for root in pack.roots() {
+        host.add_root(root.clone());
+    }
+    host.scan()?;
+    kernel.tools_mut().unregister("skill");
+    if !host.is_empty() {
+        crate::skills::register_skill_tool(kernel.tools_mut(), Arc::new(host.clone()))?;
+    }
+    Ok(())
 }
 
 /// Resolve a plugin's registered name from its source string.
@@ -860,5 +1060,167 @@ stages:
         // A path or URL is not a plugin name.
         assert_eq!(plugin_name("npm:@dshd/search@^2", "fallback"), "fallback");
         assert_eq!(plugin_name("./local/thing", "fallback"), "fallback");
+    }
+
+    /// A plugin whose whole contribution is one tool, so an unload has
+    /// something visible to take away.
+    struct WithTool {
+        name: String,
+    }
+
+    impl Plugin for WithTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn apply(&self, _ctx: &PluginCtx) -> Result<Contributions> {
+            Ok(Contributions::new().tool(crate::tools::ToolDef::new(
+                format!("tool_of_{}", self.name),
+                "a test tool",
+                serde_json::json!({ "type": "object", "properties": {} }),
+                self.name.clone(),
+                |_| {
+                    Box::pin(async { Ok(crate::tools::ToolOutput::text("ok")) })
+                        as crate::tools::ToolFuture
+                },
+            )))
+        }
+    }
+
+    fn ledger_entry(kind: &str, id: &str, source: &str, path: Option<String>) -> LedgerEntry {
+        LedgerEntry {
+            kind: kind.into(),
+            id: id.into(),
+            source: source.into(),
+            sha1: None,
+            path,
+            scope: "session".into(),
+            pack: "demo-1.0.0".into(),
+            installed_at: "now".into(),
+        }
+    }
+
+    #[test]
+    fn unloading_a_pack_takes_everything_it_brought_and_leaves_the_files_alone() {
+        let dir = temp_dir("unload");
+        let ledger_path = dir.join("installed.json");
+        let skills_root = dir.join("skills");
+        write_skill(&skills_root, "demo-skill");
+
+        let mut kernel = Kernel::new();
+        kernel.define(Arc::new(WithTool { name: "demo".into() }));
+        // The appearance a look.json installs, registered under the manifest
+        // name rather than the ledger label.
+        kernel.define(Arc::new(WithTool { name: "pack:demo".into() }));
+        kernel
+            .load("demo", RealmMap::new(), serde_json::Value::Null)
+            .unwrap();
+        kernel
+            .load("pack:demo", RealmMap::new(), serde_json::Value::Null)
+            .unwrap();
+        assert!(kernel.tools().get("tool_of_demo").is_some());
+
+        let mut skills = SkillRegistry::new();
+        skills.add_root(&skills_root);
+        skills.scan().unwrap();
+        register_skill_tool(kernel.tools_mut(), Arc::new(skills.clone())).unwrap();
+        assert!(kernel.tools().get("skill").is_some());
+
+        let mut ledger = Ledger::new();
+        ledger.record(ledger_entry(
+            "plugin",
+            "demo",
+            "builtin:demo",
+            None,
+        ));
+        ledger.record(ledger_entry(
+            "skill",
+            "demo-skill",
+            &skills_root.display().to_string(),
+            Some(skills_root.display().to_string()),
+        ));
+        ledger.record(ledger_entry("mcp", "demo-server", "stdio:x", None));
+        ledger.save(&ledger_path).unwrap();
+
+        let report =
+            unload_pack(&mut kernel, &mut skills, &ledger_path, "demo-1.0.0", "demo").unwrap();
+
+        // Everything it contributed is out of the conversation.
+        assert!(kernel.tools().get("tool_of_demo").is_none(), "its tool");
+        assert!(
+            kernel.tools()
+                .get("tool_of_pack:demo")
+                .is_none(),
+            "its appearance"
+        );
+        assert!(kernel.tools().get("skill").is_none(), "no skills left to advertise");
+        assert_eq!(report.plugins, vec!["demo".to_string(), "pack:demo".to_string()]);
+        assert_eq!(report.mcp, vec!["demo-server".to_string()]);
+        assert_eq!(report.skills, vec!["demo-skill".to_string()]);
+        assert!(
+            skills.roots().iter().all(|root| root != &skills_root),
+            "the root is out of the catalog"
+        );
+
+        // The ledger no longer claims they are in place, so a later load sees
+        // them as work to do rather than as already done.
+        let back = Ledger::load(&ledger_path).unwrap();
+        assert!(
+            back.entries.iter().all(|entry| entry.pack != "demo-1.0.0"),
+            "{:?}",
+            back.entries
+        );
+
+        // …and the pack's own files are untouched: unload is not delete.
+        assert!(skills_root.join("demo-skill").join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn unloading_a_pack_that_is_not_loaded_says_so_rather_than_looking_successful() {
+        let dir = temp_dir("unload-nothing");
+        let ledger_path = dir.join("installed.json");
+        let mut kernel = Kernel::new();
+        let mut skills = SkillRegistry::new();
+
+        let report =
+            unload_pack(&mut kernel, &mut skills, &ledger_path, "ghost-1.0.0", "ghost").unwrap();
+
+        assert!(report.plugins.is_empty());
+        assert!(report.mcp.is_empty());
+        assert!(report.skills.is_empty());
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("nothing in the ledger")),
+            "{:?}",
+            report.notes
+        );
+    }
+
+    #[test]
+    fn merging_pack_skills_keeps_the_hosts_own() {
+        // Before this, a pack's skills replaced the standing catalog — the
+        // model would lose every skill it had as soon as one pack loaded.
+        let dir = temp_dir("merge-skills");
+        let host_root = dir.join("host");
+        let pack_root = dir.join("pack");
+        write_skill(&host_root, "host-skill");
+        write_skill(&pack_root, "pack-skill");
+
+        let mut host = SkillRegistry::new();
+        host.add_root(&host_root);
+        host.scan().unwrap();
+
+        let mut pack = SkillRegistry::new();
+        pack.add_root(&pack_root);
+        pack.scan().unwrap();
+
+        let mut kernel = Kernel::new();
+        merge_skills(&mut kernel, &mut host, pack).unwrap();
+
+        let catalog = host.catalog().expect("both skills are in the catalog");
+        assert!(catalog.contains("host-skill"), "{catalog}");
+        assert!(catalog.contains("pack-skill"), "{catalog}");
+        assert!(kernel.tools().get("skill").is_some());
     }
 }

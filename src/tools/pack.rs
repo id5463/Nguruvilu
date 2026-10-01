@@ -15,6 +15,7 @@
 //! at, so the transcript shows what happened.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
@@ -22,29 +23,85 @@ use serde_json::{json, Value};
 use crate::source::{FilesystemSource, PackSource};
 use crate::tools::{ConflictPolicy, ToolDef, ToolFuture, ToolOutput};
 
-/// Register the pack tool.
+/// A load or unload this conversation asked for.
+///
+/// Queued rather than done inside the call: the tool runs while the loop owns
+/// the kernel, and the host applies the change at the end of the turn — which
+/// is the next moment the tool table is read anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pending {
+    /// Bring an installed pack into this conversation.
+    Load(String),
+    /// Take it out of this conversation, keeping its files.
+    Unload(String),
+}
+
+/// What the tool hands the host, drained once the turn is over.
+#[derive(Default)]
+pub struct PendingQueue {
+    items: std::sync::Mutex<Vec<Pending>>,
+}
+
+impl PendingQueue {
+    /// An empty queue.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one request.
+    pub fn push(&self, item: Pending) {
+        self.items.lock().expect("pending queue lock").push(item);
+    }
+
+    /// Take every request recorded so far, leaving the queue empty.
+    pub fn drain(&self) -> Vec<Pending> {
+        std::mem::take(&mut *self.items.lock().expect("pending queue lock"))
+    }
+}
+
+/// Register the pack tool with no host attached.
+///
+/// Enough for tests and for a caller that only wants build/verify/list: the
+/// load and unload actions then change state on disk and say so, rather than
+/// pretending a kernel was reached.
 pub fn register(registry: &mut crate::tools::ToolRegistry) -> Result<()> {
+    register_with(registry, None)
+}
+
+/// Register the pack tool, handing its load and unload requests to `pending`.
+pub fn register_with(
+    registry: &mut crate::tools::ToolRegistry,
+    pending: Option<Arc<PendingQueue>>,
+) -> Result<()> {
     registry.register(
         ToolDef::new(
             "pack",
-            "Build, inspect, and install `.dshpack` archives. A pack is a zip holding \
-             `dsh.index.json` (identity: name, version, license), `assembly.yaml` (what it \
-             loads), and whatever those reference. Actions: \
+            "Build, inspect, install, load, and unload `.dshpack` archives. A pack is a zip \
+             holding `dsh.index.json` (identity: name, version, license) plus a few small \
+             document files, and nothing else — everything it needs is referenced from the \
+             manifest. Actions: \
              `build` an archive from a directory, `verify` an archive without installing it, \
-             `list` installed packs, `install` an archive, `apply` an installed pack's \
-             assembly. Building needs the directory to already contain `dsh.index.json` — \
-             write that file first.",
+             `list` installed packs with whether each is loaded, `install` an archive, \
+             `load` an installed pack into this conversation (files are kept, and an unloaded \
+             pack comes back), `unload` an installed pack out of this conversation (its tools \
+             stop being callable; the files stay), `apply` an installed pack's assembly. \
+             Building needs the directory to already contain `dsh.index.json` — write that \
+             file first.",
             json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["build", "verify", "list", "install", "apply"],
+                        "enum": ["build", "verify", "list", "install", "load", "unload", "apply"],
                         "description": "What to do."
                     },
                     "path": {
                         "type": "string",
-                        "description": "build: the pack directory. verify/install: the .dshpack archive. apply: the installed pack's assembly.yaml. Not used by list."
+                        "description": "build: the pack directory. verify/install: the .dshpack archive. apply: the installed pack's assembly.yaml. Not used by list, load, or unload."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "load/unload: the installed pack's name, optionally name@version. Not used by the other actions."
                     },
                     "out": {
                         "type": "string",
@@ -54,7 +111,10 @@ pub fn register(registry: &mut crate::tools::ToolRegistry) -> Result<()> {
                 "required": ["action"]
             }),
             "kernel",
-            |args| Box::pin(run(args)) as ToolFuture,
+            move |args| {
+                let pending = pending.clone();
+                Box::pin(async move { run_with(args, pending).await }) as ToolFuture
+            },
         ),
         ConflictPolicy::Error,
     )?;
@@ -62,20 +122,27 @@ pub fn register(registry: &mut crate::tools::ToolRegistry) -> Result<()> {
 }
 
 async fn run(args: Value) -> Result<ToolOutput> {
+    run_with(args, None).await
+}
+
+async fn run_with(args: Value, pending: Option<Arc<PendingQueue>>) -> Result<ToolOutput> {
     let action = args
         .get("action")
         .and_then(|a| a.as_str())
         .ok_or_else(|| anyhow!("missing required argument: action"))?;
     let path = args.get("path").and_then(|p| p.as_str());
+    let name = args.get("name").and_then(|n| n.as_str());
 
     match action {
         "build" => build(path, args.get("out").and_then(|o| o.as_str())),
         "verify" => verify(path),
         "list" => list(),
         "install" => install(path).await,
-        "apply" => apply(path),
+        "load" => set_loaded(name, true, pending.as_ref()),
+        "unload" => set_loaded(name, false, pending.as_ref()),
+        "apply" => apply(path, pending.as_ref()),
         other => Err(anyhow!(
-            "unknown action '{other}'; expected build, verify, list, install, or apply"
+            "unknown action '{other}'; expected build, verify, list, install, load, unload, or apply"
         )),
     }
 }
@@ -159,13 +226,15 @@ fn list() -> Result<ToolOutput> {
         )));
     }
 
-    let mut text = format!("{} installed:", packs.len());
+    let loaded = packs.iter().filter(|p| p.enabled).count();
+    let mut text = format!("{} installed ({loaded} loaded):", packs.len());
     for pack in packs {
         text.push_str(&format!(
-            "\n- {} {} ({}){}",
+            "\n- {} {} ({}){}{}",
             pack.manifest.name,
             pack.manifest.version_id,
             pack.manifest.license,
+            if pack.enabled { " [loaded]" } else { " [unloaded, files kept]" },
             match &pack.assembly {
                 Some(assembly) => format!("\n  assembly: {}", assembly.display()),
                 None => "  (no assembly)".to_string(),
@@ -173,6 +242,150 @@ fn list() -> Result<ToolOutput> {
         ));
     }
     Ok(ToolOutput::text(text))
+}
+
+/// Installed packs matching `name` or `name@version`.
+fn installed_matching(wanted: &str) -> Result<Vec<crate::pack::InstalledPack>> {
+    let (base, version) = match wanted.split_once('@') {
+        Some((base, version)) => (base, Some(version)),
+        None => (wanted, None),
+    };
+    let packs = FilesystemSource::default_root().list()?;
+    let matches: Vec<_> = packs
+        .into_iter()
+        .filter(|pack| pack.manifest.name == base)
+        .filter(|pack| version.map_or(true, |v| pack.manifest.version_id == v))
+        .collect();
+
+    if matches.is_empty() {
+        // Naming what is installed turns a dead end into a next step, the same
+        // way the CLI's uninstall does.
+        let installed = FilesystemSource::default_root().list()?;
+        anyhow::bail!(
+            "no installed pack matches '{wanted}'.{}",
+            if installed.is_empty() {
+                " Nothing is installed.".to_string()
+            } else {
+                format!(
+                    " Installed: {}",
+                    installed
+                        .iter()
+                        .map(|p| format!("{}@{}", p.manifest.name, p.manifest.version_id))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        );
+    }
+    Ok(matches)
+}
+
+/// Load or unload an installed pack for this conversation.
+///
+/// Unloading keeps the files: it takes the pack *out of the conversation*,
+/// which is a different act from deleting it.
+fn set_loaded(
+    wanted: Option<&str>,
+    enable: bool,
+    pending: Option<&Arc<PendingQueue>>,
+) -> Result<ToolOutput> {
+    let wanted = wanted.ok_or_else(|| {
+        anyhow!(
+            "{} needs a `name`: which installed pack to {}",
+            if enable { "load" } else { "unload" },
+            if enable { "load" } else { "unload" }
+        )
+    })?;
+
+    let matches = installed_matching(wanted)?;
+    let mut text = format!(
+        "{} {wanted}:",
+        if enable { "loaded" } else { "unloaded" }
+    );
+    for pack in &matches {
+        let was = crate::pack::set_enabled(&pack.path, enable)?;
+        text.push_str(&format!(
+            "\n- {}@{} {} → {}",
+            pack.manifest.name,
+            pack.manifest.version_id,
+            if was == enable { "was already" } else { "now" },
+            if enable { "loaded" } else { "unloaded" }
+        ));
+        text.push_str(&format!("\n  files: {}", pack.path.display()));
+    }
+
+    let label = matches[0].manifest.name.clone();
+    match pending {
+        Some(queue) => {
+            queue.push(if enable {
+                Pending::Load(label)
+            } else {
+                Pending::Unload(label)
+            });
+            text.push_str(if enable {
+                "\nThis conversation picks it up at the end of this turn."
+            } else {
+                "\nThis conversation drops what it brought at the end of this turn: \
+                 its tools stop being callable from then on."
+            });
+        }
+        None => {
+            text.push_str(
+                "\nNo host is attached to this tool, so only the state changed; \
+                 it takes effect from the next start.",
+            );
+        }
+    }
+    Ok(ToolOutput::text(text))
+}
+
+fn apply(path: Option<&str>, pending: Option<&Arc<PendingQueue>>) -> Result<ToolOutput> {
+    let path = path.ok_or_else(|| anyhow!("apply needs a path: the installed assembly.yaml"))?;
+    let assembly = PathBuf::from(path);
+
+    if !assembly.is_file() {
+        return Err(anyhow!(
+            "{} does not exist. Use action `list` to see installed packs and the assembly \
+             path for each.",
+            assembly.display()
+        ));
+    }
+
+    // With a host attached, applying is a real load: the pack is enabled and
+    // the host brings it in at the end of this turn. Hot loading is the whole
+    // point of the action existing as a verb rather than as an instruction.
+    if let Some(queue) = pending {
+        let dir = assembly
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let name = crate::pack::read_manifest(&dir)
+            .map(|manifest| manifest.name)
+            .unwrap_or_else(|_| {
+                dir.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "pack".to_string())
+            });
+        if let Ok(was) = crate::pack::set_enabled(&dir, true) {
+            let _ = was;
+        }
+        queue.push(Pending::Load(name.clone()));
+        return Ok(ToolOutput::text(format!(
+            "Queued {name}: it loads into this conversation at the end of this turn."
+        )));
+    }
+
+    // Without one, the honest answer is to say what to run instead of
+    // pretending.
+    Ok(ToolOutput::text(format!(
+        "To load {}: the kernel loads packs at startup or through the CLI, not from inside \
+         a tool call. Run:\n\n    ngu apply \"{}\"\n\nor start the session with:\n\n    \
+         ngu --assembly \"{}\"\n\nThe pack is installed and its assembly is valid; loading it \
+         is the one step that has to happen outside this conversation.",
+        assembly.display(),
+        assembly.display(),
+        assembly.display()
+    )))
 }
 
 async fn install(path: Option<&str>) -> Result<ToolOutput> {
@@ -188,6 +401,10 @@ async fn install(path: Option<&str>) -> Result<ToolOutput> {
         .install(&archive)
         .await
         .with_context(|| format!("installing {}", archive.display()))?;
+
+    // Installing is a load: a pack the user had unloaded and then reinstalled
+    // is a pack the user just asked for.
+    crate::pack::set_enabled(&placed.path, true)?;
 
     let mut text = format!(
         "Installed {} {} → {}",
@@ -208,32 +425,6 @@ async fn install(path: Option<&str>) -> Result<ToolOutput> {
         text.push_str(&format!("\nwarning: {warning}"));
     }
     Ok(ToolOutput::text(text))
-}
-
-fn apply(path: Option<&str>) -> Result<ToolOutput> {
-    let path = path.ok_or_else(|| anyhow!("apply needs a path: the installed assembly.yaml"))?;
-    let assembly = PathBuf::from(path);
-
-    if !assembly.is_file() {
-        return Err(anyhow!(
-            "{} does not exist. Use action `list` to see installed packs and the assembly \
-             path for each.",
-            assembly.display()
-        ));
-    }
-
-    // Applying loads plugins, MCP servers, and skills, and it is asynchronous,
-    // so it cannot run from inside a tool call without re-entering the kernel.
-    // The honest answer is to say what to run instead of pretending.
-    Ok(ToolOutput::text(format!(
-        "To load {}: the kernel loads packs at startup or through the CLI, not from inside \
-         a tool call. Run:\n\n    ngu apply \"{}\"\n\nor start the session with:\n\n    \
-         ngu --assembly \"{}\"\n\nThe pack is installed and its assembly is valid; loading it \
-         is the one step that has to happen outside this conversation.",
-        assembly.display(),
-        assembly.display(),
-        assembly.display()
-    )))
 }
 
 #[cfg(test)]
@@ -297,6 +488,8 @@ mod tests {
             ("verify", ".dshpack archive"),
             ("install", ".dshpack archive"),
             ("apply", "assembly.yaml"),
+            ("load", "name"),
+            ("unload", "name"),
         ] {
             let error = run(json!({ "action": action })).await.expect_err(action);
             let text = format!("{error:#}");
@@ -308,8 +501,36 @@ mod tests {
     async fn an_unknown_action_lists_the_real_ones() {
         let error = run(json!({ "action": "explode" })).await.expect_err("must fail");
         let text = format!("{error:#}");
-        for action in ["build", "verify", "list", "install", "apply"] {
+        for action in ["build", "verify", "list", "install", "load", "unload", "apply"] {
             assert!(text.contains(action), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unloading_a_pack_that_is_not_installed_says_what_is() {
+        // The dead end has to name the alternatives, or the model can only
+        // guess at what to try next.
+        let error = run(json!({ "action": "unload", "name": "definitely-not-installed" }))
+            .await
+            .expect_err("must fail");
+        let text = format!("{error:#}");
+        assert!(text.contains("no installed pack matches"), "{text}");
+        assert!(
+            text.contains("Installed") || text.contains("Nothing is installed"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_and_unload_both_name_the_pack_they_mean() {
+        // Neither action can guess which pack is meant, and both must say so
+        // in the same words the argument is documented under.
+        for action in ["load", "unload"] {
+            let error = run(json!({ "action": action }))
+                .await
+                .expect_err("no name");
+            let text = format!("{error:#}");
+            assert!(text.contains("name"), "{action}: {text}");
         }
     }
 
@@ -366,7 +587,7 @@ mod tests {
         let actions = schema["function"]["parameters"]["properties"]["action"]["enum"]
             .as_array()
             .expect("action enum");
-        assert_eq!(actions.len(), 5);
+        assert_eq!(actions.len(), 7);
         assert_eq!(schema["function"]["name"], "pack");
     }
 

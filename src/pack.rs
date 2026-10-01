@@ -964,6 +964,44 @@ pub struct InstalledPack {
     pub path: PathBuf,
     /// Its assembly, when it has one.
     pub assembly: Option<PathBuf>,
+    /// Whether it is loaded into conversations.
+    ///
+    /// Unloading flips this off and keeps the files; deleting removes the
+    /// directory. The two are different acts, so a pack that is unloaded but
+    /// still on disk is a normal state rather than an error.
+    pub enabled: bool,
+}
+
+/// Marker file inside an installed pack meaning "do not load this".
+///
+/// A file rather than a field in the manifest: the manifest is the pack
+/// author's declaration, and this is the *user's* decision about it. Keeping
+/// them apart is what lets a user unload a pack without editing — or
+/// invalidating — what the pack says about itself.
+pub const DISABLED_MARKER: &str = ".ngu-disabled";
+
+/// Whether an installed pack directory is enabled.
+pub fn is_enabled(dir: &Path) -> bool {
+    !dir.join(DISABLED_MARKER).exists()
+}
+
+/// Enable or disable an installed pack, keeping its files either way.
+///
+/// Returns the state before the change, so a caller can report a no-op as a
+/// no-op instead of as a success it did not have to earn.
+pub fn set_enabled(dir: &Path, enabled: bool) -> Result<bool> {
+    let marker = dir.join(DISABLED_MARKER);
+    let was = is_enabled(dir);
+    if enabled {
+        if marker.exists() {
+            std::fs::remove_file(&marker)
+                .with_context(|| format!("removing {}", marker.display()))?;
+        }
+    } else if !marker.exists() {
+        std::fs::write(&marker, "unloaded by the user; files kept.\n")
+            .with_context(|| format!("writing {}", marker.display()))?;
+    }
+    Ok(was)
 }
 
 /// Read `dsh.index.json` from a pack directory.
@@ -1396,6 +1434,7 @@ async fn install_inner(
         manifest,
         path: destination,
         assembly: assembly_path.is_file().then_some(assembly_path),
+        enabled: true,
     })
 }
 
@@ -1587,10 +1626,12 @@ pub fn installed(packs_dir: &Path) -> Result<Vec<InstalledPack>> {
         let manifest = read_manifest(&path)
             .with_context(|| format!("reading the pack at {}", path.display()))?;
         let assembly = path.join(ASSEMBLY_NAME);
+        let enabled = is_enabled(&path);
         out.push(InstalledPack {
             manifest,
             path,
             assembly: assembly.is_file().then_some(assembly),
+            enabled,
         });
     }
     out.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));
@@ -2043,6 +2084,54 @@ mod tests {
         let written = r#"{"themes":[],"panels":[]}"#;
         let back: LookFile = serde_json::from_str(written).unwrap();
         assert!(back.strings.is_empty());
+    }
+
+    #[test]
+    fn unloading_a_pack_keeps_the_files_and_reverses() {
+        // Unload and delete are different acts; this is the unload half: the
+        // directory stays, only the decision changes.
+        let dir = scratch("unload");
+        write_manifest(&dir, &PackManifest::new("flip", "1.0.0")).unwrap();
+        std::fs::write(dir.join("soul.md"), "You are terse.\n").unwrap();
+
+        assert!(is_enabled(&dir));
+        assert_eq!(
+            set_enabled(&dir, false).unwrap(),
+            true,
+            "it reports the state it changed from"
+        );
+        assert!(!is_enabled(&dir));
+        assert!(dir.join(DISABLED_MARKER).is_file(), "the decision is recorded");
+        assert!(dir.join(MANIFEST_NAME).is_file(), "the pack is still there");
+        assert!(dir.join("soul.md").is_file(), "and so is its content");
+
+        assert_eq!(
+            set_enabled(&dir, false).unwrap(),
+            false,
+            "a repeated unload is a no-op and says so"
+        );
+        assert_eq!(set_enabled(&dir, true).unwrap(), false);
+        assert!(is_enabled(&dir));
+        assert!(
+            !dir.join(DISABLED_MARKER).exists(),
+            "loading again clears the decision"
+        );
+    }
+
+    #[test]
+    fn listing_reports_whether_a_pack_is_loaded() {
+        let root = scratch("listing-state");
+        let pack_dir = root.join("listed-1.0.0");
+        write_manifest(&pack_dir, &PackManifest::new("listed", "1.0.0")).unwrap();
+
+        let listed = installed(&root).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].enabled, "installed means loaded");
+
+        set_enabled(&pack_dir, false).unwrap();
+        let listed = installed(&root).unwrap();
+        assert!(!listed[0].enabled, "an unloaded pack is still listed");
+        assert_eq!(listed[0].manifest.name, "listed", "with its identity intact");
     }
 
     #[test]

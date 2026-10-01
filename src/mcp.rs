@@ -341,6 +341,21 @@ fn resolve_program(command: &str) -> std::path::PathBuf {
     }
 }
 
+impl Drop for McpClient {
+    /// Stop the server when its last handle goes.
+    ///
+    /// Synchronous and best-effort: this runs while a host is on its way out,
+    /// where awaiting a kill is not on offer — and depending on the child's own
+    /// drop instead kept the process alive long after everything it had to say
+    /// was printed. Unloading a pack reaches here too: its tools are the
+    /// handles, so the last one going takes the server with it.
+    fn drop(&mut self) {
+        if let Ok(mut child) = self.child.try_lock() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
 /// Flatten an MCP content array into plain text.
 fn flatten_content(result: &Value) -> String {
     let Some(items) = result.get("content").and_then(|c| c.as_array()) else {

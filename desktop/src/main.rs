@@ -100,7 +100,7 @@ fn headless(startup_prompt: Option<String>) -> anyhow::Result<()> {
     let state = Arc::new(Mutex::new(AppState::bootstrap()?));
     let sink: Arc<dyn EventSink> = Arc::new(StdoutSink);
 
-    runtime.block_on(async {
+    let result = runtime.block_on(async {
         // The windowed path starts from the page's "ready"; headless has no page,
         // so the shell announces itself the same way.
         dispatch(
@@ -141,8 +141,27 @@ fn headless(startup_prompt: Option<String>) -> anyhow::Result<()> {
                 sink.emit(json!({ "ev": "error", "message": format!("{error:#}") }));
             }
         }
+        // Stop the MCP servers before the runtime tears down: a server still
+        // registered with a runtime that is shutting down is what keeps the
+        // process alive after everything it has printed.
+        let clients = state.lock().expect("state lock").mcp.clone();
+        for client in &clients {
+            client.shutdown().await;
+        }
         Ok::<(), anyhow::Error>(())
-    })
+    });
+
+    // Deliberately not dropping the runtime — the same reason the CLI's main
+    // exits instead: teardown waits on state a spawned server left behind, and
+    // the process would then never leave. Everything it owned was stopped
+    // above.
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(error) => {
+            eprintln!("ngu: {error:#}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Run with a window.
@@ -265,6 +284,15 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
 
         match event {
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
+                // Stop the MCP servers before the runtime goes away: a server
+                // still registered with a runtime that is shutting down is what
+                // keeps a process alive after everything it has printed.
+                let clients = state.lock().expect("state lock").mcp.clone();
+                runtime.block_on(async {
+                    for client in &clients {
+                        client.shutdown().await;
+                    }
+                });
                 *control_flow = ControlFlow::Exit;
             }
             Event::UserEvent(UserEvent::ToUi(value)) => {
@@ -330,7 +358,8 @@ async fn dispatch(
             }
             if let Some(text) = startup_prompt {
                 emit(&sink, json!({ "ev": "turn_start", "text": text }));
-                state::run_turn(state, text, Arc::clone(&sink)).await?;
+                state::run_turn(Arc::clone(&state), text, Arc::clone(&sink)).await?;
+                drain_packs(state, Arc::clone(&sink)).await;
             }
         }
 
@@ -345,7 +374,8 @@ async fn dispatch(
                 return Ok(());
             }
             emit(&sink, json!({ "ev": "turn_start", "text": text }));
-            state::run_turn(state, text, Arc::clone(&sink)).await?;
+            state::run_turn(Arc::clone(&state), text, Arc::clone(&sink)).await?;
+            drain_packs(state, Arc::clone(&sink)).await;
         }
 
         "new_session" | "open_session" | "delete_session" => {
@@ -491,7 +521,78 @@ async fn dispatch(
             emit_panels(&state, &sink);
         }
 
-        "uninstall_pack" => {
+        "uninstall_pack" | "load_pack" => {
+            let enable = name == "load_pack";
+            let name = command
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let version = command
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+
+            let mut matched: Vec<String> = Vec::new();
+            match nguruvilu::pack::installed(&nguruvilu::pack::default_packs_dir()) {
+                Ok(packs) => {
+                    for pack in packs
+                        .iter()
+                        .filter(|pack| pack.manifest.name == name)
+                        .filter(|pack| {
+                            version
+                                .as_deref()
+                                .map_or(true, |v| pack.manifest.version_id == v)
+                        })
+                    {
+                        match nguruvilu::pack::set_enabled(&pack.path, enable) {
+                            Ok(_) => matched.push(format!(
+                                "{}@{}",
+                                pack.manifest.name, pack.manifest.version_id
+                            )),
+                            Err(error) => emit(
+                                &sink,
+                                json!({ "ev": "error", "message": format!("{}: {error:#}", pack.manifest.name) }),
+                            ),
+                        }
+                    }
+                }
+                Err(error) => emit(
+                    &sink,
+                    json!({ "ev": "error", "message": format!("listing packs: {error:#}") }),
+                ),
+            }
+
+            if matched.is_empty() {
+                emit(
+                    &sink,
+                    json!({ "ev": "error", "message": format!("no installed pack matches '{name}'") }),
+                );
+            } else {
+                // The state is written; now the conversation itself has to
+                // follow, or a loaded pack would keep working until a restart.
+                state.lock().expect("state lock").pending.push(if enable {
+                    nguruvilu::tools::pack::Pending::Load(name.clone())
+                } else {
+                    nguruvilu::tools::pack::Pending::Unload(name.clone())
+                });
+                drain_packs(Arc::clone(&state), Arc::clone(&sink)).await;
+                emit(
+                    &sink,
+                    json!({
+                        "ev": "notice",
+                        "text": if enable {
+                            format!("Loaded {}", matched.join(", "))
+                        } else {
+                            format!("Unloaded {} (files kept)", matched.join(", "))
+                        },
+                    }),
+                );
+            }
+            refresh_packs(&state, &sink);
+        }
+
+        "delete_pack" => {
             let name = command
                 .get("name")
                 .and_then(|v| v.as_str())
@@ -505,20 +606,19 @@ async fn dispatch(
                 Some(version) => format!("{name}@{version}"),
                 None => name.clone(),
             };
+            // Unload first, then delete: removing files under a live kernel
+            // would leave tools whose backing directory no longer exists.
+            state.lock().expect("state lock").pending.push(
+                nguruvilu::tools::pack::Pending::Unload(name.clone()),
+            );
+            drain_packs(Arc::clone(&state), Arc::clone(&sink)).await;
             match remove_pack(&target) {
                 Ok(()) => {
-                    sink.emit(json!({ "ev": "notice", "text": format!("Removed {target}") }));
-                    // The shell loaded the pack at startup, so the panels and
-                    // theme it contributed are still live. Say what to do about
-                    // it rather than leaving a removed pack on screen.
-                    sink.emit(json!({
-                        "ev": "notice",
-                        "text": "Restart the app to drop what it loaded.",
-                    }));
+                    emit(&sink, json!({ "ev": "notice", "text": format!("Deleted {target}") }));
                 }
                 Err(error) => emit(
                     &sink,
-                    json!({ "ev": "error", "message": format!("removing {target}: {error:#}") }),
+                    json!({ "ev": "error", "message": format!("deleting {target}: {error:#}") }),
                 ),
             }
             refresh_packs(&state, &sink);
@@ -641,6 +741,205 @@ fn refresh_packs(state: &Arc<Mutex<AppState>>, sink: &Arc<dyn EventSink>) {
     }
 }
 
+/// Apply the pack load and unload the last turn asked for.
+///
+/// The tool records what it wants while the turn owns the kernel; this runs
+/// between turns, which is the next moment the tool table is read anyway. No
+/// restart, no pausing — the conversation continues with a new table, and a
+/// tool that was unloaded answers "no tool named …" from then on.
+async fn drain_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
+    let actions = {
+        let guard = state.lock().expect("state lock");
+        guard.pending.drain()
+    };
+    if actions.is_empty() {
+        return;
+    }
+
+    let mut changed = false;
+    for action in actions {
+        match action {
+            nguruvilu::tools::pack::Pending::Unload(name) => {
+                // The guard lives inside this block and the kill happens
+                // outside it: a guard held across an await would make the whole
+                // future non-Send, and the UI thread would wait on it.
+                let (found, to_stop) = {
+                    let mut guard = state.lock().expect("state lock");
+                    let packs =
+                        match nguruvilu::pack::installed(&nguruvilu::pack::default_packs_dir()) {
+                            Ok(packs) => packs,
+                            Err(error) => {
+                                emit(
+                                    &sink,
+                                    json!({ "ev": "error", "message": format!("listing packs: {error:#}") }),
+                                );
+                                continue;
+                            }
+                        };
+                    let mut found = false;
+                    let mut to_stop: Vec<Arc<nguruvilu::mcp::McpClient>> = Vec::new();
+                    for pack in packs.iter().filter(|pack| pack.manifest.name == name) {
+                        let label =
+                            format!("{}-{}", pack.manifest.name, pack.manifest.version_id);
+                        let skills = Arc::clone(&guard.config.skills);
+                        let result = {
+                            let mut host = skills.lock().expect("skills lock");
+                            nguruvilu::loader::unload_pack(
+                                &mut guard.kernel,
+                                &mut *host,
+                                &nguruvilu::ledger::default_ledger_path(),
+                                &label,
+                                &pack.manifest.name,
+                            )
+                        };
+                        match result {
+                            Ok(report) => {
+                                found = true;
+                                changed = true;
+                                eprintln!(
+                                    "[pack] unloaded {label}: {} plugin instance(s), {} mcp server(s), {} skill root(s)",
+                                    report.plugins.len(),
+                                    report.mcp.len(),
+                                    report.skills.len()
+                                );
+                                to_stop.extend(
+                                    guard
+                                        .mcp
+                                        .iter()
+                                        .filter(|client| {
+                                            report.mcp.iter().any(|id| id == client.server())
+                                        })
+                                        .cloned(),
+                                );
+                            }
+                            Err(error) => emit(
+                                &sink,
+                                json!({ "ev": "error", "message": format!("unloading {label}: {error:#}") }),
+                            ),
+                        }
+                    }
+                    (found, to_stop)
+                };
+
+                // The tools are gone, so the servers they belonged to have no
+                // reason to keep running.
+                for client in &to_stop {
+                    client.shutdown().await;
+                }
+                if !to_stop.is_empty() {
+                    let mut guard = state.lock().expect("state lock");
+                    guard
+                        .mcp
+                        .retain(|kept| !to_stop.iter().any(|stop| Arc::ptr_eq(kept, stop)));
+                }
+                if !found {
+                    emit(
+                        &sink,
+                        json!({ "ev": "notice", "text": format!("{name} is not installed; nothing was loaded to unload") }),
+                    );
+                }
+            }
+            nguruvilu::tools::pack::Pending::Load(name) => {
+                let targets: Vec<(String, PathBuf, PathBuf)> = {
+                    match nguruvilu::pack::installed(&nguruvilu::pack::default_packs_dir()) {
+                        Ok(packs) => packs
+                            .iter()
+                            .filter(|pack| pack.manifest.name == name && pack.enabled)
+                            .filter_map(|pack| {
+                                pack.assembly.clone().map(|assembly| {
+                                    (
+                                        format!("{}-{}", pack.manifest.name, pack.manifest.version_id),
+                                        assembly,
+                                        pack.path.clone(),
+                                    )
+                                })
+                            })
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    }
+                };
+                if targets.is_empty() {
+                    emit(
+                        &sink,
+                        json!({ "ev": "notice", "text": format!("nothing to load for '{name}'") }),
+                    );
+                }
+
+                for (label, assembly, dir) in targets {
+                    // The kernel moves out for the await: holding the state
+                    // lock across it would deadlock the UI thread.
+                    let mut kernel = {
+                        let mut guard = state.lock().expect("state lock");
+                        guard.take_kernel()
+                    };
+                    let loaded = nguruvilu::loader::load_pack(
+                        &mut kernel,
+                        &nguruvilu::ledger::default_ledger_path(),
+                        &assembly,
+                        &label,
+                    )
+                    .await;
+
+                    let mut guard = state.lock().expect("state lock");
+                    match loaded {
+                        Ok((pack_skills, report, servers)) => {
+                            guard.mcp.extend(servers);
+                            {
+                                let mut host = guard.config.skills.lock().expect("skills lock");
+                                if let Err(error) =
+                                    nguruvilu::loader::merge_skills(&mut kernel, &mut *host, pack_skills)
+                                {
+                                    emit(
+                                        &sink,
+                                        json!({ "ev": "error", "message": format!("skills for {label}: {error:#}") }),
+                                    );
+                                }
+                            }
+                            if let Ok(manifest) = nguruvilu::pack::read_manifest(&dir) {
+                                match nguruvilu::content::apply(&mut kernel, &dir, &manifest) {
+                                    Ok(content) => guard.adopt_pack_content(content),
+                                    Err(error) => emit(
+                                        &sink,
+                                        json!({ "ev": "error", "message": format!("{label} content: {error:#}") }),
+                                    ),
+                                }
+                            }
+                            eprintln!(
+                                "[pack] loaded {label}: {} entr(ies), {} failed",
+                                report.loaded.len(),
+                                report.failed.len()
+                            );
+                            changed = true;
+                        }
+                        Err(error) => emit(
+                            &sink,
+                            json!({ "ev": "error", "message": format!("loading {label}: {error:#}") }),
+                        ),
+                    }
+                    if let Err(error) = guard.restore_kernel(kernel) {
+                        emit(
+                            &sink,
+                            json!({ "ev": "error", "message": format!("restoring the kernel: {error:#}") }),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if changed {
+        // Panels, theme, and labels move with the kernel, and the tool table
+        // is what the next turn reads.
+        emit_panels(&state, &sink);
+        let status = state.lock().expect("state lock").describe();
+        emit(&sink, json!({ "ev": "status", "status": status }));
+        emit(
+            &sink,
+            json!({ "ev": "notice", "text": "The next turn sees the new tool table." }),
+        );
+    }
+}
+
 /// Load an installed pack's plugins, MCP servers, and skills into the kernel.
 /// Load every installed pack, in name order.
 ///
@@ -658,6 +957,12 @@ async fn load_installed_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSi
     };
 
     for pack in packs {
+        // An unloaded pack keeps its files and stays out of every
+        // conversation until it is loaded again.
+        if !pack.enabled {
+            eprintln!("[pack] {} is unloaded; files kept", pack.manifest.name);
+            continue;
+        }
         let Some(assembly) = pack.assembly.clone() else {
             continue;
         };
@@ -703,8 +1008,16 @@ async fn apply_pack(
         .with_pack_dir(assembly.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")));
 
     let report = loader.apply(&plan).await?;
-    let mut kernel = loader.finish().await;
-
+    // The MCP servers stay up: their tools are in this kernel and are meant to
+    // stay callable for as long as the app runs. The pack's skill roots join
+    // the shell's catalog rather than replacing it.
+    let (mut kernel, pack_skills, servers) = loader.finish().await;
+    {
+        let mut guard = state.lock().expect("state lock");
+        guard.mcp.extend(servers);
+        let mut host = guard.config.skills.lock().expect("skills lock");
+        nguruvilu::loader::merge_skills(&mut kernel, &mut host, pack_skills)?;
+    }
     // Apply what the pack carries beyond its entries. Appearance lands on the
     // kernel; the rest describes the session and is applied to the shell's
     // settings, which the state owns.
