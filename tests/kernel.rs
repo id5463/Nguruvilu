@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use nguruvilu::agent::TurnConfig;
 use nguruvilu::assembly::Assembly;
-use nguruvilu::context::{CachePolicy, InjectionEngine, InjectionEntry, Position};
+use nguruvilu::context::{CachePolicy, InjectionEngine, InjectionEntry, PositionKind};
 use nguruvilu::git::GitSnapshot;
 use nguruvilu::hotreload::{
     ApplyOutcome, Change, ChangeKind, ChangePayload, Consent, ModelRoute, Runtime,
@@ -21,7 +21,7 @@ use nguruvilu::message::{Message, Role, ToolCall};
 use nguruvilu::plugin::{Contributions, FiberState, Kernel, Plugin, PluginCtx, RealmMap};
 use nguruvilu::session::{JsonlStore, Session, SessionStore};
 use nguruvilu::skills::SkillRegistry;
-use nguruvilu::tools::{ConflictPolicy, ToolDef, ToolFuture, ToolRegistry};
+use nguruvilu::tools::{ConflictPolicy, ToolDef, ToolFuture, ToolOutput, ToolRegistry};
 use serde_json::{json, Value};
 
 // ------------------------------------------------------------------ helpers
@@ -48,7 +48,7 @@ fn empty_tool(name: &str, owner: &str) -> ToolDef {
         "a test tool",
         json!({ "type": "object", "properties": {} }),
         owner,
-        |_| Box::pin(async { Ok("ok".to_string()) }) as ToolFuture,
+        |_| Box::pin(async { Ok(ToolOutput::text("ok")) }) as ToolFuture,
     )
 }
 
@@ -167,7 +167,7 @@ async fn the_four_tools_work_together() {
         .execute("write", &json!({ "path": file, "content": "alpha\n" }).to_string())
         .await
         .unwrap();
-    assert!(written.contains("wrote"));
+    assert!(written.text.contains("wrote"));
 
     let edited = tools
         .execute(
@@ -176,21 +176,21 @@ async fn the_four_tools_work_together() {
         )
         .await
         .unwrap();
-    assert!(edited.contains("replaced 1 occurrence"));
+    assert!(edited.text.contains("replaced 1 occurrence"));
 
     let read = tools
         .execute("read", &json!({ "path": file }).to_string())
         .await
         .unwrap();
-    assert!(read.contains("beta"));
-    assert!(!read.contains("alpha"));
+    assert!(read.text.contains("beta"));
+    assert!(!read.text.contains("alpha"));
 
     let shell = tools
         .execute("bash", &json!({ "command": "echo done" }).to_string())
         .await
         .unwrap();
-    assert!(shell.contains("exit code: 0"));
-    assert!(shell.contains("done"));
+    assert!(shell.text.contains("exit code: 0"));
+    assert!(shell.text.contains("done"));
 }
 
 #[tokio::test]
@@ -208,8 +208,8 @@ async fn bash_works_with_posix_syntax_on_every_platform() {
         )
         .await
         .unwrap();
-    assert!(out.contains("exit code: 0"), "{out}");
-    assert!(out.contains("marker.txt"), "{out}");
+    assert!(out.text.contains("exit code: 0"), "{}", out.text);
+    assert!(out.text.contains("marker.txt"), "{}", out.text);
 }
 
 // ------------------------------------------------------------ plugin kernel
@@ -528,7 +528,7 @@ fn a_denied_change_kind_never_reaches_the_runtime() {
 fn the_injection_engine_budgets_and_places_fragments() {
     let mut engine = InjectionEngine::new();
     engine.budget_percent = 25;
-    engine.add(InjectionEntry::constant("rule", "standing rule").at(Position::Prefix));
+    engine.add(InjectionEntry::constant("rule", "standing rule").at(PositionKind::Prefix));
     engine.add(InjectionEntry::triggered(
         "pdf",
         "use pdftotext",
@@ -547,7 +547,7 @@ fn the_injection_engine_budgets_and_places_fragments() {
 #[test]
 fn cache_first_moves_prefix_injections_into_the_history() {
     let mut engine = InjectionEngine::new();
-    engine.add(InjectionEntry::constant("rule", "standing rule").at(Position::Prefix));
+    engine.add(InjectionEntry::constant("rule", "standing rule").at(PositionKind::Prefix));
 
     let injection = engine.inject(&[Message::user("hi")], 8000, CachePolicy::CacheFirst);
     assert!(injection.prefix.is_empty(), "the prefix was left alone");
@@ -644,6 +644,9 @@ fn turn_settings_carry_the_skills_catalog_into_the_prompt() {
                 tools: Arc::new(ToolRegistry::with_base_tools().unwrap()),
                 model: "m".into(),
                 version: 1,
+                policy: Arc::new(nguruvilu::window::DefaultContextPolicy::default()),
+                injection: Arc::new(InjectionEngine::load_default()),
+                cache_policy: CachePolicy::default(),
             }
         }
     }

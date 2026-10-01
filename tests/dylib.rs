@@ -201,7 +201,7 @@ fn the_plugin_loads_into_the_kernel_and_its_tool_runs() {
         .unwrap()
         .block_on(kernel.tools().execute("demo_echo", r#"{"text":"via kernel"}"#))
         .expect("tool runs");
-    assert!(out.contains("via kernel"), "{out}");
+    assert!(out.text.contains("via kernel"), "{}", out.text);
 
     // Unloading removes exactly this plugin's tools and leaves the base tools.
     kernel.unload(fiber).expect("unload");
