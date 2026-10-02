@@ -2,7 +2,7 @@
   "formatVersion": 1,
   "game": "nguruvilu",
   "name": "computer-use",
-  "versionId": "1.1.0",
+  "versionId": "1.2.0",
   "license": "MIT",
   "kernelVersion": "0.1.0",
   "dependencies": { "nguruvilu": ">=0.1.0" },

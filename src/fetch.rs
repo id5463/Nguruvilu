@@ -286,6 +286,142 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> Result<
     Ok(())
 }
 
+/// Whether a file name points at an archive this kernel can unpack.
+///
+/// The check is on the name alone: a query string is not part of it, and an
+/// unknown extension is refused by [`extract_archive`] rather than guessed at.
+pub fn is_archive_name(name: &str) -> bool {
+    let path = name.split('?').next().unwrap_or(name).to_ascii_lowercase();
+    path.ends_with(".zip") || path.ends_with(".tar.gz") || path.ends_with(".tgz")
+}
+
+/// Unpack a `.zip`, `.tar.gz`, or `.tgz` into `into`, created as needed.
+///
+/// Every entry name is resolved against `into` first: one carrying `..` or an
+/// absolute path aborts the extraction with the same refusal a pack archive
+/// gets, so an archive cannot write a byte outside the directory it was given.
+/// Executable permission bits are kept on unix; link entries are never
+/// materialized, because writing through a link is the other way out.
+pub fn extract_archive(archive: &Path, into: &Path) -> Result<()> {
+    std::fs::create_dir_all(into)
+        .with_context(|| format!("creating {}", into.display()))?;
+    let name = archive
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if name.ends_with(".zip") {
+        return extract_zip(archive, into);
+    }
+    if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        return extract_tar(archive, into);
+    }
+    Err(anyhow!(
+        "{} is not an archive this kernel can unpack; expected .zip, .tar.gz or .tgz",
+        archive.display()
+    ))
+}
+
+/// Resolve one entry name under `into`, refusing anything that escapes it.
+fn contained(raw: &str, archive: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+    let escapes = Path::new(raw).components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    });
+    if escapes {
+        return Err(anyhow!(
+            "{} contains an entry that escapes the archive: {raw}",
+            archive.display()
+        ));
+    }
+    Ok(PathBuf::from(raw))
+}
+
+fn extract_zip(archive: &Path, into: &Path) -> Result<()> {
+    let file = std::fs::File::open(archive)
+        .with_context(|| format!("opening {}", archive.display()))?;
+    let mut zip = zip::ZipArchive::new(file)
+        .with_context(|| format!("{} is not a zip archive", archive.display()))?;
+    for index in 0..zip.len() {
+        let mut entry = zip.by_index(index)?;
+        // `enclosed_name` answers containment for zip the way `contained`
+        // does for tar: no `..`, no absolute path, no drive prefix.
+        let Some(relative) = entry.enclosed_name() else {
+            return Err(anyhow!(
+                "{} contains an entry that escapes the archive: {}",
+                archive.display(),
+                entry.name()
+            ));
+        };
+        let target = into.join(relative);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&target)?;
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut buffer = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut buffer)?;
+        std::fs::write(&target, buffer)
+            .with_context(|| format!("writing {}", target.display()))?;
+
+        #[cfg(unix)]
+        if let Some(mode) = entry.unix_mode() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode));
+        }
+    }
+    Ok(())
+}
+
+fn extract_tar(archive: &Path, into: &Path) -> Result<()> {
+    let file = std::fs::File::open(archive)
+        .with_context(|| format!("opening {}", archive.display()))?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive_reader = tar::Archive::new(decoder);
+    for entry in archive_reader
+        .entries()
+        .with_context(|| format!("reading the entries of {}", archive.display()))?
+    {
+        let mut entry = entry.with_context(|| format!("reading an entry of {}", archive.display()))?;
+        let raw = entry
+            .path()
+            .map_err(|error| anyhow!("{} has an unreadable entry name: {error}", archive.display()))?
+            .to_string_lossy()
+            .to_string();
+        let relative = contained(&raw, archive)?;
+        let target = into.join(&relative);
+        if entry.header().entry_type().is_dir() {
+            std::fs::create_dir_all(&target)?;
+            continue;
+        }
+        if !entry.header().entry_type().is_file() {
+            // A link, device, or fifo: never materialized, so nothing can be
+            // written through one on a later entry.
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut buffer = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut buffer)?;
+        std::fs::write(&target, buffer)
+            .with_context(|| format!("writing {}", target.display()))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(mode) = entry.header().mode() {
+                let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// What a fetch produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fetched {
@@ -445,6 +581,74 @@ impl Fetcher {
     /// The cache root.
     pub fn cache_root(&self) -> &Path {
         &self.cache
+    }
+
+    /// Fetch one URL as a single file whose own sha256 the pack declares.
+    ///
+    /// `fetch` hashes the *directory* it writes, which is right for content
+    /// arriving as a tree. A release asset is one file, and the project that
+    /// ships it publishes the file's hash (a `checksums.txt`); declaring
+    /// exactly that keeps the pack's hash checkable against the release with
+    /// no derivative to recompute, and the cache is keyed by the same hash so
+    /// a second install of the pack does no network work.
+    pub async fn fetch_file(&self, url: &str, expect: &str) -> Result<Fetched> {
+        if let Some(path) = self.cache_hit(expect) {
+            return Ok(Fetched {
+                path,
+                sha256: expect.to_string(),
+                cached: true,
+            });
+        }
+
+        // Download into a scratch directory and only then move under the hash
+        // the bytes actually have, so a failed download leaves no partial
+        // entry — the same order `fetch` keeps.
+        let scratch = self.scratch()?;
+        let result = self.get_bytes(url).await;
+        let bytes = match result {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&scratch);
+                return Err(error);
+            }
+        };
+        let actual = sha256(&bytes);
+        if actual != expect {
+            let _ = std::fs::remove_dir_all(&scratch);
+            return Err(anyhow!(
+                "hash mismatch for {url}: the pack declares {expect}, the download is {actual}. \
+                 The content is not what the pack named; refusing to install it."
+            ));
+        }
+
+        // The name comes from the URL, so the cached entry holds the archive
+        // under the name the pack asked for.
+        let name = url
+            .rsplit('/')
+            .next()
+            .filter(|n| !n.is_empty() && !n.contains('?'))
+            .unwrap_or("download");
+        if let Err(error) = std::fs::write(scratch.join(name), bytes) {
+            let _ = std::fs::remove_dir_all(&scratch);
+            return Err(error).with_context(|| format!("writing {name}"));
+        }
+
+        let destination = self.cache.join(&actual);
+        if destination.exists() {
+            let _ = std::fs::remove_dir_all(&scratch);
+        } else {
+            std::fs::create_dir_all(&self.cache)
+                .with_context(|| format!("creating {}", self.cache.display()))?;
+            std::fs::rename(&scratch, &destination).with_context(|| {
+                format!("moving {} into the cache", scratch.display())
+            })?;
+        }
+
+        Ok(Fetched {
+            path: destination,
+            sha256: actual,
+            cached: false,
+        })
     }
 
     /// Fetch a source, reusing the cache when the expected hash is present.
@@ -681,6 +885,7 @@ pub fn default_cache_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn a_github_reference_parses_into_its_parts() {
@@ -951,6 +1156,169 @@ mod tests {
             "o/r@p@v"
         );
         assert_eq!(Source::parse("builtin:x").unwrap().describe(), "builtin:x");
+    }
+
+    #[test]
+    fn archive_recognition_looks_at_the_name() {
+        assert!(is_archive_name("cua-driver-rs-0.28.0-windows-x86_64-binary.zip"));
+        assert!(is_archive_name("https://host/x/driver.tar.gz"));
+        assert!(is_archive_name("driver.tgz?download=1"));
+        assert!(!is_archive_name("driver.tar"));
+        assert!(!is_archive_name("driver"));
+    }
+
+    #[test]
+    fn a_zip_unpacks_into_the_directory_it_is_given() {
+        let dir = scratch("extract-zip");
+        let archive = dir.join("bundle.zip");
+        {
+            let file = std::fs::File::create(&archive).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default();
+            writer.start_file("tool.exe", options).unwrap();
+            writer.write_all(b"binary").unwrap();
+            writer.start_file("docs/readme.txt", options).unwrap();
+            writer.write_all(b"notes").unwrap();
+            writer.finish().unwrap();
+        }
+
+        let into = dir.join("out");
+        extract_archive(&archive, &into).unwrap();
+        assert_eq!(std::fs::read(into.join("tool.exe")).unwrap(), b"binary");
+        assert_eq!(
+            std::fs::read_to_string(into.join("docs/readme.txt")).unwrap(),
+            "notes"
+        );
+    }
+
+    #[test]
+    fn a_zip_entry_that_escapes_is_refused() {
+        let dir = scratch("extract-escape");
+        let archive = dir.join("evil.zip");
+        {
+            let file = std::fs::File::create(&archive).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer
+                .start_file("../outside.txt", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"escaped").unwrap();
+            writer.finish().unwrap();
+        }
+
+        let error = extract_archive(&archive, &dir.join("out")).expect_err("must refuse");
+        assert!(
+            format!("{error:#}").contains("escapes the archive"),
+            "{error:#}"
+        );
+        assert!(!dir.join("outside.txt").exists(), "nothing was written outside");
+    }
+
+    #[test]
+    fn a_tgz_unpacks_and_keeps_the_executable_bit() {
+        let dir = scratch("extract-tgz");
+        let archive = dir.join("bundle.tar.gz");
+        write_tgz(&archive, "bin/tool", 0o755, b"script");
+
+        let into = dir.join("out");
+        extract_archive(&archive, &into).unwrap();
+        assert_eq!(std::fs::read(into.join("bin/tool")).unwrap(), b"script");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(into.join("bin/tool"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_ne!(mode & 0o111, 0, "the executable bit survives: {mode:o}");
+        }
+    }
+
+    #[test]
+    fn a_tgz_entry_that_escapes_is_refused() {
+        // The same refusal for tar as for zip: a `..` name aborts before a
+        // single byte is written.
+        let dir = scratch("extract-tgz-escape");
+        let archive = dir.join("evil.tar.gz");
+        write_tgz_raw_name(&archive, "../outside.txt", 0o644, b"bad");
+
+        let error = extract_archive(&archive, &dir.join("out")).expect_err("must refuse");
+        assert!(
+            format!("{error:#}").contains("escapes the archive"),
+            "{error:#}"
+        );
+        assert!(!dir.join("outside.txt").exists());
+    }
+
+    #[test]
+    fn a_name_that_is_not_an_archive_says_so() {
+        let dir = scratch("extract-unknown");
+        let plain = dir.join("bundle.rar");
+        std::fs::write(&plain, b"not an archive").unwrap();
+        let error = extract_archive(&plain, &dir.join("out")).expect_err("must refuse");
+        assert!(format!("{error:#}").contains("expected .zip"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn a_single_file_fetch_reuses_the_cache_keyed_by_the_file_hash() {
+        // The cache hit answers before any network call, which is what makes
+        // a second install of the same pack work with no connection.
+        let root = scratch("file-fetch");
+        let bytes = b"release asset";
+        let hash = sha256(bytes);
+        std::fs::create_dir_all(root.join(&hash)).unwrap();
+        std::fs::write(root.join(&hash).join("asset.zip"), bytes).unwrap();
+
+        let fetcher = Fetcher::at(&root).unwrap();
+        let fetched = fetcher
+            .fetch_file("https://example.invalid/asset.zip", &hash)
+            .await
+            .unwrap();
+        assert!(fetched.cached, "the seeded entry answers the fetch");
+        assert_eq!(fetched.path, root.join(&hash));
+        assert_eq!(
+            std::fs::read(fetched.path.join("asset.zip")).unwrap(),
+            bytes
+        );
+    }
+
+    /// One small `.tar.gz` holding a single file, built in the test rather
+    /// than kept as a fixture.
+    fn write_tgz(into: &Path, name: &str, mode: u32, contents: &[u8]) {
+        let file = std::fs::File::create(into).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(mode);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, name, contents)
+            .unwrap();
+        builder.finish().unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+    }
+
+    /// A `.tar.gz` whose entry name is written straight into the header
+    /// bytes: `tar::Builder` refuses to *set* a `..` path, so an archive
+    /// that actually carries one has to be laid down by hand.
+    fn write_tgz_raw_name(into: &Path, name: &str, mode: u32, contents: &[u8]) {
+        let file = std::fs::File::create(into).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(mode);
+        {
+            let bytes = header.as_mut_bytes();
+            for (index, byte) in name.as_bytes().iter().enumerate() {
+                bytes[index] = *byte;
+            }
+        }
+        header.set_cksum();
+        builder.append(&header, contents).unwrap();
+        builder.finish().unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
     }
 
     fn scratch(tag: &str) -> PathBuf {

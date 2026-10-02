@@ -5,7 +5,39 @@
       "transport": "stdio",
       "command": "cua-driver",
       "args": ["mcp"],
-      "scope": "session"
+      "scope": "session",
+      "platforms": {
+        "win-x64": {
+          "source": "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.28.0/cua-driver-rs-0.28.0-windows-x86_64-binary.zip",
+          "sha256": "9db2096df8d80da4e73ffb797947dcdfab2a362faddd9d1b77682c77aace5aa9",
+          "command": "cua-driver.exe"
+        },
+        "win-arm64": {
+          "source": "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.28.0/cua-driver-rs-0.28.0-windows-arm64-binary.zip",
+          "sha256": "d8059fa1e963169258e5086029c7d0627bb76bd91703f040aff5286b0cd1b1f5",
+          "command": "cua-driver.exe"
+        },
+        "linux-x64": {
+          "source": "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.28.0/cua-driver-rs-0.28.0-linux-x86_64-binary.tar.gz",
+          "sha256": "120cd7f40340c5e012422aca393932767e228c224dd8b9df2124ca29c5e48226",
+          "command": "cua-driver"
+        },
+        "linux-arm64": {
+          "source": "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.28.0/cua-driver-rs-0.28.0-linux-arm64-binary.tar.gz",
+          "sha256": "6f687c3eadcc47e0f8cc25cf74f996bf0d55ddc7839154df7bff44bbb7c35c6f",
+          "command": "cua-driver"
+        },
+        "mac-x64": {
+          "source": "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.28.0/cua-driver-rs-0.28.0-darwin-x86_64.tar.gz",
+          "sha256": "d758a7d45df89dbf849f01011d6e88591449face9277707d9dc749345343442d",
+          "command": "cua-driver-rs-0.28.0-darwin-x86_64/cua-driver"
+        },
+        "mac-arm64": {
+          "source": "https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.28.0/cua-driver-rs-0.28.0-darwin-arm64.tar.gz",
+          "sha256": "82ea1801a5a800b2e46199e8b88694e8bba5670fd533c63a32766c753300d4d6",
+          "command": "cua-driver-rs-0.28.0-darwin-arm64/cua-driver"
+        }
+      }
     }
   ]
 }

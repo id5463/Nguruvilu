@@ -820,7 +820,8 @@ pub struct McpServerDecl {
     /// sha256 of the fetched server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
-    /// Executable. Relative to the fetched directory when there is a source.
+    /// Executable. Resolved inside the fetched directory when there is a
+    /// source; install rewrites it to the absolute path it unpacked into.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     /// Arguments.
@@ -832,6 +833,35 @@ pub struct McpServerDecl {
     /// `session` or `global`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// One source per platform, when a server ships a different artifact to
+    /// each. A non-empty map replaces the single `source` at install time:
+    /// the entry for `fetch::platform_tag()` is fetched — an archive URL is
+    /// unpacked into `files/mcp/<id>/` — and the choice is written back into
+    /// the mcp file so the assembly resolves the command from inside the
+    /// pack. A tag the map does not carry is an error naming the tags it
+    /// does, never another platform's binary.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub platforms: BTreeMap<String, PlatformSource>,
+}
+
+/// One platform's source for an MCP server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlatformSource {
+    /// Where this platform's artifact comes from. An archive URL is unpacked
+    /// into the server's directory; every other source fetches and copies,
+    /// exactly as the single-source form does.
+    pub source: String,
+    /// sha256 the fetch is checked against: the file's own hash for a URL —
+    /// the value a release's `checksums.txt` publishes — and the directory
+    /// hash for a directory source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Command name override, for an artifact whose executable is not named
+    /// like the others: Windows ships `cua-driver.exe`, macOS nests its
+    /// binary under the release directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 impl LookFile {
@@ -1359,6 +1389,52 @@ pub fn verify(pack_path: &Path) -> Result<VerifyReport> {
     result
 }
 
+/// The entry this machine's platform maps to, when a server declares one per
+/// platform.
+///
+/// `Ok(None)` means the single-source form, with nothing platform-specific to
+/// choose. A map without this platform's tag is an error rather than a
+/// fallback: fetching another platform's binary would install something that
+/// cannot run. The error names the tag it looked for, the tags the map does
+/// carry, and every tag the format knows — that is the whole of what the
+/// author needs to fix it.
+fn platform_entry(server: &McpServerDecl) -> Result<Option<&PlatformSource>> {
+    if server.platforms.is_empty() {
+        return Ok(None);
+    }
+    let tag = crate::fetch::platform_tag();
+    match server.platforms.get(tag) {
+        Some(entry) => Ok(Some(entry)),
+        None => Err(anyhow!(
+            "mcp '{}' declares no source for platform '{tag}'; it has {}. Supported platforms: {}",
+            server.id,
+            server.platforms.keys().map(String::as_str).collect::<Vec<_>>().join(", "),
+            crate::fetch::PLATFORMS.join(", ")
+        )),
+    }
+}
+
+/// The single file a one-file fetch produced, which is what an archive
+/// download stores under the cache entry.
+fn only_file(dir: &Path) -> Result<PathBuf> {
+    let mut files = Vec::new();
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("listing {}", dir.display()))?
+    {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            files.push(entry.path());
+        }
+    }
+    match files.len() {
+        1 => Ok(files.pop().expect("one file")),
+        count => Err(anyhow!(
+            "{} holds {count} files; an archive fetch stores exactly one",
+            dir.display()
+        )),
+    }
+}
+
 // ------------------------------------------------------------------ install
 
 /// Install an archive into the packs directory.
@@ -1441,7 +1517,16 @@ async fn install_inner(
     // MCP servers named by a source are fetched alongside skills and plugins.
     // A server only reachable through npx is a server the user has to install a
     // runtime for.
-    let mcp_decls = match manifest.mcp.as_ref() {
+    // Where this pack will sit once placed. A platform-selected server's
+    // command is written back as an absolute path under it: the loader
+    // spawns stdio commands against the caller's working directory rather
+    // than the pack's, so a relative `files/mcp/...` would resolve only when
+    // `ngu` happened to start in the right place.
+    let mcp_root = packs_dir
+        .join(format!("{}-{}", manifest.name, manifest.version_id))
+        .join(FILES_DIR)
+        .join("mcp");
+    let mut mcp_decls = match manifest.mcp.as_ref() {
         Some(reference) => {
             let path = staging.join(reference.path());
             if path.is_file() {
@@ -1455,7 +1540,64 @@ async fn install_inner(
         }
         None => Vec::new(),
     };
+    // A declaration with `platforms` fetches this machine's entry. An
+    // archive URL is unpacked straight into the server's directory; every
+    // other source fetches and copies, like the single-source loop below.
+    // The chosen source and command are written back into the mcp file after
+    // both loops, which is what lets the assembly render the command from
+    // inside the pack.
+    let mut mcp_changed = false;
+    for server in &mut mcp_decls {
+        let Some(entry) = platform_entry(server)? else {
+            continue;
+        };
+        let source = entry.source.clone();
+        let sha256 = entry.sha256.clone();
+        let command = entry.command.clone();
+        let parsed = Source::parse(&source)
+            .with_context(|| format!("mcp '{}' source", server.id))?;
+        // Fetch and unpack into staging — install replaces the destination
+        // wholesale afterwards, so anything meant to survive must be here.
+        let local = staging.join(FILES_DIR).join("mcp").join(&server.id);
+        match &parsed {
+            Source::Url { url } if crate::fetch::is_archive_name(url) => {
+                let expect = sha256.as_deref().ok_or_else(|| {
+                    anyhow!(
+                        "mcp '{}' names the archive {source} but declares no sha256; \
+                         an archive is fetched by the hash of the file",
+                        server.id
+                    )
+                })?;
+                let fetched = fetcher
+                    .fetch_file(url, expect)
+                    .await
+                    .with_context(|| format!("fetching mcp '{}' from {source}", server.id))?;
+                let archive = only_file(&fetched.path)?;
+                crate::fetch::extract_archive(&archive, &local)
+                    .with_context(|| format!("unpacking mcp '{}' from {source}", server.id))?;
+            }
+            _ => {
+                let fetched = fetcher
+                    .fetch(&parsed, sha256.as_deref())
+                    .await
+                    .with_context(|| format!("fetching mcp '{}' from {source}", server.id))?;
+                copy_tree(&fetched.path, &local)?;
+            }
+        }
+        server.source = Some(source);
+        // The effective command is the platform's override, else the base
+        // name — either way an executable the fetch just placed, so it is
+        // resolved to an absolute path under the installed pack.
+        if let Some(name) = command.or_else(|| server.command.clone()) {
+            let absolute = mcp_root.join(&server.id).join(name);
+            server.command = Some(absolute.to_string_lossy().replace('\\', "/"));
+        }
+        mcp_changed = true;
+    }
     for server in &mcp_decls {
+        if !server.platforms.is_empty() {
+            continue; // fetched above, with this platform's source
+        }
         let Some(source) = &server.source else {
             continue;
         };
@@ -1466,6 +1608,26 @@ async fn install_inner(
             .await
             .with_context(|| format!("fetching mcp '{}' from {source}", server.id))?;
         copy_tree(&fetched.path, &staging.join(FILES_DIR).join("mcp").join(&server.id))?;
+    }
+
+    // The assembly is rendered from this file and reads each server's
+    // `source` and `command`, so the platform choice made above is written
+    // back here — once, after both loops. From here on the installed pack
+    // looks exactly like a single-source declaration for this machine.
+    if mcp_changed {
+        let path = staging
+            .join(
+                manifest
+                    .mcp
+                    .as_ref()
+                    .expect("declared: a server was fetched")
+                    .path(),
+            );
+        let text = serde_json::to_string_pretty(&McpFile {
+            servers: mcp_decls,
+        })?;
+        std::fs::write(&path, format!("{text}\n"))
+            .with_context(|| format!("writing {}", path.display()))?;
     }
 
     // A fetched interface lands under files/ui/, and the declaration is
@@ -2562,6 +2724,227 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn a_server_with_platforms_round_trips_and_an_empty_map_is_omitted() {
+        let text = r#"{"servers":[{"id":"d","command":"d","platforms":{
+            "win-x64":{"source":"https://host/a.zip","sha256":"aa","command":"d.exe"},
+            "linux-x64":{"source":"https://host/a.tar.gz","sha256":"bb"}}}]}"#;
+        let mcp: McpFile = serde_json::from_str(text).unwrap();
+        let server = &mcp.servers[0];
+        assert_eq!(server.platforms.len(), 2);
+        assert_eq!(server.platforms["win-x64"].command.as_deref(), Some("d.exe"));
+        assert_eq!(server.platforms["linux-x64"].command, None);
+        assert_eq!(server.platforms["win-x64"].sha256.as_deref(), Some("aa"));
+
+        // Round trip: what the author wrote comes back out, and the
+        // single-source form gains no platforms key.
+        let back = serde_json::to_string(&mcp).unwrap();
+        let again: McpFile = serde_json::from_str(&back).unwrap();
+        assert_eq!(again.servers[0].platforms.len(), 2);
+        assert_eq!(
+            again.servers[0].platforms["win-x64"].source,
+            "https://host/a.zip"
+        );
+
+        let plain: McpFile =
+            serde_json::from_str(r#"{"servers":[{"id":"n","command":"npx"}]}"#).unwrap();
+        assert!(plain.servers[0].platforms.is_empty());
+        let plain_text = serde_json::to_string(&plain).unwrap();
+        assert!(!plain_text.contains("platforms"), "{plain_text}");
+    }
+
+    #[test]
+    fn the_platform_entry_is_picked_for_this_machine_or_reported() {
+        let tag = crate::fetch::platform_tag().to_string();
+        let other = crate::fetch::PLATFORMS
+            .iter()
+            .find(|platform| **platform != tag)
+            .expect("another platform")
+            .to_string();
+        let base = || McpServerDecl {
+            id: "d".into(),
+            transport: "stdio".into(),
+            source: None,
+            sha256: None,
+            command: Some("driver".into()),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            scope: None,
+            platforms: BTreeMap::new(),
+        };
+
+        // Present: this machine's entry, with its command override.
+        let mut picked = base();
+        picked.platforms.insert(
+            tag.clone(),
+            PlatformSource {
+                source: "https://host/a.zip".into(),
+                sha256: Some("aa".repeat(32)),
+                command: Some("driver.exe".into()),
+            },
+        );
+        let entry = platform_entry(&picked).unwrap().expect("picked");
+        assert_eq!(entry.source, "https://host/a.zip");
+        assert_eq!(entry.command.as_deref(), Some("driver.exe"));
+
+        // Absent: an error naming the tag sought, the tags declared, and the
+        // tags the format knows — never another platform's binary.
+        let mut missing = base();
+        missing.platforms.insert(
+            other.clone(),
+            PlatformSource {
+                source: "https://host/b.zip".into(),
+                sha256: None,
+                command: None,
+            },
+        );
+        let error = platform_entry(&missing).expect_err("must refuse");
+        let text = format!("{error:#}");
+        assert!(text.contains(&tag), "{text}");
+        assert!(text.contains(&other), "{text}");
+        assert!(text.contains("Supported platforms"), "{text}");
+
+        // Single-source form: nothing platform-specific to choose.
+        assert!(platform_entry(&base()).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_platform_server_is_unpacked_into_the_pack_and_written_back() {
+        // The download is seeded into the cache first, so the fetch answers
+        // from disk: the test exercises the real install path with no network
+        // and proves what a warm cache does for a second install.
+        let dir = scratch("platform-install");
+        let packs = dir.join("packs");
+
+        let cache = crate::fetch::default_cache_dir();
+        let artifact = dir.join("driver.zip");
+        {
+            let file = std::fs::File::create(&artifact).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer
+                .start_file("driver.exe", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"MZ fake").unwrap();
+            writer.finish().unwrap();
+        }
+        let bytes = std::fs::read(&artifact).unwrap();
+        let hash = crate::fetch::sha256(&bytes);
+        std::fs::create_dir_all(cache.join(&hash)).unwrap();
+        std::fs::write(cache.join(&hash).join("driver.zip"), &bytes).unwrap();
+
+        let mut manifest = PackManifest::new("platform-pack", "1.0.0");
+        manifest.mcp = Some(ContentRef::carried("mcp.json"));
+        write_manifest(&dir, &manifest).unwrap();
+        let declared = McpFile {
+            servers: vec![McpServerDecl {
+                id: "driver".into(),
+                transport: "stdio".into(),
+                source: None,
+                sha256: None,
+                command: Some("driver".into()),
+                args: vec!["mcp".into()],
+                env: BTreeMap::new(),
+                scope: Some("session".into()),
+                platforms: BTreeMap::from([(
+                    crate::fetch::platform_tag().to_string(),
+                    PlatformSource {
+                        source: "https://example.invalid/driver.zip".into(),
+                        sha256: Some(hash.clone()),
+                        command: Some("driver.exe".into()),
+                    },
+                )]),
+            }],
+        };
+        std::fs::write(
+            dir.join("mcp.json"),
+            serde_json::to_string_pretty(&declared).unwrap(),
+        )
+        .unwrap();
+
+        let archive = dir.join("out.dshpack");
+        pack(&dir, &archive).unwrap();
+        let placed = install(&archive, &packs).await.unwrap();
+
+        // The archive was unpacked into the server's directory...
+        assert_eq!(
+            std::fs::read(placed.path.join("files/mcp/driver/driver.exe")).unwrap(),
+            b"MZ fake"
+        );
+
+        // ...the platform's source and command were written back, the command
+        // absolute under where the pack was placed...
+        let written: McpFile = serde_json::from_str(
+            &std::fs::read_to_string(placed.path.join("mcp.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            written.servers[0].source.as_deref(),
+            Some("https://example.invalid/driver.zip")
+        );
+        let expected = packs
+            .join("platform-pack-1.0.0")
+            .join("files/mcp/driver/driver.exe")
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert_eq!(written.servers[0].command.as_deref(), Some(expected.as_str()));
+
+        // ...and the assembly renders that command for the loader.
+        let assembly = std::fs::read_to_string(placed.path.join(ASSEMBLY_NAME)).unwrap();
+        assert!(assembly.contains(&expected), "{assembly}");
+        assert!(assembly.contains("mcp"), "{assembly}");
+
+        let _ = std::fs::remove_dir_all(cache.join(&hash));
+    }
+
+    #[tokio::test]
+    async fn an_install_on_an_undeclared_platform_names_the_ones_that_are_there() {
+        let dir = scratch("platform-missing");
+        let mut manifest = PackManifest::new("missing", "1.0.0");
+        manifest.mcp = Some(ContentRef::carried("mcp.json"));
+        write_manifest(&dir, &manifest).unwrap();
+
+        let other = crate::fetch::PLATFORMS
+            .iter()
+            .find(|platform| **platform != crate::fetch::platform_tag())
+            .expect("another platform")
+            .to_string();
+        let declared = McpFile {
+            servers: vec![McpServerDecl {
+                id: "d".into(),
+                transport: "stdio".into(),
+                source: None,
+                sha256: None,
+                command: Some("d".into()),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                scope: None,
+                platforms: BTreeMap::from([(
+                    other.clone(),
+                    PlatformSource {
+                        source: "https://example.invalid/x.zip".into(),
+                        sha256: None,
+                        command: None,
+                    },
+                )]),
+            }],
+        };
+        std::fs::write(
+            dir.join("mcp.json"),
+            serde_json::to_string_pretty(&declared).unwrap(),
+        )
+        .unwrap();
+
+        let archive = dir.join("out.dshpack");
+        pack(&dir, &archive).unwrap();
+        let error = install(&archive, &dir.join("packs"))
+            .await
+            .expect_err("must refuse");
+        let text = format!("{error:#}");
+        assert!(text.contains("Supported platforms"), "{text}");
+        assert!(text.contains(crate::fetch::platform_tag()), "{text}");
+        assert!(text.contains(&other), "{text}");
+    }
+
     fn a_search_file_without_a_provider_changes_nothing() {
         // No provider and nothing standing means there is nothing to build on;
         // inventing one would be a guess that can reach the network.

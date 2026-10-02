@@ -195,6 +195,36 @@ my-pack-1.0.0.dshpack          ← zip
 }
 ```
 
+**`source` / `platforms` —— 装包时自动取来的服务器**:
+
+```jsonc
+{
+  "servers": [
+    {
+      "id": "cua-driver",
+      "command": "cua-driver",
+      "args": ["mcp"],
+      "platforms": {
+        "win-x64":   { "source": "https://…/driver-windows.zip",   "sha256": "…", "command": "cua-driver.exe" },
+        "linux-x64": { "source": "https://…/driver-linux.tar.gz",  "sha256": "…" },
+        "mac-arm64": { "source": "https://…/driver-darwin.tar.gz", "sha256": "…", "command": "driver-darwin/cua-driver" }
+      }
+    }
+  ]
+}
+```
+
+- **`platforms` 非空时按 `fetch::platform_tag()` 选当平台条目**;取不到就报错,信息里
+  列出声明过的平台和全部平台标签 —— 绝不退回另一个平台的二进制。
+- **URL 是压缩包(`.zip` / `.tar.gz` / `.tgz`)就解包**进 `files/mcp/<id>/`;条目名带
+  `..` 或绝对路径即拒绝,一个字节也不写出目录。其它来源照旧抓取后整目录拷入。
+- **`sha256` 是压缩包文件本身的 sha256** —— 上游 release 的 `checksums.txt` 里就是这个
+  值,直接照抄;缓存按它寻址,第二次安装不再联网。目录来源用目录哈希。
+- **`command` 可按平台覆盖**(Windows 是 `cua-driver.exe`,有些平台的二进制包了一层
+  目录)。装包时把选中的 `source` 和可执行文件的**绝对路径**写回,装载时直接执行,
+  不查 PATH。
+- 单平台、或所有平台同一来源时,继续用顶层 `source` / `sha256` / `command`,写法不变。
+
 **`command` 指向本机已装的程序** —— 和 `builtin:` 一个道理:包只声明"要什么",
 机器上得有。内核按 PATH 解析这个名字,找不到就在装载时报一条 `failed mcp:<id>`
 并跳过,不影响其它条目。**版本在安装时定死**,不要写 `npx …@latest`:那会让每次
@@ -269,6 +299,8 @@ my-pack-1.0.0.dshpack          ← zip
 
 **目录哈希**:确定性算法 —— 相对路径排序,逐个拼接 `路径 + ':' + 内容 + '\n'`,再取 sha256。同一个目录在 Windows 和 Linux 上算出同一个值。
 
+**单文件例外**:`mcp.json` 平台条目里的压缩包 URL,声明的是**文件本身**的 sha256(上游 `checksums.txt` 的值),详见上文 `mcp.json` 一节。
+
 **缓存**:`~/.nguruvilu/cache/<sha256>/`,按内容寻址。命中即复用,**不联网**。
 
 ```
@@ -322,7 +354,7 @@ packs 目录:
 | `ui` | 界面的可改副本 —— 窗口服务的就是它;卸载则回到内核里的内置界面 |
 | `search` | 搜索 provider 与 key 的环境变量名(没 key 就没有工具) |
 | `subagent` | `delegate` 工具 —— 内核自带能力,由这个包启用 |
-| `computer-use` | 桌面操作:声明已装的 `cua-driver`(执行 `cua-driver mcp`);驱动没装则每次启动报一条 `failed mcp:cua-driver`,不要就卸载 |
+| `computer-use` | 桌面操作:`cua-driver` MCP —— 装包时按平台自动下载并解包驱动(首装需联网,约 27–67MB 一次,之后走缓存);没装上则每次启动报一条 `failed mcp:cua-driver`,不要就卸载 |
 
 放置的三条规则(记录在 `~/.nguruvilu/preinstalled.json`):
 
