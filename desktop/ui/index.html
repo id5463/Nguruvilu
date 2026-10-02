@@ -846,7 +846,12 @@ function ensureSearchSection(present) {
 function renderPacks(list) {
   packList.replaceChildren();
   const packs = (list && list.packs) || [];
-  packsDir.textContent = list && list.dir ? "Installed in " + list.dir : "";
+  // "How many packs do I have" answered at the header, where the eye lands
+  // first — the details stay in the rows below.
+  const loaded = packs.filter((pack) => pack.loaded !== false).length;
+  packsDir.textContent =
+    (list && list.dir ? "Installed in " + list.dir + " \u00b7 " : "") +
+    packs.length + " pack(s) \u00b7 " + loaded + " loaded";
 
   // The search section follows the pack that owns the capability.
   ensureSearchSection(packs.some((pack) => pack.name === "search" && pack.loaded !== false));
