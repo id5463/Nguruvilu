@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{json, Value};
 use tao::dpi::LogicalSize;
+use tao::rwh_06::{HasDisplayHandle, HasWindowHandle};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::window::WindowBuilder;
@@ -181,6 +182,17 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
         .with_min_inner_size(LogicalSize::new(760.0, 500.0))
         .build(&event_loop)?;
 
+    // Captured once for the file dialogs: the IPC callback must be `'static`
+    // so it cannot borrow the window, and a dialog without an owner opens
+    // *behind* the main window — where the click looks dead.
+    let (parent_window, parent_display) = {
+        let window_handle = window
+            .window_handle()
+            .expect("the window has a handle before any dialog can open");
+        let display_handle = window.display_handle().expect("display handle");
+        (window_handle.as_raw(), display_handle.as_raw())
+    };
+
     let state = Arc::new(Mutex::new(AppState::bootstrap()?));
     let sink: Arc<dyn EventSink> = Arc::new(WindowSink::new(proxy));
 
@@ -254,16 +266,23 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
 
                 // A native file dialog has to run on this thread, so the picker
                 // is opened here and only the follow-up work is handed to the
-                // runtime. `None` means the user cancelled.
-                let picked: Option<PathBuf> = match name.as_str() {
-                    "pick_install" | "pick_verify" => rfd::FileDialog::new()
-                        .set_title("Choose a .dshpack archive")
-                        .add_filter("pack archive", &["dshpack"])
-                        .pick_file(),
-                    "pick_pack" => rfd::FileDialog::new()
-                        .set_title("Choose a pack directory (it must contain dsh.index.json)")
-                        .pick_folder(),
-                    _ => None,
+                // runtime. `None` means the user cancelled. The dialog is owned
+                // by the main window (see `DialogParent`) so it cannot hide
+                // behind it.
+                let picked: Option<PathBuf> = {
+                    let parent = DialogParent::new(parent_window, parent_display);
+                    match name.as_str() {
+                        "pick_install" | "pick_verify" => rfd::FileDialog::new()
+                            .set_title("Choose a .dshpack archive")
+                            .add_filter("pack archive", &["dshpack"])
+                            .set_parent(&parent)
+                            .pick_file(),
+                        "pick_pack" => rfd::FileDialog::new()
+                            .set_title("Choose a pack directory (it must contain dsh.index.json)")
+                            .set_parent(&parent)
+                            .pick_folder(),
+                        _ => None,
+                    }
                 };
 
                 let state = Arc::clone(&state);
@@ -1266,6 +1285,47 @@ static ACTIVE_UI: OnceLock<PathBuf> = OnceLock::new();
 /// One thread, one request per connection: this is a file server for a window
 /// that loads once, not a service. Bound to loopback and sending no CORS
 /// headers, so a page on another origin cannot read these responses.
+/// The file dialog's owner, rebuilt from raw handles captured at window
+/// creation.
+///
+/// The IPC callback must be `'static`, so it cannot borrow the tao window;
+/// instead the two raw handles are copied once, and the window outlives every
+/// dialog because dialogs only open while the event loop is running. Without
+/// an owner the dialog opens *behind* the main window and the click looks like
+/// nothing happened.
+struct DialogParent {
+    window: tao::rwh_06::RawWindowHandle,
+    display: tao::rwh_06::RawDisplayHandle,
+}
+
+impl DialogParent {
+    fn new(
+        window: tao::rwh_06::RawWindowHandle,
+        display: tao::rwh_06::RawDisplayHandle,
+    ) -> Self {
+        Self { window, display }
+    }
+}
+
+impl tao::rwh_06::HasWindowHandle for DialogParent {
+    fn window_handle(
+        &self,
+    ) -> Result<tao::rwh_06::WindowHandle<'_>, tao::rwh_06::HandleError> {
+        // SAFETY: these handles came from a window that outlives every dialog —
+        // dialogs only open while the event loop, and so the window, runs.
+        Ok(unsafe { tao::rwh_06::WindowHandle::borrow_raw(self.window) })
+    }
+}
+
+impl tao::rwh_06::HasDisplayHandle for DialogParent {
+    fn display_handle(
+        &self,
+    ) -> Result<tao::rwh_06::DisplayHandle<'_>, tao::rwh_06::HandleError> {
+        // SAFETY: same window as `window_handle` above.
+        Ok(unsafe { tao::rwh_06::DisplayHandle::borrow_raw(self.display) })
+    }
+}
+
 fn serve_interface_on_loopback() -> std::io::Result<u16> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
