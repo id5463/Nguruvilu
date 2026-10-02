@@ -659,6 +659,33 @@ impl Kernel {
         Ok(())
     }
 
+    /// Re-apply every fiber of one plugin.
+    ///
+    /// [`Kernel::refresh`] reacts to *service* changes through epochs, which
+    /// never fire for a plugin whose configuration lives in a cell the host
+    /// owns. This is the other trigger: the host changed that cell and asked
+    /// for the plugin's contributions to be rebuilt from it. Mechanics are
+    /// [`Kernel::reload`]'s — unload then load — scoped by plugin name, and
+    /// fibers that are pending or failed are re-armed exactly like active
+    /// ones.
+    ///
+    /// Returns how many fibers were re-applied.
+    pub fn reload_plugin(&mut self, name: &str) -> Result<usize> {
+        let targets: Vec<(u64, String, RealmMap)> = self
+            .fibers
+            .iter()
+            .filter(|(_, fiber)| fiber.plugin == name)
+            .map(|(id, fiber)| (*id, fiber.plugin.clone(), fiber.realm.clone()))
+            .collect();
+        let mut reloaded = 0;
+        for (id, plugin, realm) in targets {
+            self.unload(id)?;
+            self.load(&plugin, realm, Value::Null)?;
+            reloaded += 1;
+        }
+        Ok(reloaded)
+    }
+
     /// Recompute every fiber's epoch and reconcile the ones that changed.
     ///
     /// This is the whole of hot reload: nothing calls `reload` by hand. A fiber

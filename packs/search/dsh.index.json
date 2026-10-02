@@ -2,9 +2,10 @@
   "formatVersion": 1,
   "game": "nguruvilu",
   "name": "search",
-  "versionId": "1.0.0",
+  "versionId": "1.1.0",
   "license": "MIT",
   "kernelVersion": "0.1.0",
   "dependencies": { "nguruvilu": ">=0.1.0" },
-  "search": "search.json"
+  "search": "search.json",
+  "plugins": [ { "id": "search", "source": "builtin:search", "license": "MIT" } ]
 }

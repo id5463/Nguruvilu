@@ -607,8 +607,12 @@ async fn run() -> Result<()> {
     // `packs/subagent` asks for `builtin:delegate` and it appears, and without
     // that pack the kernel has no such tool.
     nguruvilu::tools::subagent::define(&mut kernel);
-    // Search is registered later — after the pack's content has landed, since
-    // a pack may be what configured it.
+    // Same split for search: the code is available, the pack's assembly is
+    // what makes a conversation have it. The cell is the host's copy of the
+    // settings — filled now, refilled after pack content lands, and again
+    // whenever something changes them.
+    let search_cell = nguruvilu::tools::search::cell(settings.search.clone());
+    nguruvilu::tools::search::install(&mut kernel, search_cell.clone());
     if !skills.is_empty() {
         register_skill_tool(kernel.tools_mut(), Arc::new(skills.clone()))?;
     }
@@ -769,10 +773,11 @@ async fn run() -> Result<()> {
     for content in contents {
         adopt_content(content, &mut settings, &mut runtime, &injection)?;
     }
-    // Search appears only when a provider and a key are configured — and a
-    // pack may be what configured them, so this runs after the content lands
-    // rather than at boot.
-    if sync_search(&mut kernel, &settings)? {
+    // A pack may be what configured search, so the settings go back into the
+    // plugin after the content lands: the fibers re-apply, and the tool table
+    // says the truth about whether search is usable right now.
+    nguruvilu::tools::search::configure(&mut kernel, &search_cell, settings.search.clone())?;
+    if kernel.tools().get(nguruvilu::tools::search::TOOL).is_some() {
         eprintln!("[search] enabled");
     }
 
@@ -960,6 +965,7 @@ async fn run() -> Result<()> {
                 injection: &injection,
                 queue: &pending_packs,
                 mcp: &mut mcp_clients,
+                search: &search_cell,
             }
             .drain()
             .await?;
@@ -1032,6 +1038,7 @@ async fn run() -> Result<()> {
                     injection: &injection,
                     queue: &pending_packs,
                     mcp: &mut mcp_clients,
+                    search: &search_cell,
                 },
             )
             .await?;
@@ -2434,6 +2441,9 @@ struct PackHost<'a> {
     /// The session's MCP servers: joined when a pack loads, stopped when it
     /// unloads, and stopped for good on the way out.
     mcp: &'a mut Vec<Arc<nguruvilu::mcp::McpClient>>,
+    /// The search plugin's settings cell: a hot load may have configured
+    /// search, and the plugin re-reads it through `search::configure`.
+    search: &'a nguruvilu::tools::search::SettingsCell,
 }
 
 impl PackHost<'_> {
@@ -2547,9 +2557,14 @@ impl PackHost<'_> {
         }
 
         if changed {
-            // A hot load may have configured search as well, so the tool is
-            // put in step with the settings before the table is published.
-            let _ = sync_search(self.kernel, self.settings)?;
+            // A hot load may have configured search as well: the settings go
+            // back into the plugin's cell and its fibers re-apply, so the tool
+            // table is in step before it is published.
+            nguruvilu::tools::search::configure(
+                self.kernel,
+                self.search,
+                self.settings.search.clone(),
+            )?;
             // The route may have moved with the pack's content, and the tool
             // table certainly did; both are published together so the next
             // turn reads one consistent view.
@@ -2563,20 +2578,6 @@ impl PackHost<'_> {
             eprintln!("[pack] the next turn sees the new tool table");
         }
         Ok(())
-    }
-}
-
-/// Put the search tool in step with the settings.
-///
-/// Called after a pack's content lands and after a hot load, because a pack
-/// may be what configured the provider — and with no key there is no tool at
-/// all: a search tool that cannot authenticate costs a turn every time the
-/// model tries it, while an absent one costs nothing.
-fn sync_search(kernel: &mut Kernel, settings: &Settings) -> Result<bool> {
-    kernel.tools_mut().unregister(nguruvilu::tools::search::TOOL);
-    match &settings.search {
-        Some(search) => nguruvilu::tools::search::register(kernel.tools_mut(), search.clone()),
-        None => Ok(false),
     }
 }
 

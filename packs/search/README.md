@@ -4,7 +4,16 @@
 
 ## 它怎么工作
 
-这个包只带一个 `search.json`:
+这个包带两样东西:一个 `search.json`,和**一行插件声明**:
+
+```json
+{ "plugins": [ { "id": "search", "source": "builtin:search", "license": "MIT" } ] }
+```
+
+声明意味着:**`search_web` 工具属于这个包** —— 内核只提供代码,是这个包让对话里出现它。
+没装这个包,工具就不会出现,哪怕设置里配了 key。
+
+`search.json` 只带默认值:
 
 ```json
 {
@@ -46,7 +55,9 @@ ngu config set --search-provider brave --search-api-key BRAVE_KEY
 ngu uninstall search        # 卸载,文件留着
 ```
 
-卸载后这个包的默认值不再补进设置;你自己配的 `search` 设置不受影响。
+**卸载 = 工具消失**:`search_web` 随这个包走,包不在,对话里就没有它 —— 这是"能力属于
+包"的语义。你自己配的 `search` 设置**不删**,重新装上(或用 `ngu pack` / Apply 加载)
+就恢复;`ngu uninstall search --delete` 才会连文件一起删,那时默认值也不再补进设置。
 
 ## 许可
 

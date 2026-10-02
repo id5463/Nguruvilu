@@ -28,7 +28,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::tools::{ConflictPolicy, ToolDef, ToolFuture, ToolOutput};
+use crate::tools::{ToolDef, ToolFuture, ToolOutput};
 
 /// A search provider's request shape and response layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,18 +246,78 @@ pub fn parse_response(dialect: Dialect, body: &Value) -> Vec<Hit> {
 /// So the name is `search_web`, and a test pins it.
 pub const TOOL: &str = "search_web";
 
-/// Register the tool, when search is configured.
+/// The plugin's name: what a pack asks for as `builtin:search`, and what the
+/// kernel stamps on the tool it contributes.
+pub const PLUGIN: &str = "search";
+
+/// The host's copy of the search settings, shared with the plugin.
 ///
-/// Returns whether it was registered. A caller that configured nothing gets no
-/// tool rather than one that always fails.
-pub fn register(
-    registry: &mut crate::tools::ToolRegistry,
-    settings: SearchSettings,
-) -> Result<bool> {
-    if !settings.is_configured() {
-        return Ok(false);
+/// The plugin never reaches into `Settings` — the host owns those and pushes
+/// them here; the plugin reads the cell when its fibers apply.
+pub type SettingsCell = std::sync::Arc<std::sync::RwLock<Option<SearchSettings>>>;
+
+/// A cell holding `search` for the given settings.
+pub fn cell(search: Option<SearchSettings>) -> SettingsCell {
+    std::sync::Arc::new(std::sync::RwLock::new(search))
+}
+
+/// Make the code available: a pack's assembly asking for `builtin:search`
+/// decides whether a conversation actually has search.
+///
+/// Defining is not loading, the same split as `builtin:delegate` — the code
+/// ships inside this binary, *whether it is in use* is the pack's decision.
+pub fn install(kernel: &mut crate::plugin::Kernel, settings: SettingsCell) {
+    kernel.define(std::sync::Arc::new(Search { settings }));
+}
+
+/// Push new settings and re-apply every fiber of the plugin.
+///
+/// This is how a panel save or a pack's content reaches the tool table: the
+/// cell changes, the fibers re-read it, and the tool appears or disappears
+/// with the key. With no pack asking for the plugin there are no fibers to
+/// re-apply — the settings are still stored, and the next pack load reads
+/// them.
+pub fn configure(
+    kernel: &mut crate::plugin::Kernel,
+    settings: &SettingsCell,
+    search: Option<SearchSettings>,
+) -> Result<()> {
+    *settings.write().expect("search settings cell") = search;
+    kernel.reload_plugin(PLUGIN)?;
+    Ok(())
+}
+
+/// The plugin behind [`TOOL`].
+pub struct Search {
+    settings: SettingsCell,
+}
+
+impl crate::plugin::Plugin for Search {
+    fn name(&self) -> &str {
+        PLUGIN
     }
 
+    fn apply(&self, _ctx: &crate::plugin::PluginCtx) -> Result<crate::plugin::Contributions> {
+        // Present only while a key is configured: a search tool that cannot
+        // authenticate costs a turn every time the model tries it, while an
+        // absent one costs nothing. The pack decides the plugin is there; the
+        // settings decide whether it has a tool.
+        let current = self
+            .settings
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or(None);
+        match current {
+            Some(search) if search.is_configured() => {
+                Ok(crate::plugin::Contributions::new().tool(tool(search)?))
+            }
+            _ => Ok(crate::plugin::Contributions::new()),
+        }
+    }
+}
+
+/// Build the tool: client, schema, handler.
+fn tool(settings: SearchSettings) -> Result<ToolDef> {
     let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(45))
         .user_agent(concat!("nguruvilu/", env!("CARGO_PKG_VERSION")));
@@ -275,35 +335,31 @@ pub fn register(
     let settings = std::sync::Arc::new(settings);
     let client = std::sync::Arc::new(http);
 
-    registry.register(
-        ToolDef::new(
-            TOOL,
-            format!(
-                "Search the web with {}. Returns titles, URLs, and excerpts. \
-                 Use it when you need information you do not have, and cite the \
-                 URLs you used.",
-                settings.provider.as_str()
-            ),
-            json!({
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "What to search for. Be specific."
-                    }
-                },
-                "required": ["query"]
-            }),
-            "kernel",
-            move |args| {
-                let settings = std::sync::Arc::clone(&settings);
-                let client = std::sync::Arc::clone(&client);
-                Box::pin(async move { search(&settings, &client, args).await }) as ToolFuture
-            },
+    Ok(ToolDef::new(
+        TOOL,
+        format!(
+            "Search the web with {}. Returns titles, URLs, and excerpts. \
+             Use it when you need information you do not have, and cite the \
+             URLs you used.",
+            settings.provider.as_str()
         ),
-        ConflictPolicy::Error,
-    )?;
-    Ok(true)
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "What to search for. Be specific."
+                }
+            },
+            "required": ["query"]
+        }),
+        PLUGIN,
+        move |args| {
+            let settings = std::sync::Arc::clone(&settings);
+            let client = std::sync::Arc::clone(&client);
+            Box::pin(async move { search(&settings, &client, args).await }) as ToolFuture
+        },
+    ))
 }
 
 async fn search(
@@ -516,28 +572,80 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_tool_is_not_registered_without_a_key() {
-        let mut registry = crate::tools::ToolRegistry::new();
-        let mut settings = settings(Dialect::Tavily);
-        settings.api_key = String::new();
-        assert!(!register(&mut registry, settings).unwrap());
-        assert!(registry.get(TOOL).is_none(), "no tool appears");
+    /// The kernel a pack that asks for `builtin:search` leaves behind: the
+    /// code defined, one fiber loaded, and the host's cell to configure it.
+    fn loaded(search: Option<SearchSettings>) -> (crate::plugin::Kernel, SettingsCell) {
+        let mut kernel = crate::plugin::Kernel::new();
+        let cell = cell(search);
+        install(&mut kernel, cell.clone());
+        kernel
+            .load(PLUGIN, crate::plugin::RealmMap::new(), serde_json::Value::Null)
+            .unwrap();
+        (kernel, cell)
     }
 
     #[test]
-    fn the_tool_is_registered_when_configured() {
-        let mut registry = crate::tools::ToolRegistry::new();
-        assert!(register(&mut registry, settings(Dialect::Tavily)).unwrap());
-        assert!(registry.get(TOOL).is_some());
-        assert_eq!(registry.owner(TOOL), Some("kernel"));
+    fn defining_alone_puts_no_tool_in_the_table() {
+        // The same split as `builtin:delegate`: the kernel holds the code,
+        // `packs/search` is what asks for it. Without the pack's assembly the
+        // kernel must not appear to have search.
+        let mut kernel = crate::plugin::Kernel::new();
+        install(&mut kernel, cell(Some(settings(Dialect::Tavily))));
+
+        assert!(kernel.tools().get(TOOL).is_none());
+        assert!(kernel.plugin(PLUGIN).is_some(), "but the code is available");
+    }
+
+    #[test]
+    fn the_tool_is_absent_without_a_key_and_present_with_one() {
+        let mut without = settings(Dialect::Tavily);
+        without.api_key = String::new();
+        let (kernel, _cell) = loaded(Some(without));
+        assert!(kernel.tools().get(TOOL).is_none(), "no key, no tool");
+
+        let (kernel, _cell) = loaded(Some(settings(Dialect::Tavily)));
+        assert!(kernel.tools().get(TOOL).is_some());
+        assert_eq!(
+            kernel.tools().owner(TOOL),
+            Some(PLUGIN),
+            "the plugin owns the tool it contributes"
+        );
+    }
+
+    #[test]
+    fn configure_makes_the_tool_appear_and_vanish() {
+        // The panel's path: settings go into the cell, the fibers re-apply.
+        let (mut kernel, cell) = loaded(None);
+        assert!(kernel.tools().get(TOOL).is_none());
+
+        configure(&mut kernel, &cell, Some(settings(Dialect::Tavily))).unwrap();
+        assert!(kernel.tools().get(TOOL).is_some(), "a key lands the tool");
+
+        configure(&mut kernel, &cell, None).unwrap();
+        assert!(kernel.tools().get(TOOL).is_none(), "off takes it away");
+    }
+
+    #[test]
+    fn without_the_pack_configuring_changes_nothing() {
+        // The capability belongs to the pack: settings alone must not smuggle
+        // the tool into a conversation that never loaded it.
+        let mut kernel = crate::plugin::Kernel::new();
+        let cell = cell(None);
+        install(&mut kernel, cell.clone());
+
+        configure(&mut kernel, &cell, Some(settings(Dialect::Tavily))).unwrap();
+        assert!(kernel.tools().get(TOOL).is_none());
     }
 
     #[test]
     fn the_tool_description_names_the_provider() {
-        let mut registry = crate::tools::ToolRegistry::new();
-        register(&mut registry, settings(Dialect::Brave)).unwrap();
-        let schema = &registry.schemas()[0];
+        let (kernel, _cell) = loaded(Some(settings(Dialect::Brave)));
+        let schema = kernel
+            .tools()
+            .schemas()
+            .into_iter()
+            .find(|schema| schema["function"]["name"] == TOOL)
+            .expect("the search tool has a schema");
         assert!(schema["function"]["description"].as_str().unwrap().contains("brave"));
     }
 

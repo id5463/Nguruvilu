@@ -42,8 +42,8 @@ pub const SHIPPED: &[(&str, &str, &[u8])] = &[
     ),
     (
         "search",
-        "1.0.0",
-        include_bytes!("../packs/search/search-1.0.0.dshpack"),
+        "1.1.0",
+        include_bytes!("../packs/search/search-1.1.0.dshpack"),
     ),
     (
         "subagent",

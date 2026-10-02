@@ -157,6 +157,11 @@ pub struct AppState {
     /// pack's reload, is stopped when the pack unloads, and is stopped for
     /// good when the window closes.
     pub mcp: Vec<Arc<nguruvilu::mcp::McpClient>>,
+    /// The search plugin's settings cell.
+    ///
+    /// The plugin holds this and reads it when its fibers apply; the panel
+    /// writes it through `search::configure`, which also re-applies them.
+    pub search_cell: nguruvilu::tools::search::SettingsCell,
 }
 
 impl AppState {
@@ -179,10 +184,11 @@ impl AppState {
         // Available to a pack, not loaded by the kernel: `packs/subagent` asks
         // for `builtin:delegate` and it appears.
         nguruvilu::tools::subagent::define(&mut kernel);
-        // Search appears only when a provider and key are configured.
-        if let Some(search) = settings.search.clone() {
-            let _ = nguruvilu::tools::search::register(kernel.tools_mut(), search)?;
-        }
+        // Available to a pack, not loaded by the kernel: `packs/search` asks
+        // for `builtin:search` and it appears — with a tool only while a key
+        // is configured (see `search::configure`).
+        let search_cell = nguruvilu::tools::search::cell(settings.search.clone());
+        nguruvilu::tools::search::install(&mut kernel, search_cell.clone());
         if !skills.is_empty() {
             register_skill_tool(kernel.tools_mut(), Arc::new(skills.clone()))?;
         }
@@ -263,6 +269,7 @@ impl AppState {
             last_prompt_tokens: None,
             pending,
             mcp: Vec::new(),
+            search_cell,
         })
     }
 
@@ -481,14 +488,14 @@ impl AppState {
         self.route = ModelRoute::from_settings(&self.settings);
 
         // And the search tool follows its key at once: a key typed into the
-        // panel should make `search_web` appear in the very next status, not
-        // after a restart. Without a key there is no tool — see `restore_kernel`.
-        self.kernel
-            .tools_mut()
-            .unregister(nguruvilu::tools::search::TOOL);
-        if let Some(search) = self.settings.search.clone() {
-            let _ = nguruvilu::tools::search::register(self.kernel.tools_mut(), search)?;
-        }
+        // panel goes into the plugin's cell and its fibers re-apply, so
+        // `search_web` appears in the very next status — and vanishes when
+        // the key does.
+        nguruvilu::tools::search::configure(
+            &mut self.kernel,
+            &self.search_cell,
+            self.settings.search.clone(),
+        )?;
         let tools = Arc::new(self.kernel.tools().clone());
 
         let mut runtime = self.config.runtime.lock().expect("runtime lock");
@@ -670,16 +677,16 @@ impl AppState {
         let network = self.settings.network.clone();
         nguruvilu::network::install(&mut self.kernel, network)?;
 
-        // A pack may be what configured search, so the tool follows the
-        // settings here rather than only at boot: registered while a key is
-        // configured, and absent when it is not — a search tool that cannot
-        // authenticate costs a turn every time the model tries it.
-        self.kernel
-            .tools_mut()
-            .unregister(nguruvilu::tools::search::TOOL);
-        if let Some(search) = self.settings.search.clone() {
-            let _ = nguruvilu::tools::search::register(self.kernel.tools_mut(), search)?;
-        }
+        // A pack may be what configured search: the settings go into the
+        // plugin's cell and its fibers re-apply against this kernel — the
+        // tool present while a key is configured, absent when it is not (a
+        // search tool that cannot authenticate costs a turn every time the
+        // model tries it).
+        nguruvilu::tools::search::configure(
+            &mut self.kernel,
+            &self.search_cell,
+            self.settings.search.clone(),
+        )?;
 
         let tools = Arc::new(self.kernel.tools().clone());
         let mut route = ModelRoute::from_settings(&self.settings);
