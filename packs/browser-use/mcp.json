@@ -1,0 +1,11 @@
+{
+  "servers": [
+    {
+      "id": "chrome-devtools-mcp",
+      "transport": "stdio",
+      "command": "chrome-devtools-mcp",
+      "args": ["--headless"],
+      "scope": "session"
+    }
+  ]
+}

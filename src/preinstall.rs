@@ -37,8 +37,8 @@ pub const SHIPPED: &[(&str, &str, &[u8])] = &[
     ),
     (
         "computer-use",
-        "1.0.0",
-        include_bytes!("../packs/computer-use/computer-use-1.0.0.dshpack"),
+        "1.1.0",
+        include_bytes!("../packs/computer-use/computer-use-1.1.0.dshpack"),
     ),
     (
         "search",

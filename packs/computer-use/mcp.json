@@ -1,10 +1,10 @@
 {
   "servers": [
     {
-      "id": "browser",
+      "id": "cua-driver",
       "transport": "stdio",
-      "command": "npx",
-      "args": ["-y", "@playwright/mcp@latest", "--headless", "--isolated"],
+      "command": "cua-driver",
+      "args": ["mcp"],
       "scope": "session"
     }
   ]

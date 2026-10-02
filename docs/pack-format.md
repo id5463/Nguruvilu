@@ -187,13 +187,18 @@ my-pack-1.0.0.dshpack          ← zip
       "id": "filesystem",
       "transport": "stdio",
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "args": ["-y", "@modelcontextprotocol/server-filesystem@2026.8.31", "."],
       "env": { "TOKEN": "${MY_TOKEN}" },   // 引用环境变量
       "scope": "session"                    // session|global
     }
   ]
 }
 ```
+
+**`command` 指向本机已装的程序** —— 和 `builtin:` 一个道理:包只声明"要什么",
+机器上得有。内核按 PATH 解析这个名字,找不到就在装载时报一条 `failed mcp:<id>`
+并跳过,不影响其它条目。**版本在安装时定死**,不要写 `npx …@latest`:那会让每次
+启动都去问一遍 npm registry,慢,而且随时可能拿到一个没测过的版本。
 
 ### `look.json` —— 外观
 
@@ -317,7 +322,7 @@ packs 目录:
 | `ui` | 界面的可改副本 —— 窗口服务的就是它;卸载则回到内核里的内置界面 |
 | `search` | 搜索 provider 与 key 的环境变量名(没 key 就没有工具) |
 | `subagent` | `delegate` 工具 —— 内核自带能力,由这个包启用 |
-| `computer-use` | Playwright MCP(浏览器操作;不要就卸载,否则每次会话都会起它) |
+| `computer-use` | 桌面操作:声明已装的 `cua-driver`(执行 `cua-driver mcp`);驱动没装则每次启动报一条 `failed mcp:cua-driver`,不要就卸载 |
 
 放置的三条规则(记录在 `~/.nguruvilu/preinstalled.json`):
 
