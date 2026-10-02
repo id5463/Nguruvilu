@@ -176,6 +176,9 @@ impl AppState {
         // shell applies the load and unload between turns.
         let pending = Arc::new(nguruvilu::tools::pack::PendingQueue::new());
         nguruvilu::tools::pack::register_with(kernel.tools_mut(), Some(Arc::clone(&pending)))?;
+        // Available to a pack, not loaded by the kernel: `packs/subagent` asks
+        // for `builtin:delegate` and it appears.
+        nguruvilu::tools::subagent::define(&mut kernel);
         // Search appears only when a provider and key are configured.
         if let Some(search) = settings.search.clone() {
             let _ = nguruvilu::tools::search::register(kernel.tools_mut(), search)?;
@@ -206,18 +209,6 @@ impl AppState {
                 policy: Arc::clone(&policy),
             });
         nguruvilu::model::install(&mut kernel, Arc::clone(&access))?;
-
-        // The delegate tool shares that access, so a subtask runs on the route
-        // and tool table the session is using. The runtime snapshotted the
-        // kernel's table before the service existed, so adopt it again —
-        // otherwise the session would never see the tool it just gained.
-        if nguruvilu::tools::subagent::register(kernel.tools_mut(), Arc::clone(&access))? {
-            eprintln!("[subagent] delegate enabled");
-            runtime
-                .lock()
-                .expect("runtime lock")
-                .adopt_kernel_tools(&kernel);
-        }
 
         let config = Arc::new(SharedConfig {
             runtime,
@@ -565,6 +556,12 @@ impl AppState {
                 *injection = std::sync::Arc::new(rules);
             }
         }
+
+        // A pack may be what configured search; the tool is put in step with
+        // the settings when the kernel comes back (see `restore_kernel`).
+        if let Some(search) = &content.search {
+            search.apply(&mut self.settings.search);
+        }
     }
 
     /// Installed packs.
@@ -643,6 +640,17 @@ impl AppState {
         self.kernel = kernel;
         let network = self.settings.network.clone();
         nguruvilu::network::install(&mut self.kernel, network)?;
+
+        // A pack may be what configured search, so the tool follows the
+        // settings here rather than only at boot: registered while a key is
+        // configured, and absent when it is not — a search tool that cannot
+        // authenticate costs a turn every time the model tries it.
+        self.kernel
+            .tools_mut()
+            .unregister(nguruvilu::tools::search::TOOL);
+        if let Some(search) = self.settings.search.clone() {
+            let _ = nguruvilu::tools::search::register(self.kernel.tools_mut(), search)?;
+        }
 
         let tools = Arc::new(self.kernel.tools().clone());
         let mut route = ModelRoute::from_settings(&self.settings);

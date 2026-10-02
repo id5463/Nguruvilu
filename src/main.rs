@@ -603,14 +603,12 @@ async fn run() -> Result<()> {
     // applies the load and unload between turns.
     let pending_packs = Arc::new(nguruvilu::tools::pack::PendingQueue::new());
     nguruvilu::tools::pack::register_with(kernel.tools_mut(), Some(Arc::clone(&pending_packs)))?;
-    // Search appears only when a provider and key are configured. A tool
-    // that is present and fails on every call costs a turn every time a
-    // model tries it; absent, the model does not know it exists.
-    if let Some(search) = settings.search.clone() {
-        if nguruvilu::tools::search::register(kernel.tools_mut(), search)? {
-            eprintln!("[search] enabled");
-        }
-    }
+    // The subagent's code is available to a pack, not loaded by the kernel:
+    // `packs/subagent` asks for `builtin:delegate` and it appears, and without
+    // that pack the kernel has no such tool.
+    nguruvilu::tools::subagent::define(&mut kernel);
+    // Search is registered later — after the pack's content has landed, since
+    // a pack may be what configured it.
     if !skills.is_empty() {
         register_skill_tool(kernel.tools_mut(), Arc::new(skills.clone()))?;
     }
@@ -679,6 +677,16 @@ async fn run() -> Result<()> {
     // pack, in name order, so the command line and the desktop agree on what a
     // conversation has. An unloaded pack keeps its files and is skipped — it
     // can be brought back with `pack` action `load` without reinstalling.
+    //
+    // Before any of that, the packs this build ships are placed: a program
+    // that has to be told to install its own features is not finished. A
+    // failure here is reported rather than fatal — a read-only or full disk
+    // must not stop a session from starting.
+    match nguruvilu::preinstall::seed(&nguruvilu::pack::default_packs_dir()).await {
+        Ok(placed) if !placed.is_empty() => eprintln!("[preinstall] placed {}", placed.join(", ")),
+        Ok(_) => {}
+        Err(error) => eprintln!("[preinstall] {error:#}"),
+    }
     for pack in nguruvilu::pack::installed(&nguruvilu::pack::default_packs_dir())? {
         if !pack.enabled {
             eprintln!("[pack] {} is unloaded; files kept", pack.manifest.name);
@@ -761,6 +769,12 @@ async fn run() -> Result<()> {
     for content in contents {
         adopt_content(content, &mut settings, &mut runtime, &injection)?;
     }
+    // Search appears only when a provider and a key are configured — and a
+    // pack may be what configured them, so this runs after the content lands
+    // rather than at boot.
+    if sync_search(&mut kernel, &settings)? {
+        eprintln!("[search] enabled");
+    }
 
     // A pack's numbers replace the standing ones, so the route is rebuilt from
     // what the settings now say — and the client is built from that route
@@ -797,19 +811,18 @@ async fn run() -> Result<()> {
     });
     nguruvilu::model::install(&mut kernel, Arc::clone(&access))?;
 
-    // The delegate tool reads the route and the tool table through the service
-    // above, so it registers against that shared access rather than its own
-    // copy of the settings. It belongs to the kernel's table, which the turn
-    // snapshotted before the service existed, so the kernel is adopted again
-    // afterwards — otherwise the session would never see the tool it just
-    // gained.
-    if nguruvilu::tools::subagent::register(kernel.tools_mut(), Arc::clone(&access))? {
-        eprintln!("[subagent] delegate enabled");
-        runtime
-            .lock()
-            .expect("runtime lock")
-            .adopt_kernel_tools(&kernel);
+    // A pack that asked for `builtin:delegate` was waiting on the route above;
+    // now that it is published the kernel activates it, and the turn's tool
+    // snapshot — taken long before any of this — is taken again so the session
+    // sees whatever just arrived.
+    kernel.refresh()?;
+    if kernel.tools().get(nguruvilu::tools::subagent::TOOL).is_some() {
+        eprintln!("[subagent] delegate loaded by the subagent pack");
     }
+    runtime
+        .lock()
+        .expect("runtime lock")
+        .adopt_kernel_tools(&kernel);
 
     // `runtime` describes the session that would run, so it is answered from
     // the assembled kernel: the tools a turn would actually see, the services
@@ -2397,6 +2410,9 @@ fn adopt_content(
             .lock()
             .expect("injection lock") = Arc::new(rules);
     }
+    if let Some(search) = &content.search {
+        search.apply(&mut settings.search);
+    }
     Ok(())
 }
 
@@ -2531,6 +2547,9 @@ impl PackHost<'_> {
         }
 
         if changed {
+            // A hot load may have configured search as well, so the tool is
+            // put in step with the settings before the table is published.
+            let _ = sync_search(self.kernel, self.settings)?;
             // The route may have moved with the pack's content, and the tool
             // table certainly did; both are published together so the next
             // turn reads one consistent view.
@@ -2544,6 +2563,20 @@ impl PackHost<'_> {
             eprintln!("[pack] the next turn sees the new tool table");
         }
         Ok(())
+    }
+}
+
+/// Put the search tool in step with the settings.
+///
+/// Called after a pack's content lands and after a hot load, because a pack
+/// may be what configured the provider — and with no key there is no tool at
+/// all: a search tool that cannot authenticate costs a turn every time the
+/// model tries it, while an absent one costs nothing.
+fn sync_search(kernel: &mut Kernel, settings: &Settings) -> Result<bool> {
+    kernel.tools_mut().unregister(nguruvilu::tools::search::TOOL);
+    match &settings.search {
+        Some(search) => nguruvilu::tools::search::register(kernel.tools_mut(), search.clone()),
+        None => Ok(false),
     }
 }
 

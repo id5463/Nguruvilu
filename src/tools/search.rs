@@ -134,6 +134,23 @@ impl SearchSettings {
     }
 }
 
+impl Default for SearchSettings {
+    /// A starting point for a merge, before a pack or the user names anything.
+    ///
+    /// Tavily is first only because it is the first dialect listed, not because
+    /// it is preferred: any file that says otherwise overwrites this, and with
+    /// no key the tool does not register at all, so a wrong guess here cannot
+    /// reach the network.
+    fn default() -> Self {
+        Self {
+            provider: Dialect::Tavily,
+            api_key: String::new(),
+            endpoint: None,
+            max_results: default_limit(),
+        }
+    }
+}
+
 /// Build the request for a query.
 ///
 /// Returns the method, the URL, the headers, and the body. Public so a test can

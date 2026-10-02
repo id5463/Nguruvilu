@@ -1,0 +1,29 @@
+{
+  "strings": {
+    "sec-sessions": "会话",
+    "sec-settings": "设置",
+    "sec-packages": "包",
+    "sec-runtime": "运行时",
+    "sec-skills": "技能",
+    "sec-tools": "工具",
+    "sec-log": "工具输出",
+    "cap-endpoint": "API 地址",
+    "cap-key": "API 密钥",
+    "cap-model": "模型",
+    "cap-proxy": "代理(可选)",
+    "cap-window": "上下文窗口(词元)",
+    "cap-compact": "压缩阈值 %",
+    "cap-keep": "保留最近",
+    "cap-output": "最大输出词元",
+    "cap-effort": "思考强度",
+    "cap-reasoning": "显示思考过程",
+    "new-session": "+ 新会话",
+    "save-settings": "保存",
+    "btn-install": "安装…",
+    "btn-pack": "打包…",
+    "btn-verify": "校验…",
+    "btn-fetch-models": "拉取列表",
+    "send": "发送",
+    "placeholder:input": "问内核点什么…(回车发送,Shift+回车换行)"
+  }
+}

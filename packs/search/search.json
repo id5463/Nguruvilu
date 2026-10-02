@@ -1,0 +1,5 @@
+{
+  "provider": "tavily",
+  "apiKeyEnv": "TAVILY_API_KEY",
+  "maxResults": 5
+}

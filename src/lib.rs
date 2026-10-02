@@ -37,6 +37,7 @@ pub mod network;
 pub mod pack;
 pub mod model;
 pub mod plugin;
+pub mod preinstall;
 pub mod request;
 pub mod session;
 pub mod window;

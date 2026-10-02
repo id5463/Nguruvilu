@@ -191,6 +191,19 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
         .build()?;
     let handle = runtime.handle().clone();
 
+    // Before the interface is chosen: which interface runs is a pack's
+    // decision, so the packs this build ships have to be there first. Without
+    // this the very first launch would fall back to the built-in one and the
+    // second would not — the same window, two answers, depending on nothing
+    // the user did.
+    match runtime.block_on(nguruvilu::preinstall::seed(
+        &nguruvilu::pack::default_packs_dir(),
+    )) {
+        Ok(placed) if !placed.is_empty() => eprintln!("[preinstall] placed {}", placed.join(", ")),
+        Ok(_) => {}
+        Err(error) => eprintln!("[preinstall] {error:#}"),
+    }
+
     let webview = {
         let state = Arc::clone(&state);
         let sink = Arc::clone(&sink);
@@ -948,6 +961,16 @@ async fn drain_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
 /// bad manifest must not leave the shell with no appearance at all.
 async fn load_installed_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
     let dir = nguruvilu::pack::default_packs_dir();
+
+    // Place what this build ships before listing: the packs decide what a
+    // conversation has, and a report rather than a failure keeps a full or
+    // read-only disk from stopping the shell.
+    match nguruvilu::preinstall::seed(&dir).await {
+        Ok(placed) if !placed.is_empty() => eprintln!("[preinstall] placed {}", placed.join(", ")),
+        Ok(_) => {}
+        Err(error) => eprintln!("[preinstall] {error:#}"),
+    }
+
     let packs = match nguruvilu::pack::installed(&dir) {
         Ok(packs) => packs,
         Err(error) => {
@@ -1159,6 +1182,11 @@ fn resolve_active_ui(wanted: Option<&str>) -> Option<PathBuf> {
     let packs = nguruvilu::pack::installed(&nguruvilu::pack::default_packs_dir()).ok()?;
 
     for pack in &packs {
+        // An unloaded pack is out of every conversation, and that includes the
+        // interface it brought: unloading it puts the built-in one back.
+        if !pack.enabled {
+            continue;
+        }
         let Some(ui) = &pack.manifest.ui else {
             continue;
         };

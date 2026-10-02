@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 
 use crate::agent::{Agent, StaticConfig};
 use crate::model::ModelAccess;
-use crate::tools::{ConflictPolicy, ToolDef, ToolFuture, ToolOutput};
+use crate::tools::{ToolDef, ToolFuture, ToolOutput};
 
 /// The tool name.
 ///
@@ -41,50 +41,70 @@ pub const TOOL: &str = "delegate";
 /// higher; this is deliberately lower.
 pub const MAX_STEPS: usize = 12;
 
-/// Register the tool against a model service.
+/// Register the plugin a pack loads to bring the tool in.
 ///
-/// Returns whether it was registered. A caller with no service gets no tool,
-/// for the same reason search is absent without a key: a tool that always fails
-/// costs a turn every time a model tries it.
-pub fn register(
-    registry: &mut crate::tools::ToolRegistry,
-    access: Arc<dyn ModelAccess>,
-) -> Result<bool> {
-    registry.register(
-        ToolDef::new(
-            TOOL,
-            format!(
-                "Run a self-contained subtask in a fresh agent with no memory of this \
-                 conversation, and get back only its answer. Use it to keep a large \
-                 side investigation out of this transcript. \
-                 The subtask sees the same tools and the same model you do, but not \
-                 what was said here — so state everything it needs, including paths \
-                 and what 'done' looks like. It cannot ask you anything, and it stops \
-                 after {MAX_STEPS} steps."
-            ),
-            json!({
-                "type": "object",
-                "properties": {
-                    "task": {
-                        "type": "string",
-                        "description": "The whole subtask, standing on its own: what to do, where, and what counts as finished."
-                    },
-                    "model": {
-                        "type": "string",
-                        "description": "Optional model for the subtask. Defaults to the session's. A cheaper model is usually right for mechanical work."
-                    }
-                },
-                "required": ["task"]
-            }),
-            "kernel",
-            move |args| {
-                let access = Arc::clone(&access);
-                Box::pin(async move { run(access, args).await }) as ToolFuture
-            },
+/// Defining is not loading: nothing appears in a tool table until a pack's
+/// assembly asks for `builtin:delegate`. The code ships inside this binary —
+/// a pack never carries a binary — but *whether a conversation has it* is the
+/// pack's decision, which is what keeps the kernel from growing a capability
+/// of its own.
+pub fn define(kernel: &mut crate::plugin::Kernel) {
+    kernel.define(std::sync::Arc::new(Delegate));
+}
+
+/// The plugin behind [`TOOL`].
+pub struct Delegate;
+
+impl crate::plugin::Plugin for Delegate {
+    fn name(&self) -> &str {
+        TOOL
+    }
+
+    /// The route publishes as a service, so the tool waits for it rather than
+    /// capturing a client at startup.
+    fn inject(&self) -> Vec<String> {
+        vec![crate::model::SERVICE.to_string()]
+    }
+
+    fn apply(&self, ctx: &crate::plugin::PluginCtx) -> Result<crate::plugin::Contributions> {
+        let access = crate::model::ModelHandle::from_view(&ctx.services)
+            .ok_or_else(|| anyhow!("the session has not published a route"))?;
+        Ok(crate::plugin::Contributions::new().tool(tool(access)))
+    }
+}
+
+fn tool(access: Arc<dyn ModelAccess>) -> ToolDef {
+    ToolDef::new(
+        TOOL,
+        format!(
+            "Run a self-contained subtask in a fresh agent with no memory of this \
+             conversation, and get back only its answer. Use it to keep a large \
+             side investigation out of this transcript. \
+             The subtask sees the same tools and the same model you do, but not \
+             what was said here — so state everything it needs, including paths \
+             and what 'done' looks like. It cannot ask you anything, and it stops \
+             after {MAX_STEPS} steps."
         ),
-        ConflictPolicy::Error,
-    )?;
-    Ok(true)
+        json!({
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "The whole subtask, standing on its own: what to do, where, and what counts as finished."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional model for the subtask. Defaults to the session's. A cheaper model is usually right for mechanical work."
+                }
+            },
+            "required": ["task"]
+        }),
+        TOOL,
+        move |args| {
+            let access = Arc::clone(&access);
+            Box::pin(async move { run(access, args).await }) as ToolFuture
+        },
+    )
 }
 
 async fn run(access: Arc<dyn ModelAccess>, args: Value) -> Result<ToolOutput> {
@@ -230,12 +250,66 @@ mod tests {
         })
     }
 
+    /// The state a session is in once the subagent pack has loaded: the plugin
+    /// defined by the kernel, the route published, and a pack that asked for
+    /// it.
+    fn loaded_kernel() -> crate::plugin::Kernel {
+        let mut kernel = crate::plugin::Kernel::new();
+        define(&mut kernel);
+        crate::model::install(&mut kernel, access()).unwrap();
+        kernel
+            .load(TOOL, crate::plugin::RealmMap::new(), serde_json::Value::Null)
+            .unwrap();
+        kernel
+    }
+
+    /// The tool's schema, wherever it sits in the table.
+    fn schema_of(kernel: &crate::plugin::Kernel) -> serde_json::Value {
+        kernel
+            .tools()
+            .schemas()
+            .into_iter()
+            .find(|schema| schema["function"]["name"] == TOOL)
+            .expect("the delegate tool has a schema")
+    }
+
     #[test]
-    fn the_tool_is_registered_under_the_kernel() {
-        let mut registry = ToolRegistry::new();
-        assert!(register(&mut registry, access()).unwrap());
-        assert!(registry.get(TOOL).is_some());
-        assert_eq!(registry.owner(TOOL), Some("kernel"));
+    fn defining_the_plugin_alone_loads_nothing() {
+        // The kernel holds the code; the pack decides it is there. Between
+        // `define` and a pack's assembly asking for it, the tool must not be
+        // in the table — otherwise the kernel grew a capability it claims not
+        // to have.
+        let mut kernel = crate::plugin::Kernel::new();
+        define(&mut kernel);
+        crate::model::install(&mut kernel, access()).unwrap();
+
+        assert!(kernel.tools().get(TOOL).is_none());
+        assert!(kernel.plugin(TOOL).is_some(), "but the code is available");
+    }
+
+    #[test]
+    fn without_a_published_route_nothing_activates() {
+        // The tool waits for the route rather than capturing a client at
+        // startup: a pack that loads before the host publishes one must leave
+        // the kernel usable, not half-configured.
+        let mut kernel = crate::plugin::Kernel::new();
+        define(&mut kernel);
+        kernel
+            .load(TOOL, crate::plugin::RealmMap::new(), serde_json::Value::Null)
+            .unwrap();
+
+        assert!(kernel.tools().get(TOOL).is_none());
+    }
+
+    #[test]
+    fn the_tool_is_registered_under_the_pack_that_asked_for_it() {
+        let kernel = loaded_kernel();
+        assert!(kernel.tools().get(TOOL).is_some());
+        assert_eq!(
+            kernel.tools().owner(TOOL),
+            Some(TOOL),
+            "the kernel stamps ownership, so the pack cannot claim someone else's tool"
+        );
     }
 
     #[test]
@@ -250,9 +324,7 @@ mod tests {
     fn the_description_says_the_subtask_starts_blind() {
         // The single most important thing about this tool for a caller to know:
         // the subtask has no memory of the conversation.
-        let mut registry = ToolRegistry::new();
-        register(&mut registry, access()).unwrap();
-        let description = registry.schemas()[0]["function"]["description"]
+        let description = schema_of(&loaded_kernel())["function"]["description"]
             .as_str()
             .unwrap()
             .to_string();
@@ -263,9 +335,7 @@ mod tests {
     #[test]
     fn the_description_carries_the_step_budget() {
         // A caller that does not know the budget cannot size its task.
-        let mut registry = ToolRegistry::new();
-        register(&mut registry, access()).unwrap();
-        let description = registry.schemas()[0]["function"]["description"]
+        let description = schema_of(&loaded_kernel())["function"]["description"]
             .as_str()
             .unwrap()
             .to_string();

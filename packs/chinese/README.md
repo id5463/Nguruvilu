@@ -5,10 +5,15 @@
 
 ## 装
 
+**随程序预装**:装上就有,不用手动装。想手动来也行:
+
 ```
 ngu install chinese-1.0.0.dshpack
 ngu --assembly ~/.nguruvilu/packs/chinese-1.0.0/assembly.yaml
 ```
+
+卸载:`ngu uninstall chinese`(文件留着)。界面文案会当场撤掉;已经写进对话的人设是
+对话的一部分,不会被追回。
 
 ## 里面是什么
 
@@ -16,6 +21,7 @@ ngu --assembly ~/.nguruvilu/packs/chinese-1.0.0/assembly.yaml
 |---|---|
 | `soul.md` | 中文人设:语言、风格、做事方式 |
 | `injections.json` | 两条常驻规则:用中文回答、不要开场白 |
+| `look.json` | **界面文案**:把窗口里的按钮、栏目、占位符换成中文(纯数据,零代码) |
 
 **零代码,全平台通用。**
 

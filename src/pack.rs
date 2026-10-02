@@ -77,6 +77,7 @@ pub const CONTENT_FILES: &[(&str, &str)] = &[
     ("mcp", "mcp.json"),
     ("look", "look.json"),
     ("injections", "injections.json"),
+    ("search", "search.json"),
 ];
 
 /// The kernel version this build is.
@@ -148,6 +149,9 @@ pub struct PackManifest {
     /// Injection rule file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub injections: Option<ContentRef>,
+    /// Search provider file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<ContentRef>,
     /// A user interface this pack brings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<UiDecl>,
@@ -326,6 +330,7 @@ impl PackManifest {
             mcp: None,
             look: None,
             injections: None,
+            search: None,
             ui: None,
         }
     }
@@ -339,6 +344,7 @@ impl PackManifest {
             "mcp" => self.mcp.as_ref(),
             "look" => self.look.as_ref(),
             "injections" => self.injections.as_ref(),
+            "search" => self.search.as_ref(),
             _ => None,
         }
     }
@@ -385,6 +391,7 @@ impl PackManifest {
             "mcp" => self.mcp = Some(reference),
             "look" => self.look = Some(reference),
             "injections" => self.injections = Some(reference),
+            "search" => self.search = Some(reference),
             _ => {}
         }
     }
@@ -695,6 +702,72 @@ pub struct ModelsFile {
     /// Fields merged into every request body.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub extra_body: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `search.json`: which search provider this pack expects.
+///
+/// Carried like `models.json`, and for the same reason: the key itself never
+/// travels, only the name of the variable holding it. A pack that names a
+/// provider whose variable is unset leaves the tool unregistered — a search
+/// tool that cannot authenticate costs a turn every time the model tries it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SearchFile {
+    /// `tavily`, `brave`, or `exa`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<crate::tools::search::Dialect>,
+    /// **Name** of the environment variable holding the key. Never the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    /// Endpoint override, for a proxy or a mirror.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// How many results to ask for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_results: Option<usize>,
+}
+
+impl SearchFile {
+    /// Fold this pack's choices into the standing search settings.
+    ///
+    /// A pack that ships with the kernel does not outvote what the user has
+    /// already configured: it fills what is absent, and only builds the whole
+    /// thing when nothing is there yet. An unset variable never erases a key
+    /// that already works, and with no standing settings and no provider in
+    /// the file there is nothing to build on — the settings stay unset, which
+    /// is the honest outcome: no provider, no tool.
+    pub fn apply(&self, current: &mut Option<crate::tools::search::SearchSettings>) {
+        if current.is_none() {
+            let Some(provider) = self.provider else {
+                return;
+            };
+            let defaults = crate::tools::search::SearchSettings::default();
+            *current = Some(crate::tools::search::SearchSettings {
+                provider,
+                endpoint: self.endpoint.clone(),
+                max_results: self
+                    .max_results
+                    .filter(|limit| *limit > 0)
+                    .unwrap_or(defaults.max_results),
+                ..defaults
+            });
+        }
+        let Some(merged) = current.as_mut() else {
+            return;
+        };
+        if merged.endpoint.is_none() {
+            merged.endpoint = self.endpoint.clone();
+        }
+        if merged.api_key.trim().is_empty() {
+            if let Some(var) = &self.api_key_env {
+                if let Ok(value) = std::env::var(var) {
+                    if !value.trim().is_empty() {
+                        merged.api_key = value;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// `context.json`: how much to remember.
@@ -1501,17 +1574,32 @@ fn render_assembly(manifest: &PackManifest, staging: &Path) -> Result<String> {
         .plugins
         .iter()
         .map(|plugin| {
-            // The loader takes a path inside the pack; the fetched directory is
-            // copied to `files/<id>` at install time.
-            let file = plugin
-                .platforms
-                .get(platform)
-                .map(|artifact| artifact.file.clone())
-                .unwrap_or_else(|| plugin.id.clone());
+            // A plugin the kernel already carries is *named*, not fetched: the
+            // pack decides that it loads, the kernel decides what it is. This
+            // is how a capability the kernel ships (a subagent, say) becomes a
+            // pack's to enable without shipping a binary anywhere.
+            //
+            // Everything else is fetched at install time and lands in
+            // `files/<id>`, so the loader gets a path inside the pack.
+            let named = matches!(
+                crate::fetch::Source::parse(&plugin.source),
+                Ok(crate::fetch::Source::Builtin { .. })
+                    | Ok(crate::fetch::Source::Local { .. })
+            );
+            let source = if named {
+                plugin.source.clone()
+            } else {
+                let file = plugin
+                    .platforms
+                    .get(platform)
+                    .map(|artifact| artifact.file.clone())
+                    .unwrap_or_else(|| plugin.id.clone());
+                format!("dylib:{FILES_DIR}/{}/{file}", plugin.id)
+            };
             OutPlugin {
                 base: OutBase {
                     id: plugin.id.clone(),
-                    source: format!("dylib:{FILES_DIR}/{}/{file}", plugin.id),
+                    source,
                     scope: Some("global".into()),
                 },
             }
@@ -2369,5 +2457,117 @@ mod tests {
         let mcp: McpFile = serde_json::from_str(text).unwrap();
         assert!(mcp.servers[0].source.is_none());
         assert_eq!(mcp.servers[0].args.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_pack_that_enables_a_kernel_plugin_renders_its_name_not_a_path() {
+        // The whole point of `builtin:`: the pack decides *that* it loads, the
+        // kernel decides *what* it is — and nothing is downloaded or pointed at.
+        let dir = scratch("builtin-plugin");
+        let mut manifest = PackManifest::new("delegate-pack", "1.0.0");
+        manifest.plugins.push(PluginRef {
+            id: "delegate".into(),
+            source: "builtin:delegate".into(),
+            license: "MIT".into(),
+            sha256: None,
+            platforms: BTreeMap::new(),
+        });
+        write_manifest(&dir, &manifest).unwrap();
+
+        let archive = dir.join("delegate-pack.dshpack");
+        pack(&dir, &archive).unwrap();
+        let placed = install(&archive, &dir.join("packs")).await.unwrap();
+
+        let assembly =
+            std::fs::read_to_string(placed.path.join(ASSEMBLY_NAME)).unwrap_or_default();
+        assert!(assembly.contains("builtin:delegate"), "{assembly}");
+        assert!(!assembly.contains("dylib:"), "{assembly}");
+    }
+
+    #[test]
+    fn the_rendered_assembly_keeps_a_fetched_plugin_on_its_file() {
+        // The other half of the rule, checked where the decision is made: a
+        // plugin with a real source still becomes `dylib:files/...`, because
+        // that is where install puts what it fetched.
+        let dir = scratch("fetched-plugin");
+        let mut manifest = PackManifest::new("native-pack", "1.0.0");
+        manifest.plugins.push(PluginRef {
+            id: "thing".into(),
+            source: "github:owner/repo@thing@v1".into(),
+            license: "MIT".into(),
+            sha256: None,
+            platforms: BTreeMap::new(),
+        });
+
+        let assembly = render_assembly(&manifest, &dir).unwrap();
+        assert!(
+            assembly.contains(&format!("dylib:{FILES_DIR}/thing/thing")),
+            "{assembly}"
+        );
+        assert!(!assembly.contains("github:"), "{assembly}");
+    }
+
+    #[test]
+    fn a_search_file_builds_settings_from_nothing_and_never_outvotes_a_person() {
+        use crate::tools::search::{Dialect, SearchSettings};
+
+        // From nothing, the file is the whole configuration.
+        let file: SearchFile = serde_json::from_str(
+            r#"{"provider":"tavily","apiKeyEnv":"NGU_TEST_SEARCH_KEY","maxResults":7}"#,
+        )
+        .unwrap();
+        std::env::set_var("NGU_TEST_SEARCH_KEY", "tk-test");
+        let mut current: Option<SearchSettings> = None;
+        file.apply(&mut current);
+        let built = current.expect("built from the file");
+        assert!(matches!(built.provider, Dialect::Tavily));
+        assert_eq!(built.max_results, 7);
+        assert_eq!(built.api_key, "tk-test");
+        assert!(built.is_configured());
+
+        // With something standing, the file fills gaps and changes nothing else:
+        // a pack that ships with the kernel does not outvote its user.
+        let mut standing = Some(SearchSettings {
+            provider: Dialect::Brave,
+            api_key: "brave-key".into(),
+            endpoint: None,
+            max_results: 3,
+        });
+        file.apply(&mut standing);
+        let kept = standing.expect("still there");
+        assert!(matches!(kept.provider, Dialect::Brave), "the choice stays");
+        assert_eq!(kept.max_results, 3, "so does the limit");
+        assert_eq!(kept.api_key, "brave-key", "and the key");
+
+        // An unset variable fills an empty key and never replaces a full one.
+        let mut empty = Some(SearchSettings {
+            provider: Dialect::Exa,
+            api_key: String::new(),
+            endpoint: None,
+            max_results: 5,
+        });
+        file.apply(&mut empty);
+        assert_eq!(
+            empty.as_ref().unwrap().api_key,
+            "tk-test",
+            "an empty key takes what the environment offers"
+        );
+        std::env::remove_var("NGU_TEST_SEARCH_KEY");
+        file.apply(&mut empty);
+        assert_eq!(
+            empty.as_ref().unwrap().api_key,
+            "tk-test",
+            "and a missing variable does not erase it"
+        );
+    }
+
+    #[test]
+    fn a_search_file_without_a_provider_changes_nothing() {
+        // No provider and nothing standing means there is nothing to build on;
+        // inventing one would be a guess that can reach the network.
+        let file: SearchFile = serde_json::from_str(r#"{"maxResults":3}"#).unwrap();
+        let mut current: Option<crate::tools::search::SearchSettings> = None;
+        file.apply(&mut current);
+        assert!(current.is_none());
     }
 }

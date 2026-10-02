@@ -25,8 +25,9 @@ my-pack-1.0.0.dshpack          ← zip
 ├── models.json                ← 模型路由 / 输出 / 请求塑形
 ├── context.json               ← 上下文窗口 / 压缩 / 缓存策略
 ├── mcp.json                   ← MCP 服务器
-├── look.json                  ← 主题 / UI 面板
-└── injections.json            ← 注入规则
+├── look.json                  ← 主题 / UI 面板 / 界面文案
+├── injections.json            ← 注入规则
+└── search.json                ← 搜索 provider 与 key 的环境变量名
 ```
 
 内容文件**全部可选**。一个只加一条注入规则的包,可以只有一个 `dsh.index.json` 和一个 `injections.json`。
@@ -120,9 +121,23 @@ my-pack-1.0.0.dshpack          ← zip
   "context":    "context.json",
   "mcp":        "mcp.json",
   "look":       "look.json",
-  "injections": "injections.json"
+  "injections": "injections.json",
+  "search":     "search.json"
 }
 ```
+
+**内核自带的插件用名字,不下载**:
+
+```jsonc
+{
+  "plugins": [
+    { "id": "delegate", "source": "builtin:delegate", "license": "MIT" }
+  ]
+}
+```
+
+`builtin:` 的来源在渲染装配时原样透传 —— 包决定"它要不要装",内核决定"它是什么",
+所以内核自带的能力(比如子代理)可以由一个包启用,而包里不放任何二进制。
 
 ---
 
@@ -226,6 +241,23 @@ my-pack-1.0.0.dshpack          ← zip
 
 ---
 
+### `search.json` —— 搜索
+
+```jsonc
+{
+  "provider": "tavily",          // tavily | brave | exa
+  "apiKeyEnv": "TAVILY_API_KEY", // 只写环境变量的名字,永远不写 key
+  "endpoint": "https://…",       // 可选:代理 / 镜像
+  "maxResults": 5                // 可选
+}
+```
+
+- **钥匙从不进包**;变量没设 → `search_web` 不注册 —— 不出现,模型就不知道它存在,
+  好过"出现了,每轮调用都失败"。
+- **不盖过已配置的设置**:这个包随内核预装,所以它只补空缺 —— 你用
+  `ngu config set --search-provider …` 配好的值不会被它改回去;只有什么都没配时,
+  它才从零搭起来。
+
 ## 哈希与缓存
 
 **sha256** —— 不是 sha1。sha1 的碰撞在 2026 年已经是实际可行的,而这个哈希是用来判断"下下来的东西是不是声明的那份"。
@@ -273,6 +305,26 @@ my-pack-1.0.0.dshpack          ← zip
   落下时子进程随之停止)、技能根目录(并重建 `skill` 目录工具)、外观纤维(`pack:<name>`)。
   台账里属于该包的条目一并移除,所以重新加载是真正的重新加载,而不是"已经装过"。
 - **卸载不碰人设和已经写进对话历史的文本**:那是对话本身的一部分,不是可以拔掉的插件。
+
+## 预装:随程序带来的五个包
+
+程序自带五个包,**嵌在可执行文件里**(不联网、不带额外文件),第一次运行时放进
+packs 目录:
+
+| 包 | 带来什么 |
+|---|---|
+| `chinese` | 中文人设、两条常驻注入、**界面文案** |
+| `ui` | 界面的可改副本 —— 窗口服务的就是它;卸载则回到内核里的内置界面 |
+| `search` | 搜索 provider 与 key 的环境变量名(没 key 就没有工具) |
+| `subagent` | `delegate` 工具 —— 内核自带能力,由这个包启用 |
+| `computer-use` | Playwright MCP(浏览器操作;不要就卸载,否则每次会话都会起它) |
+
+放置的三条规则(记录在 `~/.nguruvilu/preinstalled.json`):
+
+1. **用户的决定优先**:卸载或删除过的包**永远不会**被重新放置;
+2. **改过的包绝不覆盖**:放置时记下每个文件的 sha256,只有"和我们放进去的一模一样"
+   才会被新版本替换 —— 你自己编辑过的那份,永远是你那份;
+3. **幂等**:每次启动都跑一遍,稳态下只是一次目录列举和几个哈希,什么都不做。
 
 ## 版本兼容
 
