@@ -280,6 +280,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_shipped_pack_source_parses_and_matches_the_shipped_version() {
+        // The archives are checked above; the *source directory* is what the
+        // next edit touches, and a broken manifest there only surfaces when
+        // somebody packs it — one missing comma in chinese's manifest went out
+        // exactly that way. Version drift matters for the same reason: the
+        // record compares versions to decide whether to replace what is on
+        // disk.
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("packs");
+        for (name, version, _) in SHIPPED {
+            let manifest = crate::pack::read_manifest(&root.join(name))
+                .unwrap_or_else(|error| panic!("{name} source manifest: {error:#}"));
+            assert_eq!(manifest.name, *name, "{name}");
+            assert_eq!(
+                manifest.version_id, *version,
+                "{name} source version drifted from SHIPPED"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn seeding_places_every_pack_once_and_never_again() {
         let (dir, record) = scratch("place");

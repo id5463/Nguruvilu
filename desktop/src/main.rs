@@ -453,6 +453,20 @@ async fn dispatch(
                 .get("max_output_tokens")
                 .and_then(|v| v.as_str())
                 .and_then(|v| nguruvilu::size::parse_size(v).ok());
+            // Web search: provider decides on/off, blank key box keeps the
+            // stored key — the same two rules the panel applies to the model key.
+            let search_provider = command
+                .get("search_provider")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let search_api_key = command
+                .get("search_api_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let search_endpoint = command
+                .get("search_endpoint")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
 
             let outcome = {
                 let mut guard = state.lock().expect("state lock");
@@ -474,6 +488,9 @@ async fn dispatch(
                     compact_percent,
                     keep_recent,
                     max_output,
+                    search_provider,
+                    search_api_key,
+                    search_endpoint,
                 )
             };
 

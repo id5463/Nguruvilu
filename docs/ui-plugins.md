@@ -74,6 +74,7 @@
   "context": { "window": 128000, "window_source": "table",
                "threshold_percent": 75, "keep_recent": 8 },
   "max_output_tokens": "8K",
+  "search": { "provider": "tavily", "endpoint": null, "key": "(set)" },
   "network": { "request_timeout_secs": 300, "pool_idle_timeout_secs": 30,
                "retry_attempts": 3, "retry_backoff_ms": 200 },
   "tools": ["bash", "delegate", "edit", "pack", "read", "write"]
@@ -98,10 +99,13 @@
 ```jsonc
 { "base_url": "...", "api_key": "...", "keep_api_key": true, "model": "...",
   "reasoning_effort": "minimal", "proxy": "", "context_window": "128K",
-  "compact_percent": 75, "compact_keep_recent": 8, "max_output_tokens": "8K" }
+  "compact_percent": 75, "compact_keep_recent": 8, "max_output_tokens": "8K",
+  "search_provider": "tavily", "search_api_key": "…", "search_endpoint": "" }
 ```
 
 `api_key` 留空 + `keep_api_key: true` 表示"不改密钥" —— 界面拿不到已保存的密钥。
+`search_api_key` 同规则(留空 = 保留已存的);`search_provider` 为空表示**关掉搜索**
+(此时已存的搜索配置一并丢弃,面板提示里写明了)。
 
 **接口就这些。** 界面怎么画、怎么摆、有没有快捷键、有没有动画、用不用框架 —— **内核一概不管**。
 

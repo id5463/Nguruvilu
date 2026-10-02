@@ -304,6 +304,15 @@ impl AppState {
             "configured": self.settings.is_configured(),
             "missing": self.settings.missing(),
             "api_key_masked": self.settings.masked_key(),
+            // The panel sets these; the key itself never comes back.
+            "search": match &self.settings.search {
+                Some(search) => json!({
+                    "provider": serde_json::to_value(&search.provider).unwrap_or(Value::Null),
+                    "endpoint": search.endpoint,
+                    "key": if search.api_key.trim().is_empty() { "(not set)" } else { "(set)" },
+                }),
+                None => json!({ "provider": "", "endpoint": "", "key": "(not set)" }),
+            },
             "settings_path": Settings::path().display().to_string(),
             "last_error": self.last_error,
             "context": {
@@ -432,6 +441,9 @@ impl AppState {
         compact_percent: u32,
         compact_keep_recent: usize,
         max_output_tokens: Option<usize>,
+        search_provider: &str,
+        search_api_key: &str,
+        search_endpoint: &str,
     ) -> Result<()> {
         let settings = Settings {
             base_url: base_url.trim().to_string(),
@@ -444,7 +456,12 @@ impl AppState {
             compact_keep_recent: compact_keep_recent.max(1),
             max_output_tokens: max_output_tokens.filter(|t| *t > 0),
             network: self.settings.network.clone(),
-            search: self.settings.search.clone(),
+            search: resolve_search(
+                &self.settings.search,
+                search_provider,
+                search_api_key,
+                search_endpoint,
+            )?,
             extra_body: self.settings.extra_body.clone(),
         };
         settings.save()?;
@@ -463,7 +480,19 @@ impl AppState {
         // the panel is most likely to have touched.
         self.route = ModelRoute::from_settings(&self.settings);
 
+        // And the search tool follows its key at once: a key typed into the
+        // panel should make `search_web` appear in the very next status, not
+        // after a restart. Without a key there is no tool — see `restore_kernel`.
+        self.kernel
+            .tools_mut()
+            .unregister(nguruvilu::tools::search::TOOL);
+        if let Some(search) = self.settings.search.clone() {
+            let _ = nguruvilu::tools::search::register(self.kernel.tools_mut(), search)?;
+        }
+        let tools = Arc::new(self.kernel.tools().clone());
+
         let mut runtime = self.config.runtime.lock().expect("runtime lock");
+        runtime.set_tools(tools);
         runtime.apply(Change::session(
             self.session.id.clone(),
             ChangePayload::ModelRoute(self.route.clone()),
@@ -678,6 +707,46 @@ impl AppState {
     }
 }
 
+/// Fold the panel's three search fields into the stored settings.
+///
+/// The panel never receives the stored key, so a blank box means "keep it" —
+/// the same rule as the model key. The provider decides whether search is on:
+/// an empty value means off, and off drops what was stored, because a key that
+/// no reachable tool can use is worse than no key. The panel's hint says so,
+/// and `search_web` appears only while a key is actually configured.
+fn resolve_search(
+    stored: &Option<nguruvilu::tools::search::SearchSettings>,
+    provider: &str,
+    api_key: &str,
+    endpoint: &str,
+) -> Result<Option<nguruvilu::tools::search::SearchSettings>> {
+    let provider = provider.trim();
+    if provider.is_empty() {
+        return Ok(None);
+    }
+    let dialect = nguruvilu::tools::search::Dialect::parse(provider).ok_or_else(|| {
+        anyhow!(
+            "unknown search provider '{provider}'; expected {}",
+            nguruvilu::tools::search::Dialect::all()
+                .iter()
+                .map(|candidate| format!("{candidate:?}").to_lowercase())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+    let mut merged = stored.clone().unwrap_or_default();
+    merged.provider = dialect;
+    if !api_key.trim().is_empty() {
+        merged.api_key = api_key.trim().to_string();
+    }
+    merged.endpoint = if endpoint.trim().is_empty() {
+        None
+    } else {
+        Some(endpoint.trim().to_string())
+    };
+    Ok(Some(merged))
+}
+
 /// Where sessions live for the desktop shell.
 ///
 /// Deliberately not the current directory: a windowed app is launched from
@@ -790,11 +859,15 @@ pub async fn run_turn(
 ) -> Result<()> {
     let (client, config, messages) = {
         let mut guard = state.lock().expect("state lock");
-        guard.busy = true;
         // A new attempt supersedes the previous failure; leaving a stale error
         // on screen while a retry runs would be a lie.
         guard.last_error = None;
-        (guard.client()?, Arc::clone(&guard.config), guard.session.messages.clone())
+        // The fallible part runs *before* `busy` flips: a `?` here used to
+        // return with `busy` stuck true, and the page blocks every later send
+        // for a turn that never started.
+        let client = guard.client()?;
+        guard.busy = true;
+        (client, Arc::clone(&guard.config), guard.session.messages.clone())
     };
 
     let observer = Arc::new(UiObserver::new(Arc::clone(&sink)));

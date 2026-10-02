@@ -271,6 +271,28 @@
         <input id="set-api-key" type="password" placeholder="sk-..." spellcheck="false">
       </label>
       <label class="field">
+        <span class="cap" id="cap-search">Web search provider</span>
+        <select id="set-search-provider">
+          <option value="">off &mdash; no search tool</option>
+          <option value="tavily">tavily</option>
+          <option value="brave">brave</option>
+          <option value="exa">exa</option>
+        </select>
+      </label>
+      <label class="field">
+        <span class="cap" id="cap-search-key">Search API key</span>
+        <input id="set-search-key" type="password" placeholder="leave blank to keep the stored key" spellcheck="false">
+      </label>
+      <label class="field">
+        <span class="cap" id="cap-search-endpoint">Search endpoint (optional)</span>
+        <input id="set-search-endpoint" placeholder="provider default" spellcheck="false">
+      </label>
+      <div class="hint tight" id="hint-search">
+        <code>search_web</code> appears only while a key is set: a tool that cannot
+        authenticate costs a turn every time the model tries it. Choosing "off" drops
+        the stored key — set it again to re-enable.
+      </div>
+      <label class="field">
         <span class="cap"><span id="cap-model">Model</span> <button class="tiny" id="btn-fetch-models" type="button">fetch list</button></span>
         <input id="set-model" list="model-options" placeholder="model-id" spellcheck="false">
       </label>
@@ -283,7 +305,6 @@
       <div class="hint tight">
         Leave empty to connect directly. A value here is the <em>only</em> proxy used:
         the system HTTP_PROXY / HTTPS_PROXY variables are ignored, because a proxy set
-        for another tool would otherwise reroute model traffic and fail with a TLS error.
         for another tool would otherwise reroute model traffic and fail with a TLS error.
       </div>
       <label class="field">
@@ -832,6 +853,15 @@ function renderSettings(status) {
     setApiKey.placeholder = status.api_key_masked
       ? status.api_key_masked + "  (leave blank to keep)"
       : "sk-...";
+    // Search: the shell sends the provider and endpoint back (they are not
+    // secrets), never the key.
+    const search = status.search || {};
+    setSearchProvider.value = search.provider || "";
+    setSearchEndpoint.value = search.endpoint || "";
+    setSearchKey.value = "";
+    setSearchKey.placeholder = search.key === "(set)"
+      ? "stored key  (leave blank to keep)"
+      : "required for search_web";
   }
 
   const missing = status.missing || [];
@@ -1131,9 +1161,10 @@ document.getElementById("new-session").addEventListener("click", () => {
 
 // ---------------------------------------------------------------- settings
 
-for (const field of [setBaseUrl, setApiKey, setModel, setEffort, setProxy, setWindow, setPercent, setKeep, setMaxOutput]) {
+for (const field of [setBaseUrl, setApiKey, setModel, setEffort, setProxy, setWindow, setPercent, setKeep, setMaxOutput, setSearchProvider, setSearchKey, setSearchEndpoint]) {
   field.addEventListener("input", () => { settingsDirty = true; });
 }
+setSearchProvider.addEventListener("change", () => { settingsDirty = true; });
 
 function saveSettings() {
   // A blank key box means "keep the stored key": the shell never sends the key
@@ -1148,11 +1179,16 @@ function saveSettings() {
     compact_percent: parseInt(setPercent.value, 10) || 75,
     compact_keep_recent: parseInt(setKeep.value, 10) || 8,
     max_output_tokens: setMaxOutput.value.trim(),
+    search_provider: setSearchProvider.value,
+    search_endpoint: setSearchEndpoint.value.trim(),
   };
   if (setApiKey.value.trim() !== "") {
     payload.api_key = setApiKey.value.trim();
   } else {
     payload.keep_api_key = true;
+  }
+  if (setSearchKey.value.trim() !== "") {
+    payload.search_api_key = setSearchKey.value.trim();
   }
   toShell(payload);
 }
