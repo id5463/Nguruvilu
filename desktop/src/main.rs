@@ -15,7 +15,7 @@
 mod sink;
 mod state;
 
-use std::io::BufRead;
+use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -215,17 +215,21 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
             set_active_ui(directory);
         }
 
+        let ui_port = serve_interface_on_loopback()?;
         WebViewBuilder::new()
-            // `with_html` serves the page from an opaque origin, where WebView2
-            // refuses to run inline scripts — the page renders but stays inert.
-            // A custom protocol gives it a real origin, so its script runs.
+            // The page is served over loopback HTTP rather than a custom
+            // scheme: WebView2 refuses an unknown scheme as the document's own
+            // origin, so `ngu://localhost/` navigates to nothing and the window
+            // comes up blank. A real origin also means the script runs (the
+            // opaque origin of `with_html` gets inline scripts refused) and the
+            // same `serve_ui` answers every request — a file server, because a
+            // pack brings a directory of assets whose stylesheets, scripts, and
+            // images resolve as relative paths. Which directory is served is
+            // decided when a pack declares one; until then it is the built-in
+            // interface, so the window is never blank.
             //
-            // The handler is a file server rather than a single page: an
-            // interface a pack brings is a directory of assets, and its own
-            // stylesheets, scripts, and images resolve as relative paths
-            // against it. Which directory is served is decided when a pack
-            // declares one; until then it is the built-in interface, so the
-            // window is never blank.
+            // The custom scheme stays registered for anything that still asks
+            // for `ngu://`; the window itself does not.
             .with_custom_protocol("ngu".into(), move |_id, request| {
                 let path = request.uri().path().trim_start_matches('/').to_string();
                 let (body, mime) = serve_ui(&path);
@@ -237,7 +241,7 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
                     .body(std::borrow::Cow::Owned(body))
                     .expect("building the response")
             })
-            .with_url("ngu://localhost/")
+            .with_url(&format!("http://127.0.0.1:{ui_port}/"))
             .with_ipc_handler(move |request| {
                 let body = request.body().to_string();
                 let command: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
@@ -1235,6 +1239,51 @@ static ACTIVE_UI: OnceLock<PathBuf> = OnceLock::new();
 /// A path that is not there falls back to the entry file rather than 404: a
 /// single-page interface routes its own URLs, and a reload on one of those must
 /// still render the application.
+/// Serve the interface over a loopback HTTP origin, and return the port.
+///
+/// The window navigates to `http://127.0.0.1:<port>/` because WebView2 refuses
+/// an unknown scheme as the document's own origin — `ngu://localhost/` lands on
+/// nothing and the window comes up blank. A real origin is what lets the script
+/// run, and [`serve_ui`] answers every request exactly as before.
+///
+/// One thread, one request per connection: this is a file server for a window
+/// that loads once, not a service. Bound to loopback and sending no CORS
+/// headers, so a page on another origin cannot read these responses.
+fn serve_interface_on_loopback() -> std::io::Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    // Logged so a stalled page can be checked with one curl instead of a
+    // debugger: `curl -I http://127.0.0.1:<port>/` shows the Content-Type.
+    eprintln!("[ui] serving http://127.0.0.1:{port}/");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut request = [0u8; 8192];
+            let read = stream.read(&mut request).unwrap_or(0);
+            let text = String::from_utf8_lossy(&request[..read]).to_string();
+            // GET <path> HTTP/1.1 — anything unparseable gets the entry page.
+            let path = text
+                .split_whitespace()
+                .nth(1)
+                .and_then(|target| target.split('?').next())
+                .map(|target| target.trim_start_matches('/').to_string())
+                .unwrap_or_default();
+            let (body, mime) = serve_ui(&path);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\n\
+                 Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if stream.write_all(head.as_bytes()).is_err() {
+                continue;
+            }
+            let _ = stream.write_all(&body);
+            let _ = stream.flush();
+        }
+    });
+    Ok(port)
+}
+
 fn serve_ui(path: &str) -> (Vec<u8>, &'static str) {
     let builtin = || (UI_HTML.as_bytes().to_vec(), "text/html; charset=utf-8");
 
@@ -1279,6 +1328,10 @@ fn mime_for(path: &Path) -> &'static str {
         .to_ascii_lowercase()
         .as_str()
     {
+        // The entry document first: without `text/html` the browser treats the
+        // page as a download and the window comes up blank — which is exactly
+        // what every window did while `html` was missing from this match.
+        "html" | "htm" => "text/html; charset=utf-8",
         "css" => "text/css; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",
         "json" => "application/json",
