@@ -2474,27 +2474,7 @@ mod tests {
             report.contents.files
         );
         assert!(report.contents.files.iter().any(|f| f == "soul.md"));
-
-    #[test]
-    fn an_archive_never_contains_an_archive() {
-        // A leftover archive from an earlier build is still an archive, and
-        // embedding one ships a stale pack inside a fresh one.
-        let dir = scratch("no-nesting");
-        sample(&dir, "demo", "1.0.0");
-        std::fs::write(dir.join("stale-0.9.0.dshpack"), b"an old archive").unwrap();
-
-        let archive = dir.join("demo-1.0.0.dshpack");
-        pack(&dir, &archive).unwrap();
-
-        let report = verify(&archive).unwrap();
-        assert!(
-            !report.contents.files.iter().any(|f| f.ends_with(".dshpack")),
-            "{:?}",
-            report.contents.files
-        );
-        assert!(report.contents.files.iter().any(|f| f == "soul.md"));
     }
-}
 
     #[test]
     fn an_unpinned_reference_is_a_warning_not_a_problem() {
@@ -2724,7 +2704,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn a_server_with_platforms_round_trips_and_an_empty_map_is_omitted() {
         let text = r#"{"servers":[{"id":"d","command":"d","platforms":{
             "win-x64":{"source":"https://host/a.zip","sha256":"aa","command":"d.exe"},
@@ -2945,6 +2924,7 @@ mod tests {
         assert!(text.contains(&other), "{text}");
     }
 
+    #[test]
     fn a_search_file_without_a_provider_changes_nothing() {
         // No provider and nothing standing means there is nothing to build on;
         // inventing one would be a guess that can reach the network.

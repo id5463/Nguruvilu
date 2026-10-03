@@ -231,6 +231,52 @@ fn a_plugin_loads_its_service_and_tool_into_a_realm() {
 }
 
 #[test]
+fn provenance_tracks_which_pack_asked_and_survives_a_reload() {
+    let mut kernel = Kernel::new();
+    kernel.define(Arc::new(Contributor {
+        name: "contrib".into(),
+        service: "thing".into(),
+    }));
+
+    // A load with no pack behind it stays bare — that is kernel code.
+    let bare = kernel.load("contrib", RealmMap::new(), Value::Null).unwrap();
+    assert!(kernel.plugin_origins().is_empty());
+    kernel.unload(bare).unwrap();
+
+    // A pack's assembly names itself…
+    kernel
+        .load_owned(
+            "contrib",
+            RealmMap::new(),
+            Value::Null,
+            Some("subagent".into()),
+        )
+        .unwrap();
+    assert_eq!(
+        kernel.plugin_origins().get("contrib").map(String::as_str),
+        Some("subagent")
+    );
+
+    // …re-applying (the configuration axis) must not lose it…
+    kernel.reload_plugin("contrib").unwrap();
+    assert_eq!(
+        kernel.plugin_origins().get("contrib").map(String::as_str),
+        Some("subagent"),
+        "a reload keeps the provenance it was loaded with"
+    );
+
+    // …and unloading forgets it: the pack is not there anymore.
+    let current = kernel
+        .fibers()
+        .iter()
+        .find(|fiber| fiber.plugin == "contrib")
+        .map(|fiber| fiber.id)
+        .expect("the fiber is loaded");
+    kernel.unload(current).unwrap();
+    assert!(kernel.plugin_origins().is_empty());
+}
+
+#[test]
 fn a_dependent_plugin_activates_when_its_dependency_appears() {
     let mut kernel = Kernel::new();
     kernel.define(Arc::new(Dependent {

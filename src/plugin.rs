@@ -274,6 +274,13 @@ pub struct Fiber {
     pub id: u64,
     /// Plugin name.
     pub plugin: String,
+    /// Which pack activated this fiber, when a pack did.
+    ///
+    /// Display provenance: [`Kernel::plugin_origins`] pairs it with
+    /// [`Kernel::plugin_names`] so the panel can read a capability back to
+    /// the pack that brought it. A load with no pack behind it (kernel code,
+    /// a test) keeps `None`.
+    pub origin: Option<String>,
     /// Services this fiber needs.
     pub inject: Vec<String>,
     /// Services this fiber declared it provides.
@@ -590,6 +597,20 @@ impl Kernel {
     /// Returns the fiber id. The fiber may be `Pending` when dependencies are
     /// missing; [`Kernel::refresh`] activates it once they appear.
     pub fn load(&mut self, name: &str, realm: RealmMap, config: Value) -> Result<u64> {
+        self.load_owned(name, realm, config, None)
+    }
+
+    /// Load, recording which pack asked for the plugin.
+    ///
+    /// The same as [`Kernel::load`] with provenance attached — see
+    /// [`Fiber::origin`].
+    pub fn load_owned(
+        &mut self,
+        name: &str,
+        realm: RealmMap,
+        config: Value,
+        origin: Option<String>,
+    ) -> Result<u64> {
         let plugin = self
             .plugins
             .get(name)
@@ -617,6 +638,7 @@ impl Kernel {
             Fiber {
                 id,
                 plugin: name.to_string(),
+                origin,
                 inject,
                 provide,
                 realm: realm.clone(),
@@ -653,9 +675,10 @@ impl Kernel {
         };
         let name = fiber.plugin.clone();
         let realm = fiber.realm.clone();
+        let origin = fiber.origin.clone();
 
         self.unload(id)?;
-        self.load(&name, realm, Value::Null)?;
+        self.load_owned(&name, realm, Value::Null, origin)?;
         Ok(())
     }
 
@@ -671,19 +694,39 @@ impl Kernel {
     ///
     /// Returns how many fibers were re-applied.
     pub fn reload_plugin(&mut self, name: &str) -> Result<usize> {
-        let targets: Vec<(u64, String, RealmMap)> = self
+        let targets: Vec<(u64, String, RealmMap, Option<String>)> = self
             .fibers
             .iter()
             .filter(|(_, fiber)| fiber.plugin == name)
-            .map(|(id, fiber)| (*id, fiber.plugin.clone(), fiber.realm.clone()))
+            .map(|(id, fiber)| {
+                (*id, fiber.plugin.clone(), fiber.realm.clone(), fiber.origin.clone())
+            })
             .collect();
         let mut reloaded = 0;
-        for (id, plugin, realm) in targets {
+        for (id, plugin, realm, origin) in targets {
             self.unload(id)?;
-            self.load(&plugin, realm, Value::Null)?;
+            self.load_owned(&plugin, realm, Value::Null, origin)?;
             reloaded += 1;
         }
         Ok(reloaded)
+    }
+
+    /// Which pack activated each plugin, for display.
+    ///
+    /// Pairs with [`Kernel::plugin_names`]: the panel reads `delegate` back as
+    /// `delegate ← subagent`, so a capability has a pack to point at. Plugins
+    /// with no pack behind them are absent — those belong to the kernel
+    /// itself. If two packs ever load the same plugin, the first one is kept.
+    pub fn plugin_origins(&self) -> std::collections::BTreeMap<String, String> {
+        let mut origins = std::collections::BTreeMap::new();
+        for fiber in self.fibers.values() {
+            if let Some(origin) = &fiber.origin {
+                origins
+                    .entry(fiber.plugin.clone())
+                    .or_insert_with(|| origin.clone());
+            }
+        }
+        origins
     }
 
     /// Recompute every fiber's epoch and reconcile the ones that changed.

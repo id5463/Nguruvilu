@@ -108,6 +108,17 @@ impl Loader {
         self
     }
 
+    /// The pack these steps come from, by manifest name.
+    ///
+    /// `None` when the directory has no manifest (a bare assembly): nothing
+    /// points at a pack because there is none.
+    fn origin(&self) -> Option<String> {
+        self.pack_dir
+            .as_ref()
+            .and_then(|dir| crate::pack::read_manifest(dir).ok())
+            .map(|manifest| manifest.name)
+    }
+
     /// The kernel.
     pub fn kernel(&self) -> &Kernel {
         &self.kernel
@@ -242,7 +253,11 @@ impl Loader {
         }
 
         let realm = self.realm_for(step);
-        self.kernel.load(&name, realm, step.config.clone())?;
+        // Which pack asked, for the panel: the manifest beside the assembly
+        // is the same source `pack:` naming uses — not the label, which would
+        // have to be split on a dash.
+        self.kernel
+            .load_owned(&name, realm, step.config.clone(), self.origin())?;
 
         self.ledger.record(LedgerEntry {
             kind: EntryKind::Plugin.as_str().into(),
@@ -795,6 +810,49 @@ stages:
         assert!(report.is_clean());
         assert!(loader.ledger().has("plugin", "my-provider", None));
         assert!(loader.ledger().find("plugin", "my-provider").unwrap().pack == "test-pack");
+    }
+
+    #[tokio::test]
+    async fn steps_record_the_pack_they_came_from() {
+        // The panel pairs a plugin with its pack (`delegate ← subagent`), and
+        // the manifest beside the assembly is the same file `pack:` naming
+        // uses — not the `name-version` label, which would have to be split.
+        let dir = temp_dir("origin");
+        let mut loader = loader_with(
+            &dir,
+            vec![Arc::new(Echo {
+                name: "provider".into(),
+                inject: vec![],
+                provide: vec!["thing".into()],
+            })],
+        )
+        .with_pack_dir(&dir);
+        std::fs::write(
+            dir.join("dsh.index.json"),
+            r#"{"formatVersion":1,"game":"nguruvilu","name":"origin-pack","versionId":"1.0.0","license":"MIT","kernelVersion":"0.1.0","dependencies":{"nguruvilu":">=0.1.0"}}"#,
+        )
+        .unwrap();
+
+        let manifest = r#"
+version: 1
+stages:
+  - name: foundation
+    plugins:
+      - id: my-provider
+        source: "builtin:provider"
+"#;
+        let plan = Assembly::parse(manifest).unwrap().plan("linux").unwrap();
+        loader.apply(&plan).await.unwrap();
+
+        assert_eq!(
+            loader
+                .kernel()
+                .plugin_origins()
+                .get("provider")
+                .map(String::as_str),
+            Some("origin-pack"),
+            "the plugin is pointed at its pack"
+        );
     }
 
     #[tokio::test]

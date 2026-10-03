@@ -302,6 +302,9 @@ impl AppState {
             })).collect::<Vec<_>>(),
             "skill_roots": skills.roots().iter().map(|r| r.display().to_string()).collect::<Vec<_>>(),
             "plugins": self.kernel.plugin_names(),
+            // Which pack brought each one: `delegate ← subagent`, so a
+            // capability can be read back to the pack it came from.
+            "plugin_origins": self.kernel.plugin_origins(),
             "services": self.kernel.service_list().iter().map(|(name, realm, owner)| json!({
                 "name": name,
                 "realm": realm.to_string(),

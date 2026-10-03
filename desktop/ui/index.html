@@ -1006,7 +1006,11 @@ function renderStatus(status) {
     ["max output", status.max_output_tokens || "(provider default)"],
     ["cache", status.cache_policy],
     ["config v", String(status.config_version)],
-    ["plugins", (status.plugins || []).join(", ") || "none"],
+    ["plugins", (status.plugins || [])
+    .map((name) => ((status.plugin_origins || {})[name]
+      ? name + " ← " + status.plugin_origins[name]
+      : name))
+    .join(", ") || "none"],
   ];
   for (const pair of rows) {
     const row = el("div", "kv");

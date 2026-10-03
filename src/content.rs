@@ -250,7 +250,14 @@ fn install_appearance(
         name: name.clone(),
         look,
     }));
-    kernel.load(&name, crate::plugin::RealmMap::new(), serde_json::Value::Null)?;
+    // Originated by the pack itself: this fiber *is* the pack's appearance,
+    // so `plugin_origins` points it straight back at the manifest name.
+    kernel.load_owned(
+        &name,
+        crate::plugin::RealmMap::new(),
+        serde_json::Value::Null,
+        Some(pack_name.to_string()),
+    )?;
     Ok(())
 }
 
