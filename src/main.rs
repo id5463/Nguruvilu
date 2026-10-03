@@ -1058,7 +1058,11 @@ async fn run() -> Result<()> {
 /// Loading keeps them running; this is the other half of that decision.
 async fn stop_mcp(clients: &[Arc<nguruvilu::mcp::McpClient>]) {
     for client in clients {
-        client.shutdown().await;
+        // Bounded: a server that will not die must not keep the CLI alive
+        // after everything it has printed. `shutdown_within` kills on timeout.
+        client
+            .shutdown_within(std::time::Duration::from_secs(3))
+            .await;
     }
 }
 

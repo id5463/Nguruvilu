@@ -301,6 +301,49 @@ fn resolve_program(command: &str) -> std::path::PathBuf {
         let _ = child.wait().await;
     }
 
+    /// A bounded close: returns whether the shutdown finished inside `deadline`.
+    ///
+    /// On timeout the wait is cancelled — which releases the child lock — and
+    /// the server is killed synchronously instead. A close must finish whatever
+    /// the server is doing: an unbounded wait here is how a window turns into a
+    /// ghost on quit (it did).
+    pub async fn shutdown_within(&self, deadline: std::time::Duration) -> bool {
+        if tokio::time::timeout(deadline, self.shutdown()).await.is_ok() {
+            return true;
+        }
+        self.force_kill();
+        false
+    }
+
+    /// Best-effort synchronous kill: no await, never panics.
+    ///
+    /// The close path calls this *first* so the servers are already on their
+    /// way out before any waiting starts; the `Drop` path is the same call for
+    /// handles nobody shut down explicitly.
+    pub fn force_kill(&self) {
+        if let Ok(mut child) = self.child.try_lock() {
+            let _ = child.start_kill();
+        }
+    }
+
+    /// A client over an already-running child, without the handshake.
+    ///
+    /// Tests only: the real path is [`McpClient::connect`], which must
+    /// initialize and discover tools before anything may call the server.
+    #[cfg(test)]
+    pub(crate) fn from_child_for_tests(mut child: Child, server: &str) -> Self {
+        let stdin = child.stdin.take().expect("the test child pipes stdin");
+        Self {
+            server: server.to_string(),
+            stdin: Arc::new(Mutex::new(stdin)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: AtomicU64::new(1),
+            child: Mutex::new(child),
+            tools: Vec::new(),
+            timeout: Duration::from_secs(60),
+        }
+    }
+
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
@@ -350,9 +393,7 @@ impl Drop for McpClient {
     /// was printed. Unloading a pack reaches here too: its tools are the
     /// handles, so the last one going takes the server with it.
     fn drop(&mut self) {
-        if let Ok(mut child) = self.child.try_lock() {
-            let _ = child.start_kill();
-        }
+        self.force_kill();
     }
 }
 
@@ -423,5 +464,53 @@ mod tests {
         assert_eq!(spec.id, "github");
         // The naming rule is what keeps two servers from colliding.
         assert_eq!(format!("mcp__{}__{}", sanitize("github"), sanitize("create_issue")), "mcp__github__create_issue");
+    }
+
+    /// A child that would happily sit there for thirty seconds — the shape of
+    /// the server that hung a window's quit.
+    #[cfg(windows)]
+    async fn stubborn_child() -> Child {
+        tokio::process::Command::new("cmd")
+            .args(["/c", "ping -n 30 127.0.0.1"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawning the stub server")
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_bounded_close_kills_instead_of_waiting_out_the_server() {
+        let client = McpClient::from_child_for_tests(stubborn_child().await, "stub");
+        let started = std::time::Instant::now();
+        let finished = client
+            .shutdown_within(std::time::Duration::from_secs(30))
+            .await;
+        assert!(finished, "the kill path finishes");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "and quickly, not in thirty: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn force_kill_ends_the_child_so_the_next_close_is_instant() {
+        let client = McpClient::from_child_for_tests(stubborn_child().await, "stub");
+        client.force_kill();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let started = std::time::Instant::now();
+        assert!(
+            client
+                .shutdown_within(std::time::Duration::from_secs(10))
+                .await
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "already dead: {:?}",
+            started.elapsed()
+        );
     }
 }

@@ -144,10 +144,11 @@ fn headless(startup_prompt: Option<String>) -> anyhow::Result<()> {
         }
         // Stop the MCP servers before the runtime tears down: a server still
         // registered with a runtime that is shutting down is what keeps the
-        // process alive after everything it has printed.
+        // process alive after everything it has printed. Bounded — a server
+        // that refuses to die must not postpone the exit it is blocking.
         let clients = state.lock().expect("state lock").mcp.clone();
         for client in &clients {
-            client.shutdown().await;
+            client.shutdown_within(std::time::Duration::from_secs(3)).await;
         }
         Ok::<(), anyhow::Error>(())
     });
@@ -320,13 +321,44 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
 
         match event {
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
-                // Stop the MCP servers before the runtime goes away: a server
-                // still registered with a runtime that is shutting down is what
-                // keeps a process alive after everything it has printed.
-                let clients = state.lock().expect("state lock").mcp.clone();
+                // Close must finish — this runs on the UI thread, so anything
+                // unbounded here turns the window into a ghost. It did: a
+                // server that ignored the kill hung the quit forever (CPU
+                // idle, children alive, window never responding again).
+                //
+                // Three rules: take the client list without trusting the state
+                // lock blindly (a panic elsewhere poisons it; a task may hold
+                // it for a moment); kill the servers first so they are already
+                // exiting; then give each a short window to be reaped.
+                let clients = {
+                    let mut found = None;
+                    for _ in 0..20 {
+                        match state.try_lock() {
+                            Ok(guard) => {
+                                found = Some(guard.mcp.clone());
+                                break;
+                            }
+                            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                                found = Some(poisoned.into_inner().mcp.clone());
+                                break;
+                            }
+                            Err(std::sync::TryLockError::WouldBlock) => {
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                        }
+                    }
+                    // No list in a second: leave anyway. An orphaned server is
+                    // a bad exit; a window that never closes is a broken app.
+                    found.unwrap_or_default()
+                };
+                for client in &clients {
+                    client.force_kill();
+                }
                 runtime.block_on(async {
                     for client in &clients {
-                        client.shutdown().await;
+                        client
+                            .shutdown_within(std::time::Duration::from_millis(500))
+                            .await;
                     }
                 });
                 *control_flow = ControlFlow::Exit;
@@ -875,9 +907,10 @@ async fn drain_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
                 };
 
                 // The tools are gone, so the servers they belonged to have no
-                // reason to keep running.
+                // reason to keep running. Bounded: an unload must not wedge
+                // because one server ignores the kill.
                 for client in &to_stop {
-                    client.shutdown().await;
+                    client.shutdown_within(std::time::Duration::from_secs(5)).await;
                 }
                 if !to_stop.is_empty() {
                     let mut guard = state.lock().expect("state lock");
