@@ -195,7 +195,8 @@ enum Command {
     },
     /// Install a `.dshpack` archive.
     Install {
-        /// Archive to install.
+        /// What to install: a local `.dshpack` path, `github:owner/repo[@path][@ref]`,
+        /// or an `https://` URL to an archive.
         file: PathBuf,
         /// Directory to install into.
         #[arg(long)]
@@ -1629,7 +1630,20 @@ async fn pack_command(
 
 async fn install_command(file: &PathBuf, into: Option<&PathBuf>, as_json: bool) -> Result<()> {
     let packs_dir = into.cloned().unwrap_or_else(nguruvilu::pack::default_packs_dir);
-    let placed = nguruvilu::pack::install(file, &packs_dir).await?;
+
+    // Two ways in, both the same command: a spec downloads the archive first,
+    // a path installs what is already on disk — the offline half. The content
+    // inside has always had both forms (`Carried` vs `Fetched`); this is the
+    // pack itself catching up.
+    let raw = file.to_string_lossy();
+    let raw = raw.trim();
+    let local = if is_remote_spec(raw) {
+        resolve_pack_source(raw).await?
+    } else {
+        file.clone()
+    };
+
+    let placed = nguruvilu::pack::install(&local, &packs_dir).await?;
 
     if as_json {
         println!(
@@ -1655,6 +1669,79 @@ async fn install_command(file: &PathBuf, into: Option<&PathBuf>, as_json: bool) 
         }
     }
     Ok(())
+}
+
+/// A download spec rather than a path: `github:…`, `https://…`, `http://…`.
+///
+/// A prefix check rather than `Source::parse` on purpose: a Windows path
+/// (`C:\…`) contains a colon too, and a typo in a path must fail as a path
+/// instead of being reinterpreted as a source.
+fn is_remote_spec(raw: &str) -> bool {
+    raw.starts_with("github:") || raw.starts_with("https://") || raw.starts_with("http://")
+}
+
+/// Resolve a download spec to a local archive to install.
+///
+/// A URL that *is* the archive lands as a file and goes straight through; a
+/// `github:` spec lands as a directory (the pack's own directory, or a repo),
+/// and the archive inside it is picked.
+async fn resolve_pack_source(spec: &str) -> Result<PathBuf> {
+    let source = nguruvilu::fetch::Source::parse(spec)
+        .with_context(|| format!("reading '{spec}' as a download source"))?;
+    let fetcher = nguruvilu::fetch::Fetcher::new()?;
+    let fetched = fetcher
+        .fetch(&source, None)
+        .await
+        .with_context(|| format!("fetching '{spec}'"))?;
+    if fetched.path.is_file() {
+        return Ok(fetched.path);
+    }
+    pack_archive_in(&fetched.path)
+}
+
+/// The one `.dshpack` inside a fetched directory.
+///
+/// A pack's own directory contains one archive; a repository contains many,
+/// and guessing which was meant would install the wrong pack — so it lists
+/// them instead of choosing.
+fn pack_archive_in(dir: &std::path::Path) -> Result<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("dshpack") {
+                found.push(path);
+            }
+        }
+    }
+    match found.len() {
+        0 => Err(anyhow::anyhow!("no .dshpack archive under {}", dir.display())),
+        1 => Ok(found.pop().expect("exactly one match")),
+        _ => {
+            found.sort();
+            let names = found
+                .iter()
+                .map(|path| {
+                    path.strip_prefix(dir)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(anyhow::anyhow!(
+                "{} archives under {}; point at the pack's own directory, one of: {names}",
+                found.len(),
+                dir.display()
+            ))
+        }
+    }
 }
 
 fn list_packs(as_json: bool) -> Result<()> {
@@ -2617,4 +2704,46 @@ fn model_route(cli: &Cli, settings: &Settings, kernel: Option<&Kernel>) -> Model
         }
     }
     route
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_specs_are_recognised_and_paths_are_not() {
+        // The split decides whether the argument is downloaded or installed
+        // from disk, so a path must never be reinterpreted as a spec.
+        assert!(is_remote_spec("github:id5463/Nguruvilu@packs/computer-use@main"));
+        assert!(is_remote_spec("https://example.com/packs/demo-1.0.0.dshpack"));
+        assert!(is_remote_spec("http://example.com/demo-1.0.0.dshpack"));
+        assert!(!is_remote_spec(r"C:\packs\demo-1.0.0.dshpack"));
+        assert!(!is_remote_spec("packs/demo-1.0.0.dshpack"));
+        assert!(!is_remote_spec("./github:looks-like-a-spec"));
+    }
+
+    #[test]
+    fn one_archive_is_picked_and_many_list_themselves() {
+        let root = std::env::temp_dir().join(format!(
+            "ngu-install-spec-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        assert!(
+            pack_archive_in(&root).is_err(),
+            "an empty directory yields nothing, by name"
+        );
+
+        std::fs::write(root.join("sub/demo-1.0.0.dshpack"), b"one").unwrap();
+        let one = pack_archive_in(&root).unwrap();
+        assert!(one.ends_with("demo-1.0.0.dshpack"));
+
+        // A repository holds several packs: refuse and say which, rather than
+        // guess and install the wrong one.
+        std::fs::write(root.join("other-2.0.0.dshpack"), b"two").unwrap();
+        let error = format!("{:#}", pack_archive_in(&root).expect_err("two archives"));
+        assert!(error.contains("2 archives"), "{error}");
+        assert!(error.contains("demo-1.0.0.dshpack"), "{error}");
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
