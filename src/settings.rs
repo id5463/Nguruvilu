@@ -88,6 +88,13 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<crate::tools::search::SearchSettings>,
 
+    /// The decision judge (Jev / TypeSafe System One), when configured.
+    ///
+    /// Absent means no `judge` tool — the same rule as search: a tool that
+    /// cannot authenticate costs a turn every time the model tries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge: Option<crate::tools::judge::JudgeSettings>,
+
     /// Extra fields merged into every request body.
     ///
     /// This is how a provider difference stays a settings change: an endpoint
@@ -247,6 +254,10 @@ impl Settings {
             settings.search = Some(from_env);
         }
 
+        if let Some(from_env) = crate::tools::judge::from_env() {
+            settings.judge = Some(from_env);
+        }
+
         if let Ok(value) = std::env::var("NGU_MAX_OUTPUT_TOKENS") {
             if let Ok(tokens) = crate::size::parse_size(&value) {
                 settings.max_output_tokens = Some(tokens);
@@ -323,6 +334,7 @@ mod tests {
             max_output_tokens: None,
             network: crate::network::NetworkSettings::default(),
             search: None,
+            judge: None,
             extra_body: serde_json::Map::new(),
         };
         assert!(settings.is_configured());
@@ -343,6 +355,7 @@ mod tests {
             max_output_tokens: None,
             network: crate::network::NetworkSettings::default(),
             search: None,
+            judge: None,
             extra_body: serde_json::Map::new(),
         };
         assert_eq!(settings.model_or_default(), DEFAULT_MODEL);
@@ -392,6 +405,7 @@ mod tests {
             max_output_tokens: None,
             network: crate::network::NetworkSettings::default(),
             search: None,
+            judge: None,
             extra_body: serde_json::Map::new(),
         };
         let text = serde_json::to_string_pretty(&settings).unwrap();

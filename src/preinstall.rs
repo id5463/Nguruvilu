@@ -41,6 +41,11 @@ pub const SHIPPED: &[(&str, &str, &[u8])] = &[
         include_bytes!("../packs/computer-use/computer-use-1.2.0.dshpack"),
     ),
     (
+        "judge",
+        "1.0.0",
+        include_bytes!("../packs/judge/judge-1.0.0.dshpack"),
+    ),
+    (
         "search",
         "1.1.0",
         include_bytes!("../packs/search/search-1.1.0.dshpack"),

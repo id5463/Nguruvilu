@@ -308,6 +308,15 @@ enum ConfigAction {
         /// Search API key. The tool appears only when this is set.
         #[arg(long)]
         search_api_key: Option<String>,
+        /// Judge endpoint, e.g. https://api.typesafe.ai (no path).
+        #[arg(long)]
+        judge_endpoint: Option<String>,
+        /// Judge API key. The `judge` tool appears only when this is set.
+        #[arg(long)]
+        judge_key: Option<String>,
+        /// Judge model alias (default: jev-latest).
+        #[arg(long)]
+        judge_model: Option<String>,
     },
     /// Print the settings file path.
     Path,
@@ -614,6 +623,10 @@ async fn run() -> Result<()> {
     // whenever something changes them.
     let search_cell = nguruvilu::tools::search::cell(settings.search.clone());
     nguruvilu::tools::search::install(&mut kernel, search_cell.clone());
+    // And the same split for the judge: code in the kernel, permission to
+    // exist from the pack, settings from the host's cell.
+    let judge_cell = nguruvilu::tools::judge::cell(settings.judge.clone());
+    nguruvilu::tools::judge::install(&mut kernel, judge_cell.clone());
     if !skills.is_empty() {
         register_skill_tool(kernel.tools_mut(), Arc::new(skills.clone()))?;
     }
@@ -780,6 +793,13 @@ async fn run() -> Result<()> {
     nguruvilu::tools::search::configure(&mut kernel, &search_cell, settings.search.clone())?;
     if kernel.tools().get(nguruvilu::tools::search::TOOL).is_some() {
         eprintln!("[search] enabled");
+    }
+
+    // The judge keeps its own cell: settings first, fibers re-apply, and the
+    // table says whether a verdict is available this turn.
+    nguruvilu::tools::judge::configure(&mut kernel, &judge_cell, settings.judge.clone())?;
+    if kernel.tools().get(nguruvilu::tools::judge::TOOL).is_some() {
+        eprintln!("[judge] enabled");
     }
 
     // A pack's numbers replace the standing ones, so the route is rebuilt from
@@ -967,6 +987,7 @@ async fn run() -> Result<()> {
                 queue: &pending_packs,
                 mcp: &mut mcp_clients,
                 search: &search_cell,
+                judge: &judge_cell,
             }
             .drain()
             .await?;
@@ -1040,6 +1061,7 @@ async fn run() -> Result<()> {
                     queue: &pending_packs,
                     mcp: &mut mcp_clients,
                     search: &search_cell,
+                    judge: &judge_cell,
                 },
             )
             .await?;
@@ -2136,6 +2158,9 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             retry_backoff_ms,
             search_provider,
             search_api_key,
+            judge_endpoint,
+            judge_key,
+            judge_model,
         }) => {
             let mut settings = Settings::load()?;
             if let Some(value) = base_url {
@@ -2222,6 +2247,30 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
                 settings.search = Some(search);
             }
 
+            // The judge mirrors search: one of three flags means "touch it",
+            // the key alone decides whether the tool exists, and an endpoint
+            // must be a URL because a typo here becomes a failed call later.
+            if judge_endpoint.is_some() || judge_key.is_some() || judge_model.is_some() {
+                let mut judge = settings
+                    .judge
+                    .clone()
+                    .unwrap_or_else(nguruvilu::tools::judge::JudgeSettings::default);
+                if let Some(endpoint) = judge_endpoint {
+                    let endpoint = endpoint.trim().trim_end_matches('/').to_string();
+                    if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+                        anyhow::bail!("judge endpoint must be an http(s) URL, got '{endpoint}'");
+                    }
+                    judge.endpoint = endpoint;
+                }
+                if let Some(key) = judge_key {
+                    judge.api_key = key.clone();
+                }
+                if let Some(model) = judge_model {
+                    judge.model = model.trim().to_string();
+                }
+                settings.judge = Some(judge);
+            }
+
             let network_problems = settings.network.problems();
             if !network_problems.is_empty() {
                 anyhow::bail!("{}", network_problems.join("; "));
@@ -2253,6 +2302,17 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
                         &settings.reasoning_effort
                     }
                 );
+                if let Some(judge) = &settings.judge {
+                    println!(
+                        "  judge:    {} ({})",
+                        judge.endpoint,
+                        if judge.is_configured() {
+                            "key set — judge tool on"
+                        } else {
+                            "no key — judge tool off"
+                        }
+                    );
+                }
                 if !settings.is_configured() {
                     println!("\nstill missing: {}", settings.missing().join(", "));
                 }
@@ -2535,6 +2595,8 @@ struct PackHost<'a> {
     /// The search plugin's settings cell: a hot load may have configured
     /// search, and the plugin re-reads it through `search::configure`.
     search: &'a nguruvilu::tools::search::SettingsCell,
+    /// The judge plugin's settings cell — same rule, `judge::configure`.
+    judge: &'a nguruvilu::tools::judge::SettingsCell,
 }
 
 impl PackHost<'_> {
@@ -2655,6 +2717,11 @@ impl PackHost<'_> {
                 self.kernel,
                 self.search,
                 self.settings.search.clone(),
+            )?;
+            nguruvilu::tools::judge::configure(
+                self.kernel,
+                self.judge,
+                self.settings.judge.clone(),
             )?;
             // The route may have moved with the pack's content, and the tool
             // table certainly did; both are published together so the next

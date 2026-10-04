@@ -162,6 +162,8 @@ pub struct AppState {
     /// The plugin holds this and reads it when its fibers apply; the panel
     /// writes it through `search::configure`, which also re-applies them.
     pub search_cell: nguruvilu::tools::search::SettingsCell,
+    /// The judge plugin's settings cell — same contract as search.
+    pub judge_cell: nguruvilu::tools::judge::SettingsCell,
 }
 
 impl AppState {
@@ -189,6 +191,10 @@ impl AppState {
         // is configured (see `search::configure`).
         let search_cell = nguruvilu::tools::search::cell(settings.search.clone());
         nguruvilu::tools::search::install(&mut kernel, search_cell.clone());
+        // The judge follows the same rule: code available, pack decides,
+        // settings from the host's cell.
+        let judge_cell = nguruvilu::tools::judge::cell(settings.judge.clone());
+        nguruvilu::tools::judge::install(&mut kernel, judge_cell.clone());
         if !skills.is_empty() {
             register_skill_tool(kernel.tools_mut(), Arc::new(skills.clone()))?;
         }
@@ -270,6 +276,7 @@ impl AppState {
             pending,
             mcp: Vec::new(),
             search_cell,
+            judge_cell,
         })
     }
 
@@ -322,6 +329,16 @@ impl AppState {
                     "key": if search.api_key.trim().is_empty() { "(not set)" } else { "(set)" },
                 }),
                 None => json!({ "provider": "", "endpoint": "", "key": "(not set)" }),
+            },
+            // Same shape for the judge: endpoint and model are not secrets;
+            // the key is reported as presence only.
+            "judge": match &self.settings.judge {
+                Some(judge) => json!({
+                    "endpoint": judge.endpoint,
+                    "model": judge.model,
+                    "key": if judge.api_key.trim().is_empty() { "(not set)" } else { "(set)" },
+                }),
+                None => json!({ "endpoint": "", "model": "", "key": "(not set)" }),
             },
             "settings_path": Settings::path().display().to_string(),
             "last_error": self.last_error,
@@ -454,6 +471,9 @@ impl AppState {
         search_provider: &str,
         search_api_key: &str,
         search_endpoint: &str,
+        judge_endpoint: &str,
+        judge_api_key: &str,
+        judge_model: &str,
     ) -> Result<()> {
         let settings = Settings {
             base_url: base_url.trim().to_string(),
@@ -471,6 +491,12 @@ impl AppState {
                 search_provider,
                 search_api_key,
                 search_endpoint,
+            )?,
+            judge: resolve_judge(
+                &self.settings.judge,
+                judge_endpoint,
+                judge_api_key,
+                judge_model,
             )?,
             extra_body: self.settings.extra_body.clone(),
         };
@@ -498,6 +524,12 @@ impl AppState {
             &mut self.kernel,
             &self.search_cell,
             self.settings.search.clone(),
+        )?;
+        // The judge takes the panel's three fields the same way.
+        nguruvilu::tools::judge::configure(
+            &mut self.kernel,
+            &self.judge_cell,
+            self.settings.judge.clone(),
         )?;
         let tools = Arc::new(self.kernel.tools().clone());
 
@@ -690,6 +722,12 @@ impl AppState {
             &self.search_cell,
             self.settings.search.clone(),
         )?;
+        // A pack may have configured the judge too — same re-apply.
+        nguruvilu::tools::judge::configure(
+            &mut self.kernel,
+            &self.judge_cell,
+            self.settings.judge.clone(),
+        )?;
 
         let tools = Arc::new(self.kernel.tools().clone());
         let mut route = ModelRoute::from_settings(&self.settings);
@@ -754,6 +792,43 @@ fn resolve_search(
     } else {
         Some(endpoint.trim().to_string())
     };
+    Ok(Some(merged))
+}
+
+/// Fold the panel's judge fields into the stored settings.
+///
+/// The panel never receives the stored key, so a blank box means "keep it" —
+/// the model key's rule again. Three empties mean the judge is off, and off
+/// drops what was stored: a key no tool can reach is worse than no key. A
+/// provided endpoint must be an http(s) URL — it is pasted straight into a
+/// request, and a typo there becomes a failed call with no hint about why.
+fn resolve_judge(
+    stored: &Option<nguruvilu::tools::judge::JudgeSettings>,
+    endpoint: &str,
+    api_key: &str,
+    model: &str,
+) -> Result<Option<nguruvilu::tools::judge::JudgeSettings>> {
+    let endpoint = endpoint.trim().trim_end_matches('/');
+    let api_key = api_key.trim();
+    let model = model.trim();
+
+    if endpoint.is_empty() && api_key.is_empty() && model.is_empty() {
+        return Ok(None);
+    }
+
+    let mut merged = stored.clone().unwrap_or_default();
+    if !endpoint.is_empty() {
+        if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+            anyhow::bail!("judge endpoint must be an http(s) URL, got '{endpoint}'");
+        }
+        merged.endpoint = endpoint.to_string();
+    }
+    if !api_key.is_empty() {
+        merged.api_key = api_key.to_string();
+    }
+    if !model.is_empty() {
+        merged.model = model.to_string();
+    }
     Ok(Some(merged))
 }
 

@@ -1,0 +1,10 @@
+{
+  "formatVersion": 1,
+  "game": "nguruvilu",
+  "name": "judge",
+  "versionId": "1.0.0",
+  "license": "MIT",
+  "kernelVersion": "0.1.0",
+  "dependencies": { "nguruvilu": ">=0.1.0" },
+  "plugins": [ { "id": "judge", "source": "builtin:judge", "license": "MIT" } ]
+}

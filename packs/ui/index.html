@@ -407,6 +407,10 @@ const setMaxOutput = document.getElementById("set-max-output");
 let setSearchProvider = null;
 let setSearchKey = null;
 let setSearchEndpoint = null;
+// The judge section is built the same way (`ensureJudgeSection`).
+let judgeEndpoint = null;
+let judgeKey = null;
+let judgeModel = null;
 // The last strings event, replayed when a section is built after it arrived.
 let activeStrings = null;
 const notConfigured = document.getElementById("not-configured");
@@ -841,6 +845,78 @@ function ensureSearchSection(present) {
   if (activeStrings) applyStrings(activeStrings);
 }
 
+/// Build or remove the decision-judge settings section.
+///
+/// Same contract as the search section: it exists only while `packs/judge` is
+/// loaded — an endpoint and key for a tool nobody can call without that pack
+/// are configuration for nothing.
+function ensureJudgeSection(present) {
+  const existing = document.getElementById("judge-section");
+  if (!present) {
+    if (existing) existing.remove();
+    judgeEndpoint = null;
+    judgeKey = null;
+    judgeModel = null;
+    return;
+  }
+  if (existing) return;
+
+  const field = (control, capId) => {
+    const label = document.createElement("label");
+    label.className = "field";
+    const cap = document.createElement("span");
+    cap.className = "cap";
+    cap.id = capId;
+    label.append(cap, control);
+    return label;
+  };
+
+  const endpoint = document.createElement("input");
+  endpoint.id = "set-judge-endpoint";
+  endpoint.placeholder = "https://api.typesafe.ai";
+  endpoint.spellcheck = false;
+
+  const key = document.createElement("input");
+  key.id = "set-judge-key";
+  key.type = "password";
+  key.placeholder = "leave blank to keep the stored key";
+  key.spellcheck = false;
+
+  const model = document.createElement("input");
+  model.id = "set-judge-model";
+  model.placeholder = "jev-latest";
+  model.spellcheck = false;
+
+  const hint = document.createElement("div");
+  hint.className = "hint tight";
+  hint.id = "hint-judge";
+  hint.textContent =
+    "The judge tool appears only while a key is set — and only as an adviser: " +
+    "its verdict arrives as data the model weighs, never as a gate that " +
+    "silently blocks an action. Clear the endpoint and the key to turn it off.";
+
+  const section = document.createElement("div");
+  section.id = "judge-section";
+  section.append(
+    field(endpoint, "cap-judge"),
+    field(key, "cap-judge-key"),
+    field(model, "cap-judge-model"),
+    hint,
+  );
+  // Right after the credentials block, above the search section.
+  setApiKey.closest("label").insertAdjacentElement("afterend", section);
+
+  judgeEndpoint = endpoint;
+  judgeKey = key;
+  judgeModel = model;
+  for (const control of [endpoint, key, model]) {
+    control.addEventListener("input", () => { settingsDirty = true; });
+  }
+
+  // Same replay rule: the strings event may have come first.
+  if (activeStrings) applyStrings(activeStrings);
+}
+
 /// Render the installed packs, each with its own Apply, Load/Unload, and
 /// Delete actions.
 function renderPacks(list) {
@@ -855,6 +931,8 @@ function renderPacks(list) {
 
   // The search section follows the pack that owns the capability.
   ensureSearchSection(packs.some((pack) => pack.name === "search" && pack.loaded !== false));
+  // The judge section follows its pack — the same rule.
+  ensureJudgeSection(packs.some((pack) => pack.name === "judge" && pack.loaded !== false));
 
   if (packs.length === 0) {
     packList.append(el("div", "empty", "No packs installed. Use Install to add one."));
@@ -966,6 +1044,16 @@ function renderSettings(status) {
       setSearchKey.placeholder = search.key === "(set)"
         ? "stored key  (leave blank to keep)"
         : "required for search_web";
+    }
+    const judge = status.judge || {};
+    if (judgeEndpoint) {
+      judgeEndpoint.value = judge.endpoint || "";
+      judgeModel.value = judge.model || "";
+      judgeKey.value = "";
+      judgeKey.placeholder = judge.key === "(set)"
+        ? "stored key  (leave blank to keep)"
+        : "leave blank to keep the stored key";
+      if (!judgeEndpoint.value) judgeEndpoint.placeholder = "https://api.typesafe.ai";
     }
   }
 
@@ -1271,7 +1359,7 @@ document.getElementById("new-session").addEventListener("click", () => {
 
 // ---------------------------------------------------------------- settings
 
-for (const field of [setBaseUrl, setApiKey, setModel, setEffort, setProxy, setWindow, setPercent, setKeep, setMaxOutput, setSearchProvider, setSearchKey, setSearchEndpoint].filter(Boolean)) {
+for (const field of [setBaseUrl, setApiKey, setModel, setEffort, setProxy, setWindow, setPercent, setKeep, setMaxOutput, setSearchProvider, setSearchKey, setSearchEndpoint, judgeEndpoint, judgeKey, judgeModel].filter(Boolean)) {
   field.addEventListener("input", () => { settingsDirty = true; });
 }
 
@@ -1294,14 +1382,23 @@ function saveSettings() {
   } else {
     payload.keep_api_key = true;
   }
-  // Only while the section exists: an absent search section means the pack is
-  // unloaded, and a payload invented for it would silently clear stored search
-  // settings the shell still owns.
+  // Present flags: a section that does not exist (its pack is unloaded) must
+  // not be read as "the user cleared it" — the shell keeps the stored values
+  // when the page says the section is absent.
+  payload.search_present = !!setSearchProvider;
+  payload.judge_present = !!judgeEndpoint;
   if (setSearchProvider) {
     payload.search_provider = setSearchProvider.value;
     payload.search_endpoint = setSearchEndpoint.value.trim();
     if (setSearchKey.value.trim() !== "") {
       payload.search_api_key = setSearchKey.value.trim();
+    }
+  }
+  if (judgeEndpoint) {
+    payload.judge_endpoint = judgeEndpoint.value.trim();
+    payload.judge_model = judgeModel.value.trim();
+    if (judgeKey.value.trim() !== "") {
+      payload.judge_api_key = judgeKey.value.trim();
     }
   }
   toShell(payload);

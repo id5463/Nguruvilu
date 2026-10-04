@@ -17,6 +17,7 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
 pub mod base;
+pub mod judge;
 pub mod pack;
 pub mod search;
 pub mod subagent;

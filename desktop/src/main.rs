@@ -518,6 +518,20 @@ async fn dispatch(
                 .get("search_endpoint")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            // The judge's three: same rules as search (blank key keeps the
+            // stored one; blank endpoint with blank key turns it off).
+            let judge_endpoint = command
+                .get("judge_endpoint")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let judge_api_key = command
+                .get("judge_api_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let judge_model = command
+                .get("judge_model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
 
             let outcome = {
                 let mut guard = state.lock().expect("state lock");
@@ -542,6 +556,9 @@ async fn dispatch(
                     search_provider,
                     search_api_key,
                     search_endpoint,
+                    judge_endpoint,
+                    judge_api_key,
+                    judge_model,
                 )
             };
 
