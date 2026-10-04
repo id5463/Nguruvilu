@@ -22,3 +22,7 @@ Thumbs.db
 .env
 *.key
 config.local.*
+
+# 改版前后对照截图,不属于仓库内容
+shots/
+.gitignore.extra

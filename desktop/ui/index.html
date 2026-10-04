@@ -22,14 +22,20 @@
   body {
     margin: 0;
     display: grid;
-    grid-template-columns: 220px minmax(0, 1fr) 340px;
+    grid-template-columns: 200px minmax(0, 1fr) 360px;
     grid-template-rows: minmax(0, 1fr) auto 26px;
     font: 13px/1.55 ui-sans-serif, system-ui, "Segoe UI", sans-serif;
     background: var(--bg);
     color: var(--text);
     overflow: hidden;
   }
-  .panel { background: var(--panel); overflow: auto; }
+  .panel {
+    background: var(--panel);
+    overflow: auto;
+    /* A light scrollbar bar on a dark panel is a scratch on the whole column. */
+    scrollbar-color: var(--dim) transparent;
+    scrollbar-width: thin;
+  }
   #sessions { border-right: 1px solid var(--line); padding: 12px 10px; }
   #details  { border-left: 1px solid var(--line); padding: 12px 12px; }
 
@@ -37,7 +43,7 @@
     font-size: 10px; text-transform: uppercase; letter-spacing: .09em;
     color: var(--dim); margin: 0 0 8px; font-weight: 600;
   }
-  h2:not(:first-child) { margin-top: 18px; }
+  h2:not(:first-child) { margin-top: 22px; border-top: 1px solid var(--line); padding-top: 14px; }
 
 /* ---- packages ---- */
   .pack {
@@ -59,14 +65,37 @@
   .notice.bad { background: color-mix(in srgb, var(--bad) 16%, var(--panel)); border-color: color-mix(in srgb, var(--bad) 50%, var(--panel)); color: var(--bad); }
   .hint.tight { margin-top: 4px; }
 
+  /* Settings groups: one card per concern, so a column of twenty fields reads
+     as six decisions instead of a wall of inputs. */
+  .group {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--bg);
+    padding: 10px 10px 2px;
+    margin: 0 0 12px;
+  }
+  .group-title {
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    color: var(--dim);
+    font-weight: 600;
+    margin: 0 0 8px;
+  }
+  /* Long rationales collapse: fields first, essays one click away. */
+  .hint-more { margin: 0 0 8px; font-size: 10.5px; }
+  .hint-more > summary { color: var(--dim); cursor: pointer; }
+  .hint-more[open] > summary { margin-bottom: 4px; }
+  .hint-more .hint { margin-top: 0; }
+
   /* ---- settings ---- */
   .warn {
     background: color-mix(in srgb, var(--warn) 16%, var(--panel)); border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--panel)); color: var(--warn);
     border-radius: 6px; padding: 8px 10px; font-size: 11.5px;
     margin-bottom: 10px; line-height: 1.5;
   }
-  label.field { display: block; margin-bottom: 8px; }
-  label.field .cap { display: block; font-size: 10.5px; color: var(--dim); margin-bottom: 3px; }
+  label.field { display: block; margin-bottom: 10px; }
+  label.field .cap { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; }
   label.field input {
     width: 100%; background: var(--panel); color: var(--text);
     border: 1px solid var(--line); border-radius: 6px;
@@ -262,69 +291,88 @@
     <h2 id="sec-settings">Settings</h2>
     <div id="settings">
       <div class="warn" id="not-configured" hidden></div>
-      <label class="field">
-        <span class="cap" id="cap-endpoint">API endpoint</span>
-        <input id="set-base-url" placeholder="https://your-host/v1" spellcheck="false">
-      </label>
-      <label class="field">
-        <span class="cap" id="cap-key">API key</span>
-        <input id="set-api-key" type="password" placeholder="sk-..." spellcheck="false">
-      </label>
-      <!-- The web-search fields are not written here: `ensureSearchSection`
-           builds them when the search pack is loaded and removes them when it
-           is not. A row for a capability nobody can reach is a lie. -->
-      <label class="field">
-        <span class="cap"><span id="cap-model">Model</span> <button class="tiny" id="btn-fetch-models" type="button">fetch list</button></span>
-        <input id="set-model" list="model-options" placeholder="model-id" spellcheck="false">
-      </label>
-      <datalist id="model-options"></datalist>
-      <div id="model-list" class="picker" hidden></div>
-      <label class="field">
-        <span class="cap" id="cap-proxy">Proxy (optional)</span>
-        <input id="set-proxy" placeholder="http://127.0.0.1:7890" spellcheck="false">
-      </label>
-      <div class="hint tight">
-        Leave empty to connect directly. A value here is the <em>only</em> proxy used:
-        the system HTTP_PROXY / HTTPS_PROXY variables are ignored, because a proxy set
-        for another tool would otherwise reroute model traffic and fail with a TLS error.
-      </div>
-      <label class="field">
-        <span class="cap" id="cap-window">Context window (tokens)</span>
-        <input id="set-window" placeholder="128K, 1M, or a number" spellcheck="false">
-      </label>
-      <div class="row">
-        <label class="field" style="flex:1">
-          <span class="cap" id="cap-compact">Compact at %</span>
-          <input id="set-percent" placeholder="75" spellcheck="false">
+
+      <div class="group" id="group-connect">
+        <div class="group-title" id="title-connect">Connection</div>
+        <label class="field">
+          <span class="cap" id="cap-endpoint">API endpoint</span>
+          <input id="set-base-url" placeholder="https://your-host/v1" spellcheck="false">
         </label>
-        <label class="field" style="flex:1">
-          <span class="cap" id="cap-keep">Keep recent</span>
-          <input id="set-keep" placeholder="8" spellcheck="false">
+        <label class="field">
+          <span class="cap" id="cap-key">API key</span>
+          <input id="set-api-key" type="password" placeholder="sk-..." spellcheck="false">
+        </label>
+        <!-- The web-search and judge sections are not written here: they are
+             built next to this group when their pack is loaded, and removed
+             when it is not. A row for a capability nobody can reach is a lie. -->
+        <label class="field">
+          <span class="cap"><span id="cap-model">Model</span> <button class="tiny" id="btn-fetch-models" type="button">fetch list</button></span>
+          <input id="set-model" list="model-options" placeholder="model-id" spellcheck="false">
+        </label>
+        <datalist id="model-options"></datalist>
+        <div id="model-list" class="picker" hidden></div>
+        <label class="field">
+          <span class="cap" id="cap-proxy">Proxy (optional)</span>
+          <input id="set-proxy" placeholder="http://127.0.0.1:7890" spellcheck="false">
+        </label>
+        <details class="hint-more" id="more-proxy">
+          <summary id="sum-proxy">Why is this the only place the proxy can be set?</summary>
+          <div class="hint">
+            Leave empty to connect directly. A value here is the <em>only</em> proxy used:
+            the system HTTP_PROXY / HTTPS_PROXY variables are ignored, because a proxy set
+            for another tool would otherwise reroute model traffic and fail with a TLS error.
+          </div>
+        </details>
+      </div>
+
+      <div class="group" id="group-think">
+        <div class="group-title" id="title-think">Thinking</div>
+        <label class="field">
+          <span class="cap" id="cap-effort">Thinking effort</span>
+          <select id="set-effort">
+            <option value="">provider default</option>
+            <option value="none">none &mdash; no thinking</option>
+            <option value="minimal">minimal &mdash; cheapest</option>
+            <option value="low">low</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+            <option value="xhigh">xhigh</option>
+            <option value="max">max &mdash; most thorough</option>
+          </select>
         </label>
       </div>
-      <div class="hint tight">
-        Empty window means auto: the provider’s own number if it reports one,
-        a built-in table for well-known models, otherwise a conservative 32k.
-        When the prompt passes the threshold, the oldest messages are summarized
-        and replaced — tool-call pairs are never split.
+
+      <div class="group" id="group-context">
+        <div class="group-title" id="title-context">Context</div>
+        <label class="field">
+          <span class="cap" id="cap-window">Context window (tokens)</span>
+          <input id="set-window" placeholder="128K, 1M, or a number" spellcheck="false">
+        </label>
+        <div class="row">
+          <label class="field" style="flex:1">
+            <span class="cap" id="cap-compact">Compact at %</span>
+            <input id="set-percent" placeholder="75" spellcheck="false">
+          </label>
+          <label class="field" style="flex:1">
+            <span class="cap" id="cap-keep">Keep recent</span>
+            <input id="set-keep" placeholder="8" spellcheck="false">
+          </label>
+        </div>
+        <label class="field">
+          <span class="cap" id="cap-output">Max output tokens</span>
+          <input id="set-max-output" placeholder="8K, or blank for provider default" spellcheck="false">
+        </label>
+        <details class="hint-more" id="more-context">
+          <summary id="sum-context">How does the window and compaction behave?</summary>
+          <div class="hint">
+            Empty window means auto: the provider’s own number if it reports one,
+            a built-in table for well-known models, otherwise a conservative 32k.
+            When the prompt passes the threshold, the oldest messages are summarized
+            and replaced — tool-call pairs are never split.
+          </div>
+        </details>
       </div>
-      <label class="field">
-        <span class="cap" id="cap-output">Max output tokens</span>
-        <input id="set-max-output" placeholder="8K, or blank for provider default" spellcheck="false">
-      </label>
-      <label class="field">
-        <span class="cap" id="cap-effort">Thinking effort</span>
-        <select id="set-effort">
-          <option value="">provider default</option>
-          <option value="none">none &mdash; no thinking</option>
-          <option value="minimal">minimal &mdash; cheapest</option>
-          <option value="low">low</option>
-          <option value="medium">medium</option>
-          <option value="high">high</option>
-          <option value="xhigh">xhigh</option>
-          <option value="max">max &mdash; most thorough</option>
-        </select>
-      </label>
+
       <div class="row">
         <button class="small" id="save-settings">Save</button>
         <span class="saved" id="settings-saved" hidden>saved</span>
@@ -779,12 +827,14 @@ function ensureSearchSection(present) {
   }
   if (existing) return;
 
-  const field = (control, capId) => {
+  const field = (control, capId, labelText) => {
     const label = document.createElement("label");
     label.className = "field";
     const cap = document.createElement("span");
     cap.className = "cap";
     cap.id = capId;
+    // A default, so the field is labelled even before (or without) strings.
+    cap.textContent = labelText;
     label.append(cap, control);
     return label;
   };
@@ -815,23 +865,38 @@ function ensureSearchSection(present) {
   endpoint.spellcheck = false;
 
   const hint = document.createElement("div");
-  hint.className = "hint tight";
+  hint.className = "hint";
   hint.id = "hint-search";
   hint.textContent =
     'search_web appears only while a key is set: a tool that cannot ' +
     'authenticate costs a turn every time the model tries it. Choosing ' +
     '"off" drops the stored key — set it again to re-enable.';
 
+  const more = document.createElement("details");
+  more.className = "hint-more";
+  more.id = "more-search";
+  const summary = document.createElement("summary");
+  summary.id = "sum-search";
+  summary.textContent = "Why does search appear only with a key?";
+  more.append(summary, hint);
+
+  const title = document.createElement("div");
+  title.className = "group-title";
+  title.id = "group-search";
+  title.textContent = "Web search";
+
   const section = document.createElement("div");
   section.id = "search-section";
+  section.className = "group";
   section.append(
-    field(provider, "cap-search"),
-    field(key, "cap-search-key"),
-    field(endpoint, "cap-search-endpoint"),
-    hint,
+    title,
+    field(provider, "cap-search", "Web search provider"),
+    field(key, "cap-search-key", "Search API key"),
+    field(endpoint, "cap-search-endpoint", "Search endpoint (optional)"),
+    more,
   );
-  // Between the model key and the model list: the credentials block.
-  setApiKey.closest("label").insertAdjacentElement("afterend", section);
+  // Its own card, right after the connection card.
+  document.getElementById("group-connect").insertAdjacentElement("afterend", section);
 
   setSearchProvider = provider;
   setSearchKey = key;
@@ -861,12 +926,14 @@ function ensureJudgeSection(present) {
   }
   if (existing) return;
 
-  const field = (control, capId) => {
+  const field = (control, capId, labelText) => {
     const label = document.createElement("label");
     label.className = "field";
     const cap = document.createElement("span");
     cap.className = "cap";
     cap.id = capId;
+    // A default, so the field is labelled even before (or without) strings.
+    cap.textContent = labelText;
     label.append(cap, control);
     return label;
   };
@@ -888,23 +955,38 @@ function ensureJudgeSection(present) {
   model.spellcheck = false;
 
   const hint = document.createElement("div");
-  hint.className = "hint tight";
+  hint.className = "hint";
   hint.id = "hint-judge";
   hint.textContent =
     "The judge tool appears only while a key is set — and only as an adviser: " +
     "its verdict arrives as data the model weighs, never as a gate that " +
     "silently blocks an action. Clear the endpoint and the key to turn it off.";
 
+  const more = document.createElement("details");
+  more.className = "hint-more";
+  more.id = "more-judge";
+  const summary = document.createElement("summary");
+  summary.id = "sum-judge";
+  summary.textContent = "The judge advises, never blocks — the rule in full";
+  more.append(summary, hint);
+
+  const title = document.createElement("div");
+  title.className = "group-title";
+  title.id = "group-judge";
+  title.textContent = "Decision judge";
+
   const section = document.createElement("div");
   section.id = "judge-section";
+  section.className = "group";
   section.append(
-    field(endpoint, "cap-judge"),
-    field(key, "cap-judge-key"),
-    field(model, "cap-judge-model"),
-    hint,
+    title,
+    field(endpoint, "cap-judge", "Judge endpoint"),
+    field(key, "cap-judge-key", "Judge API key"),
+    field(model, "cap-judge-model", "Judge model (optional)"),
+    more,
   );
-  // Right after the credentials block, above the search section.
-  setApiKey.closest("label").insertAdjacentElement("afterend", section);
+  // Its own card, right after the connection card.
+  document.getElementById("group-connect").insertAdjacentElement("afterend", section);
 
   judgeEndpoint = endpoint;
   judgeKey = key;

@@ -532,6 +532,26 @@ async fn dispatch(
                 .get("judge_model")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            // Present flags: the page says whether it *shows* each section, so
+            // an unloaded pack's absence never reads as "the user erased it".
+            // A payload without flags (scripted call) falls back to "present
+            // when any of its fields was sent".
+            let search_present = command
+                .get("search_present")
+                .and_then(|v| v.as_bool())
+                .unwrap_or_else(|| {
+                    command.get("search_provider").is_some()
+                        || command.get("search_api_key").is_some()
+                        || command.get("search_endpoint").is_some()
+                });
+            let judge_present = command
+                .get("judge_present")
+                .and_then(|v| v.as_bool())
+                .unwrap_or_else(|| {
+                    command.get("judge_endpoint").is_some()
+                        || command.get("judge_api_key").is_some()
+                        || command.get("judge_model").is_some()
+                });
 
             let outcome = {
                 let mut guard = state.lock().expect("state lock");
@@ -556,9 +576,11 @@ async fn dispatch(
                     search_provider,
                     search_api_key,
                     search_endpoint,
+                    search_present,
                     judge_endpoint,
                     judge_api_key,
                     judge_model,
+                    judge_present,
                 )
             };
 

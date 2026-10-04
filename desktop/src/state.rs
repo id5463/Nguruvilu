@@ -471,9 +471,11 @@ impl AppState {
         search_provider: &str,
         search_api_key: &str,
         search_endpoint: &str,
+        search_present: bool,
         judge_endpoint: &str,
         judge_api_key: &str,
         judge_model: &str,
+        judge_present: bool,
     ) -> Result<()> {
         let settings = Settings {
             base_url: base_url.trim().to_string(),
@@ -486,18 +488,24 @@ impl AppState {
             compact_keep_recent: compact_keep_recent.max(1),
             max_output_tokens: max_output_tokens.filter(|t| *t > 0),
             network: self.settings.network.clone(),
-            search: resolve_search(
-                &self.settings.search,
-                search_provider,
-                search_api_key,
-                search_endpoint,
-            )?,
-            judge: resolve_judge(
-                &self.settings.judge,
-                judge_endpoint,
-                judge_api_key,
-                judge_model,
-            )?,
+            // A section the page does not show (its pack is unloaded) is not a
+            // section the user cleared: absent means "keep what is stored",
+            // present means "these fields are the truth".
+            search: if search_present {
+                resolve_search(
+                    &self.settings.search,
+                    search_provider,
+                    search_api_key,
+                    search_endpoint,
+                )?
+            } else {
+                self.settings.search.clone()
+            },
+            judge: if judge_present {
+                resolve_judge(&self.settings.judge, judge_endpoint, judge_api_key, judge_model)?
+            } else {
+                self.settings.judge.clone()
+            },
             extra_body: self.settings.extra_body.clone(),
         };
         settings.save()?;
