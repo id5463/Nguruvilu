@@ -646,13 +646,23 @@ impl AppState {
             *policy = std::sync::Arc::new(self.settings.context_policy(None));
         }
 
-        if let Some(soul) = content.soul {
-            if let Ok(mut runtime) = self.config.runtime.lock() {
-                let _ = runtime.apply(nguruvilu::hotreload::Change::session(
-                    "pack",
-                    nguruvilu::hotreload::ChangePayload::Persona(soul),
-                ));
+        // The persona is the joined soul of every installed pack — never this
+        // pack's alone: applied one by one, load order would decide who the
+        // model is. Best-effort here because adoption must not fail over the
+        // persona; `installed_persona` itself reports read errors upward.
+        match nguruvilu::content::installed_persona(
+            &nguruvilu::pack::default_packs_dir(),
+        ) {
+            Ok(Some(persona)) => {
+                if let Ok(mut runtime) = self.config.runtime.lock() {
+                    let _ = runtime.apply(nguruvilu::hotreload::Change::session(
+                        "pack",
+                        nguruvilu::hotreload::ChangePayload::Persona(persona),
+                    ));
+                }
             }
+            Ok(None) => {}
+            Err(error) => eprintln!("[pack] persona: {error:#}"),
         }
 
         // The pack's settings replace the standing ones, so the route is

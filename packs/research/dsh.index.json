@@ -1,0 +1,15 @@
+{
+  "formatVersion": 1,
+  "game": "nguruvilu",
+  "name": "research",
+  "versionId": "1.0.0",
+  "license": "MIT",
+  "kernelVersion": "0.1.0",
+  "dependencies": { "nguruvilu": ">=0.1.0" },
+  "soul": "soul.md",
+  "skills": [
+    { "id": "cite-sources", "source": "./skills/cite-sources", "license": "MIT" },
+    { "id": "draft-critique", "source": "./skills/draft-critique", "license": "MIT" },
+    { "id": "publish-figures", "source": "./skills/publish-figures", "license": "MIT" }
+  ]
+}

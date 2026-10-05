@@ -176,6 +176,49 @@ pub fn apply(
     Ok(content)
 }
 
+/// The persona every installed pack contributes, joined into one replace.
+///
+/// The runtime holds a **single** persona slot. Applying each pack's soul
+/// one by one would make load order decide who the model is — the alphabet
+/// would decide it. The join is over the *set* of installed, enabled packs
+/// instead, sorted by name, so every boot rebuilds the same text, installing
+/// a pack changes exactly its own line, and unloading one removes its
+/// contribution at the next adoption (the conversation history keeps what it
+/// already absorbed — that part is the user's).
+///
+/// `None` when no pack carries a soul: hosts leave the standing persona
+/// (including an explicit `--persona`) alone.
+pub fn installed_persona(packs_dir: &std::path::Path) -> Result<Option<String>> {
+    let mut packs = crate::pack::installed(packs_dir)?;
+    packs.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));
+    let mut parts = Vec::new();
+    for pack in packs {
+        if !pack.enabled {
+            continue;
+        }
+        let Some(file) = &pack.manifest.soul else {
+            continue;
+        };
+        let path = pack.path.join(file.path());
+        if !path.is_file() {
+            // A declared-but-missing soul is the pack's own error; `apply`
+            // reports it when content loads. Here it simply contributes
+            // nothing rather than failing everyone's persona.
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading the persona from {}", path.display()))?;
+        if !text.trim().is_empty() {
+            parts.push(text.trim().to_string());
+        }
+    }
+    if parts.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(parts.join("\n\n---\n\n")))
+    }
+}
+
 /// Install themes and panels as one built-in plugin.
 ///
 /// A plugin rather than a direct registry write, so they land on a fiber and
@@ -311,6 +354,51 @@ mod tests {
         let content = apply(&mut kernel, &dir, &manifest).unwrap();
         assert_eq!(content.soul.as_deref(), Some("Be terse.\n"));
         assert!(content.summary()[0].contains("persona"));
+    }
+
+    #[test]
+    fn the_persona_joins_every_installed_soul_in_name_order() {
+        // The runtime's persona slot is single: applying each pack's soul
+        // one by one would let load order — effectively the alphabet — decide
+        // who the model is. The join is over the set instead.
+        let root = scratch("persona-join");
+        for (dir_name, pack_name, soul) in [
+            ("zz-pack", "zz", "ZZ voice."),
+            ("aa-pack", "aa", "AA voice."),
+        ] {
+            let dir = root.join(dir_name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut manifest = PackManifest::new(pack_name, "1.0.0");
+            manifest.soul = Some("soul.md".into());
+            write_manifest(&dir, &manifest).unwrap();
+            std::fs::write(dir.join("soul.md"), format!("{soul}\n")).unwrap();
+        }
+        // A pack with no soul contributes nothing…
+        let quiet = root.join("quiet-pack");
+        std::fs::create_dir_all(&quiet).unwrap();
+        write_manifest(&quiet, &PackManifest::new("quiet", "1.0.0")).unwrap();
+        // …and an unloaded one has already left.
+        let off = root.join("off-pack");
+        std::fs::create_dir_all(&off).unwrap();
+        let mut off_manifest = PackManifest::new("off", "1.0.0");
+        off_manifest.soul = Some("soul.md".into());
+        write_manifest(&off, &off_manifest).unwrap();
+        std::fs::write(off.join("soul.md"), "never seen\n").unwrap();
+        crate::pack::set_enabled(&off, false).unwrap();
+
+        let joined = installed_persona(&root).unwrap().expect("two souls");
+        assert!(joined.contains("AA voice."), "{joined}");
+        assert!(joined.contains("ZZ voice."), "{joined}");
+        assert!(
+            joined.find("AA voice.").unwrap() < joined.find("ZZ voice.").unwrap(),
+            "name order, not load order: {joined}"
+        );
+        assert!(!joined.contains("never seen"), "unloaded leaves: {joined}");
+
+        // Nothing to join: hosts keep the standing persona (and any
+        // explicit `--persona`) alone.
+        let empty = scratch("persona-none");
+        assert!(installed_persona(&empty).unwrap().is_none());
     }
 
     #[test]

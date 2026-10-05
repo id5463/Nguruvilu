@@ -777,6 +777,11 @@ async fn run() -> Result<()> {
             for entry in &report.failed {
                 eprintln!("[pack] failed {}:{}: {}", entry.kind, entry.id, entry.error);
             }
+            // Skips are decisions too: a silently skipped entry is how a pack
+            // ends up "installed but nothing happened".
+            for entry in &report.skipped {
+                eprintln!("[pack] skipped {}: {}", entry.id, entry.reason);
+            }
         }
         match nguruvilu::pack::read_manifest(&pack.path) {
             Ok(manifest) => match nguruvilu::content::apply(&mut kernel, &pack.path, &manifest) {
@@ -815,12 +820,6 @@ async fn run() -> Result<()> {
     ))?;
 
     let base_prompt = cli.system.clone().unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
-    if let Some(persona) = &cli.persona {
-        runtime.apply(Change::session(
-            "cli",
-            ChangePayload::Persona(persona.clone()),
-        ))?;
-    }
 
     // The context policy comes from settings, so `--context-window` and the
     // settings file both land here. A provider-reported window would be folded
@@ -835,6 +834,14 @@ async fn run() -> Result<()> {
     let pack_ran = !contents.is_empty();
     for content in contents {
         adopt_content(content, &mut settings, &mut runtime, &injection)?;
+    }
+    // `--persona` outranks every pack: applied *after* adoption, or a pack's
+    // soul would silently replace what the user asked for on this run.
+    if let Some(persona) = &cli.persona {
+        runtime.apply(Change::session(
+            "cli",
+            ChangePayload::Persona(persona.clone()),
+        ))?;
     }
     // A pack may be what configured search, so the settings go back into the
     // plugin after the content lands: the fibers re-apply, and the tool table
@@ -1089,6 +1096,7 @@ async fn run() -> Result<()> {
                 mcp: &mut mcp_clients,
                 search: &search_cell,
                 judge: &judge_cell,
+                persona_override: cli.persona.clone(),
             }
             .drain()
             .await?;
@@ -1163,6 +1171,7 @@ async fn run() -> Result<()> {
                     mcp: &mut mcp_clients,
                     search: &search_cell,
                     judge: &judge_cell,
+                    persona_override: cli.persona.clone(),
                 },
             )
             .await?;
@@ -2978,8 +2987,14 @@ fn adopt_content(
     for line in content.summary() {
         eprintln!("pack content: {line}");
     }
-    if let Some(soul) = content.soul {
-        runtime.apply(Change::session("pack", ChangePayload::Persona(soul)))?;
+    // The persona is the joined soul of every installed pack — never this
+    // pack's alone: applied one by one, load order would decide who the
+    // model is. A user's `--persona` outranks it and is re-applied after
+    // adoption (and after a drain) by the callers that hold the flag.
+    if let Some(persona) =
+        nguruvilu::content::installed_persona(&nguruvilu::pack::default_packs_dir())?
+    {
+        runtime.apply(Change::session("pack", ChangePayload::Persona(persona)))?;
     }
     if let Some(models) = &content.models {
         if let Some(url) = &models.base_url {
@@ -3060,6 +3075,10 @@ struct PackHost<'a> {
     search: &'a nguruvilu::tools::search::SettingsCell,
     /// The judge plugin's settings cell — same rule, `judge::configure`.
     judge: &'a nguruvilu::tools::judge::SettingsCell,
+    /// An explicit `--persona` from this run: adoption joins the installed
+    /// packs' souls, and this outranks them, so it goes back on top after
+    /// every drain.
+    persona_override: Option<String>,
 }
 
 impl PackHost<'_> {
@@ -3141,6 +3160,9 @@ impl PackHost<'_> {
                                 report.loaded.len(),
                                 report.failed.len()
                             );
+                            for entry in &report.skipped {
+                                eprintln!("[pack] skipped {}: {}", entry.id, entry.reason);
+                            }
                             changed = true;
                         }
                         match nguruvilu::pack::read_manifest(&pack.path) {
@@ -3195,6 +3217,14 @@ impl PackHost<'_> {
                 "pack",
                 ChangePayload::ModelRoute(route),
             ))?;
+            // The join inside adoption just rewrote the persona; a run started
+            // with `--persona` outranks packs, so it goes back on top here.
+            if let Some(persona) = self.persona_override.as_ref() {
+                guard.apply(Change::session(
+                    "cli",
+                    ChangePayload::Persona(persona.clone()),
+                ))?;
+            }
             guard.adopt_kernel_tools(self.kernel);
             eprintln!("[pack] the next turn sees the new tool table");
         }

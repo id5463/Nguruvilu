@@ -561,7 +561,7 @@ cargo build --release --offline          # → target/release/ngu
 # 桌面(独立 crate,单文件,约 8.4 MB;界面是"母版",运行时服务的是 ui 包那份)
 cargo build --release --offline --manifest-path desktop/Cargo.toml
 
-# 测试:单元 + 动态库集成 + 内核集成 + CLI + 界面一致性,共 451 项
+# 测试:单元 + 动态库集成 + 内核集成 + CLI + 界面一致性,共 452 项
 cargo test --offline
 
 # 发布:出 dist/ 与桌面副本,打印 SHA256
@@ -580,7 +580,7 @@ pwsh -File release.ps1
 
 ## 状态
 
-**完整架构已实现:451 个测试通过(409 单元 + 9 动态库集成 + 26 内核集成 + 5 CLI + 2 界面)。**
+**完整架构已实现:452 个测试通过(410 单元 + 9 动态库集成 + 26 内核集成 + 5 CLI + 2 界面)。**
 
 | 能力 | 状态 | 说明 |
 |---|---|---|

@@ -1067,6 +1067,11 @@ async fn drain_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
                                 report.loaded.len(),
                                 report.failed.len()
                             );
+                            // Skips are decisions too: a silently skipped entry
+                            // is how a pack ends up "installed, nothing happened".
+                            for entry in &report.skipped {
+                                eprintln!("[pack] skipped {}: {}", entry.id, entry.reason);
+                            }
                             changed = true;
                         }
                         Err(error) => emit(
@@ -1218,6 +1223,9 @@ async fn apply_pack(
         guard.describe()
     };
 
+    for entry in &report.skipped {
+        eprintln!("[pack] skipped {}: {}", entry.id, entry.reason);
+    }
     eprintln!(
         "[pack] applied {} entries from {}",
         report.loaded.len(),
