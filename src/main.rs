@@ -202,19 +202,10 @@ enum Command {
         #[arg(long)]
         into: Option<PathBuf>,
     },
-    /// Import MCP servers from a Claude Code / Claude Desktop config into a pack.
-    McpImport {
-        /// The `.mcp.json` (or claude_desktop_config.json) to read.
-        file: PathBuf,
-        /// Pack directory to create (default: ./<name>).
-        #[arg(long)]
-        out: Option<PathBuf>,
-        /// Pack name (default: derived from the file name).
-        #[arg(long)]
-        name: Option<String>,
-        /// License for the generated pack — the servers' own licenses stay yours to check.
-        #[arg(long, default_value = "MIT")]
-        license: String,
+    /// MCP helpers (`ngu mcp import`, matching `config set` / `plugin load`).
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
     },
     /// List installed packs.
     Packs,
@@ -352,6 +343,24 @@ enum PluginAction {
         /// Arguments as a JSON object.
         #[arg(default_value = "{}")]
         args: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum McpAction {
+    /// Import MCP servers from a Claude Code / Claude Desktop config into a pack.
+    Import {
+        /// The `.mcp.json` (or claude_desktop_config.json) to read.
+        file: PathBuf,
+        /// Pack directory to create (default: ./<name>).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Pack name (default: derived from the file name).
+        #[arg(long)]
+        name: Option<String>,
+        /// License for the generated pack — the servers' own licenses stay yours to check.
+        #[arg(long, default_value = "MIT")]
+        license: String,
     },
 }
 
@@ -592,9 +601,9 @@ async fn run() -> Result<()> {
             return pack_command(dir, out.as_ref(), *pin, *offline, cli.json).await
         }
         Some(Command::Install { file, into }) => return install_command(file, into.as_ref(), cli.json).await,
-        Some(Command::McpImport { file, out, name, license }) => {
-            return mcp_import_command(file, out.as_deref(), name.as_deref(), license)
-        }
+        Some(Command::Mcp {
+            action: McpAction::Import { file, out, name, license },
+        }) => return mcp_import_command(&file, out.as_deref(), name.as_deref(), &license),
         Some(Command::Packs) => return list_packs(cli.json),
         Some(Command::Uninstall { name, all, delete, into }) => {
             return uninstall_command(name, *all, *delete, into.as_ref(), cli.json)
