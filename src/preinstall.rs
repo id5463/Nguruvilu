@@ -31,36 +31,28 @@ use sha2::{Digest, Sha256};
 /// payload folder to be complete is not a single-file program.
 pub const SHIPPED: &[(&str, &str, &[u8])] = &[
     (
-        "chinese",
-        "1.1.0",
-        include_bytes!("../packs/chinese/chinese-1.1.0.dshpack"),
-    ),
-    (
-        "computer-use",
-        "1.2.0",
-        include_bytes!("../packs/computer-use/computer-use-1.2.0.dshpack"),
+        "starter",
+        "1.0.0",
+        include_bytes!("../packs/starter/starter-1.0.0.dshpack"),
     ),
     (
         "judge",
         "1.0.0",
         include_bytes!("../packs/judge/judge-1.0.0.dshpack"),
     ),
-    (
-        "search",
-        "1.1.0",
-        include_bytes!("../packs/search/search-1.1.0.dshpack"),
-    ),
-    (
-        "subagent",
-        "1.0.0",
-        include_bytes!("../packs/subagent/subagent-1.0.0.dshpack"),
-    ),
-    (
-        "ui",
-        "1.0.0",
-        include_bytes!("../packs/ui/ui-1.0.0.dshpack"),
-    ),
 ];
+
+/// The five packs this project once shipped separately, now merged into
+/// `starter`: chinese, ui, search, subagent, computer-use.
+///
+/// A machine that still has the old five would load their souls and plugins
+/// beside starter's — two personas, two `builtin:search`, two interfaces.
+/// Retiring them follows the same rule as everything here: only bytes *we*
+/// placed and nobody edited go. Recorded, still hashing to the record, and
+/// `shipped` (ours by construction — an adopted pack was the user's first).
+/// Anything else is kept and named, because "kept" is the safe answer when
+/// touching it could destroy work.
+const MERGED_INTO_STARTER: &[&str] = &["chinese", "ui", "search", "subagent", "computer-use"];
 
 /// What this program has placed, so a later run can tell its own work apart
 /// from the user's.
@@ -98,6 +90,10 @@ pub async fn seed(dir: &Path) -> Result<Vec<String>> {
 
 /// [`seed`] with the record somewhere a caller chooses — tests pick a scratch
 /// path so they cannot touch the real one.
+///
+/// Returns one line per pack placed, updated, retired, or kept with a reason;
+/// a steady-state run on a fully consolidated machine returns nothing, which
+/// is the point.
 pub async fn seed_with_record(dir: &Path, record_path: &Path) -> Result<Vec<String>> {
     let mut record = match std::fs::read_to_string(record_path) {
         Ok(text) => serde_json::from_str(&text)
@@ -126,7 +122,7 @@ pub async fn seed_with_record(dir: &Path, record_path: &Path) -> Result<Vec<Stri
                     shipped: Some(sha256(bytes)),
                 },
             );
-            placed.push(format!("{name}@{version}"));
+            placed.push(format!("placed {name}@{version}"));
             continue;
         };
 
@@ -183,7 +179,89 @@ pub async fn seed_with_record(dir: &Path, record_path: &Path) -> Result<Vec<Stri
                 shipped: Some(sha256(bytes)),
             },
         );
-        placed.push(format!("{name}@{version} (updated)"));
+        placed.push(format!("placed {name}@{version} (updated)"));
+    }
+
+    // Retire the packs `starter` merged into: a twin soul or a second
+    // `builtin:search` loading beside starter's is a conflict nobody asked
+    // for. Only our own untouched bytes go (recorded, still matching, and
+    // `shipped`); everything else stays and says why.
+    for name in MERGED_INTO_STARTER {
+        for pack in crate::pack::installed(dir)?
+            .into_iter()
+            .filter(|pack| pack.manifest.name == *name)
+            .collect::<Vec<_>>()
+        {
+            let version = pack.manifest.version_id.clone();
+            let Some(entry) = record.packs.get(*name) else {
+                placed.push(format!(
+                    "{name}@{version} kept: never placed by this program, so untouched cannot be proven"
+                ));
+                continue;
+            };
+            if entry.shipped.is_none() {
+                placed.push(format!(
+                    "{name}@{version} kept: adopted from your own install — starter carries the same content"
+                ));
+                continue;
+            }
+            if entry.files != hashes_of(&pack.path)? {
+                placed.push(format!(
+                    "{name}@{version} kept: you have edits; it may now duplicate starter's copy"
+                ));
+                continue;
+            }
+            // Removal can fail for reasons that are not the pack's content —
+            // the desktop is running the driver right now. Report it, keep the
+            // record so the next run retries, and finish the seed: one locked
+            // pack must not swallow the report of everything else.
+            if let Err(error) = std::fs::remove_dir_all(&pack.path) {
+                placed.push(format!(
+                    "{name}@{version} kept: cannot remove yet ({error:#}) — in use; will retry next run"
+                ));
+                continue;
+            }
+            record.packs.remove(*name);
+            placed.push(format!("{name}@{version} retired: merged into starter"));
+        }
+    }
+
+    // A retire that died halfway leaves a husk: the manifest gone, the locked
+    // files left — and installed() cannot see a directory without a manifest,
+    // so the loop above would miss it forever. Sweep by name, touching only a
+    // directory this program has a record of placing.
+    for name in MERGED_INTO_STARTER {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let prefix = format!("{name}-");
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir()
+                || !entry.file_name().to_string_lossy().starts_with(&prefix)
+                || path.join("dsh.index.json").exists()
+            {
+                continue;
+            }
+            let ours = record
+                .packs
+                .get(*name)
+                .is_some_and(|entry| entry.shipped.is_some());
+            if !ours {
+                continue;
+            }
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    record.packs.remove(*name);
+                    placed.push(format!(
+                        "{name} leftover retired: the remains of an earlier attempt"
+                    ));
+                }
+                Err(error) => placed.push(format!(
+                    "{name} leftover kept: cannot remove yet ({error:#}) — in use; will retry next run"
+                )),
+            }
+        }
     }
 
     if !placed.is_empty() {
@@ -322,7 +400,7 @@ mod tests {
         let installed = crate::pack::installed(&dir).unwrap();
         let target = installed
             .iter()
-            .find(|pack| pack.manifest.name == "chinese")
+            .find(|pack| pack.manifest.name == "judge")
             .unwrap();
         std::fs::remove_dir_all(&target.path).unwrap();
         let after = seed_with_record(&dir, &record).await.unwrap();
@@ -340,7 +418,7 @@ mod tests {
         let installed = crate::pack::installed(&dir).unwrap();
         let soul = installed
             .iter()
-            .find(|pack| pack.manifest.name == "chinese")
+            .find(|pack| pack.manifest.name == "starter")
             .unwrap()
             .path
             .join("soul.md");
@@ -350,7 +428,7 @@ mod tests {
         // what was placed no longer matches any archive we have.
         let mut value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
-        value["packs"]["chinese"]["shipped"] = json!("a-different-archive");
+        value["packs"]["starter"]["shipped"] = json!("a-different-archive");
         std::fs::write(&record, serde_json::to_string(&value).unwrap()).unwrap();
 
         let again = seed_with_record(&dir, &record).await.unwrap();
@@ -373,19 +451,19 @@ mod tests {
         // what is on disk is untouched, which is the whole difference.
         let mut value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
-        value["packs"]["chinese"]["shipped"] = json!("a-different-archive");
+        value["packs"]["starter"]["shipped"] = json!("a-different-archive");
         std::fs::write(&record, serde_json::to_string(&value).unwrap()).unwrap();
 
         let again = seed_with_record(&dir, &record).await.unwrap();
         assert!(
-            again.iter().any(|line| line.starts_with("chinese@")),
+            again.iter().any(|line| line.starts_with("placed starter@")),
             "an untouched pack takes the update: {again:?}"
         );
         let installed = crate::pack::installed(&dir).unwrap();
         assert!(
             installed
                 .iter()
-                .any(|pack| pack.manifest.name == "chinese" && pack.enabled),
+                .any(|pack| pack.manifest.name == "starter" && pack.enabled),
             "and is still installed and enabled"
         );
 
@@ -402,7 +480,7 @@ mod tests {
         let installed = crate::pack::installed(&dir).unwrap();
         let target = installed
             .iter()
-            .find(|pack| pack.manifest.name == "search")
+            .find(|pack| pack.manifest.name == "judge")
             .unwrap();
         crate::pack::set_enabled(&target.path, false).unwrap();
 
@@ -415,10 +493,125 @@ mod tests {
         assert!(
             !installed
                 .iter()
-                .find(|pack| pack.manifest.name == "search")
+                .find(|pack| pack.manifest.name == "judge")
                 .unwrap()
                 .enabled,
             "and is still unloaded"
         );
+    }
+
+    #[tokio::test]
+    async fn merged_twins_retire_only_when_ours_and_untouched() {
+        let (dir, record) = scratch("retire");
+        seed_with_record(&dir, &record).await.unwrap();
+
+        // Four twins a pre-merge machine could still have. The first is the
+        // normal case — ours, recorded, untouched — and retires. The rest are
+        // the three reasons *not* to touch a pack, one each.
+        let manifest = |name: &str, version: &str| {
+            format!(
+                r#"{{"formatVersion":1,"game":"nguruvilu","name":"{name}","versionId":"{version}","license":"MIT","kernelVersion":"0.1.0","dependencies":{{"nguruvilu":">=0.1.0"}}}}"#
+            )
+        };
+        let make = |dir: &Path, name: &str, version: &str, file: &str, bytes: &str| {
+            let pack = dir.join(format!("{name}-{version}"));
+            std::fs::create_dir_all(&pack).unwrap();
+            std::fs::write(pack.join("dsh.index.json"), manifest(name, version)).unwrap();
+            std::fs::write(pack.join(file), bytes).unwrap();
+            pack
+        };
+
+        let untouched = make(&dir, "chinese", "1.1.0", "soul.md", "old soul\n");
+        let edited = make(&dir, "ui", "1.0.0", "index.html", "pristine\n");
+        let adopted = make(&dir, "search", "1.1.0", "search.json", "{}\n");
+        let stranger = make(&dir, "subagent", "1.0.0", "notes.txt", "x\n");
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+        value["packs"]["chinese"] = json!({
+            "version": "1.1.0",
+            "files": hashes_of(&untouched).unwrap(),
+            "shipped": "our-archive",
+        });
+        let pristine = hashes_of(&edited).unwrap();
+        std::fs::write(edited.join("index.html"), "user edited\n").unwrap();
+        value["packs"]["ui"] = json!({
+            "version": "1.0.0",
+            "files": pristine,
+            "shipped": "our-archive",
+        });
+        value["packs"]["search"] = json!({
+            "version": "1.1.0",
+            "files": hashes_of(&adopted).unwrap(),
+        });
+        std::fs::write(&record, serde_json::to_string(&value).unwrap()).unwrap();
+
+        let report = seed_with_record(&dir, &record).await.unwrap();
+        let line = |needle: &str| {
+            report
+                .iter()
+                .find(|l| l.contains(needle))
+                .cloned()
+                .unwrap_or_else(|| panic!("no line for {needle}: {report:?}"))
+        };
+
+        assert!(!untouched.exists(), "ours and untouched retires: {report:?}");
+        assert!(line("chinese@1.1.0").contains("retired"));
+        assert!(edited.exists(), "an edit is never destroyed: {report:?}");
+        assert!(line("ui@1.0.0").contains("edits"));
+        assert!(adopted.exists(), "an adopted pack was theirs first");
+        assert!(line("search@1.1.0").contains("adopted"));
+        assert!(stranger.exists(), "unproven stays");
+        assert!(line("subagent@1.0.0").contains("never placed"));
+
+        // The retired one stays gone; the kept ones are named again next run —
+        // reporting every time is the honest version of a warning.
+        let again = seed_with_record(&dir, &record).await.unwrap();
+        assert!(!untouched.exists());
+        assert!(!again.iter().any(|l| l.contains("chinese@")), "{again:?}");
+        assert!(again.iter().any(|l| l.contains("ui@1.0.0")), "{again:?}");
+
+        let names: Vec<String> = crate::pack::installed(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|pack| pack.manifest.name)
+            .collect();
+        assert!(names.contains(&"starter".to_string()), "{names:?}");
+        assert!(names.contains(&"judge".to_string()), "{names:?}");
+        assert!(!names.contains(&"chinese".to_string()), "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn a_manifest_less_husk_is_swept_only_when_ours() {
+        let (dir, record) = scratch("husk");
+        seed_with_record(&dir, &record).await.unwrap();
+
+        // What a retire that died halfway leaves: the manifest gone, the
+        // record still saying we placed it.
+        let husk = dir.join("computer-use-1.2.0");
+        std::fs::create_dir_all(husk.join("files")).unwrap();
+        std::fs::write(husk.join("files").join("locked.bin"), "x\n").unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+        value["packs"]["computer-use"] = json!({
+            "version": "1.2.0",
+            "files": json!({}),
+            "shipped": "our-archive",
+        });
+        std::fs::write(&record, serde_json::to_string(&value).unwrap()).unwrap();
+
+        // And one nobody placed: a husk under a merged name with no record is
+        // not provably ours, so it stays.
+        let stranger_husk = dir.join("search-1.1.0");
+        std::fs::create_dir_all(&stranger_husk).unwrap();
+        std::fs::write(stranger_husk.join("notes.txt"), "someone's\n").unwrap();
+
+        let report = seed_with_record(&dir, &record).await.unwrap();
+        assert!(!husk.exists(), "our husk is swept: {report:?}");
+        assert!(
+            report.iter().any(|l| l.contains("computer-use") && l.contains("leftover")),
+            "{report:?}"
+        );
+        assert!(stranger_husk.exists(), "an unproven husk stays: {report:?}");
     }
 }

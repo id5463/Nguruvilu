@@ -3,7 +3,8 @@
 给模型一个可以操作的浏览器:打开页面、读快照、点击、填表、截图。装载后工具表里
 出现一组 `mcp__chrome-devtools-mcp__*` 工具。
 
-真桌面那条线不归这个包管:桌面操作是独立的 [`computer-use`](../computer-use/README.md)(预装)。
+真桌面那条线不归这个包管:桌面操作随预装的 `starter` 包提供(`mcp.json` 声明
+`cua-driver`,装包时自动下载驱动)。
 
 ## 里面是什么
 
@@ -54,15 +55,15 @@ ngu uninstall browser-use           # 卸载:文件留着,以后可再加载
 ngu uninstall browser-use --delete  # 删除:连文件一起清掉
 ```
 
-## 和 computer-use 的分工
+## 和桌面操作的分工
 
 | 包 | 管什么 | 驱动 |
 |---|---|---|
 | `browser-use`(本包) | 网页:快照读结构、点、填、截图 | `chrome-devtools-mcp`(npm 包) |
-| `computer-use`(预装) | 真实桌面:任何窗口、任何应用 | `cua-driver`(上游二进制) |
+| `starter` 的桌面部分(预装) | 真实桌面:任何窗口、任何应用 | `cua-driver`(上游二进制) |
 
 网页用 `browser-use` —— 结构化文本,快且省;要动浏览器之外的东西,才用
-`computer-use`。
+桌面那条线(`starter` 的 `mcp__cua-driver__*`)。
 
 ## 许可
 

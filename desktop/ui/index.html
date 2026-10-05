@@ -1011,9 +1011,11 @@ function renderPacks(list) {
     (list && list.dir ? "Installed in " + list.dir + " \u00b7 " : "") +
     packs.length + " pack(s) \u00b7 " + loaded + " loaded";
 
-  // The search section follows the pack that owns the capability.
-  ensureSearchSection(packs.some((pack) => pack.name === "search" && pack.loaded !== false));
-  // The judge section follows its pack — the same rule.
+  // The search section follows the pack that owns the capability: the old
+  // `search` pack, or `starter` — the merged preinstall pack now carries it.
+  ensureSearchSection(packs.some((pack) =>
+    (pack.name === "search" || pack.name === "starter") && pack.loaded !== false));
+  // The judge section follows its own pack (starter does not carry the judge).
   ensureJudgeSection(packs.some((pack) => pack.name === "judge" && pack.loaded !== false));
 
   if (packs.length === 0) {

@@ -212,7 +212,7 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
     match runtime.block_on(nguruvilu::preinstall::seed(
         &nguruvilu::pack::default_packs_dir(),
     )) {
-        Ok(placed) if !placed.is_empty() => eprintln!("[preinstall] placed {}", placed.join(", ")),
+        Ok(placed) if !placed.is_empty() => eprintln!("[preinstall] {}", placed.join(", ")),
         Ok(_) => {}
         Err(error) => eprintln!("[preinstall] {error:#}"),
     }
@@ -1078,7 +1078,7 @@ async fn load_installed_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSi
     // conversation has, and a report rather than a failure keeps a full or
     // read-only disk from stopping the shell.
     match nguruvilu::preinstall::seed(&dir).await {
-        Ok(placed) if !placed.is_empty() => eprintln!("[preinstall] placed {}", placed.join(", ")),
+        Ok(placed) if !placed.is_empty() => eprintln!("[preinstall] {}", placed.join(", ")),
         Ok(_) => {}
         Err(error) => eprintln!("[preinstall] {error:#}"),
     }

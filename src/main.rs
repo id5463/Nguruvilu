@@ -640,7 +640,7 @@ async fn run() -> Result<()> {
     let pending_packs = Arc::new(nguruvilu::tools::pack::PendingQueue::new());
     nguruvilu::tools::pack::register_with(kernel.tools_mut(), Some(Arc::clone(&pending_packs)))?;
     // The subagent's code is available to a pack, not loaded by the kernel:
-    // `packs/subagent` asks for `builtin:delegate` and it appears, and without
+    // `packs/starter` asks for `builtin:delegate` and it appears, and without
     // that pack the kernel has no such tool.
     nguruvilu::tools::subagent::define(&mut kernel);
     // Same split for search: the code is available, the pack's assembly is
@@ -727,7 +727,7 @@ async fn run() -> Result<()> {
     // failure here is reported rather than fatal — a read-only or full disk
     // must not stop a session from starting.
     match nguruvilu::preinstall::seed(&nguruvilu::pack::default_packs_dir()).await {
-        Ok(placed) if !placed.is_empty() => eprintln!("[preinstall] placed {}", placed.join(", ")),
+        Ok(placed) if !placed.is_empty() => eprintln!("[preinstall] {}", placed.join(", ")),
         Ok(_) => {}
         Err(error) => eprintln!("[preinstall] {error:#}"),
     }
@@ -3060,7 +3060,7 @@ mod tests {
     fn remote_specs_are_recognised_and_paths_are_not() {
         // The split decides whether the argument is downloaded or installed
         // from disk, so a path must never be reinterpreted as a spec.
-        assert!(is_remote_spec("github:id5463/Nguruvilu@packs/computer-use@main"));
+        assert!(is_remote_spec("github:id5463/Nguruvilu@packs/browser-use@main"));
         assert!(is_remote_spec("https://example.com/packs/demo-1.0.0.dshpack"));
         assert!(is_remote_spec("http://example.com/demo-1.0.0.dshpack"));
         assert!(!is_remote_spec(r"C:\packs\demo-1.0.0.dshpack"));

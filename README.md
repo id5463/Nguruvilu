@@ -104,7 +104,7 @@ src/
   skills.rs        技能系统(目录扫描 / frontmatter 解析 / 目录注入 / 加载工具)
   mcp.rs           MCP 客户端(stdio,JSON-RPC,并发安全)
   pack.rs          整合包(.dshpack zip:打包 / 校验 / 安装 / 清单;Carried 与 Fetched 两种内容形态)
-  preinstall.rs    预装包(六个官方包嵌进二进制;已卸载不复活、已编辑不覆盖)
+  preinstall.rs    预装包(两个官方包:starter 五合一 + judge 嵌进二进制;已卸载不复活、已编辑不覆盖)
   dylib.rs         动态库插件(最小 C ABI + JSON API、ABI 校验、热更新)
   assembly.rs      装配清单(阶段 / 依赖 / order / 平台过滤 / 循环检测)
   ledger.rs        安装台账(哈希去重,原子写)
@@ -374,12 +374,12 @@ GitHub/URL 方式的**归档字节**按内容寻址进缓存(`~/.nguruvilu/cache
 
 | 形态 | 语义 | 典型用法 | 断网时 |
 |---|---|---|---|
-| **`Carried`(随包携带)** | 内容就在归档里,装包不解外部的东西 | 文案、人设、默认值、界面 —— 预装六包全是纯随身包 | ✅ 完全可用 |
+| **`Carried`(随包携带)** | 内容就在归档里,装包不解外部的东西 | 文案、人设、默认值、界面 —— 预装两包(starter、judge)全是纯随身包 | ✅ 完全可用 |
 | **`Fetched`(装时下载)** | 归档只有几 KB 的**引用**:`source + sha256`,装包时抓进 `files/` | 驱动二进制、远程技能目录、GitHub 上的界面 | 首次需要联网;**命中缓存后完全离线** |
 
 所以一个"下载型包"本身仍然很小(computer-use 1.2.0 的归档 **3.8 KB**,它引用的驱动
 27.7 MB 在装包时按平台取、按 sha256 校验、进缓存);一个"离线包"则一行网络都不走
-(预装六包即此类,首次启动直接放置)。
+(预装两包即此类,首次启动直接放置)。
 
 **支持的来源形式**(`Source::parse`):
 
@@ -427,14 +427,15 @@ stages:
 | 层 | 谁负责 | 例 |
 |---|---|---|
 | 插件代码 | 内核内置(`builtin:`)或动态库(`dylib:`) | `delegate`、`search` 的实现编在二进制里 |
-| 启用与否 | **包的清单**:`"plugins": [{"id":"…","source":"builtin:…"}]` | `packs/search` 声明 `builtin:search` |
+| 启用与否 | **包的清单**:`"plugins": [{"id":"…","source":"builtin:…"}]` | `packs/starter` 声明 `builtin:search` |
 | 配置 | 用户设置 / 包里的默认值文件 | `settings.search` ← `search.json` 只填空缺 |
-| 归属显示 | 装配时记来源,状态里回读 | 面板:`delegate ← subagent` |
+| 归属显示 | 装配时记来源,状态里回读 | 面板:`delegate ← starter` |
 
 - **只声明、不启用,等于没有**:`ngu` 启动时把 `builtin:*` 的代码放进去,但工具表里
   不会出现,直到某个包的装配问它要。没有包 → 内核没有这个能力。
-- **卸载跟包走**:卸掉 `search` 包 → 插件纤维卸下 → `search_web` 从工具表消失;你配的
-  设置不删,装回来即恢复。界面上那一节(搜索三栏)也随包动态创建/移除。
+- **卸载跟包走**:卸掉 `starter` 包 → 插件纤维卸下 → `delegate` 与 `search_web` 从工具表消失;你配的
+  设置不删,装回来即恢复。界面上那一节(搜索三栏)也随包动态创建/移除
+  (搜索的开关粒度另有面板 `off`,不必整包卸载)。
 - **不搞独占**:我们研究过 DSH 的 computer-use 注册表(一个会话只允许一个电脑操作
   提供方),**刻意不做** —— 多种操控电脑的方式可以自由并存,同时驱动一台桌面时由使用者
   自己协调。自由优先于互斥。
@@ -444,7 +445,7 @@ stages:
 
 ## 联网搜索
 
-`search_web` 由 `search` 包启用,三家方言各按自己的方式带 key:
+`search_web` 由包声明启用(预装由 `starter` 携带),三家服务商协议各按自己的方式带 key:
 
 | 方言 | 请求 | key 位置 |
 |---|---|---|
@@ -537,7 +538,7 @@ cargo build --release --offline          # → target/release/ngu
 # 桌面(独立 crate,单文件,约 8.4 MB;界面是"母版",运行时服务的是 ui 包那份)
 cargo build --release --offline --manifest-path desktop/Cargo.toml
 
-# 测试:单元 + 动态库集成 + 内核集成 + CLI + 界面一致性,共 444 项
+# 测试:单元 + 动态库集成 + 内核集成 + CLI + 界面一致性,共 446 项
 cargo test --offline
 
 # 发布:出 dist/ 与桌面副本,打印 SHA256
@@ -556,7 +557,7 @@ pwsh -File release.ps1
 
 ## 状态
 
-**完整架构已实现:444 个测试通过(402 单元 + 9 动态库集成 + 26 内核集成 + 5 CLI + 2 界面)。**
+**完整架构已实现:446 个测试通过(404 单元 + 9 动态库集成 + 26 内核集成 + 5 CLI + 2 界面)。**
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
@@ -564,7 +565,7 @@ pwsh -File release.ps1
 | 模型客户端 | ✅ | 仅 OpenAI 格式;流式;工具调用分片拼接;缓存命中统计 |
 | 中立消息格式 | ✅ | provider 无关,只在请求边界转换 |
 | 四个基础工具 | ✅ | ACI 原则限界输出;跨平台 shell 解析(POSIX 命令在 Windows 可用) |
-| **宿主内置工具** | ✅ | `pack` 打包安装、`search_web`(Tavily/Brave/Exa,**由 `search` 包的插件启用**,未配 key 不出现)、`delegate` 子代理、`judge` 判官(**由 `judge` 包的插件启用**,未配 key 不出现) |
+| **宿主内置工具** | ✅ | `pack` 打包安装、`search_web`(Tavily/Brave/Exa,**由 `starter` 的插件声明启用**,未配 key 不出现)、`delegate` 子代理、`judge` 判官(**由 `judge` 包的插件启用**,未配 key 不出现) |
 | **子代理** | ✅ | `delegate`:同路由同工具表同提示词,空历史起步;步数上限 12,深度上限 2 |
 | **网络调节** | ✅ | 设置 / 包 `models.json` / 插件 `network` 服务三条路径,统一进路由后才建客户端 |
 | 工具注册表 | ✅ | 冲突默认 fail loud,覆盖记录可查 |
@@ -578,10 +579,10 @@ pwsh -File release.ps1
 | **动态加载层** | ✅ | 插件·MCP·技能平级加载,台账去重,失败策略(abort/skip/retry) |
 | **整合包** | ✅ | .dshpack(zip):打包 / 校验 / 安装;身份与装配分离;路径逃逸防护 |
 | **包的加载与卸载** | ✅ | 按对话生效;卸载(留文件)与删除是两件事;对话内热加载 / 热卸载,回合结束生效,不重启 |
-| **预装包** | ✅ | 六个官方包(chinese / ui / search / subagent / computer-use / judge)嵌在可执行文件里,首次运行自动放置;卸载过不复活,改过不覆盖 |
-| **桌面 / 浏览器能力包** | ✅ | 两个包各管一条线:`computer-use`(桌面,预装,**装包时按平台自动下载并校验 `cua-driver`,之后全离线**,冷装约 20s / 二跑 0.2s,实测 57 个桌面工具)与 `browser-use`(浏览器,需自装 `chrome-devtools-mcp@1.10.1`) |
+| **预装包** | ✅ | **两个官方包**:`starter`(**五合一**:chinese+ui+search+subagent+computer-use 的人设/注入/界面文案/搜索默认值/界面副本/桌面驱动声明/两个插件)+ `judge`(判官);嵌在可执行文件里,首次运行自动放置;卸载过不复活,改过不覆盖。升级到五合一的机器上,旧五包**未改动才自动退役**(改动过的保留并每次提示) |
+| **桌面 / 浏览器能力包** | ✅ | 两条线:`starter` 的 `mcp.json`(桌面,**装包时按平台自动下载并校验 `cua-driver`,之后全离线**,冷装约 20s / 二跑 0.2s,实测 57 个桌面工具)与 `browser-use`(浏览器,需自装 `chrome-devtools-mcp@1.10.1`) |
 | **装包源** | ✅ | 本地文件 / `github:owner/repo[@path][@ref]` / `https://` 归档 URL;下载进内容寻址缓存,多归档列出不猜 |
-| **插件归属** | ✅ | 装配记录来源,状态回读成 `delegate ← subagent`;卸载跟包走,不搞独占,多种电脑操控方式自由并存 |
+| **插件归属** | ✅ | 装配记录来源,状态回读成 `delegate ← starter`;卸载跟包走,不搞独占,多种电脑操控方式自由并存 |
 | **判官(判断模型)** | ✅ | `judge` 工具:TypeSafe Jev `state + 类型化问题` → 答案/分数/是非 + 置信度(70~500ms);`judge` 包启用、面板三栏/CLI 三旗/`NGU_JUDGE_*` 三环境变量;未知结构原样透传;**红线:建议者不是闸门** |
 | **Claude Code 互操作** | ✅ | skills 同形态直吃(frontmatter 支持块标量与带引号冒号值);`ngu mcp import` 把 `.mcp.json` 变成本地包(http 传输如实跳过);commands/子代理定义 → 映射(P1);hooks 单独议题 |
 | **全部热加载** | ✅ | `apply_change` 统一入口、会话/全局作用域、同意策略表、每轮快照 |
