@@ -160,6 +160,17 @@ impl Source {
             }
         }
 
+        // A path inside the pack: `skills/pdf`, `./skills/pdf` — the offline
+        // shape the format documents and what a pack uses to ship its own
+        // skills. The scheme branch above already claimed every colon-bearing
+        // string, so this cannot swallow a URL or a Windows absolute path, and
+        // a bare word (`no-colon-here`) still fails: a word is not a path.
+        if raw.starts_with('.') || raw.contains('/') || raw.contains('\\') {
+            return Ok(Source::Local {
+                path: raw.to_string(),
+            });
+        }
+
         Err(anyhow!(
             "'{raw}' is not a usable source; expected a scheme such as {}, \
              or a plain https:// URL",
@@ -985,6 +996,24 @@ mod tests {
                 "{bad:?} produced: {text}"
             );
         }
+    }
+
+    #[test]
+    fn a_path_inside_the_pack_parses_as_local() {
+        // The offline shape pack-format documents ("相对路径"): a pack shipping
+        // its own skills writes them without a scheme. A colon-bearing string
+        // was already claimed by the scheme branch, so this cannot swallow a
+        // URL or `C:\...`; a bare word still fails.
+        for raw in ["./skills/pdf", "skills/pdf", "..\\shared\\skills"] {
+            assert_eq!(
+                Source::parse(raw).unwrap(),
+                Source::Local {
+                    path: raw.to_string()
+                },
+                "{raw}"
+            );
+        }
+        assert!(Source::parse("no-colon-here").is_err(), "a word is not a path");
     }
 
     #[test]
