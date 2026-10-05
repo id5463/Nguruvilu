@@ -247,6 +247,8 @@ fn parse_skill(manifest: &Path, dir: &Path, root: &Path) -> Result<Skill> {
 ///
 /// Only flat `key: value` pairs are read; skills do not need a full YAML
 /// parser and pulling one in would be more machinery than the format deserves.
+/// The two shapes real skills use beyond flat pairs — block scalars and
+/// quoted values — are handled explicitly (see inside).
 fn split_frontmatter(raw: &str) -> (BTreeMap<String, String>, String) {
     let mut fields = BTreeMap::new();
     let trimmed = raw.strip_prefix('\u{feff}').unwrap_or(raw);
@@ -261,14 +263,51 @@ fn split_frontmatter(raw: &str) -> (BTreeMap<String, String>, String) {
 
     let mut body_start = None;
     let mut offset = first.len() + 1;
+    // A YAML block scalar (`>` folded or `|` literal, optionally chomped with
+    // -/+) keeps its value on the following indented lines. Treating those as
+    // pairs would silently drop a long description and smuggle its sentences
+    // in as fake keys — Claude Code skills use this shape routinely, so
+    // reading their frontmatter needs it.
+    let mut block: Option<(String, bool)> = None; // (key, folded?)
     for line in lines {
         offset += line.len() + 1;
         if line.trim() == "---" {
             body_start = Some(offset);
             break;
         }
+        if let Some((key, folded)) = block.clone() {
+            let indented = line.starts_with([' ', '\t']) || line.trim().is_empty();
+            if indented {
+                let text = line.trim();
+                if !text.is_empty() {
+                    let slot = fields.entry(key).or_default();
+                    if folded {
+                        if !slot.is_empty() {
+                            slot.push(' ');
+                        }
+                    } else if !slot.is_empty() {
+                        slot.push('\n');
+                    }
+                    slot.push_str(text);
+                }
+                continue;
+            }
+            // Not indented any more: the block ended.
+            block = None;
+        }
         if let Some((key, value)) = line.split_once(':') {
-            fields.insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
+            let key = key.trim().to_ascii_lowercase();
+            let value = value.trim();
+            // `>`, `|-`, `|+` … — an indicator, never a value.
+            let scalar_shape = !value.is_empty()
+                && matches!(value.as_bytes()[0], b'>' | b'|')
+                && value.bytes().all(|b| matches!(b, b'>' | b'|' | b'-' | b'+'));
+            if scalar_shape {
+                fields.entry(key.clone()).or_default();
+                block = Some((key, value.as_bytes()[0] == b'>'));
+                continue;
+            }
+            fields.insert(key, unquote(value).to_string());
         }
     }
 
@@ -277,6 +316,21 @@ fn split_frontmatter(raw: &str) -> (BTreeMap<String, String>, String) {
         // Unterminated frontmatter: treat the whole file as body.
         None => (BTreeMap::new(), trimmed.to_string()),
     }
+}
+
+/// Strip one matching pair of surrounding quotes.
+///
+/// Quoted values are how a description carries a colon without the flat
+/// parser splitting on it, so the quotes have to go after the split.
+fn unquote(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    if value.len() >= 2 {
+        let (first, last) = (bytes[0], bytes[value.len() - 1]);
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
 }
 
 /// Register the `skill` tool against a registry.
@@ -394,6 +448,61 @@ mod tests {
         let (fields, body) = split_frontmatter("# Just a heading\n");
         assert!(fields.is_empty());
         assert_eq!(body, "# Just a heading\n");
+    }
+
+    #[test]
+    fn block_scalar_and_quoted_values_survive() {
+        // The Claude Code skill shape: long descriptions run as a folded
+        // block, unknown fields ride along, and quoted values carry colons
+        // the flat parser must not split on.
+        let raw = concat!(
+            "---\n",
+            "name: pdf-tools\n",
+            "description: >\n",
+            "  Extract text and tables from PDF files.\n",
+            "  Works when: pdftotext is missing.\n",
+            "allowed-tools: Read, Grep\n",
+            "license: MIT\n",
+            "---\n",
+            "\n",
+            "Do the thing.\n"
+        );
+        let (fields, body) = split_frontmatter(raw);
+        assert_eq!(
+            fields.get("description").unwrap(),
+            "Extract text and tables from PDF files. Works when: pdftotext is missing."
+        );
+        assert_eq!(fields.get("allowed-tools").unwrap(), "Read, Grep");
+        assert_eq!(fields.get("license").unwrap(), "MIT");
+        assert_eq!(body.trim(), "Do the thing.");
+
+        let quoted = "---\ndescription: \"Extract: text from PDFs\"\n---\n\nBody\n";
+        let (fields, body) = split_frontmatter(quoted);
+        assert_eq!(fields.get("description").unwrap(), "Extract: text from PDFs");
+        assert_eq!(body.trim(), "Body");
+    }
+
+    #[test]
+    fn a_claude_code_shaped_skill_end_to_end() {
+        let root = temp_root("claude-shape");
+        let dir = root.join("incident-review");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: incident-review\ndescription: >\n  Review an incident timeline and\n  draft the postmortem.\nallowed-tools: Read, Bash(git log:*)\nlicense: MIT\n---\n\nSteps:\n1. Read the timeline.\n",
+        )
+        .unwrap();
+
+        let mut registry = SkillRegistry::with_roots([root]);
+        registry.scan().unwrap();
+
+        let skill = registry.get("incident-review").expect("loaded");
+        assert_eq!(skill.description, "Review an incident timeline and draft the postmortem.");
+        assert!(skill.body.contains("1. Read the timeline."));
+        // The catalog is what the model sees: description in, body out.
+        let catalog = registry.catalog().unwrap();
+        assert!(catalog.contains("incident-review: Review an incident timeline"));
+        assert!(!catalog.contains("Read the timeline"));
     }
 
     #[test]

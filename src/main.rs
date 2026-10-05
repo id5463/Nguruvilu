@@ -15,7 +15,7 @@
 //! `stderr`, so the output stays pipeable.
 
 use std::io::{IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
@@ -201,6 +201,20 @@ enum Command {
         /// Directory to install into.
         #[arg(long)]
         into: Option<PathBuf>,
+    },
+    /// Import MCP servers from a Claude Code / Claude Desktop config into a pack.
+    McpImport {
+        /// The `.mcp.json` (or claude_desktop_config.json) to read.
+        file: PathBuf,
+        /// Pack directory to create (default: ./<name>).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Pack name (default: derived from the file name).
+        #[arg(long)]
+        name: Option<String>,
+        /// License for the generated pack — the servers' own licenses stay yours to check.
+        #[arg(long, default_value = "MIT")]
+        license: String,
     },
     /// List installed packs.
     Packs,
@@ -578,6 +592,9 @@ async fn run() -> Result<()> {
             return pack_command(dir, out.as_ref(), *pin, *offline, cli.json).await
         }
         Some(Command::Install { file, into }) => return install_command(file, into.as_ref(), cli.json).await,
+        Some(Command::McpImport { file, out, name, license }) => {
+            return mcp_import_command(file, out.as_deref(), name.as_deref(), license)
+        }
         Some(Command::Packs) => return list_packs(cli.json),
         Some(Command::Uninstall { name, all, delete, into }) => {
             return uninstall_command(name, *all, *delete, into.as_ref(), cli.json)
@@ -1770,6 +1787,255 @@ fn pack_archive_in(dir: &std::path::Path) -> Result<PathBuf> {
     }
 }
 
+/// Import MCP servers from a Claude Code config file into a new pack directory.
+///
+/// The classic config shape is `{"mcpServers": {name: {command, args, env}}}`
+/// (Claude Code's `.mcp.json`, Claude Desktop's config file); our own
+/// `{"servers": [...]}` passes through the strict reader. Entries without a
+/// command — the url-based transports — are reported and *not* written to the
+/// pack: this kernel connects stdio servers today, and a pack claiming
+/// otherwise would fail at load instead of at import.
+fn mcp_import_command(
+    file: &Path,
+    out: Option<&Path>,
+    name: Option<&str>,
+    license: &str,
+) -> Result<()> {
+    let raw =
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+    let doc: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing {} as JSON", file.display()))?;
+
+    let (servers, skipped) = convert_mcp_servers(&doc)?;
+
+    let pack_name = match name {
+        Some(name) => name.trim().to_string(),
+        None => sanitize_pack_name(
+            &file
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+                .unwrap_or_else(|| "mcp".into()),
+        ),
+    };
+    if pack_name.is_empty() {
+        anyhow::bail!("the pack name is empty after sanitizing; pass --name");
+    }
+
+    let dir = out.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(&pack_name));
+    if dir.exists() {
+        let non_empty = std::fs::read_dir(&dir)?.next().transpose()?.is_some();
+        if non_empty {
+            anyhow::bail!(
+                "{} exists and is not empty — refusing to overwrite; pass --out for another directory",
+                dir.display()
+            );
+        }
+    }
+    std::fs::create_dir_all(&dir)?;
+
+    let manifest = serde_json::json!({
+        "formatVersion": 1,
+        "game": "nguruvilu",
+        "name": pack_name,
+        "versionId": "1.0.0",
+        "license": license,
+        "kernelVersion": "0.1.0",
+        "dependencies": { "nguruvilu": ">=0.1.0" },
+        "mcp": "mcp.json",
+    });
+    std::fs::write(
+        dir.join("dsh.index.json"),
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
+    std::fs::write(
+        dir.join("mcp.json"),
+        serde_json::to_string_pretty(&nguruvilu::pack::McpFile {
+            servers: servers.clone(),
+        })?,
+    )?;
+    std::fs::write(
+        dir.join("README.md"),
+        generated_pack_readme(&pack_name, file, license, &servers, &skipped),
+    )?;
+
+    println!("imported {} server(s) into {}", servers.len(), dir.display());
+    for server in &servers {
+        println!(
+            "  + {}  ({})",
+            server.id,
+            server.command.as_deref().unwrap_or("(no command)")
+        );
+    }
+    for (id, reason) in &skipped {
+        println!("  - {id}: {reason}");
+    }
+    println!();
+    println!(
+        "next: ngu pack {dir} --out {name}-1.0.0.dshpack   then   ngu install <the archive>",
+        dir = dir.display(),
+        name = pack_name
+    );
+    println!("note: each server's runtime (node, …) and its own license are yours to provide.");
+    Ok(())
+}
+
+/// Convert a config document into our servers plus what had to be left out.
+fn convert_mcp_servers(
+    doc: &serde_json::Value,
+) -> Result<(Vec<nguruvilu::pack::McpServerDecl>, Vec<(String, String)>)> {
+    let mut servers = Vec::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
+
+    if let Some(map) = doc.get("mcpServers").and_then(|v| v.as_object()) {
+        for (id, entry) in map {
+            match classify_server(id, entry) {
+                Ok(server) => servers.push(server),
+                Err(reason) => skipped.push((id.clone(), reason)),
+            }
+        }
+        return Ok((servers, skipped));
+    }
+    if let Some(list) = doc.get("servers").and_then(|v| v.as_array()) {
+        // Our own format: pass it through the same strict reader an install
+        // would use, so an invalid file fails here rather than at load.
+        let ours: nguruvilu::pack::McpFile = serde_json::from_value(
+            serde_json::json!({ "servers": list.clone() }),
+        )
+        .context("the servers array does not match our mcp.json shape")?;
+        return Ok((ours.servers, skipped));
+    }
+    anyhow::bail!(
+        "no servers found: expected an object with 'mcpServers' (Claude Code / \
+         Claude Desktop) or 'servers' (our mcp.json)"
+    );
+}
+
+/// One entry → one declaration, or the reason it was left out.
+fn classify_server(
+    id: &str,
+    entry: &serde_json::Value,
+) -> Result<nguruvilu::pack::McpServerDecl, String> {
+    let obj = entry
+        .as_object()
+        .ok_or_else(|| "entry is not an object".to_string())?;
+    let command = obj
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
+    let Some(command) = command else {
+        let kind = obj.get("type").and_then(serde_json::Value::as_str).unwrap_or_else(|| {
+            if obj.contains_key("url") { "http" } else { "unknown" }
+        });
+        return Err(format!(
+            "'{kind}' transport is not supported yet (stdio only) — add it by hand when http lands"
+        ));
+    };
+    let args = obj
+        .get("args")
+        .and_then(serde_json::Value::as_array)
+        .map(|list| {
+            list.iter()
+                .map(|value| match value {
+                    serde_json::Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let env = obj
+        .get("env")
+        .and_then(serde_json::Value::as_object)
+        .map(|map| {
+            map.iter()
+                .map(|(key, value)| match value {
+                    serde_json::Value::String(text) => (key.clone(), text.clone()),
+                    other => (key.clone(), other.to_string()),
+                })
+                .collect::<std::collections::BTreeMap<String, String>>()
+        })
+        .unwrap_or_default();
+    Ok(nguruvilu::pack::McpServerDecl {
+        id: id.to_string(),
+        transport: "stdio".into(),
+        source: None,
+        sha256: None,
+        command: Some(command.to_string()),
+        args,
+        env,
+        scope: Some("session".into()),
+        platforms: std::collections::BTreeMap::new(),
+    })
+}
+
+/// A file-derived pack name: lowercase, `[a-z0-9-]`, no edge dashes.
+fn sanitize_pack_name(raw: &str) -> String {
+    let lowered = raw.trim().to_ascii_lowercase();
+    let mut out = String::new();
+    let mut dash = false;
+    for ch in lowered.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            dash = false;
+        } else if !dash && !out.is_empty() {
+            out.push('-');
+            dash = true;
+        }
+    }
+    out.trim_end_matches('-').to_string()
+}
+
+/// The generated pack's README: what was imported, what was skipped, how to
+/// pack and install it — and that the runtime and licenses stay with the user.
+fn generated_pack_readme(
+    pack_name: &str,
+    source_file: &Path,
+    license: &str,
+    servers: &[nguruvilu::pack::McpServerDecl],
+    skipped: &[(String, String)],
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# {pack_name} — imported MCP servers\n\n"));
+    out.push_str(&format!(
+        "由 `ngu mcp import {}` 生成:身份清单 + `mcp.json` + 这份说明。\n\n",
+        source_file.display()
+    ));
+    out.push_str(
+        "**只搬运声明,不搬运程序** —— 每个服务器的运行时(npx 需要 Node、各自的\n\
+         npm 包或可执行文件)与它自己的许可证,由你提供与核对。环境变量的**值**\n\
+         不会出现在这份文件里。\n\n",
+    );
+    out.push_str("## 服务器\n\n| id | 命令 | 参数 | 环境变量名 |\n|---|---|---|---|\n");
+    for server in servers {
+        let command = server.command.as_deref().unwrap_or("");
+        let args = server
+            .args
+            .iter()
+            .map(|arg| format!("`{arg}`"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let args = if args.is_empty() { "—".into() } else { args };
+        let keys = server.env.keys().cloned().collect::<Vec<_>>().join(", ");
+        let keys = if keys.is_empty() { "—".into() } else { keys };
+        out.push_str(&format!("| {} | `{command}` | {args} | {keys} |\n", server.id));
+    }
+    if !skipped.is_empty() {
+        out.push_str("\n## 未导入(本内核暂不支持)\n\n");
+        for (id, reason) in skipped {
+            out.push_str(&format!("- `{id}`:{reason}\n"));
+        }
+    }
+    out.push_str(&format!(
+        "\n## 用法\n\n```bash\nngu pack {name} --out {name}-1.0.0.dshpack\n\
+         ngu install {name}-1.0.0.dshpack\nngu packs\n```\n\n\
+         装载后每个服务器的工具以 `mcp__<id>__*` 出现;卸载留文件,`--delete` 才删。\n\n\
+         ## 许可\n\n本包清单声明 **{license}**(这是这个*包*的许可);各 MCP 服务器\n\
+         本身的许可以其上游为准。\n",
+        name = pack_name
+    ));
+    out
+}
+
 fn list_packs(as_json: bool) -> Result<()> {
     let packs_dir = nguruvilu::pack::default_packs_dir();
     let packs = nguruvilu::pack::installed(&packs_dir)?;
@@ -2816,5 +3082,61 @@ mod tests {
         assert!(error.contains("2 archives"), "{error}");
         assert!(error.contains("demo-1.0.0.dshpack"), "{error}");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn claude_config_converts_stdio_and_reports_the_rest() {
+        let doc = serde_json::json!({
+            "mcpServers": {
+                "files": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."] },
+                "brave": { "type": "stdio", "command": "node", "args": ["brave.js"],
+                           "env": { "BRAVE_API_KEY": "sekret" } },
+                "remote": { "type": "http", "url": "https://example.com/mcp" }
+            }
+        });
+        let (servers, skipped) = convert_mcp_servers(&doc).expect("converts");
+        assert_eq!(servers.len(), 2);
+        let files = servers.iter().find(|s| s.id == "files").expect("files");
+        assert_eq!(files.command.as_deref(), Some("npx"));
+        assert_eq!(files.transport, "stdio");
+        assert_eq!(files.scope.as_deref(), Some("session"));
+        assert_eq!(files.args.len(), 3);
+        let brave = servers.iter().find(|s| s.id == "brave").expect("brave");
+        assert_eq!(brave.env.get("BRAVE_API_KEY").unwrap(), "sekret");
+
+        // The url transport is reported, not smuggled into the pack.
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].0, "remote");
+        assert!(skipped[0].1.contains("stdio only"), "{}", skipped[0].1);
+
+        // And the generated file must pass our own strict reader.
+        let text = serde_json::to_string_pretty(&nguruvilu::pack::McpFile { servers }).unwrap();
+        let back: nguruvilu::pack::McpFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.servers.len(), 2);
+    }
+
+    #[test]
+    fn our_own_servers_shape_passes_through() {
+        let doc = serde_json::json!({
+            "servers": [{ "id": "browser", "transport": "stdio", "command": "x",
+                          "args": ["a"], "scope": "session" }]
+        });
+        let (servers, skipped) = convert_mcp_servers(&doc).expect("passes");
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].id, "browser");
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn an_entry_without_a_command_is_skipped_and_names_are_derived() {
+        let doc = serde_json::json!({ "mcpServers": { "broken": {} } });
+        let (servers, skipped) = convert_mcp_servers(&doc).expect("converts around it");
+        assert!(servers.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped[0].1.contains("unknown"), "{}", skipped[0].1);
+
+        assert_eq!(sanitize_pack_name(".mcp"), "mcp");
+        assert_eq!(sanitize_pack_name("Claude_Desktop Config"), "claude-desktop-config");
+        assert_eq!(sanitize_pack_name("--weird--name--"), "weird-name");
     }
 }

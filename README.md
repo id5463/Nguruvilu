@@ -97,11 +97,14 @@ src/
   tools/
     mod.rs         工具注册表(冲突默认 fail loud + 覆盖记录可查)
     base.rs        四个基础工具 read / write / edit / bash(ACI 原则限界输出)
+    search.rs      联网搜索(三家方言;包启用 + key 决定工具出不出现)
+    subagent.rs    delegate 子代理(同路由同工具表,空历史起步)
+    judge.rs       判官(TypeSafe Jev 决策模型;与 search 同一套插件形态)
   plugin.rs        插件内核(隔离域 / epoch 自动重载 / 依赖 / effect 撤销 / 权限接口)
   skills.rs        技能系统(目录扫描 / frontmatter 解析 / 目录注入 / 加载工具)
   mcp.rs           MCP 客户端(stdio,JSON-RPC,并发安全)
   pack.rs          整合包(.dshpack zip:打包 / 校验 / 安装 / 清单;Carried 与 Fetched 两种内容形态)
-  preinstall.rs    预装包(五个官方包嵌进二进制;已卸载不复活、已编辑不覆盖)
+  preinstall.rs    预装包(六个官方包嵌进二进制;已卸载不复活、已编辑不覆盖)
   dylib.rs         动态库插件(最小 C ABI + JSON API、ABI 校验、热更新)
   assembly.rs      装配清单(阶段 / 依赖 / order / 平台过滤 / 循环检测)
   ledger.rs        安装台账(哈希去重,原子写)
@@ -131,6 +134,7 @@ examples/
 export NGU_API_KEY=...
 export NGU_BASE_URL=https://api.b.ai/v1
 export NGU_MODEL=deepseek-v4.1-flash
+export NGU_JUDGE_API_KEY=...    # 可选:判官(判断模型)—— 配了才有 judge 工具
 
 # 构建(产出单文件原生可执行,约 8.4 MB)
 cargo build --release        # → target/release/ngu
@@ -148,6 +152,9 @@ ngu skills --skill-dir ./skills --verbose # 连同正文
 # 装配清单(整合包)
 ngu assembly ./assembly.yaml             # 校验并预览加载计划
 ngu apply ./assembly.yaml                # 应用:加载插件 / MCP / 技能
+
+# 从 Claude Code 导入 MCP 配置,生成一个包(审过再 pack/install)
+ngu mcp import .mcp.json --name my-tools
 
 # 工作区快照
 ngu --git-snapshot -p "重构这个模块"      # 每轮前后自动提交
@@ -367,12 +374,12 @@ GitHub/URL 方式的**归档字节**按内容寻址进缓存(`~/.nguruvilu/cache
 
 | 形态 | 语义 | 典型用法 | 断网时 |
 |---|---|---|---|
-| **`Carried`(随包携带)** | 内容就在归档里,装包不解外部的东西 | 文案、人设、默认值、界面 —— 预装五包全是纯随身包 | ✅ 完全可用 |
+| **`Carried`(随包携带)** | 内容就在归档里,装包不解外部的东西 | 文案、人设、默认值、界面 —— 预装六包全是纯随身包 | ✅ 完全可用 |
 | **`Fetched`(装时下载)** | 归档只有几 KB 的**引用**:`source + sha256`,装包时抓进 `files/` | 驱动二进制、远程技能目录、GitHub 上的界面 | 首次需要联网;**命中缓存后完全离线** |
 
 所以一个"下载型包"本身仍然很小(computer-use 1.2.0 的归档 **3.8 KB**,它引用的驱动
 27.7 MB 在装包时按平台取、按 sha256 校验、进缓存);一个"离线包"则一行网络都不走
-(预装五包即此类,首次启动直接放置)。
+(预装六包即此类,首次启动直接放置)。
 
 **支持的来源形式**(`Source::parse`):
 
@@ -454,9 +461,44 @@ stages:
 - 包里的 `search.json` 只在**空缺**时补默认值(`provider`/`apiKeyEnv`/`maxResults`),
   从不覆盖你已经写好的设置;`apiKeyEnv` 只写**环境变量的名字**,钥匙从不进包。
 
+## 判官(判断模型)
+
+`judge` 由 `judge` 包启用,背后是 TypeSafe AI 的 **Jev**(System One 决策模型,
+2026-09-15 限量发布):材料进、带类型的问题出,回来的是**有界答案 + 概率 +
+置信度**,不是散文 —— 端到端 70~500 ms、输出免费,便宜到"决策前顺手问一句"。
+
+| 题型 | 形状 |
+|---|---|
+| `choice` | `{"type":"choice","instructions":"…","choices":["A","B"]}` |
+| `score` | `{"type":"score","instructions":"…","range":[0,100]}` |
+| `noul`(是非) | `{"type":"noul","instructions":"…","criteria":{"true":"…","false":"…"}}` |
+
+- **契约**:`POST <endpoint>/v1/systemone`,body `{model, state, questions}` →
+  `answers`:`choice`/`value`/`score` 取第一个已知字段当结论,附 `confidence` 与
+  `probabilities`;**没见过的结构原样透传,不猜**(工具说明里有最小示例);
+- **配置三入口**(等价):面板"判官"三栏(接口/密钥/模型,动态随包显隐)、
+  `ngu config set --judge-endpoint/--judge-key/--judge-model`、
+  `NGU_JUDGE_API_KEY` / `NGU_JUDGE_ENDPOINT` / `NGU_JUDGE_MODEL`;
+- **没配 key 就没有工具**(和 search 同一条规则);
+- **错误有动作**:401 直接给三个配置入口;422 附响应体并点明是契约问题、别重试;
+  429/529 提示退避;
+- **红线:建议者不是闸门。** 判官结论永远是上下文里的一条数据 —— 模型权衡、用户
+  拍板,系统不因为它说"不"拦任何动作,也不因为它说"行"免掉检查;低置信度的正确
+  用法是补信息/换问法/问用户。soul 与 README 都把这条写死;
+- **许可**:包本身 MIT;**Jev 是 TypeSafe 的专有服务**,需自行申请访问(早期访问制)。
+
+## 与 Claude Code 的互操作
+
+| 面 | 状态 | 细节 |
+|---|---|---|
+| **Skills**(`.claude/skills/**/SKILL.md`) | ✅ 直接可用 | 同为"目录 + frontmatter + 正文";frontmatter 支持 `>`/`\|` **块标量**与**带引号含冒号的值**(真实 Claude Code 技能常用这两种写法),未知字段(`allowed-tools`、`license`…)原样容忍;id 取目录名 |
+| **MCP**(`.mcp.json`) | ✅ `ngu mcp import` | 生成一个可审的本地包(清单 + mcp.json + 说明);stdio 直通并经**我们的严格读取器复核**;`http`/`sse` 等传输**如实列出并跳过**(本内核今天只连 stdio),不混进包里;环境变量**只写进包,值不出现在生成的 README 里** |
+| Slash commands / 子代理定义 | ⏳ 映射成技能(P1) | 纯提示词/persona 结构,风险低 |
+| Hooks | ⏳ 单独议题 | "事前拦截"与本内核"不设关卡 + 如实报告"的关系需要先设计(依赖插件事件系统) |
+
 ## 命令参考
 
-`ngu --help` 是权威;下表是常用全集(19 个子命令 + 全局选项):
+`ngu --help` 是权威;下表是常用全集(20 个子命令 + 全局选项):
 
 | 子命令 | 作用 |
 |---|---|
@@ -467,12 +509,13 @@ stages:
 | `apply` | 应用装配清单:加载插件 / MCP / 技能 |
 | `pack` | 从包目录打 `.dshpack`(`--out` 指定输出,`--pin` 钉引用,`--offline` 离线) |
 | **`install`** | **装包:本地文件 / `github:owner/repo[@path][@ref]` / `https://` 归档 URL**(`--into` 指定目录) |
+| **`mcp import`** | **把 Claude Code / Claude Desktop 的 `.mcp.json` 变成本地包**(stdio 直通并经严格读取器复核;http 等传输如实列出、不混进包里;`--name/--out/--license`) |
 | `packs` | 列出已安装(版本 / loaded / assembly) |
 | `uninstall` | 卸载(留文件);`--delete` 连文件一起删 |
 | `verify` | 只校验归档,不安装 |
 | `ui` | 把内置界面导出到目录,作为自己界面包的起点 |
 | `plugin` | 装一个动态库插件并报告它的贡献(开发用) |
-| `config` | `show` / `set` / `path` —— endpoint、key、model、reasoning、search… |
+| `config` | `show` / `set` / `path` —— endpoint、key、model、reasoning、search、judge… |
 | `runtime` | 策略表与生效配置 |
 | `injections` | 注入策略表与会命中的注入条目 |
 | `snapshot` | 查看 / 回滚工作区 git 快照 |
@@ -482,7 +525,8 @@ stages:
 `--json`、`-q`、`--max-steps`、`--system`、`--cwd`、`--home`、`--skill-dir`、
 `--reasoning-effort`、`--persona`、`--cache-policy`、`--git-snapshot`、
 `--assembly <file>`;环境变量 `NGU_API_KEY` / `NGU_BASE_URL` / `NGU_MODEL` /
-`NGU_REASONING_EFFORT` / `NGU_HOME`。**优先级:命令行 > 环境变量 > 设置文件。**
+`NGU_REASONING_EFFORT` / `NGU_HOME` / `NGU_JUDGE_API_KEY` / `NGU_JUDGE_ENDPOINT` /
+`NGU_JUDGE_MODEL`。**优先级:命令行 > 环境变量 > 设置文件。**
 
 ## 构建、测试与发布
 
@@ -493,7 +537,7 @@ cargo build --release --offline          # → target/release/ngu
 # 桌面(独立 crate,单文件,约 8.4 MB;界面是"母版",运行时服务的是 ui 包那份)
 cargo build --release --offline --manifest-path desktop/Cargo.toml
 
-# 测试:单元 + 动态库集成 + 内核集成 + CLI + 界面一致性,共 427 项
+# 测试:单元 + 动态库集成 + 内核集成 + CLI + 界面一致性,共 444 项
 cargo test --offline
 
 # 发布:出 dist/ 与桌面副本,打印 SHA256
@@ -512,7 +556,7 @@ pwsh -File release.ps1
 
 ## 状态
 
-**完整架构已实现:427 个测试通过(388 单元 + 9 动态库集成 + 26 内核集成 + 2 CLI + 2 界面)。**
+**完整架构已实现:444 个测试通过(402 单元 + 9 动态库集成 + 26 内核集成 + 5 CLI + 2 界面)。**
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
@@ -520,7 +564,7 @@ pwsh -File release.ps1
 | 模型客户端 | ✅ | 仅 OpenAI 格式;流式;工具调用分片拼接;缓存命中统计 |
 | 中立消息格式 | ✅ | provider 无关,只在请求边界转换 |
 | 四个基础工具 | ✅ | ACI 原则限界输出;跨平台 shell 解析(POSIX 命令在 Windows 可用) |
-| **宿主内置工具** | ✅ | `pack` 打包安装、`search_web`(Tavily/Brave/Exa,**由 `search` 包的插件启用**,未配 key 不出现)、`delegate` 子代理 |
+| **宿主内置工具** | ✅ | `pack` 打包安装、`search_web`(Tavily/Brave/Exa,**由 `search` 包的插件启用**,未配 key 不出现)、`delegate` 子代理、`judge` 判官(**由 `judge` 包的插件启用**,未配 key 不出现) |
 | **子代理** | ✅ | `delegate`:同路由同工具表同提示词,空历史起步;步数上限 12,深度上限 2 |
 | **网络调节** | ✅ | 设置 / 包 `models.json` / 插件 `network` 服务三条路径,统一进路由后才建客户端 |
 | 工具注册表 | ✅ | 冲突默认 fail loud,覆盖记录可查 |
@@ -534,14 +578,16 @@ pwsh -File release.ps1
 | **动态加载层** | ✅ | 插件·MCP·技能平级加载,台账去重,失败策略(abort/skip/retry) |
 | **整合包** | ✅ | .dshpack(zip):打包 / 校验 / 安装;身份与装配分离;路径逃逸防护 |
 | **包的加载与卸载** | ✅ | 按对话生效;卸载(留文件)与删除是两件事;对话内热加载 / 热卸载,回合结束生效,不重启 |
-| **预装包** | ✅ | 五个官方包(chinese / ui / search / subagent / computer-use)嵌在可执行文件里,首次运行自动放置;卸载过不复活,改过不覆盖 |
+| **预装包** | ✅ | 六个官方包(chinese / ui / search / subagent / computer-use / judge)嵌在可执行文件里,首次运行自动放置;卸载过不复活,改过不覆盖 |
 | **桌面 / 浏览器能力包** | ✅ | 两个包各管一条线:`computer-use`(桌面,预装,**装包时按平台自动下载并校验 `cua-driver`,之后全离线**,冷装约 20s / 二跑 0.2s,实测 57 个桌面工具)与 `browser-use`(浏览器,需自装 `chrome-devtools-mcp@1.10.1`) |
 | **装包源** | ✅ | 本地文件 / `github:owner/repo[@path][@ref]` / `https://` 归档 URL;下载进内容寻址缓存,多归档列出不猜 |
 | **插件归属** | ✅ | 装配记录来源,状态回读成 `delegate ← subagent`;卸载跟包走,不搞独占,多种电脑操控方式自由并存 |
+| **判官(判断模型)** | ✅ | `judge` 工具:TypeSafe Jev `state + 类型化问题` → 答案/分数/是非 + 置信度(70~500ms);`judge` 包启用、面板三栏/CLI 三旗/`NGU_JUDGE_*` 三环境变量;未知结构原样透传;**红线:建议者不是闸门** |
+| **Claude Code 互操作** | ✅ | skills 同形态直吃(frontmatter 支持块标量与带引号冒号值);`ngu mcp import` 把 `.mcp.json` 变成本地包(http 传输如实跳过);commands/子代理定义 → 映射(P1);hooks 单独议题 |
 | **全部热加载** | ✅ | `apply_change` 统一入口、会话/全局作用域、同意策略表、每轮快照 |
 | **上下文注入引擎** | ✅ | 预算百分比+上限、触发、深度注入、分组竞争、递归激活 |
 | **工作区 git 快照** | ✅ | 每轮前后自动提交、历史、回滚(含删除新增文件) |
-| CLI | ✅ | 交互 / 打印 / JSON 三模式 + 19 个管理子命令 |
+| CLI | ✅ | 交互 / 打印 / JSON 三模式 + 20 个管理子命令 |
 | **桌面应用** | ✅ | `desktop/` 独立 crate:`ngu-desktop.exe` 约 8.4 MB 单文件,tao + wry + 系统 WebView2,三面板;界面母版编译进 exe,运行时服务 `ui` 包副本 |
 
 ## 端到端验证(`deepseek-v4.1-flash` @ `api.b.ai`)
