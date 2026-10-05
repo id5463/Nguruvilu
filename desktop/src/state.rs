@@ -195,6 +195,13 @@ impl AppState {
         // settings from the host's cell.
         let judge_cell = nguruvilu::tools::judge::cell(settings.judge.clone());
         nguruvilu::tools::judge::install(&mut kernel, judge_cell.clone());
+        // The audit log: every event appended to <data>/events.jsonl for this
+        // process. Dropping the returned disposer is deliberate — a disposer
+        // unsubscribes only when called, never when dropped.
+        let _audit = nguruvilu::events::install_audit(
+            &kernel.events(),
+            nguruvilu::events::audit_path(),
+        );
         if !skills.is_empty() {
             register_skill_tool(kernel.tools_mut(), Arc::new(skills.clone()))?;
         }
@@ -263,7 +270,7 @@ impl AppState {
             eprintln!("[skills] scan failed: {error:#}");
         }
 
-        Ok(Self {
+        let state = Self {
             kernel,
             config,
             session,
@@ -277,7 +284,14 @@ impl AppState {
             mcp: Vec::new(),
             search_cell,
             judge_cell,
-        })
+        };
+        // The session this process boots into is already current: its start
+        // belongs to bootstrap, not to the first prompt.
+        state.kernel.events().emit(
+            nguruvilu::events::SESSION_START,
+            &serde_json::json!({ "session": &state.session.id }),
+        );
+        Ok(state)
     }
 
     /// A description of the current state, for the details panel and status bar.
@@ -413,6 +427,7 @@ impl AppState {
     pub fn new_session(&mut self) -> Result<()> {
         let session = Session::new(Some(self.route.model.clone()));
         self.store.create(&session)?;
+        self.session_switch(&session.id);
         self.session = session;
         Ok(())
     }
@@ -423,8 +438,29 @@ impl AppState {
             .store
             .load(id)?
             .ok_or_else(|| anyhow!("session not found: {id}"))?;
+        self.session_switch(&session.id);
         self.session = session;
         Ok(())
+    }
+
+    /// Emit the session boundary for a switch: the old id ends (when there
+    /// was a different one), the new one starts.
+    ///
+    /// These belong at the switch itself, not at process exit — a process can
+    /// change sessions several times, and the audit log joins each turn to
+    /// its session through this pair.
+    fn session_switch(&self, next: &str) {
+        let events = self.kernel.events();
+        if self.session.id != next {
+            events.emit(
+                nguruvilu::events::SESSION_END,
+                &serde_json::json!({ "session": &self.session.id }),
+            );
+        }
+        events.emit(
+            nguruvilu::events::SESSION_START,
+            &serde_json::json!({ "session": next }),
+        );
     }
 
     /// Delete a stored session, moving to a new one when it was current.
@@ -950,7 +986,7 @@ pub async fn run_turn(
     text: String,
     sink: Arc<dyn EventSink>,
 ) -> Result<()> {
-    let (client, config, messages) = {
+    let (client, config, messages, events, session_id) = {
         let mut guard = state.lock().expect("state lock");
         // A new attempt supersedes the previous failure; leaving a stale error
         // on screen while a retry runs would be a lie.
@@ -960,7 +996,13 @@ pub async fn run_turn(
         // for a turn that never started.
         let client = guard.client()?;
         guard.busy = true;
-        (client, Arc::clone(&guard.config), guard.session.messages.clone())
+        (
+            client,
+            Arc::clone(&guard.config),
+            guard.session.messages.clone(),
+            guard.kernel.events(),
+            guard.session.id.clone(),
+        )
     };
 
     let observer = Arc::new(UiObserver::new(Arc::clone(&sink)));
@@ -968,7 +1010,41 @@ pub async fn run_turn(
         .with_max_steps(50)
         .with_observer(Arc::clone(&observer) as Arc<dyn AgentObserver>);
 
+    events.emit(
+        nguruvilu::events::PROMPT_SUBMIT,
+        &serde_json::json!({
+            "session": &session_id,
+            "text": nguruvilu::events::truncate(&text, 4000),
+        }),
+    );
+    events.emit(
+        nguruvilu::events::TURN_START,
+        &serde_json::json!({ "session": &session_id }),
+    );
+    let turn_started = std::time::Instant::now();
     let result = agent.run(&text).await;
+    let turn_ms = turn_started.elapsed().as_millis() as u64;
+    match &result {
+        Ok(outcome) => events.emit(
+            nguruvilu::events::TURN_COMPLETE,
+            &serde_json::json!({
+                "session": &session_id,
+                "ok": true,
+                "duration_ms": turn_ms,
+                "steps": outcome.steps,
+                "tool_calls": outcome.tool_calls,
+            }),
+        ),
+        Err(error) => events.emit(
+            nguruvilu::events::TURN_COMPLETE,
+            &serde_json::json!({
+                "session": &session_id,
+                "ok": false,
+                "duration_ms": turn_ms,
+                "error": nguruvilu::events::truncate(&format!("{error:#}"), 1000),
+            }),
+        ),
+    }
 
     let mut guard = state.lock().expect("state lock");
     guard.busy = false;

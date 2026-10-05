@@ -146,12 +146,21 @@ pub struct OverrideRecord {
 pub struct ToolRegistry {
     tools: HashMap<String, ToolDef>,
     overrides: Vec<OverrideRecord>,
+    /// The event bus every clone shares — the registry is where tool
+    /// execution happens, so it is where the bus lives, and the kernel hands
+    /// out clones of it (`kernel.events()`).
+    events: crate::events::EventBus,
 }
 
 impl ToolRegistry {
     /// An empty registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The event bus this registry's executions report to (shared by clones).
+    pub fn events(&self) -> crate::events::EventBus {
+        self.events.clone()
     }
 
     /// A registry with the four base tools registered.
@@ -242,6 +251,11 @@ impl ToolRegistry {
     }
 
     /// Execute a tool by name with raw JSON arguments.
+    ///
+    /// The single funnel every caller goes through (the agent loop, the pack
+    /// tool, delegates), which makes it where `tool.start` / `tool.end` are
+    /// emitted: the payload carries truncated arguments and results, because
+    /// an event must not become a copy of a 2 MB file read.
     pub async fn execute(&self, name: &str, arguments: &str) -> Result<ToolOutput> {
         let def = self
             .tools
@@ -255,6 +269,36 @@ impl ToolRegistry {
                 .map_err(|e| anyhow!("invalid JSON arguments for '{name}': {e}"))?
         };
 
-        (def.handler)(args).await
+        self.events.emit(
+            crate::events::TOOL_START,
+            &json!({
+                "tool": name,
+                "arguments": crate::events::truncate(arguments, 4000),
+            }),
+        );
+        let started = std::time::Instant::now();
+        let result = (def.handler)(args).await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        match &result {
+            Ok(output) => self.events.emit(
+                crate::events::TOOL_END,
+                &json!({
+                    "tool": name,
+                    "ok": true,
+                    "duration_ms": duration_ms,
+                    "text": crate::events::truncate(&output.text, 4000),
+                }),
+            ),
+            Err(error) => self.events.emit(
+                crate::events::TOOL_END,
+                &json!({
+                    "tool": name,
+                    "ok": false,
+                    "duration_ms": duration_ms,
+                    "error": crate::events::truncate(&format!("{error:#}"), 1000),
+                }),
+            ),
+        }
+        result
     }
 }

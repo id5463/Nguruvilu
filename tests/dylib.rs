@@ -54,6 +54,7 @@ fn bare_ctx(plugin: &str) -> PluginCtx {
         realm: RealmMap::new(),
         services: ServiceView::default(),
         config: serde_json::Value::Null,
+        events: nguruvilu::events::EventBus::default(),
     }
 }
 

@@ -736,3 +736,109 @@ fn a_stored_transcript_reconstructs_the_conversation() {
     assert_eq!(loaded.messages[2].role, Role::Tool);
     assert_eq!(loaded.messages[2].tool_call_id.as_deref(), Some("c1"));
 }
+
+// ------------------------------------------------------------------- events
+
+/// A plugin's observer runs while the fiber is loaded and stops at unload:
+/// the disposer goes through `Contributions::effect`, and effects are undone
+/// by calling — never by dropping.
+#[test]
+fn a_plugin_observes_events_until_it_unloads() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Watcher {
+        seen: Arc<AtomicUsize>,
+    }
+    impl Plugin for Watcher {
+        fn name(&self) -> &str {
+            "watcher"
+        }
+        fn apply(&self, ctx: &PluginCtx) -> anyhow::Result<Contributions> {
+            let seen = Arc::clone(&self.seen);
+            let dispose = ctx.observe("tool.end", move |_, _| {
+                seen.fetch_add(1, Ordering::Relaxed);
+            });
+            Ok(Contributions::new().effect(dispose))
+        }
+    }
+
+    let mut kernel = Kernel::new();
+    let seen = Arc::new(AtomicUsize::new(0));
+    kernel.define(Arc::new(Watcher {
+        seen: Arc::clone(&seen),
+    }));
+    let fiber = kernel
+        .load_owned(
+            "watcher",
+            RealmMap::new(),
+            Value::Null,
+            Some("watcher-pack".into()),
+        )
+        .unwrap();
+
+    kernel
+        .events()
+        .emit("tool.end", &json!({ "tool": "read" }));
+    assert_eq!(seen.load(Ordering::Relaxed), 1, "the watcher heard it");
+
+    kernel.unload(fiber).unwrap();
+    kernel.events().emit("tool.end", &json!({ "tool": "read" }));
+    assert_eq!(
+        seen.load(Ordering::Relaxed),
+        1,
+        "unload unsubscribed: effects are undone, not dropped"
+    );
+}
+
+/// The tool table is the single funnel, so `tool.start` / `tool.end` fire for
+/// every caller — with truncated payloads and an honest `ok` flag either way.
+#[tokio::test]
+async fn executing_a_tool_emits_start_and_end_with_the_verdict() {
+    use std::sync::Mutex;
+
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(
+            ToolDef::new("ok-tool", "returns", json!({ "type": "object" }), "test", |_args| {
+                Box::pin(async { Ok(ToolOutput::text("fine")) }) as ToolFuture
+            }),
+            ConflictPolicy::Error,
+        )
+        .unwrap();
+    registry
+        .register(
+            ToolDef::new("broken", "fails", json!({ "type": "object" }), "test", |_args| {
+                Box::pin(async { Err(std::io::Error::other("boom").into()) }) as ToolFuture
+            }),
+            ConflictPolicy::Error,
+        )
+        .unwrap();
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    let _listen = registry.events().subscribe_all(move |name, payload| {
+        record.lock().unwrap().push((
+            name.to_string(),
+            payload["ok"].as_bool(),
+            payload["tool"].as_str().unwrap_or("").to_string(),
+        ));
+    });
+
+    registry.execute("ok-tool", "{}").await.unwrap();
+    registry.execute("broken", "{}").await.unwrap_err();
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.iter().map(|(name, _, _)| name.as_str()).collect::<Vec<_>>(),
+        [
+            nguruvilu::events::TOOL_START,
+            nguruvilu::events::TOOL_END,
+            nguruvilu::events::TOOL_START,
+            nguruvilu::events::TOOL_END,
+        ]
+    );
+    assert_eq!(seen[1].1, Some(true), "ok-tool: ok=true");
+    assert_eq!(seen[1].2, "ok-tool");
+    assert_eq!(seen[3].1, Some(false), "broken: ok=false");
+    assert_eq!(seen[3].2, "broken");
+}

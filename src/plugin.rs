@@ -234,6 +234,9 @@ pub struct PluginCtx {
     pub services: ServiceView,
     /// Plugin configuration.
     pub config: Value,
+    /// The event bus: observational subscription only (see `events.rs`) —
+    /// a plugin watches facts, it cannot veto them.
+    pub events: crate::events::EventBus,
 }
 
 impl PluginCtx {
@@ -245,6 +248,16 @@ impl PluginCtx {
     /// Whether a service is visible.
     pub fn has(&self, name: &str) -> bool {
         self.services.has(name)
+    }
+
+    /// Subscribe to one event; put the disposer in `Contributions::effect`
+    /// so unloading actually unsubscribes (effects are undone, not dropped).
+    pub fn observe(
+        &self,
+        event: &str,
+        observer: impl Fn(&str, &Value) + Send + Sync + 'static,
+    ) -> crate::events::Disposer {
+        self.events.subscribe(event, observer)
     }
 }
 
@@ -470,6 +483,14 @@ impl Kernel {
     /// The tool table.
     pub fn tools(&self) -> &ToolRegistry {
         &self.tools
+    }
+
+    /// The kernel's event bus (shared with every clone of the tool table).
+    ///
+    /// Observational only: subscribers watch facts; vetoes belong to the
+    /// hooks milestone, not to this bus.
+    pub fn events(&self) -> crate::events::EventBus {
+        self.tools.events()
     }
 
     /// The tool table, mutably.
@@ -866,6 +887,7 @@ impl Kernel {
             realm: realm.clone(),
             services: self.service_view(realm.clone()),
             config: config.clone(),
+            events: self.tools.events(),
         };
 
         let contributions = match plugin.apply(&ctx) {

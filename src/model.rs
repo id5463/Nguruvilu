@@ -233,6 +233,7 @@ mod tests {
             realm: RealmMap::new(),
             services: crate::plugin::ServiceView::default(),
             config: serde_json::Value::Null,
+            events: crate::events::EventBus::default(),
         };
         let contributions = crate::plugin::Plugin::apply(&service, &ctx).unwrap();
         assert_eq!(contributions.services.len(), 1);

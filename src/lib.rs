@@ -25,6 +25,7 @@ pub mod compaction;
 pub mod content;
 pub mod context;
 pub mod dylib;
+pub mod events;
 pub mod fetch;
 pub mod git;
 pub mod hotreload;

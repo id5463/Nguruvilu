@@ -101,6 +101,7 @@ src/
     subagent.rs    delegate 子代理(同路由同工具表,空历史起步)
     judge.rs       判官(TypeSafe Jev 决策模型;与 search 同一套插件形态)
   plugin.rs        插件内核(隔离域 / epoch 自动重载 / 依赖 / effect 撤销 / 权限接口)
+  events.rs        事件总线(观察式订阅 / effect 退订 / 审计 JSONL 与 5MB 轮转)
   skills.rs        技能系统(目录扫描 / frontmatter 解析 / 目录注入 / 加载工具)
   mcp.rs           MCP 客户端(stdio,JSON-RPC,并发安全)
   pack.rs          整合包(.dshpack zip:打包 / 校验 / 安装 / 清单;Carried 与 Fetched 两种内容形态)
@@ -495,7 +496,28 @@ stages:
 | **Skills**(`.claude/skills/**/SKILL.md`) | ✅ 直接可用 | 同为"目录 + frontmatter + 正文";frontmatter 支持 `>`/`\|` **块标量**与**带引号含冒号的值**(真实 Claude Code 技能常用这两种写法),未知字段(`allowed-tools`、`license`…)原样容忍;id 取目录名 |
 | **MCP**(`.mcp.json`) | ✅ `ngu mcp import` | 生成一个可审的本地包(清单 + mcp.json + 说明);stdio 直通并经**我们的严格读取器复核**;`http`/`sse` 等传输**如实列出并跳过**(本内核今天只连 stdio),不混进包里;环境变量**只写进包,值不出现在生成的 README 里** |
 | Slash commands / 子代理定义 | ⏳ 映射成技能(P1) | 纯提示词/persona 结构,风险低 |
-| Hooks | ⏳ 单独议题 | "事前拦截"与本内核"不设关卡 + 如实报告"的关系需要先设计(依赖插件事件系统) |
+| Hooks | ⏳ 单独议题 | "事前拦截"与本内核"不设关卡 + 如实报告"的关系需要先设计(依赖插件事件系统,见下节) |
+
+## 插件事件总线
+
+内核里**刚发生的事**以 JSON 推给订阅者 —— 这是 hooks 与 mods 兼容的地基:
+
+| 事件 | 谁发 | 载荷 |
+|---|---|---|
+| `session.start` / `session.end` | 宿主:创建/切换/退出(桌面在关窗与 headless 退出都发;CLI 用 Drop 守卫,`?` 提前返回也逃不掉) | `session` |
+| `prompt.submit` | 宿主,一轮之前 | `session`、`text`(截 4000 字符) |
+| `turn.start` / `turn.complete` | 宿主,`agent.run` 前后 | `ok`、`duration_ms`、`steps`/`tool_calls` 或 `error` |
+| `tool.start` / `tool.end` | **工具表**(唯一漏斗:agent、pack 工具、delegate 的内嵌轮全走它) | `tool`、`arguments`/`text`(4000)、`ok`、`duration_ms` |
+
+- **订阅**:`ctx.observe("tool.end", f)` 返回 disposer,放回 `Contributions::effect(...)` ——
+  **卸载即退订**(效果靠"调用"撤销,不靠析构);交付顺序 = 注册顺序;
+- **观察者 panic 被隔离**:它跑在别人的一次执行里,坏了就报告一句继续,不能拖垮它正在看的调用;
+- **v1 只观察,不拦截**:没有 veto、不改写参数、不替换结果 —— 那需要 `next()` 链与和权限栈的
+  相对位置(hooks 里程碑)。宁可没有,也不做一个"看着能拦其实不能"的钩子;
+- **审计日志**:两个宿主启动时把 `subscribe_all` 装上,每个事件一行追加到
+  `~/.nguruvilu/events.jsonl`(`ts`/`event`/`payload`,超过 5MB 轮转成 `.1` 留一代)——
+  总线本身不留历史,**文件才是账**;
+- **查看**:`ngu events`(默认最后 20 行,`ts` 是 epoch 毫秒)、`ngu events 5 --json`(原行)。
 
 ## 命令参考
 
@@ -517,6 +539,7 @@ stages:
 | `ui` | 把内置界面导出到目录,作为自己界面包的起点 |
 | `plugin` | 装一个动态库插件并报告它的贡献(开发用) |
 | `config` | `show` / `set` / `path` —— endpoint、key、model、reasoning、search、judge… |
+| `events` | 查看事件审计日志(`~/.nguruvilu/events.jsonl`,默认最后 20 行;`--json` 原样输出) |
 | `runtime` | 策略表与生效配置 |
 | `injections` | 注入策略表与会命中的注入条目 |
 | `snapshot` | 查看 / 回滚工作区 git 快照 |
@@ -538,7 +561,7 @@ cargo build --release --offline          # → target/release/ngu
 # 桌面(独立 crate,单文件,约 8.4 MB;界面是"母版",运行时服务的是 ui 包那份)
 cargo build --release --offline --manifest-path desktop/Cargo.toml
 
-# 测试:单元 + 动态库集成 + 内核集成 + CLI + 界面一致性,共 446 项
+# 测试:单元 + 动态库集成 + 内核集成 + CLI + 界面一致性,共 451 项
 cargo test --offline
 
 # 发布:出 dist/ 与桌面副本,打印 SHA256
@@ -557,7 +580,7 @@ pwsh -File release.ps1
 
 ## 状态
 
-**完整架构已实现:446 个测试通过(404 单元 + 9 动态库集成 + 26 内核集成 + 5 CLI + 2 界面)。**
+**完整架构已实现:451 个测试通过(409 单元 + 9 动态库集成 + 26 内核集成 + 5 CLI + 2 界面)。**
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
@@ -586,6 +609,7 @@ pwsh -File release.ps1
 | **判官(判断模型)** | ✅ | `judge` 工具:TypeSafe Jev `state + 类型化问题` → 答案/分数/是非 + 置信度(70~500ms);`judge` 包启用、面板三栏/CLI 三旗/`NGU_JUDGE_*` 三环境变量;未知结构原样透传;**红线:建议者不是闸门** |
 | **Claude Code 互操作** | ✅ | skills 同形态直吃(frontmatter 支持块标量与带引号冒号值);`ngu mcp import` 把 `.mcp.json` 变成本地包(http 传输如实跳过);commands/子代理定义 → 映射(P1);hooks 单独议题 |
 | **全部热加载** | ✅ | `apply_change` 统一入口、会话/全局作用域、同意策略表、每轮快照 |
+| **插件事件总线** | ✅ | `ctx.observe` + effect 退订;`tool.start/end` 走工具表唯一漏斗;prompt/turn/session 由宿主发;审计 `events.jsonl`(5MB 轮转)+ `ngu events`;v1 观察式 —— veto 随 hooks 里程碑 |
 | **上下文注入引擎** | ✅ | 预算百分比+上限、触发、深度注入、分组竞争、递归激活 |
 | **工作区 git 快照** | ✅ | 每轮前后自动提交、历史、回滚(含删除新增文件) |
 | CLI | ✅ | 交互 / 打印 / JSON 三模式 + 20 个管理子命令 |

@@ -146,7 +146,20 @@ fn headless(startup_prompt: Option<String>) -> anyhow::Result<()> {
         // registered with a runtime that is shutting down is what keeps the
         // process alive after everything it has printed. Bounded — a server
         // that refuses to die must not postpone the exit it is blocking.
-        let clients = state.lock().expect("state lock").mcp.clone();
+        let (clients, ending_session, ending_events) = {
+            let guard = state.lock().expect("state lock");
+            (
+                guard.mcp.clone(),
+                guard.session.id.clone(),
+                guard.kernel.events(),
+            )
+        };
+        // The run is over: this session ends here. Headless exits without a
+        // window-close, so this boundary cannot live only in the GUI path.
+        ending_events.emit(
+            nguruvilu::events::SESSION_END,
+            &json!({ "session": &ending_session }),
+        );
         for client in &clients {
             client.shutdown_within(std::time::Duration::from_secs(3)).await;
         }
@@ -331,15 +344,24 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
                 // it for a moment); kill the servers first so they are already
                 // exiting; then give each a short window to be reaped.
                 let clients = {
-                    let mut found = None;
+                    let mut found: Option<(Vec<_>, String, nguruvilu::events::EventBus)> = None;
                     for _ in 0..20 {
                         match state.try_lock() {
                             Ok(guard) => {
-                                found = Some(guard.mcp.clone());
+                                found = Some((
+                                    guard.mcp.clone(),
+                                    guard.session.id.clone(),
+                                    guard.kernel.events(),
+                                ));
                                 break;
                             }
                             Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                                found = Some(poisoned.into_inner().mcp.clone());
+                                let guard = poisoned.into_inner();
+                                found = Some((
+                                    guard.mcp.clone(),
+                                    guard.session.id.clone(),
+                                    guard.kernel.events(),
+                                ));
                                 break;
                             }
                             Err(std::sync::TryLockError::WouldBlock) => {
@@ -349,7 +371,18 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
                     }
                     // No list in a second: leave anyway. An orphaned server is
                     // a bad exit; a window that never closes is a broken app.
-                    found.unwrap_or_default()
+                    match found {
+                        Some((list, session, events)) => {
+                            // The window closes with this session: its end
+                            // belongs to the exit, not to the next launch.
+                            events.emit(
+                                nguruvilu::events::SESSION_END,
+                                &serde_json::json!({ "session": &session }),
+                            );
+                            list
+                        }
+                        None => Vec::new(),
+                    }
                 };
                 for client in &clients {
                     client.force_kill();

@@ -207,6 +207,12 @@ enum Command {
         #[command(subcommand)]
         action: McpAction,
     },
+    /// Show the plugin event log (the audit trail on disk).
+    Events {
+        /// Lines from the end to show.
+        #[arg(default_value_t = 20)]
+        last: usize,
+    },
     /// List installed packs.
     Packs,
 
@@ -367,6 +373,22 @@ enum McpAction {
 /// Prints progress to stderr, keeping stdout clean for the answer.
 struct PrettyObserver {
     quiet: bool,
+}
+
+/// Emits `session.end` when the run finishes — including early `?` returns,
+/// because Drop does not care about `?`.
+struct SessionEnd {
+    events: nguruvilu::events::EventBus,
+    session: String,
+}
+
+impl Drop for SessionEnd {
+    fn drop(&mut self) {
+        self.events.emit(
+            nguruvilu::events::SESSION_END,
+            &serde_json::json!({ "session": &self.session }),
+        );
+    }
 }
 
 impl AgentObserver for PrettyObserver {
@@ -604,6 +626,7 @@ async fn run() -> Result<()> {
         Some(Command::Mcp {
             action: McpAction::Import { file, out, name, license },
         }) => return mcp_import_command(&file, out.as_deref(), name.as_deref(), &license),
+        Some(Command::Events { last }) => return events_command(*last, cli.json),
         Some(Command::Packs) => return list_packs(cli.json),
         Some(Command::Uninstall { name, all, delete, into }) => {
             return uninstall_command(name, *all, *delete, into.as_ref(), cli.json)
@@ -953,17 +976,69 @@ async fn run() -> Result<()> {
     };
 
     let observer = Arc::new(PrettyObserver { quiet: cli.quiet || cli.json });
+    // Audit + session boundary: this process runs one session (or switches it
+    // with /new), and the log joins its turns through this pair. The disposer
+    // is bound to `_audit` on purpose — a disposer unsubscribes only when
+    // called, so the log outlives this scope without holding anything open.
+    let events = kernel.events();
+    let _audit = nguruvilu::events::install_audit(&events, nguruvilu::events::audit_path());
+    events.emit(
+        nguruvilu::events::SESSION_START,
+        &serde_json::json!({ "session": &session.id }),
+    );
 
     match prompt {
         Some(text) => {
+            // One end per run: this guard fires when the arm — the whole
+            // one-shot path — finishes, early `?` returns included (Drop
+            // does not care about `?`).
+            let _session_end = SessionEnd {
+                events: events.clone(),
+                session: session.id.clone(),
+            };
             if let Some(git) = &snapshotter {
                 git.snapshot("before turn")?;
             }
 
+            events.emit(
+                nguruvilu::events::PROMPT_SUBMIT,
+                &serde_json::json!({
+                    "session": &session.id,
+                    "text": nguruvilu::events::truncate(&text, 4000),
+                }),
+            );
+            events.emit(
+                nguruvilu::events::TURN_START,
+                &serde_json::json!({ "session": &session.id }),
+            );
+            let turn_started = std::time::Instant::now();
             let mut agent = Agent::new(client, Arc::clone(&config), session.messages.clone())
                 .with_max_steps(cli.max_steps)
                 .with_observer(observer);
-            let outcome = agent.run(&text).await?;
+            let outcome = agent.run(&text).await;
+            let turn_ms = turn_started.elapsed().as_millis() as u64;
+            match &outcome {
+                Ok(done) => events.emit(
+                    nguruvilu::events::TURN_COMPLETE,
+                    &serde_json::json!({
+                        "session": &session.id,
+                        "ok": true,
+                        "duration_ms": turn_ms,
+                        "steps": done.steps,
+                        "tool_calls": done.tool_calls,
+                    }),
+                ),
+                Err(error) => events.emit(
+                    nguruvilu::events::TURN_COMPLETE,
+                    &serde_json::json!({
+                        "session": &session.id,
+                        "ok": false,
+                        "duration_ms": turn_ms,
+                        "error": nguruvilu::events::truncate(&format!("{error:#}"), 1000),
+                    }),
+                ),
+            }
+            let outcome = outcome?;
 
             ensure_session(&session)?;
             session.messages.extend(outcome.new_messages.clone());
@@ -1130,6 +1205,15 @@ async fn interactive(
     );
     println!("Type a prompt, or /exit to quit, /new for a new session.\n");
 
+    // The run that called this REPL already installed the audit log and
+    // emitted `session.start`; this function joins the same bus for turn
+    // events and owns the matching `session.end`.
+    let events = pack_host.kernel.events();
+    let mut session_end = SessionEnd {
+        events: events.clone(),
+        session: session.id.clone(),
+    };
+
     let mut agent = Agent::new(client, Arc::clone(&config), session.messages.clone())
         .with_max_steps(max_steps)
         .with_observer(Arc::new(PrettyObserver { quiet: false }));
@@ -1151,8 +1235,20 @@ async fn interactive(
             break;
         }
         if input == "/new" {
+            // The old session ends here, the new one starts: a process can
+            // switch sessions any number of times, and the audit log joins
+            // each turn to its own session through this pair.
+            events.emit(
+                nguruvilu::events::SESSION_END,
+                &serde_json::json!({ "session": &session.id }),
+            );
             session = Session::new(session.model.clone());
             store.create(&session)?;
+            events.emit(
+                nguruvilu::events::SESSION_START,
+                &serde_json::json!({ "session": &session.id }),
+            );
+            session_end.session = session.id.clone();
             agent.set_messages(Vec::new());
             println!("new session {}\n", session.id);
             continue;
@@ -1164,7 +1260,42 @@ async fn interactive(
             }
         }
 
-        match agent.run(input).await {
+        events.emit(
+            nguruvilu::events::PROMPT_SUBMIT,
+            &serde_json::json!({
+                "session": &session.id,
+                "text": nguruvilu::events::truncate(input, 4000),
+            }),
+        );
+        events.emit(
+            nguruvilu::events::TURN_START,
+            &serde_json::json!({ "session": &session.id }),
+        );
+        let turn_started = std::time::Instant::now();
+        let turn = agent.run(input).await;
+        let turn_ms = turn_started.elapsed().as_millis() as u64;
+        match &turn {
+            Ok(outcome) => events.emit(
+                nguruvilu::events::TURN_COMPLETE,
+                &serde_json::json!({
+                    "session": &session.id,
+                    "ok": true,
+                    "duration_ms": turn_ms,
+                    "steps": outcome.steps,
+                    "tool_calls": outcome.tool_calls,
+                }),
+            ),
+            Err(error) => events.emit(
+                nguruvilu::events::TURN_COMPLETE,
+                &serde_json::json!({
+                    "session": &session.id,
+                    "ok": false,
+                    "duration_ms": turn_ms,
+                    "error": nguruvilu::events::truncate(&format!("{error:#}"), 1000),
+                }),
+            ),
+        }
+        match turn {
             Ok(outcome) => {
                 store.append(&session.id, &outcome.new_messages)?;
                 session.messages.extend(outcome.new_messages);
@@ -2045,6 +2176,61 @@ fn generated_pack_readme(
     out
 }
 
+/// `ngu events` — read back the audit trail the hosts append to.
+///
+/// The file is the source of truth (the bus keeps no history), so this is a
+/// file read with a shape, not a query into a running process.
+fn events_command(last: usize, as_json: bool) -> Result<()> {
+    let path = nguruvilu::events::audit_path();
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        if as_json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "path": path.display().to_string(),
+                    "lines": [],
+                }))?
+            );
+        } else {
+            println!("no events yet — the log is {}", path.display());
+        }
+        return Ok(());
+    };
+    let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(last.max(1));
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "path": path.display().to_string(),
+                "count": lines.len(),
+                "lines": &lines[start..],
+            }))?
+        );
+        return Ok(());
+    }
+    println!(
+        "{} — {} event(s), showing the last {}",
+        path.display(),
+        lines.len(),
+        lines.len() - start
+    );
+    for line in &lines[start..] {
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(value) => println!(
+                "{:>13}  {:<15}  {}",
+                value["ts"].as_u64().unwrap_or(0),
+                value["event"].as_str().unwrap_or("?"),
+                nguruvilu::events::truncate(&value["payload"].to_string(), 200)
+            ),
+            Err(_) => println!("  (unparseable) {line}"),
+        }
+    }
+    Ok(())
+}
+
 fn list_packs(as_json: bool) -> Result<()> {
     let packs_dir = nguruvilu::pack::default_packs_dir();
     let packs = nguruvilu::pack::installed(&packs_dir)?;
@@ -2314,6 +2500,7 @@ fn plugin_load(path: &PathBuf, as_json: bool) -> Result<()> {
         realm: nguruvilu::plugin::RealmMap::new(),
         services: nguruvilu::plugin::ServiceView::default(),
         config: serde_json::Value::Null,
+        events: nguruvilu::events::EventBus::default(),
     };
     let contributions = PluginTrait::apply(&plugin, &ctx)?;
     let tools: Vec<String> = contributions.tools.iter().map(|t| t.name.clone()).collect();
@@ -2380,6 +2567,7 @@ fn plugin_call(path: &PathBuf, tool: &str, args: &str, as_json: bool) -> Result<
         realm: nguruvilu::plugin::RealmMap::new(),
         services: nguruvilu::plugin::ServiceView::default(),
         config: serde_json::Value::Null,
+        events: nguruvilu::events::EventBus::default(),
     };
     PluginTrait::apply(&plugin, &ctx)?;
 
