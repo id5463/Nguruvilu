@@ -126,6 +126,10 @@ pub struct Contributions {
     pub services: Vec<(String, Arc<dyn Any + Send + Sync>)>,
     /// Tools this plugin registers.
     pub tools: Vec<ToolDef>,
+    /// Readers this plugin contributes: byte-sniffers that teach `read` a
+    /// format the kernel does not parse — 读不了就装包, the pack provides
+    /// the format, the kernel only provides the asking.
+    pub readers: Vec<crate::tools::readers::ReaderSpec>,
     /// Cleanup for anything else the plugin started.
     pub effects: Vec<Disposer>,
 }
@@ -145,6 +149,16 @@ impl Contributions {
     /// Add a tool.
     pub fn tool(mut self, def: ToolDef) -> Self {
         self.tools.push(def);
+        self
+    }
+
+    /// Contribute a reader for one file format.
+    ///
+    /// The kernel stamps the owner (this plugin's name) and keeps the
+    /// registration in the fiber's effects, so unloading the pack unregisters
+    /// the reader.
+    pub fn reader(mut self, spec: crate::tools::readers::ReaderSpec) -> Self {
+        self.readers.push(spec);
         self
     }
 
@@ -944,12 +958,21 @@ impl Kernel {
             );
         }
 
+        // Readers join the fiber's effects: unload unregisters them
+        // (registrations are undone, not dropped), with ownership stamped
+        // here — a plugin does not get to claim provenance.
+        let mut effects = contributions.effects;
+        for spec in contributions.readers {
+            let dispose = crate::tools::readers::register(spec, plugin_name.clone());
+            effects.push(Box::new(dispose));
+        }
+
         self.fiber_tools.insert(id, registered_tools);
         if let Some(fiber) = self.fibers.get_mut(&id) {
             fiber.ui = contributions.ui;
             fiber.themes = contributions.themes;
             fiber.strings = contributions.strings;
-            fiber.effects = contributions.effects;
+            fiber.effects = effects;
             fiber.epoch = desired;
             fiber.state = FiberState::Active;
             fiber.error = None;
@@ -1377,5 +1400,50 @@ mod tests {
             "unloading a pack must take its words with it"
         );
         assert!(!strings.contains_key("save"));
+    }
+
+    /// A contributed reader exists exactly while its fiber does: registration
+    /// rides the fiber's effects, so unload unregisters (the registry's
+    /// promise — 读不了就装包 means the pack's arrival *and* departure both
+    /// show in what `read` can open).
+    #[test]
+    fn a_plugin_reader_is_registered_on_load_and_removed_on_unload() {
+        use crate::tools::readers::{ReadAnswer, ReaderSpec};
+        use std::path::Path;
+
+        let plugin = Named::new("format", |_| {
+            Ok(Contributions::new().reader(ReaderSpec {
+                id: "test-fmt".into(),
+                claims: Arc::new(|bytes: &[u8], _path: &Path| bytes.starts_with(b"FMT")),
+                convert: Arc::new(|bytes: &[u8], _path: &Path| {
+                    crate::tools::readers::ReadOutcome::Text(
+                        String::from_utf8_lossy(&bytes[3..]).into_owned(),
+                    )
+                }),
+            }))
+        });
+
+        let mut kernel = Kernel::new();
+        kernel.define(plugin);
+        let fiber = kernel.load("format", RealmMap::new(), Value::Null).unwrap();
+
+        let claimed = crate::tools::readers::convert(b"FMT readable", Path::new("x.bin"));
+        assert!(
+            matches!(claimed, ReadAnswer::Converted(ref text) if text == " readable"),
+            "the pack taught read its format"
+        );
+        assert!(
+            crate::tools::readers::installed().iter().any(|(id, owner)| id == "test-fmt" && owner == "format"),
+            "with ownership stamped by the kernel, not the plugin"
+        );
+
+        kernel.unload(fiber).unwrap();
+        assert!(
+            matches!(
+                crate::tools::readers::convert(b"FMT readable", Path::new("x.bin")),
+                ReadAnswer::Unclaimed
+            ),
+            "unload took the reader: registrations are undone, not dropped"
+        );
     }
 }

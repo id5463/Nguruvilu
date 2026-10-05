@@ -16,9 +16,9 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
-pub mod base;
+pub mod base;pub mod documents;
 pub mod judge;
-pub mod pack;
+pub mod pack;pub mod readers;
 pub mod search;
 pub mod subagent;
 

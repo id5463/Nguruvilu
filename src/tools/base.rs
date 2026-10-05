@@ -70,7 +70,6 @@ fn image_dimensions(bytes: &[u8], mime: &str) -> Option<(u32, u32)> {
         _ => None,
     }
 }
-
 /// Register all four base tools under the `kernel` owner.
 pub fn register_all(registry: &mut ToolRegistry) -> Result<()> {
     registry.register(
@@ -266,13 +265,62 @@ async fn read_any(args: Value) -> Result<crate::tools::ToolOutput> {
         return Ok(crate::tools::ToolOutput::text(text).with_image(image));
     }
 
-    // Not an image: it must be text to be useful.
-    let content = String::from_utf8(bytes).map_err(|_| {
-        anyhow!(
-            "{} is binary and not a recognised image format; read cannot show it",
-            path.display()
-        )
-    })?;
+    // The pack-provided readers teach `read` its formats (读不了就装包 —
+    // see `readers.rs`). Unclaimed falls through to plain text; Unreadable
+    // carries the reasons, which is where a machine missing its toolchain
+    // gets the install-command card back. The whole ask runs on a blocking
+    // thread: readers spawn processes and poll with sleeps, and parking an
+    // executor worker for thirty seconds is not a trade the loop agreed to.
+    let content = {
+        let probe = bytes.clone();
+        let probe_path = path.clone();
+        let answer = match tokio::task::spawn_blocking(move || {
+            crate::tools::readers::convert(&probe, &probe_path)
+        })
+        .await
+        {
+            Ok(answer) => answer,
+            Err(join) => {
+                // A panicking reader is contained the way the event bus
+                // contains a panicking observer: reported, then out of the way.
+                eprintln!("[read] a reader panicked: {join}");
+                crate::tools::readers::ReadAnswer::Unclaimed
+            }
+        };
+        match answer {
+            crate::tools::readers::ReadAnswer::Converted(text) => text,
+            crate::tools::readers::ReadAnswer::Unclaimed => {
+                String::from_utf8(bytes).map_err(|_| {
+                    let installed = crate::tools::readers::installed();
+                    let list = if installed.is_empty() {
+                        "no readers are installed — a pack can provide one for this format"
+                            .to_string()
+                    } else {
+                        format!(
+                            "installed readers: {}",
+                            installed
+                                .iter()
+                                .map(|(id, owner)| format!("{id} (from {owner})"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    };
+                    anyhow!(
+                        "{} is binary and not a recognised image format; no reader claims it, \
+                         and {list}",
+                        path.display()
+                    )
+                })?
+            }
+            crate::tools::readers::ReadAnswer::Unreadable(reasons) => {
+                return Err(anyhow!(
+                    "{} is claimed by a reader but no text came out — {}",
+                    path.display(),
+                    reasons.join(" | ")
+                ));
+            }
+        }
+    };
 
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();

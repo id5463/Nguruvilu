@@ -666,6 +666,10 @@ async fn run() -> Result<()> {
     // `packs/starter` asks for `builtin:delegate` and it appears, and without
     // that pack the kernel has no such tool.
     nguruvilu::tools::subagent::define(&mut kernel);
+    // Same for document reading (读不了就装包): `packs/documents` asks for
+    // `builtin:documents` and `read` learns PDF/Office; without the pack,
+    // `read` says so and names what is installed.
+    nguruvilu::tools::documents::define(&mut kernel);
     // Same split for search: the code is available, the pack's assembly is
     // what makes a conversation have it. The cell is the host's copy of the
     // settings — filled now, refilled after pack content lands, and again

@@ -186,6 +186,9 @@ impl AppState {
         // Available to a pack, not loaded by the kernel: `packs/subagent` asks
         // for `builtin:delegate` and it appears.
         nguruvilu::tools::subagent::define(&mut kernel);
+        // Same for document reading (读不了就装包): `packs/documents` asks for
+        // `builtin:documents` and `read` learns PDF/Office.
+        nguruvilu::tools::documents::define(&mut kernel);
         // Available to a pack, not loaded by the kernel: `packs/search` asks
         // for `builtin:search` and it appears — with a tool only while a key
         // is configured (see `search::configure`).
