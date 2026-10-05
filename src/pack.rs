@@ -1774,7 +1774,15 @@ fn render_assembly(manifest: &PackManifest, staging: &Path) -> Result<String> {
         .map(|skill| OutSkill {
             base: OutBase {
                 id: skill.id.clone(),
-                source: format!("{FILES_DIR}/{}", skill.id),
+                // The authored source, unchanged — the same rule the plugin
+                // branch applies to what it *names*. A carried skill ships
+                // inside the archive (`skills/…`) and the loader resolves a
+                // relative source against the pack directory; rewriting every
+                // source to `files/<id>` pointed the loader at a path nothing
+                // ever creates, because no skill fetch exists yet. Keeping the
+                // authored source also leaves `github:` its own honest
+                // "not implemented" message instead of "does not exist".
+                source: skill.source.clone(),
                 scope: Some("session".into()),
             },
         })
