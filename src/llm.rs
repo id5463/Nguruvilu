@@ -116,6 +116,46 @@ struct PartialCall {
     arguments: String,
 }
 
+/// Why a chat request failed, tagged with whether another attempt can succeed.
+///
+/// The loop retries a failed step only when this says it can: a retried 401 is
+/// a wasted round trip, and a retried dropped stream is a turn that survives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestError {
+    /// HTTP status when the provider answered; `None` for transport failures.
+    pub status: Option<u16>,
+    /// Whether another attempt may succeed.
+    pub retryable: bool,
+    /// Human-readable cause.
+    pub message: String,
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RequestError {}
+
+/// Whether a chat failure is worth another attempt.
+///
+/// Walks the whole cause chain, because a classification placed on the root
+/// error must still be visible after a `POST <url>` context is layered on top.
+pub fn retryable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(failure) = cause.downcast_ref::<RequestError>() {
+            return failure.retryable;
+        }
+        // A request timeout seen at the transport layer means no response
+        // arrived, so repeating the request cannot duplicate a seen answer.
+        if let Some(transport) = cause.downcast_ref::<reqwest::Error>() {
+            return transport.is_timeout();
+        }
+        false
+    })
+}
+
 /// Streaming client for one model route.
 #[derive(Clone)]
 pub struct LlmClient {
@@ -238,7 +278,13 @@ impl LlmClient {
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("provider returned {status}: {}", truncate(&text, 2000)));
+            let code = status.as_u16();
+            return Err(RequestError {
+                status: Some(code),
+                retryable: code == 429 || (500..=599).contains(&code),
+                message: format!("provider returned {status}: {}", truncate(&text, 2000)),
+            }
+            .into());
         }
 
         let (tx, rx) = mpsc::channel::<Result<LlmEvent>>(256);
@@ -253,7 +299,15 @@ impl LlmClient {
                 let chunk = match chunk {
                     Ok(c) => c,
                     Err(e) => {
-                        let _ = tx.send(Err(anyhow!("stream error: {e}"))).await;
+                        // Transport loss mid-answer: the one failure the loop
+                        // must retry, because output already shown can be
+                        // rewound while an unfinishable turn cannot.
+                        let failure = RequestError {
+                            status: None,
+                            retryable: true,
+                            message: format!("stream error: {e}"),
+                        };
+                        let _ = tx.send(Err(failure.into())).await;
                         return;
                     }
                 };
@@ -278,6 +332,31 @@ impl LlmClient {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
+
+                    // A provider that fails mid-answer reports it as an `error`
+                    // object inside an otherwise normal frame. Reading only
+                    // `choices` would drop that on the floor: the stream ends,
+                    // the turn looks complete, and half an answer reads as a
+                    // finished one.
+                    if let Some(error) = parsed.get("error").filter(|value| !value.is_null()) {
+                        let message = error
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("provider reported an error mid-stream")
+                            .to_string();
+                        let status = error
+                            .get("code")
+                            .or_else(|| error.get("status"))
+                            .and_then(|code| code.as_u64())
+                            .map(|code| code as u16);
+                        let retryable = match status {
+                            Some(code) => code == 429 || (500..=599).contains(&code),
+                            None => !looks_fatal(&message),
+                        };
+                        let failure = RequestError { status, retryable, message };
+                        let _ = tx.send(Err(failure.into())).await;
+                        return;
+                    }
 
                     if let Some(usage) = parsed.get("usage").filter(|u| !u.is_null()) {
                         let _ = tx.send(Ok(LlmEvent::Usage(extract_usage(usage)))).await;
@@ -405,9 +484,18 @@ impl LlmClient {
             }
         }
 
-        Err(last
-            .map(|error| anyhow!("{error}"))
-            .unwrap_or_else(|| anyhow!("request failed after {attempts} attempts")))
+        // Every attempt failed at the connection level: retried here as far as
+        // the settings allow, and classified retryable so a step-level retry
+        // gives the whole send phase another run after a longer backoff.
+        Err(RequestError {
+            status: None,
+            retryable: true,
+            message: match &last {
+                Some(error) => format!("connection failed after {attempts} attempts: {error}"),
+                None => format!("request failed after {attempts} attempts"),
+            },
+        }
+        .into())
     }
 
     /// Whether an error is the peer closing a connection mid-request.
@@ -775,6 +863,27 @@ mod body_tests {
     }
 }
 
+/// Whether a provider error message describes a failure no retry can fix.
+///
+/// Used when the provider reports an error without a numeric status: retrying
+/// a request the API rejected on its merits only repeats the rejection.
+fn looks_fatal(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    [
+        "context_length",
+        "context length",
+        "invalid_request",
+        "invalid request",
+        "unauthorized",
+        "authentication",
+        "not_found",
+        "insufficient_quota",
+        "quota exceeded",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 /// Whether an error is the peer closing a connection mid-request.
 ///
 /// reqwest reports this as a body or request error rather than a connect error,
@@ -1001,5 +1110,52 @@ mod retry_tests {
             "giving up took {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn a_retry_classification_survives_added_context() {
+        // chat_stream labels its failures with the URL it posted to; the loop
+        // must still read the classification the failure carries underneath.
+        let busy = RequestError {
+            status: Some(503),
+            retryable: true,
+            message: "overloaded".into(),
+        };
+        let error =
+            Result::<(), RequestError>::Err(busy)
+                .context("POST http://x/chat/completions")
+                .unwrap_err();
+        assert!(retryable(&error));
+
+        let rejected = RequestError {
+            status: Some(401),
+            retryable: false,
+            message: "bad key".into(),
+        };
+        let error =
+            Result::<(), RequestError>::Err(rejected)
+                .context("POST http://x/chat/completions")
+                .unwrap_err();
+        assert!(!retryable(&error));
+    }
+
+    #[test]
+    fn an_unclassified_error_is_not_retried() {
+        // Unknown failures are not given the benefit of the doubt: a retry
+        // loop that invents retryable failures turns a bug into a hang.
+        let error = anyhow::anyhow!("unexpected failure");
+        assert!(!retryable(&error));
+    }
+
+    #[test]
+    fn a_fatal_provider_message_ends_the_step_instead_of_retrying() {
+        // Mid-stream provider errors often arrive without a numeric status;
+        // the message is the only thing left to classify on.
+        assert!(looks_fatal("context_length_exceeded for this model"));
+        assert!(looks_fatal("invalid request: tools schema"));
+        assert!(looks_fatal("unauthorized"));
+        assert!(looks_fatal("insufficient_quota"));
+        assert!(!looks_fatal("The model is overloaded, please try again"));
+        assert!(!looks_fatal("rate_limit_exceeded"));
     }
 }

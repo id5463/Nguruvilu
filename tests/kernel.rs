@@ -149,7 +149,10 @@ fn an_explicit_override_is_recorded() {
 #[test]
 fn the_base_tools_are_registered_and_sorted() {
     let tools = ToolRegistry::with_base_tools().unwrap();
-    assert_eq!(tools.names(), vec!["bash", "edit", "read", "write"]);
+    assert_eq!(
+        tools.names(),
+        vec!["bash", "edit", "job_kill", "job_list", "job_output", "read", "write"]
+    );
     for name in tools.names() {
         assert_eq!(tools.owner(&name), Some("kernel"));
     }

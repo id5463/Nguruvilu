@@ -16,6 +16,7 @@
 //!   took versus how long tools took, because overhead that cannot be measured
 //!   cannot be fixed.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -40,6 +41,21 @@ pub trait AgentObserver: Send + Sync {
     fn on_tool_start(&self, _name: &str, _arguments: &str) {}
     /// A tool call finished.
     fn on_tool_end(&self, _name: &str, _ok: bool, _result: &str) {}
+    /// The current step is being retried: the provider failed or answered
+    /// with nothing, and whatever it had produced for this step is rewound.
+    ///
+    /// `attempt` is the attempt that just failed (1-based), `reason` says why.
+    fn on_step_retry(&self, _attempt: usize, _reason: &str) {}
+    /// The answer hit the provider's output ceiling; the loop is asking the
+    /// model to continue it in the next step.
+    fn on_continuation(&self, _reason: &str) {}
+    /// A message was committed to the history and will be part of the next
+    /// request.
+    ///
+    /// Hosts that persist the conversation as it happens write it here: a
+    /// process that dies mid-turn then loses only what never completed,
+    /// never everything since the last turn boundary.
+    fn on_message(&self, _message: &Message) {}
     /// History is being compacted, before the summary is written.
     fn on_compaction_start(&self, _messages: usize, _window: ContextWindow) {}
     /// A compaction finished.
@@ -178,6 +194,65 @@ pub struct AgentOutcome {
     /// The caller persists these so a reloaded session matches what the model
     /// actually saw.
     pub compactions: Vec<Compaction>,
+    /// Set when the loop stopped on a failure.
+    ///
+    /// The messages produced before the failure are kept and reported in
+    /// `new_messages`: a turn that dies half-done must not also erase what it
+    /// already did. This says why the turn did not finish.
+    pub error: Option<String>,
+    /// How many step attempts were retried during this turn.
+    pub retries: u32,
+}
+
+/// How many times one answer may be continued after hitting the provider's
+/// output ceiling, before the loop stops extending it.
+const MAX_CONTINUATIONS: usize = 3;
+
+/// What a stopped turn reports as its error.
+const STOPPED: &str = "stopped by the user";
+
+/// Waits until a stop is requested for the turn this receiver belongs to.
+///
+/// `false` means the requester went away without asking — nobody will ever
+/// ask, so the caller stops selecting on this signal and waits on the stream
+/// alone.
+async fn stop_flag(rx: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+    loop {
+        if *rx.borrow_and_update() {
+            return true;
+        }
+        if rx.changed().await.is_err() {
+            return false;
+        }
+    }
+}
+
+/// What one streaming attempt produced, including how it failed.
+///
+/// A failed attempt still carries the text that arrived before the failure:
+/// the caller either discards it for a retry or commits it, and losing it in
+/// transit would make those two indistinguishable.
+#[derive(Default)]
+struct StepOutput {
+    /// Assistant text streamed so far.
+    text: String,
+    /// Tool-call fragments assembled so far.
+    calls: Vec<PartialCallView>,
+    /// Usage the provider reported, when it got that far.
+    usage: TokenUsage,
+    /// The provider's finish reason, when it sent one.
+    finish_reason: Option<String>,
+    /// Whether any reasoning fragment arrived.
+    saw_reasoning: bool,
+    /// The failure that ended this attempt, if any.
+    error: Option<anyhow::Error>,
+}
+
+impl StepOutput {
+    /// The provider put out nothing at all: no text, no tool call, no thinking.
+    fn is_empty(&self) -> bool {
+        self.text.is_empty() && self.calls.is_empty() && !self.saw_reasoning
+    }
 }
 
 /// Drives one conversation.
@@ -194,6 +269,19 @@ pub struct Agent {
     summarizer: Arc<dyn Summarizer>,
     /// Injection engine override, for tests and embedding.
     injection_override: Option<Arc<crate::context::InjectionEngine>>,
+    /// A stop request for this turn, when the host can cancel it.
+    ///
+    /// Checked between steps, between stream events, and between tool joins —
+    /// a stop lands at the next safe point, keeps everything already
+    /// committed, and ends the turn with [`STOPPED`] as its error.
+    cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Pending user messages the host wants delivered while this turn runs.
+    ///
+    /// Drained at the top of every step: what the user typed mid-turn joins
+    /// the history exactly where a claim is legal — before the next request
+    /// is built — so the model reads it on its next step. `None` for hosts
+    /// without steering (CLI, subagents).
+    inbox: Option<Arc<std::sync::Mutex<VecDeque<String>>>>,
 }
 
 impl Agent {
@@ -207,6 +295,8 @@ impl Agent {
             observer: Arc::new(SilentObserver),
             summarizer: Arc::new(compaction::ModelSummarizer::default()),
             injection_override: None,
+            cancel: None,
+            inbox: None,
         }
     }
 
@@ -235,6 +325,28 @@ impl Agent {
     pub fn with_observer(mut self, observer: Arc<dyn AgentObserver>) -> Self {
         self.observer = observer;
         self
+    }
+
+    /// Make this turn stoppable: when the flag flips, the loop finishes at
+    /// its next safe point, keeps every message it committed, and reports
+    /// "stopped by the user" as the turn's error.
+    pub fn with_cancel(mut self, cancel: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// Deliver host-queued user messages at step boundaries.
+    ///
+    /// The queue is drained, not sampled: everything the user said while the
+    /// turn ran is claimed before the next request is built.
+    pub fn with_inbox(mut self, inbox: Arc<std::sync::Mutex<VecDeque<String>>>) -> Self {
+        self.inbox = Some(inbox);
+        self
+    }
+
+    /// Whether a stop has already been requested for this turn.
+    fn stop_requested(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|rx| *rx.borrow())
     }
 
 
@@ -269,6 +381,9 @@ impl Agent {
     pub async fn run(&mut self, prompt: &str) -> Result<AgentOutcome> {
         let user_message = Message::user(prompt);
         self.messages.push(user_message.clone());
+        // The prompt is committed before anything is attempted: asking the
+        // model is already a thing that happened.
+        self.observer.on_message(&user_message);
 
         // Frozen for the whole turn: a reload landing now is next turn's news.
         let settings = self.config.settings();
@@ -283,6 +398,8 @@ impl Agent {
             config_version: settings.version,
             injections: Vec::new(),
             compactions: Vec::new(),
+            error: None,
+            retries: 0,
         };
 
         let schemas = settings.tools.schemas();
@@ -292,7 +409,38 @@ impl Agent {
         // badly once tool output is involved.
         let mut last_prompt_tokens: Option<usize> = None;
 
+        // How much output was cut off by the provider's ceiling and continued
+        // so far. One answer, possibly delivered in several chunks.
+        let mut continuations: usize = 0;
+
+        // One place decides how hard a failing request is retried: the same
+        // network settings the send-phase retries read.
+        let network = self.client.network().clone();
+        let max_attempts = 1 + network.retry_attempts;
+
         for step in 1..=self.max_steps {
+            // A stop between steps ends the turn here: everything committed
+            // so far is already in the history and is reported with it.
+            if self.stop_requested() {
+                outcome.error = Some(STOPPED.to_string());
+                return Ok(outcome);
+            }
+
+            // Steering claimed at the boundary: what the user typed while this
+            // turn ran joins the history before the next request is built, so
+            // the model reads it on this very step. Claimed messages are
+            // committed like any other — they are model-visible from here on.
+            let inbox = self.inbox.clone();
+            if let Some(inbox) = inbox {
+                let texts: Vec<String> = inbox.lock().expect("inbox").drain(..).collect();
+                for text in texts {
+                    let message = Message::user(text);
+                    self.messages.push(message.clone());
+                    outcome.new_messages.push(message.clone());
+                    self.observer.on_message(&message);
+                }
+            }
+
             outcome.steps = step;
             self.observer.on_step(step);
 
@@ -337,57 +485,99 @@ impl Agent {
             // with; switching is a clone, not a reconnect.
             let client = self.client.with_model(&settings.model);
 
-            let model_started = Instant::now();
-            let mut rx = client.chat_stream(&request, &schemas).await?;
-
-            let mut text = String::new();
-            let mut calls: Vec<PartialCallView> = Vec::new();
-            let mut step_usage = TokenUsage::default();
-
-            while let Some(event) = rx.recv().await {
-                match event? {
-                    LlmEvent::TextDelta(delta) => {
-                        self.observer.on_text(&delta);
-                        text.push_str(&delta);
-                    }
-                    LlmEvent::ReasoningDelta(delta) => self.observer.on_reasoning(&delta),
-                    LlmEvent::ToolCallDelta { index, id, name, arguments } => {
-                        while calls.len() <= index {
-                            calls.push(PartialCallView::default());
-                        }
-                        let slot = &mut calls[index];
-                        if let Some(id) = id {
-                            slot.id = id;
-                        }
-                        if let Some(name) = name {
-                            slot.name = name;
-                        }
-                        if let Some(args) = arguments {
-                            slot.arguments.push_str(&args);
-                        }
-                    }
-                    LlmEvent::Usage(usage) => step_usage = usage,
-                    LlmEvent::Finished { .. } => {}
+            // One step is one or more streaming attempts. A transient
+            // failure or an empty response is retried with backoff; only a
+            // permanent failure or the attempt budget ends the step in error,
+            // and even then the turn's progress so far is kept.
+            let mut attempt: u32 = 0;
+            let mut out = loop {
+                // A stop during the backoff ends the attempt loop without
+                // another request; the error branch below reports it.
+                if self.stop_requested() {
+                    let mut stopped = StepOutput::default();
+                    stopped.error = Some(anyhow::anyhow!(STOPPED));
+                    break stopped;
                 }
-            }
+                attempt += 1;
+                let started = Instant::now();
+                let produced = self.stream_once(&client, &request, &schemas).await;
+                outcome.timing.model_ms += started.elapsed().as_millis();
 
-            outcome.timing.model_ms += model_started.elapsed().as_millis();
-            outcome.usage.input += step_usage.input;
-            outcome.usage.output += step_usage.output;
-            outcome.usage.cached += step_usage.cached;
+                match &produced.error {
+                    Some(error) => {
+                        let retry = llm::retryable(error);
+                        if retry && attempt < max_attempts {
+                            let message = format!("{error:#}");
+                            outcome.retries += 1;
+                            self.observer.on_step_retry(attempt as usize, &message);
+                            tokio::time::sleep(network.backoff(attempt)).await;
+                            continue;
+                        }
+                    }
+                    None if produced.is_empty() && attempt < max_attempts => {
+                        outcome.retries += 1;
+                        self.observer.on_step_retry(
+                            attempt as usize,
+                            "the provider returned an empty response",
+                        );
+                        tokio::time::sleep(network.backoff(attempt)).await;
+                        continue;
+                    }
+                    None => {}
+                }
+                break produced;
+            };
+
+            outcome.usage.input += out.usage.input;
+            outcome.usage.output += out.usage.output;
+            outcome.usage.cached += out.usage.cached;
 
             // Remember the prompt size the provider just reported, so the next
             // step can decide whether history needs reducing.
-            if step_usage.input > 0 {
-                last_prompt_tokens = Some(step_usage.input as usize);
+            if out.usage.input > 0 {
+                last_prompt_tokens = Some(out.usage.input as usize);
             }
 
-            let indexed: Vec<(usize, PartialCallView)> = calls
+            // The step ended in failure. Whatever text arrived before it is
+            // committed — the transcript must show what the model actually
+            // said — and the error says why the loop stopped.
+            if let Some(error) = out.error.take() {
+                if !out.text.is_empty() {
+                    let partial = Message::assistant_tools(Vec::new(), Some(out.text.clone()));
+                    self.messages.push(partial.clone());
+                    outcome.new_messages.push(partial);
+                    self.observer.on_message(self.messages.last().expect("just pushed"));
+                }
+                outcome.error = Some(format!("{error:#}"));
+                return Ok(outcome);
+            }
+
+            // The attempt budget ran out on a response with nothing in it.
+            // Reporting this as an error matters: a silent end reads as a
+            // finished turn when the task never even started.
+            if out.is_empty() {
+                outcome.error = Some(format!(
+                    "the model returned an empty response after {attempt} attempt(s)"
+                ));
+                return Ok(outcome);
+            }
+
+            let indexed: Vec<(usize, PartialCallView)> = out
+                .calls
                 .iter()
                 .enumerate()
                 .map(|(i, c)| (i, c.clone()))
                 .collect();
-            let tool_calls: Vec<ToolCall> = llm::assemble_calls(&indexed);
+            let mut tool_calls: Vec<ToolCall> = llm::assemble_calls(&indexed);
+            let text = out.text;
+
+            // Stopped between the answer and its tool calls: the calls never
+            // ran, so they are dropped rather than left unanswered — a tool
+            // call with no result is a request no provider accepts next turn.
+            let stopped_before_tools = self.stop_requested() && !tool_calls.is_empty();
+            if stopped_before_tools {
+                tool_calls.clear();
+            }
 
             let assistant = Message::assistant_tools(
                 tool_calls.clone(),
@@ -395,9 +585,42 @@ impl Agent {
             );
             self.messages.push(assistant.clone());
             outcome.new_messages.push(assistant);
-            outcome.text = text;
+            self.observer.on_message(self.messages.last().expect("just pushed"));
+            // One string across a continuation chain: each cut-off segment
+            // appends to the answer it belongs to, a plain step replaces it.
+            if continuations > 0 {
+                outcome.text.push_str(&text);
+            } else {
+                outcome.text = text;
+            }
+
+            // The answer stops at the provider's output ceiling with no tool
+            // call to execute. Without a continuation the turn ends looking
+            // complete while the task is half-done — an interruption exactly
+            // where small models produce it most.
+            if out.finish_reason.as_deref() == Some("length")
+                && tool_calls.is_empty()
+                && continuations < MAX_CONTINUATIONS
+                && !stopped_before_tools
+            {
+                continuations += 1;
+                let nudge = Message::user(
+                    "Your previous reply was cut off by the output token limit. \
+                     Continue exactly where you left off, without repeating \
+                     anything you already wrote.",
+                );
+                self.messages.push(nudge.clone());
+                outcome.new_messages.push(nudge);
+                self.observer.on_message(self.messages.last().expect("just pushed"));
+                self.observer
+                    .on_continuation(&format!("step {step} hit the output limit"));
+                continue;
+            }
 
             if tool_calls.is_empty() {
+                if stopped_before_tools {
+                    outcome.error = Some(STOPPED.to_string());
+                }
                 return Ok(outcome);
             }
 
@@ -416,11 +639,45 @@ impl Agent {
 
             let mut results: Vec<Option<(ToolCall, Result<crate::tools::ToolOutput>)>> =
                 (0..tool_calls.len()).map(|_| None).collect();
-            while let Some(joined) = set.join_next().await {
-                let (position, call, result) = joined?;
-                results[position] = Some((call, result));
+            // Collecting is cancellable: a bash call that runs for minutes
+            // must not outlive the user's decision to stop watching it.
+            let mut stopped = false;
+            let mut stop = self.cancel.clone();
+            let mut stop_closed = false;
+            'collect: loop {
+                if stop_closed {
+                    stop = None;
+                    stop_closed = false;
+                }
+                let joined = if let Some(stop_rx) = &mut stop {
+                    tokio::select! {
+                        biased;
+                        requested = stop_flag(stop_rx) => {
+                            if requested {
+                                stopped = true;
+                                break 'collect;
+                            }
+                            stop_closed = true;
+                            continue 'collect;
+                        }
+                        joined = set.join_next() => joined,
+                    }
+                } else {
+                    set.join_next().await
+                };
+                match joined {
+                    Some(Ok((position, call, result))) => results[position] = Some((call, result)),
+                    Some(Err(error)) => return Err(error.into()),
+                    // Every task finished: nothing left to wait for.
+                    None => break 'collect,
+                }
             }
             outcome.timing.tools_ms += tools_started.elapsed().as_millis();
+            if stopped {
+                // The in-flight calls are killed; the answers below fill in
+                // for them either way.
+                set.abort_all();
+            }
 
             // Images a tool produced cannot travel in its tool message: the
             // format restricts that content to text. They are collected here and
@@ -428,8 +685,18 @@ impl Agent {
             // the only place the format allows them.
             let mut attached: Vec<(String, crate::message::ImageAttachment)> = Vec::new();
 
-            for entry in results.into_iter().flatten() {
-                let (call, result) = entry;
+            for (position, call) in tool_calls.iter().enumerate() {
+                let result = match results[position].take() {
+                    Some((_, result)) => result,
+                    // Killed mid-call: the call still gets an answer, because
+                    // an unanswered tool call is a history the next request
+                    // cannot be built from.
+                    None if stopped => Err(anyhow::anyhow!(
+                        "stopped by the user before this tool call finished"
+                    )),
+                    // Unreachable without a stop: every task joined above.
+                    None => continue,
+                };
                 outcome.tool_calls += 1;
                 let (ok, body) = match result {
                     Ok(output) => {
@@ -444,6 +711,7 @@ impl Agent {
                 let message = Message::tool_result(call.id.clone(), call.name.clone(), body);
                 self.messages.push(message.clone());
                 outcome.new_messages.push(message);
+                self.observer.on_message(self.messages.last().expect("just pushed"));
             }
 
             if !attached.is_empty() {
@@ -458,6 +726,14 @@ impl Agent {
                     Message::user_with_images(text, attached.into_iter().map(|(_, i)| i).collect());
                 self.messages.push(message.clone());
                 outcome.new_messages.push(message);
+                self.observer.on_message(self.messages.last().expect("just pushed"));
+            }
+
+            // Every dispatched call now has an answer and the turn was asked
+            // to stop: report it instead of taking another step.
+            if stopped {
+                outcome.error = Some(STOPPED.to_string());
+                return Ok(outcome);
             }
         }
 
@@ -466,6 +742,121 @@ impl Agent {
             self.max_steps
         );
         Ok(outcome)
+    }
+
+    /// One streaming attempt for the current step.
+    ///
+    /// It does not fail: a transport error before the response, or partway
+    /// through it, lands in `error` carrying whatever text already arrived, so
+    /// the caller can choose between retrying and committing the partial.
+    async fn stream_once(
+        &self,
+        client: &LlmClient,
+        request: &[Message],
+        schemas: &[serde_json::Value],
+    ) -> StepOutput {
+        let mut out = StepOutput::default();
+
+        // Waiting for the response's first byte is part of the turn: a slow
+        // gateway can hold it for seconds, and a stop arriving there has to
+        // land just as it does during streaming.
+        let mut stop = self.cancel.clone();
+        let mut stop_closed = false;
+        let opened = loop {
+            // Dropping the signal here would need the borrow this loop holds;
+            // the flag is one-shot, so clearing it once and taking the plain
+            // path below is enough.
+            if stop_closed {
+                stop = None;
+            }
+            let attempt = if let Some(stop_rx) = &mut stop {
+                tokio::select! {
+                    biased;
+                    requested = stop_flag(stop_rx) => {
+                        if requested {
+                            out.error = Some(anyhow::anyhow!(STOPPED));
+                            return out;
+                        }
+                        // Nobody is asking anymore; open the stream plainly.
+                        stop_closed = true;
+                        continue;
+                    }
+                    opened = client.chat_stream(request, schemas) => opened,
+                }
+            } else {
+                client.chat_stream(request, schemas).await
+            };
+            break attempt;
+        };
+        let mut rx = match opened {
+            Ok(rx) => rx,
+            Err(error) => {
+                out.error = Some(error);
+                return out;
+            }
+        };
+
+        // The stream is cancellable: text already shown is kept (the caller
+        // commits it), and the stop ends this attempt instead of waiting for
+        // a model that may keep generating for another minute.
+        let mut stop = self.cancel.clone();
+        let mut stop_closed = false;
+        'stream: loop {
+            if stop_closed {
+                stop = None;
+                stop_closed = false;
+            }
+            let event = if let Some(stop_rx) = &mut stop {
+                tokio::select! {
+                    biased;
+                    requested = stop_flag(stop_rx) => {
+                        if requested {
+                            out.error = Some(anyhow::anyhow!(STOPPED));
+                            break 'stream;
+                        }
+                        // Nobody is asking anymore; wait on the stream alone.
+                        stop_closed = true;
+                        continue 'stream;
+                    }
+                    event = rx.recv() => event,
+                }
+            } else {
+                rx.recv().await
+            };
+            let Some(event) = event else { break 'stream; };
+            match event {
+                Ok(LlmEvent::TextDelta(delta)) => {
+                    self.observer.on_text(&delta);
+                    out.text.push_str(&delta);
+                }
+                Ok(LlmEvent::ReasoningDelta(delta)) => {
+                    self.observer.on_reasoning(&delta);
+                    out.saw_reasoning = true;
+                }
+                Ok(LlmEvent::ToolCallDelta { index, id, name, arguments }) => {
+                    while out.calls.len() <= index {
+                        out.calls.push(PartialCallView::default());
+                    }
+                    let slot = &mut out.calls[index];
+                    if let Some(id) = id {
+                        slot.id = id;
+                    }
+                    if let Some(name) = name {
+                        slot.name = name;
+                    }
+                    if let Some(args) = arguments {
+                        slot.arguments.push_str(&args);
+                    }
+                }
+                Ok(LlmEvent::Usage(usage)) => out.usage = usage,
+                Ok(LlmEvent::Finished { reason }) => out.finish_reason = reason,
+                Err(error) => {
+                    out.error = Some(error);
+                    break 'stream;
+                }
+            }
+        }
+        out
     }
 
     /// The client to use for summarization.
@@ -762,5 +1153,197 @@ mod tests {
         assert_eq!(agent.config.settings().version, 0);
         assert_eq!(agent.config.settings().version, 1);
         assert_eq!(agent.config_version(), 2);
+    }
+
+    #[test]
+    fn an_empty_step_is_nothing_at_all() {
+        let empty = StepOutput::default();
+        assert!(empty.is_empty());
+
+        let mut spoken = StepOutput::default();
+        spoken.text = "hi".into();
+        assert!(!spoken.is_empty());
+
+        let mut thought = StepOutput::default();
+        thought.saw_reasoning = true;
+        assert!(!thought.is_empty());
+
+        let mut called = StepOutput::default();
+        called.calls.push(PartialCallView::default());
+        assert!(!called.is_empty());
+    }
+
+    /// A provider answering canned HTTP responses in order, repeating the
+    /// last one, one response per connection.
+    ///
+    /// Enough of the wire for the loop under test: the loop's decisions are
+    /// made from statuses, SSE frames, and connection endings, not from
+    /// anything else the request carries — so the request head and body are
+    /// drained and ignored.
+    async fn provider(
+        responses: Vec<String>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = std::sync::Arc::clone(&hits);
+
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                // Drain the request head byte-wise, then the declared body, so
+                // a close after the response cannot race a client still
+                // writing and turn every test into a flake.
+                let mut head = Vec::new();
+                loop {
+                    let mut byte = [0u8; 1];
+                    match socket.read(&mut byte).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            head.push(byte[0]);
+                            if head.ends_with(b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let head_text = String::from_utf8_lossy(&head);
+                let declared = head_text
+                    .lines()
+                    .filter_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .next()
+                    .unwrap_or(0);
+                let mut remaining = declared;
+                let mut buf = [0u8; 4096];
+                while remaining > 0 {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => remaining = remaining.saturating_sub(read),
+                    }
+                }
+
+                let index = served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let body = responses
+                    .get(index)
+                    .or_else(|| responses.last())
+                    .cloned()
+                    .unwrap_or_default();
+                let _ = socket.write_all(body.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// One SSE response carrying a single content frame with `finish`.
+    fn sse_answer(text: &str, finish: &str) -> String {
+        let frame = serde_json::json!({
+            "choices": [{ "delta": { "content": text }, "finish_reason": finish }]
+        });
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {frame}\n\ndata: [DONE]\n\n"
+        )
+    }
+
+    fn agent_against(base: String) -> Agent {
+        let tools = Arc::new(ToolRegistry::with_base_tools().unwrap());
+        let config: Arc<dyn TurnConfig> = Arc::new(StaticConfig::new("SYS", tools, "test-model"));
+        let client =
+            LlmClient::new(crate::llm::LlmConfig::new(base, "k", "test-model")).unwrap();
+        Agent::new(client, config, Vec::new())
+    }
+
+    #[tokio::test]
+    async fn a_truncated_answer_is_continued_rather_than_taken_as_finished() {
+        // A small model hits the output ceiling mid-answer. The turn must go
+        // on asking for the rest instead of ending half-done and looking
+        // complete.
+        let (base, hits) = provider(vec![
+            sse_answer("part one ", "length"),
+            sse_answer("part two", "stop"),
+        ])
+        .await;
+        let mut agent = agent_against(base);
+
+        let outcome = agent.run("go").await.expect("the loop finishes");
+
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(outcome.steps, 2, "the cut-off step runs again");
+        assert_eq!(outcome.text, "part one part two");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "one request per step"
+        );
+
+        // The history keeps both segments and the nudge between them: the
+        // model must see where it was cut off to continue from there.
+        let messages = agent.messages();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].text(), "go");
+        assert_eq!(messages[1].text(), "part one ");
+        assert!(messages[2].text().contains("cut off"), "{:?}", messages[2].text());
+        assert_eq!(messages[3].text(), "part two");
+    }
+
+    #[tokio::test]
+    async fn a_transient_provider_failure_is_retried_within_the_step() {
+        let (base, hits) = provider(vec![
+            "HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\n\r\noverloaded"
+                .to_string(),
+            sse_answer("recovered", "stop"),
+        ])
+        .await;
+        let mut agent = agent_against(base);
+
+        let outcome = agent.run("go").await.expect("the loop finishes");
+
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(outcome.retries, 1);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(outcome.text, "recovered");
+        // Only the final attempt's answer enters the history — the failed one
+        // produced nothing worth keeping.
+        assert_eq!(agent.messages().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_permanent_failure_reports_an_error_without_losing_the_turn() {
+        let (base, hits) = provider(vec![
+            "HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\nmalformed".to_string(),
+        ])
+        .await;
+        let mut agent = agent_against(base);
+
+        let outcome = agent.run("go").await.expect("the loop still answers");
+
+        let error = outcome.error.expect("a 400 must surface as the turn's error");
+        assert!(error.contains("400"), "{error}");
+        assert_eq!(outcome.retries, 0, "a rejected request is not retried");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        // The prompt itself survives: the next turn continues from what was
+        // said, not from a conversation that pretends the ask never happened.
+        assert_eq!(outcome.new_messages.len(), 1);
+        assert_eq!(outcome.new_messages[0].text(), "go");
+    }
+
+    #[tokio::test]
+    async fn an_empty_response_is_retried_and_then_reported() {
+        let (base, hits) = provider(vec!["HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: [DONE]\n\n".to_string()])
+            .await;
+        let mut agent = agent_against(base);
+
+        let outcome = agent.run("go").await.expect("the loop still answers");
+
+        let error = outcome.error.expect("silence must not read as success");
+        assert!(error.contains("empty response"), "{error}");
+        // Default budget: one attempt plus three retries.
+        assert_eq!(outcome.retries, 3);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 4);
     }
 }

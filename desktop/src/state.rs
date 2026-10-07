@@ -8,6 +8,7 @@
 //! while agent turns run on a tokio runtime. They meet at one seam — a
 //! [`EventSink`] — the page in window mode, stdout in headless mode.
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -135,8 +136,24 @@ pub struct AppState {
     pub store: JsonlStore,
     /// Model route settings, for rebuilding clients.
     pub route: ModelRoute,
-    /// Whether a turn is running, so the UI can disable input.
-    pub busy: bool,
+    /// Sessions with a turn running right now.
+    ///
+    /// Keyed by session id rather than one flag: a session that is working
+    /// must not lock out a different one, and the id is what routes a turn's
+    /// events back to the right history when the user switches away mid-run.
+    pub running: HashSet<String>,
+    /// Stop requests for the sessions that are running right now.
+    ///
+    /// The sender lives here so any command can flip the flag while the turn
+    /// runs unguarded; the turn itself holds only the receiving end and checks
+    /// it at its next safe point.
+    pub cancels: HashMap<String, tokio::sync::watch::Sender<bool>>,
+    /// Messages typed while a session's turn runs.
+    ///
+    /// Delivered at the turn's next step boundary (steering); whatever arrives
+    /// after the last claim is chained into a follow-up turn when the current
+    /// one completes, so nothing the user sent is stranded.
+    pub inboxes: HashMap<String, Arc<std::sync::Mutex<VecDeque<String>>>>,
     /// Effective settings, as the settings panel should display them.
     pub settings: Settings,
     /// Prompt tokens the provider last reported, for the context readout.
@@ -279,7 +296,9 @@ impl AppState {
             session,
             store,
             route,
-            busy: false,
+            running: HashSet::new(),
+            cancels: HashMap::new(),
+            inboxes: HashMap::new(),
             settings,
             last_error: None,
             last_prompt_tokens: None,
@@ -302,6 +321,10 @@ impl AppState {
         let runtime = self.config.runtime.lock().expect("runtime lock");
         let snapshot = runtime.snapshot();
         let skills = self.config.skills.lock().expect("skills lock");
+        // Sorted so the page's badge order does not shuffle between pushes.
+        let mut running: Vec<&String> = self.running.iter().collect();
+        running.sort();
+        let running: Vec<String> = running.into_iter().cloned().collect();
         json!({
             "session": self.session.id,
             "title": self.session.title(),
@@ -334,7 +357,11 @@ impl AppState {
                 "realm": realm.to_string(),
                 "owner": owner,
             })).collect::<Vec<_>>(),
-            "busy": self.busy,
+            // Busy means *this* session is working. Another session running a
+            // turn is reported separately so the page can let one conversation
+            // continue while a different one is busy.
+            "busy": self.running.contains(&self.session.id),
+            "running_sessions": running,
             "configured": self.settings.is_configured(),
             "missing": self.settings.missing(),
             "api_key_masked": self.settings.masked_key(),
@@ -381,6 +408,7 @@ impl AppState {
                 "messages": s.message_count,
                 "updated_at": s.updated_at,
                 "current": s.id == self.session.id,
+                "running": self.running.contains(&s.id),
             }))
             .collect::<Vec<_>>()))
     }
@@ -922,18 +950,36 @@ pub fn data_directory() -> PathBuf {
 /// redundant DOM work actually gets avoided.
 pub struct UiObserver {
     sink: Arc<dyn EventSink>,
+    /// The shell's state, so a committed message can be written the moment it
+    /// exists instead of batched until the turn ends.
+    state: Arc<Mutex<AppState>>,
+    /// The session this turn belongs to.
+    ///
+    /// Stamped onto every event so the page can tell one conversation's
+    /// stream from another's once two sessions may be working at once — and
+    /// the key every incremental write goes under, whichever session the page
+    /// happens to be showing when the turn finishes.
+    session: String,
 }
 
 impl UiObserver {
-    /// Build an observer that pushes events to the window.
-    pub fn new(sink: Arc<dyn EventSink>) -> Self {
-        Self { sink }
+    /// Build an observer that pushes events for `session` to the window and
+    /// writes each committed message to `state`'s store as it happens.
+    pub fn new(sink: Arc<dyn EventSink>, state: Arc<Mutex<AppState>>, session: String) -> Self {
+        Self { sink, state, session }
     }
 
     fn emit(&self, event: Value) {
+        let tagged = match event {
+            Value::Object(mut map) => {
+                map.insert("session".to_string(), Value::String(self.session.clone()));
+                Value::Object(map)
+            }
+            other => other,
+        };
         // The page is the only consumer; a closed window just means the send
         // fails, which is not an error worth surfacing.
-        self.sink.emit(event);
+        self.sink.emit(tagged);
     }
 }
 
@@ -958,6 +1004,31 @@ impl AgentObserver for UiObserver {
 
     fn on_tool_end(&self, name: &str, ok: bool, result: &str) {
         self.emit(json!({ "ev": "tool_end", "name": name, "ok": ok, "result": result }));
+    }
+
+    fn on_step_retry(&self, attempt: usize, reason: &str) {
+        self.emit(json!({ "ev": "step_retry", "attempt": attempt, "reason": reason }));
+    }
+
+    fn on_continuation(&self, reason: &str) {
+        self.emit(json!({ "ev": "continuation", "reason": reason }));
+    }
+
+    fn on_message(&self, message: &nguruvilu::message::Message) {
+        // Written the moment it exists. This is what makes a force-kill
+        // survivable: the file already holds every message the conversation
+        // produced, so a restart reads exactly what happened — instead of
+        // waiting for a turn-end batch the killed process never reaches.
+        let mut guard = self.state.lock().expect("state lock");
+        if let Err(error) = guard
+            .store
+            .append(&self.session, std::slice::from_ref(message))
+        {
+            eprintln!("[store] incremental append failed: {error:#}");
+        }
+        if guard.session.id == self.session {
+            guard.session.messages.push(message.clone());
+        }
     }
 
     fn on_compaction_start(&self, messages: usize, window: nguruvilu::window::ContextWindow) {
@@ -990,38 +1061,103 @@ impl AgentObserver for UiObserver {
     }
 }
 
+/// Queue `text` as steering for the session the shell is showing, but only
+/// while that session's turn is running.
+///
+/// Returns the session id when the message was queued; `None` means the
+/// session is idle (or the text is blank) and the caller should treat the
+/// text as an ordinary prompt. The serve shell calls this directly: its
+/// command queue would otherwise hold the message until the very turn it
+/// steers has already ended.
+pub fn try_steer(guard: &mut AppState, text: &str) -> Option<String> {
+    if text.trim().is_empty() {
+        return None;
+    }
+    let session_id = guard.session.id.clone();
+    if !guard.running.contains(&session_id) {
+        return None;
+    }
+    let queue = guard
+        .inboxes
+        .entry(session_id.clone())
+        .or_insert_with(|| Arc::new(std::sync::Mutex::new(VecDeque::new())));
+    queue.lock().expect("inbox").push_back(text.to_string());
+    Some(session_id)
+}
+
 /// Run one turn, streaming progress to the page.
 ///
-/// The turn takes its settings once, at the start, so a change landing while it
-/// runs applies to the next turn rather than to a request already in flight.
+/// A turn belongs to the session it started in: it finishes against that
+/// session's file even when the user switches to a different conversation
+/// mid-run, and one session runs one turn at a time. A prompt sent while its
+/// turn runs is steering — queued for the next step boundary, or, when the
+/// running one ends before claiming it, returned as the next turn for
+/// [`run_turn_cascading`] to run. Settings are taken once, at the start, so a
+/// change landing while the turn runs applies to the next turn.
+///
+/// A failure keeps its progress: every message the agent committed is written
+/// as it happens, and the error is reported alongside it.
+///
+/// Returns the oldest unclaimed steering message, if one arrived too late to
+/// be claimed by this turn.
 pub async fn run_turn(
     state: Arc<Mutex<AppState>>,
     text: String,
     sink: Arc<dyn EventSink>,
-) -> Result<()> {
-    let (client, config, messages, events, session_id) = {
+) -> Result<Option<String>> {
+    // One turn per session, decided under the lock so two prompts racing for
+    // the same history cannot both pass the check.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let (session_id, client, config, messages, events, inbox) = {
         let mut guard = state.lock().expect("state lock");
+        // Steering, not a refusal: the message joins the running turn at its
+        // next step boundary — or, when the turn ends before claiming it, the
+        // cascade runs it as a follow-up turn.
+        if let Some(session) = try_steer(&mut guard, &text) {
+            drop(guard);
+            sink.emit(json!({
+                "ev": "steer",
+                "text": text,
+                "session": session,
+            }));
+            return Ok(None);
+        }
+        let session_id = guard.session.id.clone();
         // A new attempt supersedes the previous failure; leaving a stale error
         // on screen while a retry runs would be a lie.
         guard.last_error = None;
-        // The fallible part runs *before* `busy` flips: a `?` here used to
-        // return with `busy` stuck true, and the page blocks every later send
-        // for a turn that never started.
+        // The fallible part runs *before* the session is marked running: a `?`
+        // here must not leave the page blocking every later send for a turn
+        // that never started.
         let client = guard.client()?;
-        guard.busy = true;
+        guard.running.insert(session_id.clone());
+        // Published before the first await: a stop arriving any time after
+        // this line finds its target.
+        guard.cancels.insert(session_id.clone(), stop_tx);
+        let inbox = guard
+            .inboxes
+            .entry(session_id.clone())
+            .or_insert_with(|| Arc::new(std::sync::Mutex::new(VecDeque::new())))
+            .clone();
         (
+            session_id,
             client,
             Arc::clone(&guard.config),
             guard.session.messages.clone(),
             guard.kernel.events(),
-            guard.session.id.clone(),
+            inbox,
         )
     };
-
-    let observer = Arc::new(UiObserver::new(Arc::clone(&sink)));
+    let observer = Arc::new(UiObserver::new(
+        Arc::clone(&sink),
+        Arc::clone(&state),
+        session_id.clone(),
+    ));
     let mut agent = Agent::new(client, config, messages)
         .with_max_steps(50)
-        .with_observer(Arc::clone(&observer) as Arc<dyn AgentObserver>);
+        .with_observer(Arc::clone(&observer) as Arc<dyn AgentObserver>)
+        .with_cancel(stop_rx)
+        .with_inbox(inbox);
 
     events.emit(
         nguruvilu::events::PROMPT_SUBMIT,
@@ -1034,11 +1170,16 @@ pub async fn run_turn(
         nguruvilu::events::TURN_START,
         &serde_json::json!({ "session": &session_id }),
     );
+    // The page sees the turn start only once the running slot is held, and
+    // with the session id attached: everything streamed from here on belongs
+    // to that conversation.
+    sink.emit(json!({ "ev": "turn_start", "text": &text, "session": &session_id }));
+
     let turn_started = std::time::Instant::now();
     let result = agent.run(&text).await;
     let turn_ms = turn_started.elapsed().as_millis() as u64;
     match &result {
-        Ok(outcome) => events.emit(
+        Ok(outcome) if outcome.error.is_none() => events.emit(
             nguruvilu::events::TURN_COMPLETE,
             &serde_json::json!({
                 "session": &session_id,
@@ -1046,6 +1187,21 @@ pub async fn run_turn(
                 "duration_ms": turn_ms,
                 "steps": outcome.steps,
                 "tool_calls": outcome.tool_calls,
+                "retries": outcome.retries,
+            }),
+        ),
+        Ok(outcome) => events.emit(
+            nguruvilu::events::TURN_COMPLETE,
+            &serde_json::json!({
+                "session": &session_id,
+                "ok": false,
+                "duration_ms": turn_ms,
+                "steps": outcome.steps,
+                "retries": outcome.retries,
+                "error": nguruvilu::events::truncate(
+                    outcome.error.as_deref().unwrap_or("turn failed"),
+                    1000,
+                ),
             }),
         ),
         Err(error) => events.emit(
@@ -1060,7 +1216,19 @@ pub async fn run_turn(
     }
 
     let mut guard = state.lock().expect("state lock");
-    guard.busy = false;
+    guard.running.remove(&session_id);
+    guard.cancels.remove(&session_id);
+    // Whatever arrived after this turn's last claim still deserves its turn:
+    // take the oldest pending message; the chained run's own first step claims
+    // the rest. A cancel cleared the queue already, so stopping stops the
+    // chain too.
+    let followup = guard
+        .inboxes
+        .get(&session_id)
+        .and_then(|queue| queue.lock().expect("inbox").pop_front());
+    let is_current = guard.session.id == session_id;
+    let mut end: Option<Value> = None;
+    let mut failure: Option<String> = None;
 
     match result {
         Ok(outcome) => {
@@ -1068,9 +1236,10 @@ pub async fn run_turn(
             // terminal launch should also be able to see that a turn happened.
             let preview: String = outcome.text.chars().take(100).collect();
             eprintln!(
-                "[turn] {} steps, {} tools, {} in / {} out ({} cached), model {} ms, tools {} ms: {}",
+                "[turn] {} steps, {} tools, {} retries, {} in / {} out ({} cached), model {} ms, tools {} ms: {}",
                 outcome.steps,
                 outcome.tool_calls,
+                outcome.retries,
                 outcome.usage.input,
                 outcome.usage.output,
                 outcome.usage.cached,
@@ -1078,21 +1247,21 @@ pub async fn run_turn(
                 outcome.timing.tools_ms,
                 preview.replace('\n', " ")
             );
-            guard.session.messages.extend(outcome.new_messages.clone());
-            if let Err(error) = guard.store.append(&guard.session.id, &outcome.new_messages) {
-                eprintln!("[store] append failed: {error:#}");
-            }
 
+            // Messages were already written by `on_message`, the moment each
+            // one was committed — a kill mid-turn loses only what never
+            // completed, never a whole turn's worth. What remains here is the
+            // metadata that has no message to ride along with.
             for record in &outcome.injections {
-                if let Err(error) = guard.store.append_injection(&guard.session.id, record) {
+                if let Err(error) = guard.store.append_injection(&session_id, record) {
                     eprintln!("[store] injection append failed: {error:#}");
                 }
             }
 
-            // Record compactions after the messages they replace, then adopt the
-            // agent's reduced history so the live session matches the file.
+            // Record compactions after the messages they replace, then adopt
+            // the agent's reduced history so the live session matches the file.
             for compaction in &outcome.compactions {
-                if let Err(error) = guard.store.append_compaction(&guard.session.id, compaction) {
+                if let Err(error) = guard.store.append_compaction(&session_id, compaction) {
                     eprintln!("[store] compaction append failed: {error:#}");
                 }
                 eprintln!(
@@ -1101,37 +1270,99 @@ pub async fn run_turn(
                     compaction.summary.chars().count()
                 );
             }
-            if !outcome.compactions.is_empty() {
+            if !outcome.compactions.is_empty() && is_current {
                 guard.session.messages = agent.messages().to_vec();
             }
 
-            let payload = json!({
-                "ev": "turn_end",
-                "steps": outcome.steps,
-                "tool_calls": outcome.tool_calls,
-                "usage": {
-                    "input": outcome.usage.input,
-                    "output": outcome.usage.output,
-                    "cached": outcome.usage.cached,
-                },
-                "timing": {
-                    "model_ms": outcome.timing.model_ms,
-                    "tools_ms": outcome.timing.tools_ms,
-                },
-                "config_version": outcome.config_version,
-                "session": guard.session.id,
-                "messages": guard.session.messages.len(),
-            });
-            sink.emit(payload);
+            if outcome.usage.input > 0 {
+                guard.last_prompt_tokens = Some(outcome.usage.input as usize);
+            }
+
+            if let Some(error) = outcome.error {
+                failure = Some(error);
+            } else {
+                end = Some(json!({
+                    "ev": "turn_end",
+                    "steps": outcome.steps,
+                    "tool_calls": outcome.tool_calls,
+                    "retries": outcome.retries,
+                    "usage": {
+                        "input": outcome.usage.input,
+                        "output": outcome.usage.output,
+                        "cached": outcome.usage.cached,
+                    },
+                    "timing": {
+                        "model_ms": outcome.timing.model_ms,
+                        "tools_ms": outcome.timing.tools_ms,
+                    },
+                    "config_version": outcome.config_version,
+                    "session": &session_id,
+                    "messages": agent.messages().len(),
+                }));
+            }
         }
         Err(error) => {
-            let message = format!("{error:#}");
-            guard.last_error = Some(message.clone());
-            sink.emit(json!({
-                "ev": "error",
-                "message": message,
-            }));
+            // Nothing to salvage here: every message the agent committed was
+            // already written by `on_message` as it happened.
+            failure = Some(format!("{error:#}"));
         }
+    }
+
+    // The error belongs to the session that hit it: switching away mid-turn
+    // must not paint the session now on screen as failed.
+    if let (Some(error), true) = (&failure, is_current) {
+        guard.last_error = Some(error.clone());
+    }
+    let status = guard.describe();
+    let sessions = match guard.sessions() {
+        Ok(list) => Some(list),
+        Err(error) => {
+            eprintln!("[sessions] refresh failed: {error:#}");
+            None
+        }
+    };
+    drop(guard);
+
+    if let Some(list) = sessions {
+        sink.emit(json!({ "ev": "sessions", "list": list }));
+    }
+    sink.emit(json!({ "ev": "status", "status": status }));
+
+    match (end, failure) {
+        (_, Some(error)) => sink.emit(
+            json!({ "ev": "error", "message": error, "session": session_id }),
+        ),
+        (Some(payload), None) => sink.emit(payload),
+        (None, None) => {}
+    }
+
+    // One chained turn per completion: emitted events above first, so the page
+    // sees the old turn end before the new one starts. If a fresher prompt won
+    // the running slot meanwhile, the message is queued again — that turn
+    // claims it — rather than spun in a loop here.
+    // Whatever arrived after this turn's last claim still deserves its turn:
+    // the oldest pending message is returned for the cascade to run, and its
+    // own first step claims the rest. A cancel cleared the queue already, so
+    // stopping stops the chain too.
+    Ok(followup)
+}
+
+/// Run one prompt, then every steering message that arrived too late for the
+/// turn to claim — each as its own turn, in order.
+///
+/// A loop instead of a spawn from inside `run_turn`: awaiting the same async
+/// fn it lives in makes the future reference itself, which the compiler
+/// settles as "not Send". Here the runs are plain sequential awaits, so the
+/// queue drains until empty — and if another turn won the running slot in
+/// between, the message is queued for *it* to claim and this cascade ends.
+pub async fn run_turn_cascading(
+    state: Arc<Mutex<AppState>>,
+    text: String,
+    sink: Arc<dyn EventSink>,
+) -> Result<()> {
+    let mut next = run_turn(Arc::clone(&state), text, Arc::clone(&sink)).await?;
+    while let Some(text) = next {
+        next = run_turn(Arc::clone(&state), text, Arc::clone(&sink)).await?;
     }
     Ok(())
 }
@@ -1150,4 +1381,245 @@ pub async fn install_pack(archive: &Path) -> Result<Value> {
         "path": placed.path.display().to_string(),
         "assembly": placed.assembly.as_ref().map(|p| p.display().to_string()),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+    use std::time::Instant;
+
+    /// Records everything the shell pushes, so a test can assert which session
+    /// each event belonged to.
+    struct RecordingSink {
+        events: StdMutex<Vec<Value>>,
+    }
+
+    impl RecordingSink {
+        fn new() -> Arc<Self> {
+            Arc::new(Self { events: StdMutex::new(Vec::new()) })
+        }
+
+        fn events(&self) -> Vec<Value> {
+            self.events.lock().expect("recording sink").clone()
+        }
+    }
+
+    impl EventSink for RecordingSink {
+        fn emit(&self, event: Value) {
+            self.events.lock().expect("recording sink").push(event);
+        }
+    }
+
+    /// A provider that holds every answer for `delay` before sending it, and
+    /// records when each request arrived.
+    ///
+    /// The hold is what makes concurrency observable: if two turns run at the
+    /// same time, the second request reaches the provider while the first
+    /// answer is still being held. If they are serialized, the second arrives
+    /// only after the first hold releases — a gap no scheduling jitter can
+    /// fake.
+    async fn held_provider(
+        delay: std::time::Duration,
+    ) -> (String, Arc<StdMutex<Vec<(Instant, String)>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let arrivals: Arc<StdMutex<Vec<(Instant, String)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen = Arc::clone(&arrivals);
+
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                // Each connection is handled on its own task: holding the
+                // accept loop across a delay would queue the second client
+                // behind the first and make two concurrent turns look
+                // serialized.
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    // Drain the request head, then the declared body length,
+                    // so the reply can close the connection without racing a
+                    // client that is still writing.
+                    let mut head = Vec::new();
+                    loop {
+                        let mut byte = [0u8; 1];
+                        match socket.read(&mut byte).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                head.push(byte[0]);
+                                if head.ends_with(b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let head_text = String::from_utf8_lossy(&head);
+                    let declared = head_text
+                        .lines()
+                        .filter_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .next()
+                        .unwrap_or(0);
+                    let mut body = Vec::with_capacity(declared);
+                    while body.len() < declared {
+                        let mut chunk = [0u8; 4096];
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => body.extend_from_slice(&chunk[..read]),
+                        }
+                    }
+
+                    let text = String::from_utf8_lossy(&body);
+                    let label = if text.contains("TASK-A") {
+                        "TASK-A"
+                    } else if text.contains("TASK-B") {
+                        "TASK-B"
+                    } else {
+                        "other"
+                    };
+                    seen.lock().expect("arrivals").push((Instant::now(), label.to_string()));
+
+                    tokio::time::sleep(delay).await;
+                    let reply = format!("Mock reply for {label}: done.");
+                    let frame = serde_json::json!({
+                        "choices": [{ "delta": { "content": reply }, "finish_reason": "stop" }]
+                    });
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {frame}\n\ndata: [DONE]\n\n"
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.flush().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), arrivals)
+    }
+
+    /// Two unrelated sessions run their turns at the same time.
+    ///
+    /// This is the window path: every page command is its own task, and a turn
+    /// belongs to the session it started in. Two things must hold — both
+    /// requests are in flight together, and each session's file ends up with
+    /// its own answer and nothing from the other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_unrelated_sessions_run_their_turns_at_the_same_time() {
+        // Everything the shell persists lives under NGU_HOME, so this test
+        // gets a directory of its own and the real sessions stay untouched.
+        let home = std::env::temp_dir().join(format!("ngu-state-test-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("NGU_HOME", &home);
+
+        let delay = std::time::Duration::from_millis(1500);
+        let (base, arrivals) = held_provider(delay).await;
+
+        let state = Arc::new(Mutex::new(AppState::bootstrap().expect("bootstrap")));
+        state
+            .lock()
+            .expect("state lock")
+            .set_model("mock-model", Some(&base))
+            .expect("route points at the mock");
+
+        // Session A starts its turn.
+        state.lock().expect("state lock").new_session().expect("session A");
+        let session_a = state.lock().expect("state lock").session.id.clone();
+        let sink_a = RecordingSink::new();
+        let sink_a_trait: Arc<dyn EventSink> = sink_a.clone();
+        let task_a = tokio::spawn(run_turn(
+            Arc::clone(&state),
+            "TASK-A: first task".into(),
+            sink_a_trait,
+        ));
+
+        // B must start while A is genuinely in flight, not merely scheduled
+        // before it: wait for A's running slot.
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if state.lock().expect("state lock").running.contains(&session_a) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "session A never started running");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // Session B switches in and sends its own task while A runs.
+        state.lock().expect("state lock").new_session().expect("session B");
+        let session_b = state.lock().expect("state lock").session.id.clone();
+        assert_ne!(session_a, session_b);
+        let sink_b = RecordingSink::new();
+        let sink_b_trait: Arc<dyn EventSink> = sink_b.clone();
+        let task_b = tokio::spawn(run_turn(
+            Arc::clone(&state),
+            "TASK-B: second task".into(),
+            sink_b_trait,
+        ));
+
+        task_a.await.expect("task A panicked").expect("task A failed");
+        task_b.await.expect("task B panicked").expect("task B failed");
+
+        // Neither turn was refused: each session saw its own start and end.
+        for (sink, session) in [(&sink_a, &session_a), (&sink_b, &session_b)] {
+            let events = sink.events();
+            let mine = |name: &str| {
+                events
+                    .iter()
+                    .filter(|event| event["ev"] == name)
+                    .filter(|event| match event.get("session") {
+                        Some(value) => value.as_str() == Some(session.as_str()),
+                        None => true,
+                    })
+                    .count()
+            };
+            assert_eq!(mine("turn_start"), 1, "{session} saw one turn start");
+            assert_eq!(mine("turn_end"), 1, "{session} saw its own turn end");
+            let rejections = events
+                .iter()
+                .filter(|event| {
+                    event["ev"] == "error"
+                        && event["message"]
+                            .as_str()
+                            .is_some_and(|m| m.contains("already working"))
+                })
+                .count();
+            assert_eq!(rejections, 0, "{session} was never refused as busy");
+        }
+
+        // Both requests were in flight together: B arrived at the provider
+        // while A's answer was still inside its hold window.
+        let seen = arrivals.lock().expect("arrivals").clone();
+        assert_eq!(seen.len(), 2, "both turns reached the provider: {seen:?}");
+        let labels: Vec<&str> = seen.iter().map(|(_, label)| label.as_str()).collect();
+        assert!(labels.contains(&"TASK-A"), "{labels:?}");
+        assert!(labels.contains(&"TASK-B"), "{labels:?}");
+        let gap = if seen[0].0 >= seen[1].0 {
+            seen[0].0.duration_since(seen[1].0)
+        } else {
+            seen[1].0.duration_since(seen[0].0)
+        };
+        assert!(
+            gap < delay,
+            "the second request arrived {gap:?} after the first — outside the \
+             {delay:?} hold, so the turns ran one after the other"
+        );
+
+        // Each session's file holds its own answer, and only its own.
+        let store = &state.lock().expect("state lock").store;
+        let a = store.load(&session_a).expect("load A").expect("session A exists");
+        let b = store.load(&session_b).expect("load B").expect("session B exists");
+        let text_of = |messages: &[nguruvilu::message::Message]| -> String {
+            messages.iter().map(|m| m.text()).collect::<Vec<_>>().join("\n")
+        };
+        let a_text = text_of(&a.messages);
+        let b_text = text_of(&b.messages);
+        assert!(a_text.contains("Mock reply for TASK-A"), "A has its answer: {a_text}");
+        assert!(!a_text.contains("TASK-B"), "B never leaked into A");
+        assert!(b_text.contains("Mock reply for TASK-B"), "B has its answer: {b_text}");
+        assert!(!b_text.contains("TASK-A"), "A never leaked into B");
+
+        // Nothing left marked busy once both turns settled.
+        assert!(state.lock().expect("state lock").running.is_empty());
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }

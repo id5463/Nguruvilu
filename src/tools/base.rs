@@ -137,7 +137,9 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<()> {
             format!(
                 "Run a shell command and return its combined output.\n\
                  The command runs in {} — {} \n\
-                 Set timeout_ms to bound long-running commands. Output is truncated when very large.",
+                 Set timeout_ms to bound long-running commands. Output is truncated when very large.\n\
+                 Pass background: true to start the command as a job and return immediately; \
+                 collect it later with job_output / job_list / job_kill (timeout_ms does not apply).",
                 shell.label, shell.syntax_hint
             ),
             json!({
@@ -145,7 +147,8 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<()> {
                 "properties": {
                     "command": { "type": "string", "description": "Command to run" },
                     "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (default 120000)" },
-                    "cwd": { "type": "string", "description": "Working directory for the command" }
+                    "cwd": { "type": "string", "description": "Working directory for the command" },
+                    "background": { "type": "boolean", "description": "Run as a background job and return a job id immediately (default false)" }
                 },
                 "required": ["command"]
             }),
@@ -154,6 +157,10 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<()> {
         ),
         ConflictPolicy::Error,
     )?;
+
+    // The job tools extend `bash` (`background: true` hands a command to the
+    // registry), so they belong to the base set every host loads.
+    super::jobs::install(registry)?;
 
     Ok(())
 }
@@ -444,6 +451,19 @@ async fn bash_tool(args: Value) -> Result<String> {
         .stderr(Stdio::piped());
     if let Some(dir) = &cwd {
         cmd.current_dir(dir);
+    }
+
+    // A command that should outlive this step: hand it to the job registry
+    // instead of pinning the turn until it finishes. timeout_ms is a
+    // foreground concept — a job's lifetime belongs to job_kill.
+    if args.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let job = super::jobs::spawn_background(command, cmd)?;
+        return Ok(format!(
+            "started {} in the background: {command}\n\
+             Read its output with job_output (wait_ms blocks until it finishes), \
+             list jobs with job_list, stop it with job_kill.",
+            job.id
+        ));
     }
 
     let mut child = cmd

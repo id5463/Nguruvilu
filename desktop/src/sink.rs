@@ -6,6 +6,7 @@
 //! windowed behaviour rather than a parallel implementation that can drift.
 
 use serde_json::Value;
+#[cfg(windows)]
 use tao::event_loop::EventLoopProxy;
 
 /// A destination for shell events.
@@ -15,10 +16,12 @@ pub trait EventSink: Send + Sync + 'static {
 }
 
 /// Sends events into the page through the window's event loop.
+#[cfg(windows)]
 pub struct WindowSink {
     proxy: EventLoopProxy<crate::UserEvent>,
 }
 
+#[cfg(windows)]
 impl WindowSink {
     /// Build a sink that drives a webview.
     pub fn new(proxy: EventLoopProxy<crate::UserEvent>) -> Self {
@@ -26,6 +29,7 @@ impl WindowSink {
     }
 }
 
+#[cfg(windows)]
 impl EventSink for WindowSink {
     fn emit(&self, event: Value) {
         // A closed window makes the send fail, which is not worth surfacing.

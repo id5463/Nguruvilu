@@ -12,6 +12,7 @@
 //! * they meet at one seam: [`UserEvent::ToUi`] carries JSON to evaluate in the
 //!   page, and the webview's IPC handler carries commands the other way.
 
+mod serve;
 mod sink;
 mod state;
 
@@ -21,18 +22,26 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{json, Value};
+#[cfg(windows)]
 use tao::dpi::LogicalSize;
+#[cfg(windows)]
 use tao::rwh_06::{HasDisplayHandle, HasWindowHandle};
+#[cfg(windows)]
 use tao::event::{Event, WindowEvent};
+#[cfg(windows)]
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
+#[cfg(windows)]
 use tao::window::WindowBuilder;
+#[cfg(windows)]
 use wry::WebViewBuilder;
 
 use nguruvilu::assembly::Assembly;
 use nguruvilu::ledger::default_ledger_path;
 use nguruvilu::loader::Loader;
 
-use sink::{EventSink, StdoutSink, WindowSink};
+#[cfg(windows)]
+use sink::WindowSink;
+use sink::{EventSink, StdoutSink};
 use state::AppState;
 
 /// The interface, embedded at compile time.
@@ -53,6 +62,11 @@ struct Options {
     ui: Option<String>,
     /// Run without a window, reading commands from stdin.
     headless: bool,
+    /// Serve the shell over HTTP/SSE on this address (defaults to
+    /// 127.0.0.1:8764; `--serve 0.0.0.0:8764` is an explicit choice).
+    serve: Option<String>,
+    /// Bearer token for the served shell. Generated fresh when not given.
+    token: Option<String>,
 }
 
 fn options() -> Options {
@@ -62,10 +76,29 @@ fn options() -> Options {
             .position(|arg| arg == flag)
             .and_then(|index| args.get(index + 1).cloned())
     };
+    // `--serve` takes an address as its value; standing alone it binds the
+    // default loopback port. A value starting with `-` is another flag, not an
+    // address, so it cannot swallow the rest of the command line.
+    let serve_value = value_of("--serve").filter(|value| !value.starts_with('-'));
+    let serve = serve_value
+        .map(|value| {
+            if value.contains(':') {
+                value
+            } else {
+                format!("127.0.0.1:{value}")
+            }
+        })
+        .or_else(|| {
+            args.iter()
+                .any(|arg| arg == "--serve")
+                .then(|| "127.0.0.1:8764".to_string())
+        });
     Options {
         prompt: value_of("--prompt").or_else(|| value_of("-p")),
         ui: value_of("--ui"),
         headless: args.iter().any(|arg| arg == "--headless"),
+        serve,
+        token: value_of("--token").filter(|value| !value.starts_with('-')),
     }
 }
 
@@ -74,7 +107,26 @@ fn main() -> anyhow::Result<()> {
     if options.headless {
         return headless(options.prompt);
     }
-    windowed(options.prompt.clone(), options.ui.clone())
+    if let Some(addr) = options.serve.clone() {
+        let token = options
+            .token
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        return serve::serve(addr, token, options.prompt.clone(), options.ui.clone());
+    }
+    // The window exists only where the webview stack exists; everywhere else
+    // the same shell is reachable through --headless or --serve.
+    #[cfg(windows)]
+    {
+        return windowed(options.prompt.clone(), options.ui.clone());
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = options.ui;
+        anyhow::bail!(
+            "this build has no window; use --headless (stdin/stdout) or --serve (HTTP/SSE)"
+        );
+    }
 }
 
 /// Run without a window: JSON commands in on stdin, JSON events out on stdout.
@@ -180,6 +232,7 @@ fn headless(startup_prompt: Option<String>) -> anyhow::Result<()> {
 }
 
 /// Run with a window.
+#[cfg(windows)]
 fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Result<()> {
     // WebView2 takes its profile location from the environment. Setting it here
     // keeps the browser profile out of whatever directory the app was launched
@@ -334,6 +387,47 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
 
         match event {
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
+                // A running turn holds its conversation in memory until it
+                // ends; quitting straight through would drop everything the
+                // turn produced. Flip every stop flag, then give each turn a
+                // bounded moment to finish through the stop path — which
+                // persists exactly what it produced before returning. The
+                // loop re-sends, so a turn that registers late is caught too;
+                // the ceiling is ~2 seconds, because a window that never
+                // closes is worse than a turn that loses its tail.
+                runtime.block_on(async {
+                    for _ in 0..41 {
+                        let drained = match state.try_lock() {
+                            Ok(guard) => {
+                                for stop in guard.cancels.values() {
+                                    let _ = stop.send(true);
+                                }
+                                for queue in guard.inboxes.values() {
+                                    queue.lock().expect("inbox").clear();
+                                }
+                                guard.running.is_empty()
+                            }
+                            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                                let guard = poisoned.into_inner();
+                                for stop in guard.cancels.values() {
+                                    let _ = stop.send(true);
+                                }
+                                for queue in guard.inboxes.values() {
+                                    queue.lock().expect("inbox").clear();
+                                }
+                                guard.running.is_empty()
+                            }
+                            // Held right now — quite possibly a turn writing
+                            // its messages; the next tick sees it released.
+                            Err(std::sync::TryLockError::WouldBlock) => false,
+                        };
+                        if drained {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                });
+
                 // Close must finish — this runs on the UI thread, so anything
                 // unbounded here turns the window into a ghost. It did: a
                 // server that ignored the kill hung the quit forever (CPU
@@ -408,7 +502,7 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
 }
 
 /// Handle one command from the page.
-async fn dispatch(
+pub(crate) async fn dispatch(
     state: Arc<Mutex<AppState>>,
     body: &str,
     sink: Arc<dyn EventSink>,
@@ -458,8 +552,10 @@ async fn dispatch(
                 });
             }
             if let Some(text) = startup_prompt {
-                emit(&sink, json!({ "ev": "turn_start", "text": text }));
-                state::run_turn(Arc::clone(&state), text, Arc::clone(&sink)).await?;
+                // The turn_start event is run_turn's: it carries the session
+                // id, and it fires only once the session's running slot holds.
+                // Cascading runs any steering that arrives too late to claim.
+                state::run_turn_cascading(Arc::clone(&state), text, Arc::clone(&sink)).await?;
                 drain_packs(state, Arc::clone(&sink)).await;
             }
         }
@@ -474,8 +570,7 @@ async fn dispatch(
             if text.is_empty() {
                 return Ok(());
             }
-            emit(&sink, json!({ "ev": "turn_start", "text": text }));
-            state::run_turn(Arc::clone(&state), text, Arc::clone(&sink)).await?;
+            state::run_turn_cascading(Arc::clone(&state), text, Arc::clone(&sink)).await?;
             drain_packs(state, Arc::clone(&sink)).await;
         }
 
@@ -518,10 +613,15 @@ async fn dispatch(
             let model = command.get("model").and_then(|v| v.as_str()).unwrap_or("");
             let effort = command.get("reasoning_effort").and_then(|v| v.as_str()).unwrap_or("");
             let proxy = command.get("proxy").and_then(|v| v.as_str()).unwrap_or("");
-            let context_window = command
-                .get("context_window")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize);
+            // Accepts a number or a sized string like 128K — and must: the
+            // page sends what the user typed, because `parseInt("1M")` is `1`.
+            let context_window = command.get("context_window").and_then(|value| match value {
+                Value::Number(number) => number.as_u64().map(|n| n as usize),
+                Value::String(text) if !text.trim().is_empty() => {
+                    nguruvilu::size::parse_size(text.trim()).ok()
+                }
+                _ => None,
+            });
             let compact_percent = command
                 .get("compact_percent")
                 .and_then(|v| v.as_u64())
@@ -625,10 +725,11 @@ async fn dispatch(
                     emit(&sink, json!({ "ev": "settings_saved" }));
                 }
                 Err(error) => {
-                    emit(
-                        &sink,
-                        json!({ "ev": "error", "message": format!("saving settings: {error:#}") }),
-                    );
+                    // Both audiences: the panel needs the failure next to the
+                    // button it came from, the transcript keeps the record.
+                    let message = format!("saving settings: {error:#}");
+                    emit(&sink, json!({ "ev": "settings_error", "message": &message }));
+                    emit(&sink, json!({ "ev": "error", "message": message }));
                 }
             }
         }
@@ -779,6 +880,31 @@ async fn dispatch(
                 ),
             }
             refresh_packs(&state, &sink);
+        }
+
+        "cancel" => {
+            // The flag flips without touching the turn: the loop checks it at
+            // its next safe point and keeps everything it produced so far.
+            let stopped = {
+                let guard = state.lock().expect("state lock");
+                let session = guard.session.id.clone();
+                let sent = guard
+                    .cancels
+                    .get(&session)
+                    .is_some_and(|sender| sender.send(true).is_ok());
+                // Stop means stop: steering that was waiting for a step
+                // boundary goes with the turn that will never reach one.
+                if let Some(queue) = guard.inboxes.get(&session) {
+                    queue.lock().expect("inbox").clear();
+                }
+                (sent, session)
+            };
+            if stopped.0 {
+                eprintln!("[cancel] stop requested for {}", stopped.1);
+                emit(&sink, json!({ "ev": "cancelled", "session": stopped.1 }));
+            } else {
+                emit(&sink, json!({ "ev": "notice", "text": "nothing is running" }));
+            }
         }
 
         "ui_panels" => {
@@ -1331,7 +1457,7 @@ fn remove_pack(target: &str) -> anyhow::Result<()> {
 /// `wanted` names one by id; without it, the first installed pack that declares
 /// an interface wins. The built-in is what a machine with no such pack gets,
 /// which is why nothing has to be configured for the program to work.
-fn resolve_active_ui(wanted: Option<&str>) -> Option<PathBuf> {
+pub(crate) fn resolve_active_ui(wanted: Option<&str>) -> Option<PathBuf> {
     let packs = nguruvilu::pack::installed(&nguruvilu::pack::default_packs_dir()).ok()?;
 
     for pack in &packs {
@@ -1406,11 +1532,13 @@ static ACTIVE_UI: OnceLock<PathBuf> = OnceLock::new();
 /// dialog because dialogs only open while the event loop is running. Without
 /// an owner the dialog opens *behind* the main window and the click looks like
 /// nothing happened.
+#[cfg(windows)]
 struct DialogParent {
     window: tao::rwh_06::RawWindowHandle,
     display: tao::rwh_06::RawDisplayHandle,
 }
 
+#[cfg(windows)]
 impl DialogParent {
     fn new(
         window: tao::rwh_06::RawWindowHandle,
@@ -1420,6 +1548,7 @@ impl DialogParent {
     }
 }
 
+#[cfg(windows)]
 impl tao::rwh_06::HasWindowHandle for DialogParent {
     fn window_handle(
         &self,
@@ -1430,6 +1559,7 @@ impl tao::rwh_06::HasWindowHandle for DialogParent {
     }
 }
 
+#[cfg(windows)]
 impl tao::rwh_06::HasDisplayHandle for DialogParent {
     fn display_handle(
         &self,
@@ -1474,7 +1604,7 @@ fn serve_interface_on_loopback() -> std::io::Result<u16> {
     Ok(port)
 }
 
-fn serve_ui(path: &str) -> (Vec<u8>, &'static str) {
+pub(crate) fn serve_ui(path: &str) -> (Vec<u8>, &'static str) {
     let builtin = || (UI_HTML.as_bytes().to_vec(), "text/html; charset=utf-8");
 
     let Some(root) = ACTIVE_UI.get() else {
@@ -1510,7 +1640,7 @@ fn serve_ui(path: &str) -> (Vec<u8>, &'static str) {
 }
 
 /// A content type for the extensions an interface actually uses.
-fn mime_for(path: &Path) -> &'static str {
+pub(crate) fn mime_for(path: &Path) -> &'static str {
     match path
         .extension()
         .and_then(|e| e.to_str())
@@ -1541,7 +1671,7 @@ fn mime_for(path: &Path) -> &'static str {
 }
 
 /// Point the window at an interface directory.
-fn set_active_ui(dir: PathBuf) {
+pub(crate) fn set_active_ui(dir: PathBuf) {
     // First writer wins: the interface is chosen once, at startup, and a second
     // call would silently serve a different directory than the page was loaded
     // from.

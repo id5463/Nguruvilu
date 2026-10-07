@@ -178,6 +178,9 @@ async fn run_subagent(access: Option<Arc<dyn ModelAccess>>, args: Value) -> Resu
     let mut agent = Agent::new(client, config, Vec::new());
 
     let outcome = agent.run(task).await?;
+    if let Some(error) = outcome.error {
+        anyhow::bail!("subagent failed: {error}");
+    }
 
     Ok(ToolOutput::text(format!(
         "subagent finished after {} step(s), {} tool call(s):\n\n{}",
@@ -244,6 +247,7 @@ mod tests {
             realm: RealmMap::new(),
             services: nguruvilu::plugin::ServiceView::default(),
             config: Value::Null,
+            events: nguruvilu::events::EventBus::default(),
         };
         let _ = tools;
         Plugin::apply(&ExamplePlugin, &ctx).unwrap()
@@ -253,7 +257,7 @@ mod tests {
     fn the_plugin_contributes_all_four_kinds_of_thing() {
         let c = contributions();
         assert_eq!(c.tools.len(), 2, "echo and subagent");
-        assert!(c.theme.is_some(), "a theme layer");
+        assert!(!c.themes.is_empty(), "a theme layer");
         assert!(c.ui.len() >= 2, "a panel and a status indicator");
     }
 

@@ -60,7 +60,39 @@ if (Test-Path $pluginManifest) {
     if ($LASTEXITCODE -ne 0) { Fail 'plugin build' }
 }
 
+# Stop a running instance before its file is replaced.
+#
+# A running turn keeps its conversation in memory until the turn ends, so the
+# window is asked to close first — its close path stops the turn and persists
+# what it produced. Only what refuses to leave is force-killed.
+function Stop-Running {
+    if (-not (Get-Process ngu-desktop -ErrorAction SilentlyContinue)) { return }
+
+    if (-not ('NguruviluClose' -as [type])) {
+        Add-Type -Namespace NguruviluPublish -Name WindowClose -MemberDefinition @'
+[DllImport("user32.dll", CharSet = CharSet.Unicode)]
+public static extern bool PostMessage(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam);
+'@
+    }
+    foreach ($proc in Get-Process ngu-desktop -ErrorAction SilentlyContinue) {
+        if ($proc.MainWindowHandle -ne 0) {
+            # WM_CLOSE: the same message the title bar's X sends.
+            [NguruviluPublish.WindowClose]::PostMessage($proc.MainWindowHandle, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+            Write-Host "  asked $($proc.Id) to close (its running turn persists first)"
+        }
+    }
+    # The close path allows ~2s for a cancelled turn to land; wait a little
+    # longer than that before insisting.
+    for ($i = 0; $i -lt 30 -and (Get-Process ngu-desktop -ErrorAction SilentlyContinue); $i++) {
+        Start-Sleep -Milliseconds 100
+    }
+    Get-Process ngu-desktop -ErrorAction SilentlyContinue | Stop-Process -Force
+    Start-Sleep -Milliseconds 500
+}
+
 Step 'publishing to dist/'
+# Both copies below are held open by a running instance, so it stops first.
+Stop-Running
 New-Item -ItemType Directory -Path $dist -Force | Out-Null
 Publish (Join-Path $root 'target/release/ngu.exe') (Join-Path $dist 'ngu.exe')
 Publish (Join-Path $root 'desktop/target/release/ngu-desktop.exe') (Join-Path $dist 'ngu-desktop.exe')
@@ -76,9 +108,8 @@ if (-not $SkipDesktop) {
         Write-Host "  no desktop folder; skipping" -ForegroundColor Yellow
     } else {
         $target = Join-Path $desktop 'ngu-desktop.exe'
-        # A running instance holds the file open on Windows.
-        Get-Process ngu-desktop -ErrorAction SilentlyContinue | Stop-Process -Force
-        Start-Sleep -Milliseconds 500
+        # Stopped before the dist step above: a running instance holds both
+        # copies open on Windows, and it is already gone by now.
         Publish (Join-Path $dist 'ngu-desktop.exe') $target
     }
 }

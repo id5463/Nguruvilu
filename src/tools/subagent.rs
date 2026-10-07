@@ -159,6 +159,18 @@ async fn run(access: Arc<dyn ModelAccess>, args: Value) -> Result<ToolOutput> {
     let mut agent = Agent::new(client, config, Vec::new()).with_max_steps(MAX_STEPS);
     let outcome = agent.run(task).await?;
 
+    // A failed subtask reports the failure as the tool result, carrying any
+    // partial answer with it: the parent model reads what went wrong instead
+    // of a bare transport error surfacing as a crashed tool.
+    if let Some(error) = &outcome.error {
+        let mut message = format!("The subtask failed: {error}");
+        if !outcome.text.trim().is_empty() {
+            message.push_str("\n\nPartial answer before the failure:\n");
+            message.push_str(&outcome.text);
+        }
+        return Err(anyhow!(message));
+    }
+
     let mut text = format!(
         "The subtask finished after {} step(s) and {} tool call(s).\n\n{}",
         outcome.steps, outcome.tool_calls, outcome.text

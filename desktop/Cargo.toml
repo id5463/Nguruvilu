@@ -10,12 +10,19 @@ path = "src/main.rs"
 
 [dependencies]
 nguruvilu = { path = ".." }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
+serde_json = "1"
+anyhow = "1"
+# Fresh bearer token per `--serve` run.
+uuid = { version = "1", features = ["v4"] }
+
+# The window is a Windows concern (tao + wry + WebView2 + native dialogs); the
+# shell underneath it - dispatch, state, headless, serve - must build without
+# any GUI stack, which is what lets --serve run on a headless server.
+[target.'cfg(target_os = "windows")'.dependencies]
 tao = "0.30"
 wry = "0.47"
 rfd = "0.15"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-serde_json = "1"
-anyhow = "1"
 
 [profile.release]
 opt-level = 3

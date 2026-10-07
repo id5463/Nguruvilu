@@ -420,6 +420,18 @@ impl AgentObserver for PrettyObserver {
             eprintln!("{mark} {name}: {preview}");
         }
     }
+
+    fn on_step_retry(&self, attempt: usize, reason: &str) {
+        if !self.quiet {
+            eprintln!("\n[retry {attempt}: {reason} — output so far is discarded]");
+        }
+    }
+
+    fn on_continuation(&self, reason: &str) {
+        if !self.quiet {
+            eprintln!("\n[{reason}; asking the model to continue]");
+        }
+    }
 }
 
 /// Supplies turn settings from a runtime, adding the skill catalog.
@@ -1023,13 +1035,14 @@ async fn run() -> Result<()> {
                 &serde_json::json!({ "session": &session.id }),
             );
             let turn_started = std::time::Instant::now();
+            let original_len = session.messages.len();
             let mut agent = Agent::new(client, Arc::clone(&config), session.messages.clone())
                 .with_max_steps(cli.max_steps)
                 .with_observer(observer);
             let outcome = agent.run(&text).await;
             let turn_ms = turn_started.elapsed().as_millis() as u64;
             match &outcome {
-                Ok(done) => events.emit(
+                Ok(done) if done.error.is_none() => events.emit(
                     nguruvilu::events::TURN_COMPLETE,
                     &serde_json::json!({
                         "session": &session.id,
@@ -1037,6 +1050,21 @@ async fn run() -> Result<()> {
                         "duration_ms": turn_ms,
                         "steps": done.steps,
                         "tool_calls": done.tool_calls,
+                        "retries": done.retries,
+                    }),
+                ),
+                Ok(done) => events.emit(
+                    nguruvilu::events::TURN_COMPLETE,
+                    &serde_json::json!({
+                        "session": &session.id,
+                        "ok": false,
+                        "duration_ms": turn_ms,
+                        "steps": done.steps,
+                        "retries": done.retries,
+                        "error": nguruvilu::events::truncate(
+                            done.error.as_deref().unwrap_or("turn failed"),
+                            1000
+                        ),
                     }),
                 ),
                 Err(error) => events.emit(
@@ -1049,7 +1077,19 @@ async fn run() -> Result<()> {
                     }),
                 ),
             }
-            let outcome = outcome?;
+            // On a hard failure the outcome itself is gone, but the agent
+            // still holds every message it committed before dying: those are
+            // persisted below like any other partial turn.
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    ensure_session(&session)?;
+                    let salvaged = agent.messages()[original_len..].to_vec();
+                    session.messages.extend(salvaged.clone());
+                    store.append(&session.id, &salvaged)?;
+                    return Err(error);
+                }
+            };
 
             ensure_session(&session)?;
             session.messages.extend(outcome.new_messages.clone());
@@ -1084,6 +1124,13 @@ async fn run() -> Result<()> {
             // would send messages that are no longer part of the conversation.
             if !outcome.compactions.is_empty() {
                 session.messages = agent.messages().to_vec();
+            }
+
+            // The turn stopped on a failure — everything it produced is on
+            // disk by now, so leave with a non-zero status instead of letting
+            // a half-finished run pass as a finished one.
+            if let Some(error) = &outcome.error {
+                return Err(anyhow::anyhow!(error.clone()));
             }
 
             // Apply any pack load or unload the turn asked for, before the
@@ -1285,10 +1332,11 @@ async fn interactive(
             &serde_json::json!({ "session": &session.id }),
         );
         let turn_started = std::time::Instant::now();
+        let original_len = session.messages.len();
         let turn = agent.run(input).await;
         let turn_ms = turn_started.elapsed().as_millis() as u64;
         match &turn {
-            Ok(outcome) => events.emit(
+            Ok(outcome) if outcome.error.is_none() => events.emit(
                 nguruvilu::events::TURN_COMPLETE,
                 &serde_json::json!({
                     "session": &session.id,
@@ -1296,6 +1344,21 @@ async fn interactive(
                     "duration_ms": turn_ms,
                     "steps": outcome.steps,
                     "tool_calls": outcome.tool_calls,
+                    "retries": outcome.retries,
+                }),
+            ),
+            Ok(outcome) => events.emit(
+                nguruvilu::events::TURN_COMPLETE,
+                &serde_json::json!({
+                    "session": &session.id,
+                    "ok": false,
+                    "duration_ms": turn_ms,
+                    "steps": outcome.steps,
+                    "retries": outcome.retries,
+                    "error": nguruvilu::events::truncate(
+                        outcome.error.as_deref().unwrap_or("turn failed"),
+                        1000
+                    ),
                 }),
             ),
             Err(error) => events.emit(
@@ -1310,12 +1373,21 @@ async fn interactive(
         }
         match turn {
             Ok(outcome) => {
+                // Recorded even when the turn failed: the agent kept what it
+                // produced, and a REPL that forgets half a turn is a REPL that
+                // lies about the conversation on the next input.
                 store.append(&session.id, &outcome.new_messages)?;
                 session.messages.extend(outcome.new_messages);
+                let retries = if outcome.retries > 0 {
+                    format!(" | {} retries", outcome.retries)
+                } else {
+                    String::new()
+                };
                 println!(
-                    "\n[{} steps | {} tool calls | {} in / {} out ({} cached) | model {} ms, tools {} ms]\n",
+                    "\n[{} steps | {} tool calls{} | {} in / {} out ({} cached) | model {} ms, tools {} ms]\n",
                     outcome.steps,
                     outcome.tool_calls,
+                    retries,
                     outcome.usage.input,
                     outcome.usage.output,
                     outcome.usage.cached,
@@ -1330,8 +1402,19 @@ async fn interactive(
                 // A pack the turn loaded or unloaded is applied here, between
                 // turns: the conversation keeps going, with a new tool table.
                 pack_host.drain().await?;
+                if let Some(error) = outcome.error {
+                    eprintln!("turn interrupted: {error}\n");
+                }
             }
             Err(error) => {
+                // The agent still holds everything it committed before dying;
+                // record it so the failure costs the error message, not the
+                // progress that was already made.
+                let salvaged = agent.messages()[original_len..].to_vec();
+                if !salvaged.is_empty() {
+                    store.append(&session.id, &salvaged)?;
+                    session.messages.extend(salvaged);
+                }
                 eprintln!("error: {error:#}\n");
             }
         }

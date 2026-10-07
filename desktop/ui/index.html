@@ -138,6 +138,12 @@
   .picker .owner { color: var(--dim); font-size: 10px; }
   .hint { color: var(--dim); font-size: 10.5px; margin-top: 6px; overflow-wrap: break-word; line-height: 1.5; }
   .saved { color: var(--ok); font-size: 10.5px; }
+  /* A failed save stays under the button until the next attempt: an error
+     that scrolls away in the transcript reads as "the click did nothing". */
+  .save-error {
+    color: var(--bad); font-size: 11px; margin-top: 6px;
+    white-space: pre-wrap; word-break: break-word;
+  }
 
   /* ---- session list ---- */
   .sess {
@@ -152,6 +158,7 @@
     text-overflow: ellipsis; white-space: nowrap;
   }
   .sess .n { color: var(--dim); font-size: 10px; font-variant-numeric: tabular-nums; }
+  .sess .run { color: var(--accent); font-size: 10px; }
   .sess .del {
     opacity: 0; color: var(--dim); border: none; background: none;
     cursor: pointer; font-size: 14px; line-height: 1; padding: 0 2px;
@@ -174,7 +181,46 @@
   }
   .body { white-space: pre-wrap; word-break: break-word; }
   .user .body { color: var(--text); }
-  .assistant .body { color: var(--text); }
+  .assistant .body { color: var(--text); white-space: normal; overflow-wrap: break-word; }
+  /* ---- markdown, as the assistant's text is rendered ---- */
+  .assistant .body p { margin: 0 0 6px; }
+  .assistant .body p:last-child { margin-bottom: 0; }
+  .assistant .body h1 { font-size: 16px; margin: 10px 0 5px; }
+  .assistant .body h2 { font-size: 14.5px; margin: 9px 0 5px; }
+  .assistant .body h3 { font-size: 13.5px; margin: 8px 0 4px; }
+  .assistant .body h4, .assistant .body h5, .assistant .body h6 {
+    font-size: 13px; margin: 7px 0 4px;
+  }
+  .assistant .body ul, .assistant .body ol { margin: 4px 0 6px; padding-left: 20px; }
+  .assistant .body li { margin: 2px 0; }
+  .assistant .body blockquote {
+    border-left: 2px solid var(--line); margin: 6px 0;
+    padding: 2px 10px; color: var(--dim);
+  }
+  .assistant .body a { color: var(--accent); }
+  .assistant .body hr { border: none; border-top: 1px solid var(--line); margin: 8px 0; }
+  .assistant .body table {
+    border-collapse: collapse; margin: 6px 0; font-size: 12.5px;
+    white-space: normal;
+  }
+  .assistant .body th, .assistant .body td {
+    border: 1px solid var(--line); padding: 4px 9px; text-align: left;
+    vertical-align: top;
+  }
+  .assistant .body th {
+    background: var(--panel); color: var(--text); font-weight: 600;
+  }
+  .assistant .body pre.md-code {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    padding: 8px 10px; margin: 6px 0; overflow-x: auto;
+    font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
+    white-space: pre;
+  }
+  .assistant .body code { font-family: var(--mono); font-size: 11.5px; }
+  .assistant .body li > code, .assistant .body p > code {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 4px; padding: 0 4px;
+  }
   .tool-call {
     font-family: var(--mono); font-size: 11.5px; color: var(--accent);
     background: var(--panel); border: 1px solid var(--line); border-left: 2px solid var(--accent);
@@ -188,8 +234,21 @@
     max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-word;
   }
   .tool-result.bad { border-color: color-mix(in srgb, var(--bad) 50%, var(--panel)); color: var(--bad); }
-  .err-entry {
   .attached { margin: 6px 0 10px; }
+  .attached img {
+    max-width: 100%; max-height: 320px; border-radius: 6px;
+    border: 1px solid var(--line); display: block;
+  }
+  .attached .cap { font-size: 10px; color: var(--dim); margin-top: 3px; display: block; }
+  .err-entry {
+    background: color-mix(in srgb, var(--bad) 16%, var(--panel)); border: 1px solid color-mix(in srgb, var(--bad) 50%, var(--panel)); color: var(--bad);
+    border-radius: 6px; padding: 10px 12px; margin-bottom: 16px;
+    font-size: 12px; white-space: pre-wrap; word-break: break-word;
+  }
+  .err-entry .cap {
+    display: block; font-size: 10px; text-transform: uppercase;
+    letter-spacing: .08em; color: var(--bad); margin-bottom: 5px;
+  }
   /* Reasoning is the model thinking aloud. Shown collapsed by default
      because it is often longer than the answer, and toggleable because
      sometimes it is the most informative part. */
@@ -202,19 +261,6 @@
   .reasoning .toggle {
     display: block; font-style: normal; font-size: 10px; color: var(--accent);
     cursor: pointer; margin-bottom: 3px; user-select: none;
-  }
-  .attached img {
-    max-width: 100%; max-height: 320px; border-radius: 6px;
-    border: 1px solid var(--line); display: block;
-  }
-  .attached .cap { font-size: 10px; color: var(--dim); margin-top: 3px; display: block; }
-    background: color-mix(in srgb, var(--bad) 16%, var(--panel)); border: 1px solid color-mix(in srgb, var(--bad) 50%, var(--panel)); color: var(--bad);
-    border-radius: 6px; padding: 10px 12px; margin-bottom: 16px;
-    font-size: 12px; white-space: pre-wrap; word-break: break-word;
-  }
-  .err-entry .cap {
-    display: block; font-size: 10px; text-transform: uppercase;
-    letter-spacing: .08em; color: var(--bad); margin-bottom: 5px;
   }
   .empty { color: var(--dim); font-style: italic; }
   .caret {
@@ -245,7 +291,19 @@
     border: 1px solid var(--accent); border-radius: 7px;
   }
   #send:hover { background: color-mix(in srgb, var(--accent) 55%, var(--panel)); }
+  #attach {
+    padding: 9px 11px; cursor: pointer; font: inherit;
+    background: color-mix(in srgb, var(--accent) 25%, var(--panel)); color: var(--text);
+    border: 1px solid var(--accent); border-radius: 7px;
+  }
+  #attach:hover { background: color-mix(in srgb, var(--accent) 45%, var(--panel)); }
+  #link-health { font-size: 10.5px; color: var(--text); opacity: .8; margin-left: 10px; }
   #send:disabled { opacity: .45; cursor: default; }
+  #send.stop {
+    background: color-mix(in srgb, var(--bad) 26%, var(--panel));
+    border-color: var(--bad);
+  }
+  #send.stop:hover { background: color-mix(in srgb, var(--bad) 42%, var(--panel)); }
 
   /* ---- status bar ---- */
   #status {
@@ -377,6 +435,7 @@
         <button class="small" id="save-settings">Save</button>
         <span class="saved" id="settings-saved" hidden>saved</span>
       </div>
+      <div class="save-error" id="settings-error" hidden></div>
       <div class="hint" id="settings-path"></div>
     </div>
 
@@ -405,6 +464,8 @@
 
   <div id="slot-above-composer"></div>
   <div id="composer">
+    <button id="attach" title="上传文件给内核" hidden>&#128206;</button>
+    <input type="file" id="attach-input" hidden>
     <textarea id="input" rows="1" placeholder="Ask the kernel something&hellip;  (Enter to send, Shift+Enter for a newline)"></textarea>
     <button id="send">Send</button>
   </div>
@@ -412,6 +473,7 @@
   <div id="status">
     <span><span class="dot" id="dot">&#9679;</span> <span id="state">idle</span></span>
     <span id="model"></span>
+    <span id="link-health"></span>
     <span id="stats"></span>
     <span id="timing"></span>
     <span id="slot-status-bar"></span>
@@ -428,8 +490,115 @@
 // Named `toShell`, not `ipc`: wry already owns `window.ipc`, and a top-level
 // `const ipc` would collide with it. That collision is a parse-time SyntaxError,
 // which kills the entire script — including its first line — with no visible clue.
-const toShell = (payload) => window.ipc.postMessage(JSON.stringify(payload));
+// Which shell is on the other end is decided once: a wry window owns
+// `window.ipc`, a page served by `--serve` does not and speaks HTTP instead.
+// Everything below treats them as the same shell — same commands out, same
+// events in — because the server runs the same `dispatch`.
+const onServer = typeof window.ipc === "undefined" || window.ipc === null;
+const serveToken = new URLSearchParams(location.search).get("token") || "";
+const toShell = onServer
+  ? (payload) =>
+      fetch("/cmd", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer " + serveToken,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      }).catch((error) => notice("连接 shell 失败: " + error.message, true))
+  : (payload) => window.ipc.postMessage(JSON.stringify(payload));
+if (onServer) {
+  // The window pushes events by evaluating `receive` in the page; the served
+  // shell has no such door, so the page holds the stream open itself.
+  const events = new EventSource("/events?token=" + encodeURIComponent(serveToken));
+  // The window pushes state the moment the page says `ready`; here the very
+  // first `ready` can outrun this connection's handshake and broadcast into an
+  // empty room. Re-sending it once the stream is open makes the state push
+  // deterministic — the server treats a repeat `ready` as a re-push (the
+  // startup prompt was consumed by the first one).
+  let streamDown = false;
+  events.onopen = () => {
+    console.log("[serve] stream open; re-sending ready");
+    toShell({ cmd: "ready" });
+    if (streamDown) {
+      streamDown = false;
+      notice("事件流已恢复");
+    }
+  };
+  events.onerror = () => {
+    if (!streamDown) {
+      streamDown = true;
+      notice("事件流断开，自动重连中…（VPN 抖动属正常，重启后状态会自动补发）", true);
+    }
+  };
+  events.onmessage = (message) => {
+    try {
+      receive(JSON.parse(message.data));
+    } catch (error) {
+      console.error("事件解析失败", error, message.data);
+    }
+  };
 
+  // Attachments go the way the window’s file dialog goes, minus the dialog:
+  // bytes to `POST /upload`, then the path into the composer so the human can
+  // say what the file is for before anything reaches the shell.
+  const attach = document.getElementById("attach");
+  const attachInput = document.getElementById("attach-input");
+  attach.hidden = false;
+  attach.addEventListener("click", () => attachInput.click());
+  attachInput.addEventListener("change", () => {
+    const file = attachInput.files && attachInput.files[0];
+    if (!file) return;
+    fetch("/upload?name=" + encodeURIComponent(file.name), {
+      method: "POST",
+      headers: { Authorization: "Bearer " + serveToken },
+      body: file,
+    })
+      .then((response) => {
+        if (!response.ok) throw new Error("HTTP " + response.status);
+        return response.json();
+      })
+      .then((result) => {
+        const field = document.getElementById("input");
+        field.value = (field.value ? field.value + "\n" : "") + "已上传: " + result.path;
+        field.focus();
+        notice("已上传 " + result.name + " · " + result.size + " bytes — 回车发给内核");
+      })
+      .catch((error) => notice("上传失败: " + error.message, true))
+      .finally(() => {
+        attachInput.value = "";
+      });
+  });
+
+  // Link health, on the loop it was asked for: while the tunnel is up,
+  // keep checking at a leisurely pace; while it is down, check again
+  // every few seconds until it returns — so the light always tells the
+  // truth about the VPN rather than one sample’s mood.
+  const linkHealth = document.getElementById("link-health");
+  let healthDelay = 10000;
+  (function healthLoop() {
+    fetch("/health?token=" + encodeURIComponent(serveToken))
+      .then((response) => {
+        if (!response.ok) throw new Error("HTTP " + response.status);
+        return response.json();
+      })
+      .then((data) => {
+        if (!data.ok) throw new Error("tunnel down");
+        linkHealth.textContent = "链路 ✓ " + data.ms + "ms";
+        linkHealth.style.color = "var(--ok)";
+        if (healthDelay !== 10000) {
+          healthDelay = 10000;
+          notice("链路已恢复");
+        }
+      })
+      .catch(() => {
+        linkHealth.textContent = "链路 ✗ 重测中…";
+        linkHealth.style.color = "var(--bad)";
+        healthDelay = 5000;
+      })
+      .finally(() => setTimeout(healthLoop, healthDelay));
+  })();
+}
 // ---------------------------------------------------------------- elements
 
 const stream = document.getElementById("stream");
@@ -440,6 +609,8 @@ const skillInfo = document.getElementById("skill-info");
 const toolInfo = document.getElementById("tool-info");
 const input = document.getElementById("input");
 const send = document.getElementById("send");
+/// Placeholder restored when no turn is running (packs may replace it later).
+const IDLE_PLACEHOLDER = input.placeholder;
 
 const setBaseUrl = document.getElementById("set-base-url");
 const setApiKey = document.getElementById("set-api-key");
@@ -463,6 +634,7 @@ let judgeModel = null;
 let activeStrings = null;
 const notConfigured = document.getElementById("not-configured");
 const settingsSaved = document.getElementById("settings-saved");
+const settingsError = document.getElementById("settings-error");
 const settingsPath = document.getElementById("settings-path");
 
 const modelOptions = document.getElementById("model-options");
@@ -474,7 +646,14 @@ const packsDir = document.getElementById("packs-dir");
 const packNotice = document.getElementById("pack-notice");
 
 // The assistant turn currently being streamed, if any.
+//
+// A live turn is a chain of segments appended in arrival order: reasoning,
+// text, and tool cards land in the segment where they happened, so what the
+// model says appears at the moment it says it instead of sinking below the
+// tool cards that follow it.
 let live = null;
+// One caret, moved between segments; a segment that shows content borrows it.
+const caret = el("span", "caret");
 let busy = false;
 // Whether the user has typed into the settings fields since the last status
 // push. Without this, an incoming status would overwrite what they are typing.
@@ -491,9 +670,229 @@ function scrollToEnd() {
   stream.scrollTop = stream.scrollHeight;
 }
 
+// ---------------------------------------------------------------- markdown
+//
+// Models answer in Markdown whether or not anyone asked, so the assistant's
+// text is rendered as Markdown. Everything the renderer touches is escaped
+// first: model output is data, never markup the page trusts.
+
+// A path the shell can serve as a download link: the agent says where it
+// wrote the file, the human clicks it, the bytes arrive. Served pages only:
+// the window has no `/file` door, and a dead link beats plain text.
+function linkifyServerPaths(text) {
+  if (typeof onServer === "undefined" || !onServer) return text;
+  return text.replace(
+    /(^|[\s('"（(“])((?:\/|~\/|\.\/)(?:[\w\-.]+\/)*[\w\-.]+\.[A-Za-z0-9]{1,10})/g,
+    (_, lead, path) => lead + '<a class="file-link" href="/file?path=' +
+      encodeURIComponent(path) + "&token=" + encodeURIComponent(serveToken) +
+      '" download>' + path + "</a>"
+  );
+}
+
+function escapeHtml(text) {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/// Inline spans on already-escaped text.
+///
+/// Code spans are extracted first so bold, italic, and links cannot reach
+/// inside them; the placeholders are restored last.
+function inlineMarkdown(escaped) {
+  const codes = [];
+  let text = escaped.replace(/`([^`]+)`/g, (_, code) => {
+    codes.push(code);
+    return "\u0000" + codes.length + "\u0000";
+  });
+  text = text
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^_])__([^_]+)__/g, "$1<strong>$2</strong>")
+    .replace(/~~([^~]+)~~/g, "<del>$1</del>")
+    .replace(/(^|[\s(])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>")
+    .replace(/(^|[\s(])_([^_\s][^_]*)_(?![\w])/g, "$1<em>$2</em>")
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
+      '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+  text = linkifyServerPaths(text);
+  return text.replace(/\u0000(\d+)\u0000/g,
+    (_, n) => '<code class="md-inline">' + codes[+n - 1] + "</code>");
+}
+
+/// The `| --- | :---: |` line that separates a table's header from its body.
+function isTableRowSep(line) {
+  return /^\s*\|(\s*:?-{1,}:?\s*\|)+\s*$/.test(line);
+}
+
+/// The cells of one table row, on already-escaped text.
+///
+/// Pipes escaped as `\|` do not split a cell — that is how a cell contains a
+/// pipe — and the backslash itself is not shown.
+function tableCells(row) {
+  let text = row.trim();
+  if (text.startsWith("|")) text = text.slice(1);
+  if (text.endsWith("|")) text = text.slice(0, -1);
+  return text
+    .split(/(?<!\\)\|/)
+    .map((cell) => inlineMarkdown(cell.trim().replace(/\\\|/g, "|")));
+}
+
+/// Render Markdown to HTML. The input is escaped before any rule applies.
+///
+/// Covers what models actually emit: headings, lists, block quotes, rules,
+/// fenced code, and the inline spans. An unclosed fence consumes the rest of
+/// the text — a truncated message must render, not vanish.
+function renderMarkdown(source) {
+  const lines = escapeHtml(source.replace(/\u0000/g, "")).split("\n");
+  const html = [];
+  let para = [];
+  let list = null;
+  let quote = false;
+
+  const flushPara = () => {
+    if (para.length) {
+      html.push("<p>" + inlineMarkdown(para.join("<br>")) + "</p>");
+      para = [];
+    }
+  };
+  const flushList = () => {
+    if (list) {
+      html.push("</" + list + ">");
+      list = null;
+    }
+  };
+  const closeQuote = () => {
+    if (quote) {
+      html.push("</blockquote>");
+      quote = false;
+    }
+  };
+  const flushAll = () => {
+    flushPara();
+    flushList();
+    closeQuote();
+  };
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+
+    if (/^\s*```/.test(line)) {
+      flushAll();
+      const body = [];
+      i += 1;
+      while (i < lines.length && !/^\s*```/.test(lines[i])) {
+        body.push(lines[i]);
+        i += 1;
+      }
+      html.push('<pre class="md-code"><code>' + body.join("\n") + "</code></pre>");
+      continue;
+    }
+
+    if (!line.trim()) {
+      flushAll();
+      continue;
+    }
+
+    // A table: a row of cells, then the `| --- |` line that names the
+    // alignments, then body rows until a line without a pipe. Models reach for
+    // tables constantly; showing the raw pipes reads as a broken renderer.
+    if (line.includes("|") && i + 1 < lines.length && isTableRowSep(lines[i + 1])) {
+      flushAll();
+      const aligns = tableCells(lines[i + 1]).map((spec) => {
+        const left = spec.trim().startsWith(":");
+        const right = spec.trim().endsWith(":");
+        if (left && right) return "center";
+        if (right) return "right";
+        if (left) return "left";
+        return "";
+      });
+      const header = tableCells(line);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].includes("|") && lines[i].trim()) {
+        rows.push(tableCells(lines[i]));
+        i += 1;
+      }
+      i -= 1; // the for-loop's own step re-reads nothing: this row was consumed
+
+      const align = (n) =>
+        aligns[n] ? ' style="text-align:' + aligns[n] + '"' : "";
+      let table = "<table><thead><tr>";
+      header.forEach((cell, n) => {
+        table += "<th" + align(n) + ">" + cell + "</th>";
+      });
+      table += "</tr></thead>";
+      if (rows.length) {
+        table += "<tbody>";
+        for (const row of rows) {
+          table += "<tr>";
+          row.forEach((cell, n) => {
+            table += "<td" + align(n) + ">" + cell + "</td>";
+          });
+          table += "</tr>";
+        }
+        table += "</tbody>";
+      }
+      html.push(table + "</table>");
+      continue;
+    }
+
+    const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (heading) {
+      flushAll();
+      const level = heading[1].length;
+      html.push("<h" + level + ">" + inlineMarkdown(heading[2]) + "</h" + level + ">");
+      continue;
+    }
+
+    if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+      flushAll();
+      html.push("<hr>");
+      continue;
+    }
+
+    // `>` arrives escaped as `&gt;` — the renderer works on escaped text.
+    if (/^\s*&gt;\s?/.test(line)) {
+      flushPara();
+      flushList();
+      if (!quote) {
+        html.push("<blockquote>");
+        quote = true;
+      }
+      html.push("<p>" + inlineMarkdown(line.replace(/^\s*&gt;\s?/, "")) + "</p>");
+      continue;
+    }
+    closeQuote();
+
+    const bullet = /^\s*[-*+]\s+/.test(line);
+    const numbered = /^\s*\d+[.)]\s+/.test(line);
+    if (bullet || numbered) {
+      flushPara();
+      const kind = bullet ? "ul" : "ol";
+      if (list !== kind) {
+        flushList();
+        html.push("<" + kind + ">");
+        list = kind;
+      }
+      const item = line.replace(bullet ? /^\s*[-*+]\s+/ : /^\s*\d+[.)]\s+/, "");
+      html.push("<li>" + inlineMarkdown(item) + "</li>");
+      continue;
+    }
+
+    flushList();
+    para.push(line);
+  }
+  flushAll();
+  return html.join("\n");
+}
+
 function clearStream(entries) {
   stream.replaceChildren();
   live = null;
+  // The re-render draws every message from the log; queued-steering marks are
+  // stale against it.
+  steeredTexts.clear();
   if (!entries || entries.length === 0) {
     stream.append(el("div", "empty", "New session. Nothing said yet."));
     return;
@@ -521,9 +920,15 @@ function renderEntry(entry) {
   turn.append(el("div", "who", entry.role === "user" ? "you" : "kernel"));
 
   for (const call of entry.tool_calls || []) {
-    turn.append(el("div", "tool-call", "\u2192 " + call.name + " " + call.arguments));
+    turn.append(el("div", "tool-call", "→ " + call.name + " " + call.arguments));
   }
-  if (entry.text) turn.append(el("div", "body", entry.text));
+  if (entry.text) {
+    const body = el("div", "body");
+    // The assistant writes Markdown; the user's own words stay verbatim.
+    if (entry.role === "assistant") body.innerHTML = renderMarkdown(entry.text);
+    else body.textContent = entry.text;
+    turn.append(body);
+  }
   for (const image of entry.images || []) appendImage(turn, image);
   stream.append(turn);
 }
@@ -640,6 +1045,17 @@ function renderSlots(panels) {
 ///
 /// Rendering it is the point: the user should see exactly what the model saw,
 /// not merely be told that an image exists.
+/// Expand or collapse a thinking box and keep its label in step.
+function setReasoningExpanded(box, expanded) {
+  box.classList.toggle("collapsed", !expanded);
+  const toggle = box.querySelector(".toggle");
+  if (toggle) {
+    toggle.textContent = expanded
+      ? "thinking (click to hide)"
+      : "thinking (click to show)";
+  }
+}
+
 /// Show a fragment of the model thinking aloud.
 ///
 /// Collapsed by default: reasoning is frequently longer than the answer, and a
@@ -647,23 +1063,34 @@ function renderSlots(panels) {
 /// sometimes the thinking is the interesting part — especially when the answer
 /// is wrong and the reason is visible in how it got there.
 function appendReasoning(delta) {
-  if (!live) startAssistantTurn();
-  let box = live.turn.querySelector(".reasoning");
-  if (!box) {
-    box = el("div", "reasoning" + (showReasoning.checked ? "" : " collapsed"));
-    const toggle = el("span", "toggle", showReasoning.checked ? "thinking (click to hide)" : "thinking (click to show)");
-    toggle.addEventListener("click", () => {
-      box.classList.toggle("collapsed");
-      toggle.textContent = box.classList.contains("collapsed")
-        ? "thinking (click to show)"
-        : "thinking (click to hide)";
+  const seg = currentSegment();
+  if (!seg.thought) {
+    const box = el("div", "reasoning" + (showReasoning.checked ? "" : " collapsed"));
+    const toggle = el("span", "toggle");
+    const thought = el("span", "thought");
+    box.append(toggle, thought);
+    setReasoningExpanded(box, showReasoning.checked);
+    // A collapsed strip expands from anywhere it is clicked: the small label
+    // alone is easy to miss, and a preview strip reads as clickable. Once
+    // expanded, only the label collapses it — so reading and selecting the
+    // thinking never hides it by accident.
+    toggle.addEventListener("click", (event) => {
+      event.stopPropagation();
+      // Flip: collapsed means the next state is expanded, and vice versa.
+      setReasoningExpanded(box, box.classList.contains("collapsed"));
     });
-    box.append(toggle);
-    const body = el("span", "thought");
-    box.append(body);
-    live.turn.insertBefore(box, live.body);
+    box.addEventListener("click", () => {
+      if (box.classList.contains("collapsed")) setReasoningExpanded(box, true);
+    });
+    // Thinking sits before this segment's text when the text exists, at the
+    // segment's end otherwise — either way where it arrived.
+    seg.node.insertBefore(
+      box,
+      seg.body || (caret.parentNode === seg.node ? caret : null)
+    );
+    seg.thought = thought;
   }
-  box.querySelector(".thought").append(document.createTextNode(delta));
+  seg.thought.append(document.createTextNode(delta));
   scrollToEnd();
 }
 
@@ -680,13 +1107,50 @@ function appendImage(container, image) {
 function startAssistantTurn() {
   const turn = el("div", "turn assistant");
   turn.append(el("div", "who", "kernel"));
-  const body = el("div", "body");
-  const caret = el("span", "caret");
-  body.append(caret);
-  turn.append(body);
   stream.append(turn);
-  live = { turn, body, caret };
+  live = { turn, seg: null };
   scrollToEnd();
+}
+
+/// The segment the current step writes into, created on first content.
+///
+/// Segments are appended in arrival order, which is what keeps a spoken
+/// sentence above the tool cards that come after it: the old layout put all
+/// text in one block pinned below every card, so what the model said sank to
+/// the bottom of the turn no matter when it said it.
+function currentSegment() {
+  if (!live) startAssistantTurn();
+  if (!live.seg) {
+    const node = el("div", "seg");
+    live.turn.append(node);
+    node.append(caret);
+    live.seg = { node, source: "", body: null, thought: null };
+  }
+  return live.seg;
+}
+
+/// A new model step closes the current segment.
+///
+/// The next thing the model produces belongs after everything already shown,
+/// in a block of its own — a step is where one answer segment ends and the
+/// next begins.
+function nextSegment() {
+  if (!live) return;
+  flushPendingText();
+  caret.remove();
+  live.seg = null;
+}
+
+/// Discard the current step's output: the kernel retried it, so whatever this
+/// attempt produced is being thrown away there — and must be here too, or the
+/// retry renders on top of text that no longer exists.
+function rewindSegment() {
+  pendingText = "";
+  if (live && live.seg) {
+    live.seg.node.remove();
+    live.seg = null;
+    caret.remove();
+  }
 }
 
 // The shell already batches deltas; this merges whatever still lands inside one
@@ -695,14 +1159,34 @@ function startAssistantTurn() {
 let pendingText = "";
 let frameScheduled = false;
 
+/// The segment's text block, created on first text.
+function ensureBody(seg) {
+  if (!seg.body) {
+    seg.body = el("div", "body");
+    seg.node.insertBefore(seg.body, caret.parentNode === seg.node ? caret : null);
+  }
+  return seg.body;
+}
+
+/// Park the caret at the end of a rendered markdown block.
+function placeCaretIn(container) {
+  caret.remove();
+  const last = container.lastElementChild || container;
+  last.append(caret);
+}
+
 function flushPendingText() {
   const text = pendingText;
   pendingText = "";
-  if (!text) return;
-  if (!live) startAssistantTurn();
-  live.caret.remove();
-  live.body.append(document.createTextNode(text));
-  live.body.append(live.caret);
+  if (!text || !live) return;
+  const seg = currentSegment();
+  seg.source += text;
+  const body = ensureBody(seg);
+  // Re-rendered whole each frame: the blocks a half-finished fence or a
+  // dangling `**` would produce settle as the message completes, and the raw
+  // text stays the single source of truth.
+  body.innerHTML = renderMarkdown(seg.source);
+  placeCaretIn(body);
   scrollToEnd();
 }
 
@@ -717,20 +1201,22 @@ function appendAssistantText(delta) {
 }
 
 function appendToolCall(name, args) {
-  if (!live) startAssistantTurn();
-  // Keep the streaming text below the newest tool card.
-  live.caret.remove();
-  live.turn.insertBefore(el("div", "tool-call", "\u2192 " + name + " " + args), live.body);
-  live.body.append(live.caret);
+  flushPendingText();
+  const seg = currentSegment();
+  caret.remove();
+  seg.node.append(el("div", "tool-call", "\u2192 " + name + " " + args));
+  seg.node.append(caret);
   scrollToEnd();
 }
 
 function appendToolResult(ok, text) {
+  flushPendingText();
   const box = el("div", "tool-result" + (ok ? "" : " bad"), text);
   if (live) {
-    live.caret.remove();
-    live.turn.insertBefore(box, live.body);
-    live.body.append(live.caret);
+    const seg = currentSegment();
+    caret.remove();
+    seg.node.append(box);
+    seg.node.append(caret);
   } else {
     stream.append(box);
   }
@@ -740,7 +1226,9 @@ function appendToolResult(ok, text) {
 
 function endAssistantTurn() {
   if (live) {
-    live.caret.remove();
+    // Flush before closing the turn, or the last frame of text is lost.
+    flushPendingText();
+    caret.remove();
     live = null;
   }
 }
@@ -1080,6 +1568,13 @@ function renderSessions(list) {
     const row = el("div", "sess" + (s.current ? " active" : ""));
     row.append(el("span", "title", s.title || s.id));
     row.append(el("span", "n", String(s.messages === undefined ? 0 : s.messages)));
+    if (s.running) {
+      // A session working in the background shows it here: switching away
+      // from a running conversation must not hide that it is still running.
+      const badge = el("span", "run", "● working");
+      badge.title = "A turn is running in this session";
+      row.append(badge);
+    }
 
     const del = el("button", "del", "\u00d7");
     del.title = "Delete this session";
@@ -1108,7 +1603,7 @@ function renderSettings(status) {
     setEffort.value = status.reasoning_effort || "";
     setProxy.value = status.proxy || "";
     const ctx = status.context || {};
-    setWindow.value = ctx.configured_window ? String(ctx.configured_window) : "";
+    setWindow.value = ctx.configured_window ? formatWindow(ctx.configured_window) : "";
     setPercent.value = String(ctx.threshold_percent || 75);
     setKeep.value = String(ctx.keep_recent || 8);
     setMaxOutput.value = status.max_output_tokens || "";
@@ -1153,6 +1648,15 @@ function renderSettings(status) {
   }
 }
 
+/// A window size written back the way it was written: `1048576` becomes
+/// `1M` again, but anything not an exact multiple stays a plain number —
+/// rounding it would drift the value the next time it is saved.
+function formatWindow(tokens) {
+  if (tokens % 1048576 === 0) return tokens / 1048576 + "M";
+  if (tokens % 1024 === 0) return tokens / 1024 + "K";
+  return String(tokens);
+}
+
 function renderStatus(status) {
   if (!status) return;
 
@@ -1172,7 +1676,7 @@ function renderStatus(status) {
     ["model", status.model],
     ["thinking", status.reasoning_effort || "(provider default)"],
     ["proxy", status.proxy || "(direct; env proxies ignored)"],
-    ["context", (status.context ? (status.context.window / 1000) + "k (" + status.context.window_source + ")" : "")],
+    ["context", (status.context ? formatWindow(status.context.window) + " (" + status.context.window_source + ")" : "")],
     ["prompt tok", status.context && status.context.last_prompt_tokens ? String(status.context.last_prompt_tokens) : "\u2014"],
     ["compact at", (status.context ? status.context.threshold_percent + "%" : "")],
     ["max output", status.max_output_tokens || "(provider default)"],
@@ -1216,7 +1720,15 @@ function renderStatus(status) {
 
 function setBusy(value) {
   busy = value;
-  send.disabled = value;
+  // While a turn runs the send button *is* the stop control — disabling it
+  // would leave a runaway turn with no way out. Enter, meanwhile, keeps
+  // sending: the message is claimed as steering at the next step boundary.
+  send.textContent = value ? "■ Stop" : "Send";
+  send.classList.toggle("stop", value);
+  send.title = value ? "Stop the running turn" : "Send (Enter)";
+  input.placeholder = value
+    ? "Running — Enter sends this as steering for the next step; ■ Stop ends the turn"
+    : IDLE_PLACEHOLDER;
   if (!value) {
     document.getElementById("dot").className = "dot";
     document.getElementById("state").textContent = "idle";
@@ -1236,6 +1748,23 @@ function setBusy(value) {
 const handlers = new Map();   // 事件名 -> 处理函数
 const anyHandlers = [];       // 收全部的处理函数
 let latest = {};              // 最近一次状态快照,给 state() 用
+// The session this page is showing. Turn events carry the session they belong
+// to, and only the shown session's stream is drawn.
+let currentSessionId = null;
+
+/// Events that belong to one session's running turn.
+const turnEvents = new Set([
+  "turn_start", "text", "reasoning", "tool_start", "tool_end",
+  "step", "step_retry", "continuation", "turn_end", "error",
+  "compaction_start", "compaction", "injection", "steer",
+]);
+
+/// Steering messages already drawn when they were queued.
+///
+/// A message claimed mid-turn never starts a turn of its own, but a late one
+/// is chained into a follow-up turn whose `turn_start` carries the same text —
+/// that start must not draw the bubble a second time.
+const steeredTexts = new Set();
 
 /// 订阅一个事件。返回取消订阅的函数。
 function on(name, handler) {
@@ -1269,7 +1798,15 @@ function state() {
 /// 壳把事件送进来。内置界面自己也是通过 on/onAny 收的,没有私线。
 function receive(event) {
   const name = event.ev;
-  if (name === "status") latest = event.status || {};
+  if (name === "status") {
+    latest = event.status || {};
+    if (latest.session) currentSessionId = latest.session;
+  } else if (name === "sessions") {
+    // The server's word on which session is current — it wins over any local
+    // guess, so switching sessions cannot leave the filter pointing at the old.
+    const active = (event.list || []).find((item) => item.current);
+    if (active) currentSessionId = active.id;
+  }
   for (const handler of handlers.get(name) || []) {
     try {
       handler(event);
@@ -1291,6 +1828,11 @@ window.ngu = { on, onAny, send: sendCommand, state, receive };
 // 内置界面自己的事件处理。它走的是同一个总线 —— 没有私有通道,所以一个包带来
 // 的界面能做内置界面能做的任何事。
 onAny((name, event) => {
+  // Another session's turn is drawn in that session, not this one: while two
+  // conversations work at once, only the shown stream reaches the page.
+  if (turnEvents.has(name) && event.session && event.session !== currentSessionId) {
+    return;
+  }
   switch (name) {
       case "theme":
         applyTheme(event);
@@ -1354,12 +1896,30 @@ onAny((name, event) => {
       case "settings_saved":
         settingsDirty = false;
         settingsSaved.hidden = false;
-        setTimeout(() => { settingsSaved.hidden = true; }, 2000);
+        settingsError.hidden = true;
+        // Long enough to be seen without hunting for it: a confirmation that
+        // blinks for one screen-refresh reads as "nothing happened".
+        setTimeout(() => { settingsSaved.hidden = true; }, 4000);
+        break;
+      case "settings_error":
+        settingsError.textContent = event.message;
+        settingsError.hidden = false;
         break;
       case "turn_start":
-        appendUserTurn(event.text);
+        // Already drawn when it was queued as steering? Then this is the
+        // chained turn picking the message up — the bubble exists.
+        if (!steeredTexts.delete(event.text)) {
+          appendUserTurn(event.text);
+        }
         startAssistantTurn();
         setBusy(true);
+        break;
+      case "steer":
+        // Queued for the running turn's next step; drawn the moment it is
+        // sent, because the user should not wait for the claim to see their
+        // own words land.
+        appendUserTurn(event.text);
+        steeredTexts.add(event.text);
         break;
       case "text":
         appendAssistantText(event.delta);
@@ -1373,19 +1933,36 @@ onAny((name, event) => {
       case "tool_end":
         appendToolResult(event.ok, event.result);
         break;
+      case "step":
+        // A step closes its segment: whatever the model produces next is a
+        // new block, arriving after the tool cards of this one.
+        nextSegment();
+        break;
+      case "step_retry":
+        // The kernel is re-running this step: rewind what the failed attempt
+        // had drawn, then tell the user why the pause.
+        rewindSegment();
+        notice("Retrying (attempt " + event.attempt + ") \u2014 " + event.reason, false);
+        break;
+      case "continuation":
+        notice("The answer hit the output limit \u2014 asking the model to continue\u2026", false);
+        break;
       case "turn_end":
         // Flush before closing the turn, or the last frame of text is lost.
         flushPendingText();
         endAssistantTurn();
         setBusy(false);
         document.getElementById("timing").textContent =
-          event.steps + " steps \u00b7 " + event.tool_calls + " tools \u00b7 " +
-          event.usage.input + "/" + event.usage.output + " tok (" +
+          event.steps + " steps \u00b7 " + event.tool_calls + " tools" +
+          (event.retries ? " \u00b7 " + event.retries + " retries" : "") +
+          " \u00b7 " + event.usage.input + "/" + event.usage.output + " tok (" +
           event.usage.cached + " cached) \u00b7 model " + event.timing.model_ms +
           " ms, tools " + event.timing.tools_ms + " ms";
         toShell({ cmd: "status" });
         break;
       case "error":
+        // The shell keeps partial progress: text committed before the failure
+        // stays in the session, so the block above must stay on screen too.
         endAssistantTurn();
         setBusy(false);
         // Kept in the transcript by the shell, so it survives a session switch.
@@ -1406,9 +1983,6 @@ onAny((name, event) => {
       case "compaction":
         notice("Compacted " + event.replaced + " messages into a summary.\n\n" + event.summary, false);
         break;
-      case "step":
-        // Steps surface through tool cards and the closing summary.
-        break;
     }
 });
 
@@ -1416,12 +1990,25 @@ ngu.send({ cmd: "ready" });
 
 // ---------------------------------------------------------------- composer
 
-function submit() {
+// Send the typed text: a prompt when the session is idle, steering when its
+// turn is already running — the shell queues it and the loop claims it at the
+// next step boundary, so a running model can be redirected without stopping it.
+function sendPrompt() {
   const text = input.value.trim();
-  if (!text || busy) return;
+  if (!text) return;
   input.value = "";
   autoGrow();
   toShell({ cmd: "prompt", text });
+}
+
+// The button is the stop control while a turn runs; Enter always sends.
+function onSendClick() {
+  if (busy) {
+    toShell({ cmd: "cancel" });
+    send.textContent = "stopping…";
+    return;
+  }
+  sendPrompt();
 }
 
 function autoGrow() {
@@ -1429,16 +2016,25 @@ function autoGrow() {
   input.style.height = Math.min(input.scrollHeight, 160) + "px";
 }
 
-send.addEventListener("click", submit);
+send.addEventListener("click", onSendClick);
 input.addEventListener("input", autoGrow);
 input.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
-    submit();
+    sendPrompt();
   }
 });
 document.getElementById("new-session").addEventListener("click", () => {
   toShell({ cmd: "new_session" });
+});
+
+// "Show thinking" applies to thinking already on screen, not only to boxes
+// created after it is ticked — a switch that silently ignores what is visible
+// reads as broken.
+showReasoning.addEventListener("change", () => {
+  for (const box of stream.querySelectorAll(".reasoning")) {
+    setReasoningExpanded(box, showReasoning.checked);
+  }
 });
 
 // ---------------------------------------------------------------- settings
@@ -1456,7 +2052,10 @@ function saveSettings() {
     model: setModel.value.trim(),
     reasoning_effort: setEffort.value,
     proxy: setProxy.value.trim(),
-    context_window: parseInt(setWindow.value, 10) || 0,
+    // The raw text, not a number the page guessed at: `128K` parsed with
+    // parseInt is `128`, which is how "1M" came back as "1" after a restart.
+    // The shell parses sizes the way a person writes them.
+    context_window: setWindow.value.trim(),
     compact_percent: parseInt(setPercent.value, 10) || 75,
     compact_keep_recent: parseInt(setKeep.value, 10) || 8,
     max_output_tokens: setMaxOutput.value.trim(),
