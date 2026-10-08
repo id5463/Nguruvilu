@@ -1,0 +1,11 @@
+{
+  "servers": [
+    {
+      "id": "vk-api",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "vk-mcp-server"],
+      "scope": "session"
+    }
+  ]
+}

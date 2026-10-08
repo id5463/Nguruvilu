@@ -1,0 +1,13 @@
+{
+  "formatVersion": 1,
+  "game": "nguruvilu",
+  "name": "vk",
+  "versionId": "1.0.0",
+  "license": "MIT",
+  "kernelVersion": "0.1.0",
+  "dependencies": { "nguruvilu": ">=0.1.0" },
+  "mcp": "mcp.json",
+  "skills": [
+    { "id": "vk", "source": "skills/vk", "license": "MIT" }
+  ]
+}
