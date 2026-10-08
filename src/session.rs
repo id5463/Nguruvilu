@@ -258,6 +258,7 @@ impl SessionStore for JsonlStore {
         let path = self.path_for(id);
         let mut file = OpenOptions::new()
             .append(true)
+            .create(true)
             .open(&path)
             .with_context(|| format!("opening {} for append", path.display()))?;
 
@@ -275,6 +276,7 @@ impl SessionStore for JsonlStore {
         let path = self.path_for(id);
         let mut file = OpenOptions::new()
             .append(true)
+            .create(true)
             .open(&path)
             .with_context(|| format!("opening {} for append", path.display()))?;
         writeln!(
@@ -292,6 +294,7 @@ impl SessionStore for JsonlStore {
         let path = self.path_for(id);
         let mut file = OpenOptions::new()
             .append(true)
+            .create(true)
             .open(&path)
             .with_context(|| format!("opening {} for append", path.display()))?;
         writeln!(
