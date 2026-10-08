@@ -171,6 +171,13 @@
     border-radius: 6px; font: inherit; font-size: 12px;
   }
   button.action:hover { background: color-mix(in srgb, var(--accent) 22%, var(--panel)); color: var(--text); }
+  /* Pinned under the heading: the list scrolls beneath it, so the button is
+     reachable whether the conversation list is 3 rows or 300. */
+  #new-session {
+    position: sticky; top: -12px; z-index: 3;
+    margin-top: 0; margin-bottom: 8px;
+    box-shadow: 0 2px 0 var(--panel), 0 4px 8px color-mix(in srgb, var(--bg) 55%, transparent);
+  }
 
   /* ---- conversation ---- */
   #stream { padding: 18px 22px; }
@@ -331,14 +338,63 @@
   .skill { font-size: 12px; padding: 4px 0; }
   .skill .id { font-family: var(--mono); color: var(--accent); font-size: 11px; }
   .skill .d { color: var(--dim); font-size: 11px; }
+
+  /* ---- touch screens ----
+     A finger is not a cursor: every target grows to the 44px floor the touch
+     platform guides put under a fingertip, hover-only affordances become
+     always visible, and small text that doubles as a button stops being small.
+     Applied only where the pointer is coarse, so the mouse-driven desktop
+     keeps its density. */
+  @media (pointer: coarse) {
+    body { font-size: 14px; }
+    .sess {
+      min-height: 44px; padding: 10px; font-size: 14px;
+      border-radius: 8px;
+    }
+    /* Opacity-on-hover never fires without a hover: on touch the delete
+       button must simply be there. */
+    .sess .del { opacity: 1; width: 44px; height: 44px; font-size: 20px; }
+    button.action { min-height: 44px; padding: 11px 10px; font-size: 14px; }
+    button.small { min-height: 44px; padding: 10px 16px; font-size: 14px; }
+    button.tiny { font-size: 12px; padding: 6px 10px; }
+    #send { min-height: 46px; padding: 12px 22px; font-size: 14px; }
+    #input { min-height: 46px; font-size: 14px; }
+    /* The reasoning label is the collapse control: give the finger room. */
+    .reasoning .toggle {
+      display: block; font-size: 13px; padding: 8px 0 4px;
+      margin-bottom: 4px; min-height: 32px;
+    }
+    .reasoning { padding: 6px 12px; }
+    /* <details> summaries are buttons too. */
+    .hint-more > summary { padding: 10px 2px; font-size: 13px; min-height: 40px; }
+    /* The show-thinking switch and everything else in the status strip. */
+    #status label { padding: 10px 8px; font-size: 13px; }
+    #status { min-height: 40px; }
+    .picker .item { padding: 11px 10px; font-size: 13px; }
+    label.field input, label.field select {
+      padding: 10px; font-size: 14px; min-height: 44px;
+    }
+    .kv { font-size: 13px; padding: 4px 0; }
+    .tool-call, .tool-result { font-size: 12.5px; }
+    /* Fat scrollbars: dragging a thin rail with a fingertip fails. */
+    .panel { scrollbar-width: auto; }
+    .panel::-webkit-scrollbar { width: 14px; height: 14px; }
+    .panel::-webkit-scrollbar-thumb {
+      background: var(--dim); border-radius: 7px;
+      border: 3px solid var(--panel);
+    }
+  }
 </style>
 </head>
 <body>
   <aside id="sessions" class="panel">
     <div id="slot-sidebar-top"></div>
     <h2 id="sec-sessions">Sessions</h2>
-    <div id="session-list"></div>
+    <!-- Above the list and sticky: with dozens of conversations the button at
+         the bottom is a scroll hunt, and a scroll hunt on a touch screen is
+         worse. It stays where the thumb lands. -->
     <button class="action" id="new-session">+ New session</button>
+    <div id="session-list"></div>
     <div id="slot-sidebar-bottom"></div>
   </aside>
 

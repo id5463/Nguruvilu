@@ -1,13 +1,12 @@
-# dist-next — DSH 参照批次(后台 job + 插话 inbox + 完成唤醒)
+# dist-next — DSH 参照批次(后台 job + 插话 inbox + 完成唤醒 + 触摸适配)
 
-打包于 2026/10/8(含 notify 完成唤醒;前一版哈希已作废)。按要求**未替换** dist\ 与
-桌面副本,未关闭任何正在运行的实例——直接运行本目录的 ngu-desktop.exe 即可试用;
-确认没问题后,再决定是否发布到原位置。
+最新构建 2026/10/8 19:14,**已按用户要求发布到 dist\ 与桌面副本**(旧实例经
+WM_CLOSE 优雅关闭、进行中的回合先落盘)。本目录与已发布版本逐字节一致。
 
 | 文件 | SHA256 前12位 |
 |---|---|
-| ngu.exe | D8C91B617952 |
-| ngu-desktop.exe | 48B8F0BB7F0C |
+| ngu.exe | FBCBEBCFAD89 |
+| ngu-desktop.exe | 5C71DA8FD806 |
 | ngu_demo_plugin.dll | EB738EFCB09B |
 
 ## 本批新增(参照 DSH 移植)
