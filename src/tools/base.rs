@@ -139,7 +139,8 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<()> {
                  The command runs in {} — {} \n\
                  Set timeout_ms to bound long-running commands. Output is truncated when very large.\n\
                  Pass background: true to start the command as a job and return immediately; \
-                 collect it later with job_output / job_list / job_kill (timeout_ms does not apply).",
+                 collect it later with job_output / job_list / job_kill (timeout_ms does not apply). \
+                 With notify: true, the shell messages you when the job finishes — even after this turn ends.",
                 shell.label, shell.syntax_hint
             ),
             json!({
@@ -148,7 +149,8 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<()> {
                     "command": { "type": "string", "description": "Command to run" },
                     "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (default 120000)" },
                     "cwd": { "type": "string", "description": "Working directory for the command" },
-                    "background": { "type": "boolean", "description": "Run as a background job and return a job id immediately (default false)" }
+                    "background": { "type": "boolean", "description": "Run as a background job and return a job id immediately (default false)" },
+                    "notify": { "type": "boolean", "description": "With background: wake you with a message when the job finishes, even if this turn has ended (default false)" }
                 },
                 "required": ["command"]
             }),
@@ -457,12 +459,18 @@ async fn bash_tool(args: Value) -> Result<String> {
     // instead of pinning the turn until it finishes. timeout_ms is a
     // foreground concept — a job's lifetime belongs to job_kill.
     if args.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
-        let job = super::jobs::spawn_background(command, cmd)?;
+        let notify = args.get("notify").and_then(|v| v.as_bool()).unwrap_or(false);
+        let job = super::jobs::spawn_background(command, cmd, notify)?;
         return Ok(format!(
             "started {} in the background: {command}\n\
              Read its output with job_output (wait_ms blocks until it finishes), \
-             list jobs with job_list, stop it with job_kill.",
-            job.id
+             list jobs with job_list, stop it with job_kill.{}",
+            job.id,
+            if notify {
+                "\nWhen it finishes, you will receive a message about it — you may end this turn now."
+            } else {
+                ""
+            }
         ));
     }
 

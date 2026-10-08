@@ -74,6 +74,8 @@ pub fn serve(
 
         let (bus, _) = broadcast::channel::<String>(256);
         let sink: Arc<dyn EventSink> = Arc::new(SseSink { bus: bus.clone() });
+        // notify-jobs wake their session over the same event stream.
+        crate::state::install_job_wake(Arc::clone(&state), Arc::clone(&sink));
 
         // Two lanes, split by what a command touches. Short commands and turn
         // claims go straight to their own task — the window's IPC handler has

@@ -152,6 +152,8 @@ fn headless(startup_prompt: Option<String>) -> anyhow::Result<()> {
 
     let state = Arc::new(Mutex::new(AppState::bootstrap()?));
     let sink: Arc<dyn EventSink> = Arc::new(StdoutSink);
+    // notify-jobs wake their session even in headless runs.
+    state::install_job_wake(Arc::clone(&state), Arc::clone(&sink));
 
     let result = runtime.block_on(async {
         // The windowed path starts from the page's "ready"; headless has no page,
@@ -262,6 +264,9 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
 
     let state = Arc::new(Mutex::new(AppState::bootstrap()?));
     let sink: Arc<dyn EventSink> = Arc::new(WindowSink::new(proxy));
+    // notify-jobs wake their session: queued as steering while its turn runs,
+    // a fresh turn when it is idle.
+    state::install_job_wake(Arc::clone(&state), Arc::clone(&sink));
 
     // Agent turns are async; the window is not. The runtime lives for the whole
     // process, moved into the event loop closure so it is not dropped early.

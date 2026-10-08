@@ -64,6 +64,8 @@ pub struct Job {
     pub command: String,
     /// When it started, for age reporting.
     pub started: Instant,
+    /// Whether the settlement hook should wake the model when this job ends.
+    notify: AtomicU8,
     state: Mutex<JobState>,
     output: Mutex<Vec<u8>>,
     /// Set once `job_kill` asked; the waiter reports `Killed` instead of the
@@ -166,8 +168,9 @@ impl JobRegistry {
     /// The caller builds the command (it owns shell detection); this owns the
     /// job's lifetime: two reader tasks drain the pipes into the job's buffer,
     /// and one waiter polls for exit so the state settles without anyone
-    /// holding a lock across an await.
-    pub fn spawn(&self, command: String, mut cmd: Command) -> Result<Arc<Job>> {
+    /// holding a lock across an await. `notify` marks the job so the shell's
+    /// settlement hook — when one is installed — wakes the model on completion.
+    pub fn spawn(&self, command: String, mut cmd: Command, notify: bool) -> Result<Arc<Job>> {
         let mut child = cmd
             .spawn()
             .map_err(|error| anyhow!("spawning background command: {error}"))?;
@@ -179,6 +182,7 @@ impl JobRegistry {
             id: id.clone(),
             command,
             started: Instant::now(),
+            notify: AtomicU8::new(u8::from(notify)),
             state: Mutex::new(JobState::Running),
             output: Mutex::new(Vec::new()),
             killed: AtomicU8::new(0),
@@ -222,8 +226,18 @@ impl JobRegistry {
                 } else {
                     JobState::Exited(code)
                 };
+                let label = state.label(waiter_job.started.elapsed());
                 *waiter_job.state.lock().expect("job state") = state;
                 *waiter_job.child.lock().expect("job child") = None;
+                // A job that asked for it wakes the model: the shell's
+                // settlement hook delivers the message to the session that
+                // started this job — queued as steering if that turn still
+                // runs, a fresh turn if it has ended.
+                if waiter_job.notify.load(Ordering::Relaxed) == 1 {
+                    if let Some(hook) = SETTLE.get() {
+                        hook(&waiter_job.id, &label);
+                    }
+                }
                 break;
             }
         });
@@ -251,11 +265,25 @@ fn registry() -> &'static JobRegistry {
     REGISTRY.get_or_init(JobRegistry::new)
 }
 
+/// What runs when a job marked `notify` settles.
+///
+/// Installed once per process (the registry is process-wide). The CLI installs
+/// nothing, where a notify flag simply does nothing.
+static SETTLE: OnceLock<Arc<dyn Fn(&str, &str) + Send + Sync>> = OnceLock::new();
+
+/// Install the hook that wakes the model when a `notify` job finishes.
+///
+/// Arguments are the job id and its settled state label (`exited with code 0`,
+/// `killed`, …). Later installs are ignored: one shell, one hook.
+pub fn set_settlement_hook(hook: Arc<dyn Fn(&str, &str) + Send + Sync>) {
+    let _ = SETTLE.set(hook);
+}
+
 /// Start a prepared command as a background job.
 ///
 /// Handed to `bash` so shell detection stays in one place.
-pub fn spawn_background(command: &str, cmd: Command) -> Result<Arc<Job>> {
-    registry().spawn(command.to_string(), cmd)
+pub fn spawn_background(command: &str, cmd: Command, notify: bool) -> Result<Arc<Job>> {
+    registry().spawn(command.to_string(), cmd, notify)
 }
 
 /// Look up a job by id.
@@ -467,5 +495,44 @@ mod tests {
             .await
             .expect_err("there is no such job");
         assert!(error.to_string().contains("job_list"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_notify_job_fires_the_settlement_hook_when_it_finishes() {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        set_settlement_hook(Arc::new(move |id, label| {
+            recorder.lock().expect("seen").push(format!("{id}|{label}"));
+        }));
+
+        let started = bash(json!({
+            "command": "echo wake-test-done",
+            "background": true,
+            "notify": true
+        }))
+        .await
+        .expect("background start");
+        let id = id_from(&started);
+
+        // The hook runs from the job's waiter — no waiting on job_output here:
+        // waking must work even when nobody ever collects.
+        let mut fired = false;
+        for _ in 0..100 {
+            if seen.lock().expect("seen").iter().any(|entry| entry.starts_with(&format!("{id}|"))) {
+                fired = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(fired, "the settlement hook never fired for {id}");
+
+        let entry = seen
+            .lock()
+            .expect("seen")
+            .iter()
+            .find(|entry| entry.starts_with(&format!("{id}|")))
+            .cloned()
+            .expect("entry");
+        assert!(entry.contains("exited"), "{entry}");
     }
 }

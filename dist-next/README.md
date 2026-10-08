@@ -1,12 +1,13 @@
-# dist-next — DSH 参照批次(后台 job + 插话 inbox)
+# dist-next — DSH 参照批次(后台 job + 插话 inbox + 完成唤醒)
 
-打包于 2026/10/7。按要求**未替换** dist\ 与桌面副本,未关闭任何正在运行的实例——
-直接运行本目录的 ngu-desktop.exe 即可试用;确认没问题后,再决定是否发布到原位置。
+打包于 2026/10/8(含 notify 完成唤醒;前一版哈希已作废)。按要求**未替换** dist\ 与
+桌面副本,未关闭任何正在运行的实例——直接运行本目录的 ngu-desktop.exe 即可试用;
+确认没问题后,再决定是否发布到原位置。
 
 | 文件 | SHA256 前12位 |
 |---|---|
-| ngu.exe | C225AEB5432B |
-| ngu-desktop.exe | C065D209882D |
+| ngu.exe | D8C91B617952 |
+| ngu-desktop.exe | 48B8F0BB7F0C |
 | ngu_demo_plugin.dll | EB738EFCB09B |
 
 ## 本批新增(参照 DSH 移植)
@@ -16,15 +17,23 @@
    - 新工具 `job_list` / `job_output`(支持 `wait_ms` 等待完成)/ `job_kill`
    - job 注册表:状态(运行/退出码/被杀)、输出缓冲(256KB 封顶)、
      stdout/stderr 并行排空、100ms 轮询收尾
-2. **插话 inbox**(DSH 的 steer/followup 语义)
+2. **完成唤醒**(`bash notify: true` —— "程序跑完自动回来继续")
+   - job 完成时由 settlement hook 唤醒发起它的会话:还在跑 → 作插话在 step 边界
+     送达;已空闲 → **自动开一个新回合**把结果交回模型,无人操作
+   - 归属经回合观察者 FIFO 配对(工具 start 的 notify 标志 × end 的 job id),
+     会话上下文在观察者里天然可知
+3. **插话 inbox**(DSH 的 steer/followup 语义)
    - 回合运行中直接回车 = 插话:消息入队,**step 边界被领取**进入下一步的模型请求
    - 迟到(最后一个边界之后)的消息由回合结束后的**级联**自动跑成后续回合
    - 发送按钮在运行中仍是红色 ■ Stop;停止会清空排队中的插话
-   - serve 模式下 prompt 与 cancel 一样**绕过串行命令队列**(否则插话永远晚于它要引导的回合)
-3. 连带修复:E2E 发现并修复了"级联 turn_start 重复画插口气泡"(steeredTexts 消费)
+   - serve 模式下 prompt 与 cancel 一样**绕过命令队列**(否则插话永远晚于它要引导的回合)
+4. 连带修复:E2E 发现并修复了"级联 turn_start 重复画插口气泡"(steeredTexts 消费)
 
 ## 验证
 
-- cargo:432 lib + 28 集成测试全绿(含3个 jobs 单测、工具清单断言更新)
-- E2E(隔离 NGU_HOME + mock 端点):插话 4ms 入队、step2 请求内含 STEER-1(mock 日志
-  `#6 [probe,S1,toolresult]`)、迟到的 STEER-2 自动级联、气泡不重复、0 错误
+- cargo:433 lib + 28 集成测试全绿(含 4 个 jobs 单测:后台存活/kill/未知 id/hook 触发)
+- E2E 唤醒(隔离 NGU_HOME + mock 端点):回合 @12.8s 结束 → ping 后台 job
+  @21.1s 跑完 → **shell 自动开启新回合**"Background job job-1 finished: exited…"
+  → @27.1s 完成,0 错误
+- E2E 插话:4ms 入队、step2 请求内含 STEER-1(mock `#6 [probe,S1,toolresult]`)、
+  迟到的 STEER-2 自动级联、气泡不重复、0 错误

@@ -154,6 +154,13 @@ pub struct AppState {
     /// after the last claim is chained into a follow-up turn when the current
     /// one completes, so nothing the user sent is stranded.
     pub inboxes: HashMap<String, Arc<std::sync::Mutex<VecDeque<String>>>>,
+    /// Background jobs that asked to wake their session, by job id.
+    ///
+    /// Attribution happens where the session is known: the turn's observer
+    /// pairs each `bash` call's start (`notify` flag) with its end (job id).
+    /// The settlement hook looks the session up here and removes the entry; a
+    /// job without one never asked to be woken.
+    pub job_sessions: HashMap<String, String>,
     /// Effective settings, as the settings panel should display them.
     pub settings: Settings,
     /// Prompt tokens the provider last reported, for the context readout.
@@ -299,6 +306,7 @@ impl AppState {
             running: HashSet::new(),
             cancels: HashMap::new(),
             inboxes: HashMap::new(),
+            job_sessions: HashMap::new(),
             settings,
             last_error: None,
             last_prompt_tokens: None,
@@ -960,13 +968,23 @@ pub struct UiObserver {
     /// the key every incremental write goes under, whichever session the page
     /// happens to be showing when the turn finishes.
     session: String,
+    /// Per `bash` call in this turn: did it ask for a completion wake?
+    ///
+    /// Starts and ends arrive in tool-call order, so a FIFO pairs them even
+    /// when a step dispatches several calls at once.
+    bash_notify: Mutex<VecDeque<bool>>,
 }
 
 impl UiObserver {
     /// Build an observer that pushes events for `session` to the window and
     /// writes each committed message to `state`'s store as it happens.
     pub fn new(sink: Arc<dyn EventSink>, state: Arc<Mutex<AppState>>, session: String) -> Self {
-        Self { sink, state, session }
+        Self {
+            sink,
+            state,
+            session,
+            bash_notify: Mutex::new(VecDeque::new()),
+        }
     }
 
     fn emit(&self, event: Value) {
@@ -1000,10 +1018,36 @@ impl AgentObserver for UiObserver {
 
     fn on_tool_start(&self, name: &str, arguments: &str) {
         self.emit(json!({ "ev": "tool_start", "name": name, "arguments": arguments }));
+        if name == "bash" {
+            let notify = serde_json::from_str::<Value>(arguments)
+                .ok()
+                .and_then(|args| args.get("notify").and_then(|value| value.as_bool()))
+                .unwrap_or(false);
+            self.bash_notify.lock().expect("bash notify").push_back(notify);
+        }
     }
 
     fn on_tool_end(&self, name: &str, ok: bool, result: &str) {
         self.emit(json!({ "ev": "tool_end", "name": name, "ok": ok, "result": result }));
+        if name == "bash" {
+            let notify = self
+                .bash_notify
+                .lock()
+                .expect("bash notify")
+                .pop_front()
+                .unwrap_or(false);
+            // A job id is only in a successful background reply — pair the
+            // flag with it here, where the session is known.
+            if notify && ok {
+                if let Some(job_id) = result.split_whitespace().find(|t| t.starts_with("job-")) {
+                    self.state
+                        .lock()
+                        .expect("state lock")
+                        .job_sessions
+                        .insert(job_id.to_string(), self.session.clone());
+                }
+            }
+        }
     }
 
     fn on_step_retry(&self, attempt: usize, reason: &str) {
@@ -1365,6 +1409,42 @@ pub async fn run_turn_cascading(
         next = run_turn(Arc::clone(&state), text, Arc::clone(&sink)).await?;
     }
     Ok(())
+}
+
+/// Route settled `notify` jobs to the session that started them.
+///
+/// Installed once per shell process (the job registry is process-wide).
+/// While that session's turn still runs, the message is steering, claimed at
+/// the next step; when the session is idle, it opens as its own turn — a
+/// program that finishes after the model moved on still hands back its result
+/// and the work continues without anyone pressing anything.
+pub fn install_job_wake(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
+    nguruvilu::tools::jobs::set_settlement_hook(Arc::new(move |job_id, label| {
+        let text = format!(
+            "Background job {job_id} finished: {label}. Its output is ready — \
+             collect it with job_output, then continue the task."
+        );
+        let mut guard = state.lock().expect("state lock");
+        let Some(session) = guard.job_sessions.remove(job_id) else {
+            // A job that never asked to notify (or ran in a host without an
+            // observer) has nobody to wake.
+            return;
+        };
+        if guard.running.contains(&session) {
+            let queue = guard
+                .inboxes
+                .entry(session.clone())
+                .or_insert_with(|| Arc::new(std::sync::Mutex::new(VecDeque::new())));
+            queue.lock().expect("inbox").push_back(text.clone());
+            drop(guard);
+            sink.emit(json!({ "ev": "steer", "text": text, "session": session }));
+        } else {
+            drop(guard);
+            let wake_state = Arc::clone(&state);
+            let wake_sink = Arc::clone(&sink);
+            tokio::spawn(run_turn_cascading(wake_state, text, wake_sink));
+        }
+    }));
 }
 
 /// Install an archive and report what landed.
