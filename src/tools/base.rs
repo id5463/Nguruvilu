@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -431,6 +432,55 @@ async fn edit_tool(args: Value) -> Result<String> {
     Ok(format!("replaced 1 occurrence in {}", path.display()))
 }
 
+/// One command's stdout and stderr, formatted as the model reads them.
+///
+/// Shared by both exits of `bash_tool`: the normal one and the timed-out one,
+/// which must not throw away what the command printed before the deadline.
+fn render_bash_output(stdout: &[u8], stderr: &[u8], empty_placeholder: bool) -> String {
+    let mut out = String::new();
+    let stdout_text = String::from_utf8_lossy(stdout);
+    let stderr_text = String::from_utf8_lossy(stderr);
+
+    if !stdout_text.trim().is_empty() {
+        out.push_str(&truncate_output(&stdout_text, MAX_BASH_OUTPUT));
+    }
+    if !stderr_text.trim().is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("--- stderr ---\n");
+        out.push_str(&truncate_output(&stderr_text, MAX_BASH_OUTPUT));
+    }
+    if out.trim().is_empty() && empty_placeholder {
+        out.push_str("(no output)");
+    }
+    out
+}
+
+/// Drain one output pipe into a shared buffer until EOF.
+///
+/// Chunks land in the buffer as they arrive, so a wait that runs out of time
+/// can still return what the command printed instead of losing it with the
+/// reader. Generic because `ChildStdout` and `ChildStderr` are distinct types.
+fn pump<R>(pipe: Option<R>, buf: Arc<Mutex<Vec<u8>>>) -> tokio::task::JoinHandle<()>
+where
+    R: tokio::io::AsyncRead + Send + Unpin + 'static,
+{
+    tokio::spawn(async move {
+        let Some(mut pipe) = pipe else { return };
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => buf
+                    .lock()
+                    .expect("pipe buffer")
+                    .extend_from_slice(&chunk[..read]),
+            }
+        }
+    })
+}
+
 async fn bash_tool(args: Value) -> Result<String> {
     let command = args
         .get("command")
@@ -474,61 +524,77 @@ async fn bash_tool(args: Value) -> Result<String> {
         ));
     }
 
+    // Same process-group rule as jobs: a timeout must stop what the command
+    // forked, not just the shell. Deliberate background work (`nohup ... &`
+    // outliving the command) is unaffected -- the group is only signalled on
+    // the timeout path below.
+    #[cfg(unix)]
+    cmd.process_group(0);
+
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawning {program} (shell: {})", shell.label))?;
 
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
+    // One deadline for the whole call: waiting for the shell, then waiting
+    // for its pipes to close. The old code bounded only the wait on the
+    // shell, so a background process that inherited the pipes (`nohup ... &`)
+    // kept the readers alive forever after the shell itself had exited --
+    // one such call stalled a turn for 105 minutes with no timeout anywhere.
+    let deadline = tokio::time::Instant::now() + timeout;
 
-    // Read both pipes concurrently: a command that fills one pipe while we
-    // wait on the other would otherwise deadlock.
-    let stdout_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(pipe) = stdout_pipe.as_mut() {
-            let _ = pipe.read_to_end(&mut buf).await;
-        }
-        buf
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(pipe) = stderr_pipe.as_mut() {
-            let _ = pipe.read_to_end(&mut buf).await;
-        }
-        buf
-    });
+    let stdout_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut stdout_task = pump(child.stdout.take(), Arc::clone(&stdout_buf));
+    let mut stderr_task = pump(child.stderr.take(), Arc::clone(&stderr_buf));
 
-    let status = match tokio::time::timeout(timeout, child.wait()).await {
+    let status = match tokio::time::timeout_at(deadline, child.wait()).await {
         Ok(result) => result.context("waiting for command")?,
         Err(_) => {
-            let _ = child.kill().await;
+            super::jobs::kill_tree(&mut child);
             let _ = child.wait().await;
-            return Ok(format!(
+            stdout_task.abort();
+            stderr_task.abort();
+            let stdout = std::mem::take(&mut *stdout_buf.lock().expect("stdout buffer"));
+            let stderr = std::mem::take(&mut *stderr_buf.lock().expect("stderr buffer"));
+            let mut message = format!(
                 "command timed out after {} ms and was killed: {command}",
                 timeout.as_millis()
-            ));
+            );
+            // Whatever was printed before the deadline still answers part of
+            // the question -- dropping it would make a timed-out call
+            // strictly less informative than one that finished.
+            if !stdout.is_empty() || !stderr.is_empty() {
+                message.push('\n');
+                message.push_str(&render_bash_output(&stdout, &stderr, false));
+            }
+            return Ok(message);
         }
     };
 
-    let stdout = stdout_task.await.unwrap_or_default();
-    let stderr = stderr_task.await.unwrap_or_default();
+    // The shell exited, but its pipes only owe an EOF once every writer is
+    // gone -- and a background descendant may hold them open indefinitely.
+    // This wait runs to the same deadline: close enough is good enough, and
+    // what was already read is returned with a note instead of the turn
+    // hanging on a writer that is never going away.
+    let pipes_closed = tokio::time::timeout_at(deadline, async {
+        let _ = (&mut stdout_task).await;
+        let _ = (&mut stderr_task).await;
+    })
+    .await
+    .is_ok();
+    stdout_task.abort();
+    stderr_task.abort();
+    let stdout = std::mem::take(&mut *stdout_buf.lock().expect("stdout buffer"));
+    let stderr = std::mem::take(&mut *stderr_buf.lock().expect("stderr buffer"));
 
-    let mut out = String::new();
-    let stdout_text = String::from_utf8_lossy(&stdout);
-    let stderr_text = String::from_utf8_lossy(&stderr);
-
-    if !stdout_text.trim().is_empty() {
-        out.push_str(&truncate_output(&stdout_text, MAX_BASH_OUTPUT));
-    }
-    if !stderr_text.trim().is_empty() {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str("--- stderr ---\n");
-        out.push_str(&truncate_output(&stderr_text, MAX_BASH_OUTPUT));
-    }
-    if out.trim().is_empty() {
-        out.push_str("(no output)");
+    let mut out = render_bash_output(&stdout, &stderr, true);
+    if !pipes_closed {
+        out.push('\n');
+        out.push_str(&format!(
+            "--- the command exited, but a background process kept its output \
+             pipes open past {} ms; output ends here ---",
+            timeout.as_millis()
+        ));
     }
 
     let code = status.code();
@@ -696,6 +762,65 @@ fn truncate_output(text: &str, max: usize) -> String {
     let start: String = text.chars().take(head).collect();
     let end: String = text.chars().rev().take(tail).collect::<String>().chars().rev().collect();
     format!("{start}\n… ({} bytes omitted) …\n{end}", text.len() - head - tail)
+}
+
+#[cfg(test)]
+mod bash_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The exact shape that stalled a real turn for 105 minutes: the shell
+    /// exits at once, a background descendant inherits the output pipes, and
+    /// EOF on them never comes. The old code bounded only the wait on the
+    /// shell -- the pipe drain after it ran forever, and no timeout anywhere
+    /// covered it. The whole call now runs to one deadline.
+    #[tokio::test]
+    async fn a_background_process_holding_the_pipes_does_not_stall_the_call() {
+        let started = std::time::Instant::now();
+        // sh: spawn `sleep 30` holding stdout, then exit immediately.
+        let command = if cfg!(windows) {
+            "start /b timeout /t 30 >nul & echo shell-done"
+        } else {
+            "sleep 30 & echo shell-done"
+        };
+        let output = bash_tool(json!({ "command": command, "timeout_ms": 1500 }))
+            .await
+            .expect("the call returns");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the call must end at its deadline, not wait for an orphan: {elapsed:?}"
+        );
+        // What the shell printed before it exited is kept: an output pipe
+        // held open truncates nothing that was already written.
+        assert!(output.contains("shell-done"), "{output}");
+        assert!(
+            output.contains("output ends here") || output.contains("background process"),
+            "the truncation is named: {output}"
+        );
+    }
+
+    /// A command that runs past its deadline is killed and says so -- and
+    /// whatever it printed first comes back with the message instead of
+    /// vanishing with the killed readers.
+    #[tokio::test]
+    async fn a_timeout_still_returns_what_the_command_printed() {
+        let command = if cfg!(windows) {
+            "echo before-timeout & ping -n 60 127.0.0.1 >nul"
+        } else {
+            "echo before-timeout; sleep 60"
+        };
+        let started = std::time::Instant::now();
+        let output = bash_tool(json!({ "command": command, "timeout_ms": 800 }))
+            .await
+            .expect("the call returns");
+        let elapsed = started.elapsed();
+
+        assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
+        assert!(output.contains("timed out"), "{output}");
+        assert!(output.contains("before-timeout"), "{output}");
+    }
 }
 
 #[cfg(test)]

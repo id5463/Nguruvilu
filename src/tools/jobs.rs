@@ -114,10 +114,15 @@ impl Job {
         {
             let mut guard = self.child.lock().expect("job child");
             if let Some(child) = guard.as_mut() {
-                let _ = child.start_kill();
+                kill_tree(child);
             }
         }
-        for _ in 0..50 {
+        // The settle path may observe the exit only after its 100ms poll and
+        // then wait up to a full second for the pipes to drain -- so a 1s
+        // budget here (50 x 20ms) lost that race every time and reported a
+        // stopped job as still running. Three seconds outlasts the whole
+        // settle window; a healthy kill returns in ~200ms.
+        for _ in 0..150 {
             if !self.is_running() {
                 break;
             }
@@ -149,6 +154,44 @@ where
     });
 }
 
+/// Stop a process and everything it started.
+///
+/// The shell is never the only process that matters: a loop forks a child per
+/// iteration, and a `nohup ... &` inside the command leaves a grandchild
+/// holding the output pipes. Killing only the shell left those running -- the
+/// pipes stayed open past the settle window, and `job_kill` answered "running
+/// for 23s" about a job it had just stopped. One signal reaches the whole
+/// tree because the caller puts the child in its own process group at spawn;
+/// `getpgid` guards the negative pid so a group this code did not create can
+/// never be signalled. Windows reaches the same end with `taskkill /T`.
+pub fn kill_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let pid = pid as i32;
+        if unsafe { libc::getpgid(pid) } == pid {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    // Fire and forget: waiting on taskkill cost 200-400ms of process
+    // creation + process-table scan while the caller held the child lock.
+    // The shell is stopped by `start_kill` below, taskkill /T hunts the
+    // tree in the background, and job_list reports only this job's own
+    // state -- so nothing here needs the exit code. If even the spawn is
+    // too slow, the right fix is a Windows Job Object at child creation;
+    // this path is only the fallback for jobs started outside one.
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    let _ = child.start_kill();
+}
+
 /// Every background job this shell process owns.
 pub struct JobRegistry {
     next: AtomicU64,
@@ -171,6 +214,10 @@ impl JobRegistry {
     /// holding a lock across an await. `notify` marks the job so the shell's
     /// settlement hook — when one is installed — wakes the model on completion.
     pub fn spawn(&self, command: String, mut cmd: Command, notify: bool) -> Result<Arc<Job>> {
+        // The job leads its own process group: everything it forks inherits
+        // the group, so one signal in `kill_tree` stops the whole tree.
+        #[cfg(unix)]
+        cmd.process_group(0);
         let mut child = cmd
             .spawn()
             .map_err(|error| anyhow!("spawning background command: {error}"))?;
@@ -487,6 +534,76 @@ mod tests {
 
         let listed = tool("job_list", json!({})).await.expect("list");
         assert!(listed.contains(&format!("{id}  killed")), "{listed}");
+    }
+
+    #[tokio::test]
+    async fn job_kill_reports_killed_not_a_stale_running_state() {
+        // The live failure this fixes: the shell exits, a forked child keeps
+        // the output pipes open, the settle window waits for them -- and
+        // `kill`'s own budget expired first, answering "running for 23s"
+        // about a job it had just stopped. The group is killed, the pipes
+        // close, and the state settles well inside the budget.
+        let command = if cfg!(windows) {
+            "ping -n 60 127.0.0.1 >nul & ping -n 60 127.0.0.1 >nul"
+        } else {
+            "sleep 60 & sleep 60"
+        };
+        let started = bash(json!({ "command": command, "background": true }))
+            .await
+            .expect("background start");
+        let id = id_from(&started);
+
+        let killed = tool("job_kill", json!({ "id": id })).await.expect("kill");
+        assert!(killed.contains("killed"), "{killed}");
+
+        let listed = tool("job_list", json!({})).await.expect("list");
+        assert!(listed.contains(&format!("{id}  killed")), "{listed}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn job_kill_stops_grandchildren_not_just_the_shell() {
+        // The second live failure: killing the shell orphaned whatever it
+        // had forked (a `sleep 45` outlived `job_kill` with PPID 1, still
+        // holding the pipes). The job leads its own process group, so the
+        // kill reaches every member.
+        let started = bash(json!({
+            "command": "sleep 60 & echo grandchild=$!; wait",
+            "background": true
+        }))
+        .await
+        .expect("background start");
+        let id = id_from(&started);
+
+        // Wait for the grandchild pid to be printed, then kill the job.
+        let mut pid = None;
+        for _ in 0..50 {
+            let out = tool("job_output", json!({ "id": &id })).await.expect("output");
+            if let Some(rest) = out.split("grandchild=").nth(1) {
+                pid = rest.trim().split_whitespace().next().and_then(|s| s.parse::<i32>().ok());
+                if pid.is_some() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let pid = pid.expect("the grandchild pid was printed");
+
+        let killed = tool("job_kill", json!({ "id": id })).await.expect("kill");
+        assert!(killed.contains("killed"), "{killed}");
+
+        // The grandchild must be gone, not reparented and still running.
+        let mut gone = false;
+        for _ in 0..50 {
+            // Signal 0 probes existence; ESRCH (errno 3) means reaped.
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            if !alive {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(gone, "grandchild {pid} survived the job kill");
     }
 
     #[tokio::test]

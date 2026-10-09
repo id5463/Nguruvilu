@@ -957,6 +957,7 @@ dependencies = [
  "clap",
  "flate2",
  "futures-util",
+ "libc",
  "libloading",
  "reqwest",
  "serde",
