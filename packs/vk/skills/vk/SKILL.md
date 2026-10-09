@@ -1,68 +1,56 @@
 ---
 name: vk
-description: 操作俄罗斯社交平台 VK(VKontakte)——读取/发布动态、社群与用户信息、消息;当用户提到 VK、ВКонтакте、vk.com 或要对接 VK API 时使用
+description: 操作俄罗斯社交平台 VK(VKontakte)——读公开主页/墙/帖子/照片,配合社群 token 可发帖发消息;当用户提到 VK、ВКонтакте、vk.com 或要对接 VK API 时使用
 ---
 
 # VK(VKontakte)接入
 
-两条路,按可用性选:**优先用本包 MCP 服务器提供的结构化工具**;工具不在时,
-退回 `bash` 直接调 VK Open API(见文末"裸调 API")。
+本机**已配置**:`VK_SERVICE_KEY` 已写入用户环境(应用 54812191 «ngu vk bridge» 的
+服务密钥),MCP 服务器 `vk-api` 随本包自动拉起。先看工具表里 `mcp__vk-api__*`
+在不在,在就直接用工具;不在见文末排查。
 
-## 一、准备 token(一次性,用户操作)
+## 一、当前能力(2026-10 实测)
 
-1. 取 token(会打开浏览器完成 VK 授权):
-   ```bash
-   npx -y vk-mcp-server --login
-   ```
-   它会把 access token 打印/写好,照它说的做即可。
-2. 写入用户级环境变量(Windows):
-   ```bash
-   setx VK_ACCESS_TOKEN "<拿到的token>"
-   ```
-   **然后必须重启本程序**——MCP 服务器是新进程,只有重启后才继承到这个变量。
-3. 自检:
-   ```bash
-   npx -y vk-mcp-server --check
-   ```
-   它会报告 token 是否有效、以及能用哪些工具。
+| 能做什么 | 靠什么 |
+|---|---|
+| 读公开主页/社群资料、读墙、按 id 读帖子、读照片 | ✅ 服务密钥(已配) |
+| 发帖、评论、发故事、社群消息、社群管理 | ❌ 需要**社群 token**(`VK_ACCESS_TOKEN`) |
+| 点赞/搜索/成员列表/资讯流/统计 | ❌ VK 不再授给新应用,任何 token 都拿不到(error 1051/28/100) |
 
-**token 就是密码**:只放环境变量;不写进对话、不写进文件、不出现在要贴给
-别人的输出里。
+服务器的组合规则:调用先用 `VK_ACCESS_TOKEN`(社群 token),被拒的**读**再用
+`VK_SERVICE_KEY` 重试;写永远只走社群 token。所以只要把社群 token 补上,
+读写就都齐了——目前只有读。
 
-## 二、工具怎么来、不来怎么办
+**不要用 `npx vk-mcp-server --login`**:它拿到的 VK ID token 只有公开读权限,
+和服务密钥等价但多一道 OAuth,写操作一样是1051。
 
-本包(`vk`)加载时会拉起 MCP 服务器 `vk`(命令 `npx -y vk-mcp-server`)。
-加载成功后,它的工具会出现在工具表里,模型可直接调用。
+## 二、补社群 token(需要发帖时,一次性,约三下点击)
 
-工具没出现时按序排查:
+1. 打开你管理的社群 → 右侧菜单 **管理(Управление)**;
+2. 找 **API 使用**(新版可能在 **高级/Advanced** 下)→ **访问令牌** → **创建令牌**;
+3. 勾选 `wall`、`photos`、`stories`、`messages`、`manage` → 确认,复制令牌;
+4. `setx VK_ACCESS_TOKEN "<令牌>"`,**重启本程序**。
+   令牌永不过期、不绑机器。完成后 `npx -y vk-mcp-server --check` 应显示
+   Community token。
 
-1. `node -v` ≥ 18、`npx -v` 可用(PATH 里要有 nodejs 目录);
-2. `VK_ACCESS_TOKEN` 是否已设置、且**设置之后重启过本程序**;
-3. `npx -y vk-mcp-server --check` 单独跑一遍,它会直说哪一步坏了;
-4. 启动日志里找 `[pack] vk-1.0.0` 一行——`on_failure: abort` 会把失败说清楚,
-   不会静默少一个工具。
+> 确认码防不住:创建/查看密钥时 VK 会向手机推送确认码。用 ADB 读法:
+> `adb shell dumpsys notification --noredact | findstr "это код"` 直接取码。
 
-## 三、裸调 API(兜底)
+## 三、排查
 
-MCP 工具不可用、或需要它没封装的方法时,直接 HTTP:
+1. `node -v` ≥18、`npx -v` 可用;
+2. 环境变量是否在**本程序启动之前**已设置(启动后 setx 不生效,必须重启);
+3. `npx -y vk-mcp-server --check` —— 它会说清是哪类 token、缺哪项权限;
+4. 启动日志找 `[pack] vk-1.0.0`;`on_failure: abort` 会把装载失败说清楚。
+
+## 四、裸调 API(兜底)
 
 ```
-GET https://api.vk.com/method/<METHOD>?v=5.199&access_token=$VK_ACCESS_TOKEN&<参数>
+GET https://api.vk.com/method/<METHOD>?v=5.199&access_token=<token>&<参数>
 ```
 
-- **限速**:每 token 约 **3 req/s**。批量操作加间隔;错误码 `5`(too many
-  requests)就等 1 秒重试,别立刻重发。
-- **错误统一格式**:`{"error":{"code":…,"message":…}}`。
-  `1117`/`permission denied` = token 缺这个权限,回第一节重新授权并勾选对应 scope;
-  `1114`/`access_token invalid` = token 过期,重新 `--login`。
-- **写操作先确认目标**:发帖(`wall.post`)、发消息(`messages.send`)前,
-  向用户确认发到哪个社群/哪段对话,不要猜。
-- 常用读方法:`users.get`、`groups.getById`、`wall.get`、`newsfeed.get`、
-  `messages.getConversation`。方法总览:<https://dev.vk.com/ru/method>。
-
-## 四、token 类型速记
-
-- **用户 token**:读自己的信息/动态/消息,权限取决于授权时勾选的 scope。
-- **社群(群组)token**:在社群管理后台生成,能替社群发帖——`wall.post` 的
-  `owner_id` 为负数社群 id 时用它。
-- 两类 token 都走同一个环境变量;同时需要两类时,以当前任务需要的那个为准。
+- 限速约 3 req/s;错误码 5 = 太频繁,等 1 秒重试;
+- 响应错误统一 `{"error":{"code","message"}}`:1117 权限不足、1051/28 token
+  类型不允许、27 社群 token 被拒的读(走服务密钥)、15 数据受限;
+- 写操作(发帖/发消息)前先向用户确认目标社群/对话;
+- 方法总览:<https://dev.vk.com/ru/method>
