@@ -1,0 +1,11 @@
+{
+  "servers": [
+    {
+      "id": "moodle-herzen",
+      "transport": "stdio",
+      "command": "python",
+      "args": ["C:\\Users\\a\\.nguruvilu\\packs\\moodle-1.0.0\\scripts\\moodle_mcp.py"],
+      "scope": "session"
+    }
+  ]
+}
