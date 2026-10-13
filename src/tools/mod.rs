@@ -142,8 +142,71 @@ pub struct OverrideRecord {
     pub new_owner: String,
 }
 
+/// The session the current tool call belongs to, for the duration of one
+/// `execute`.
+///
+/// A thread-local rather than a parameter because the tool handler signature
+/// carries only the arguments — threading a session id through it would change
+/// every tool for the sake of jobs and packs, which need it to tell one
+/// conversation's work from another's. Set by `execute` around each handler
+/// call; handlers read it via `current_session`.
+///
+/// The working directory of the same session travels alongside it in
+/// `CURRENT_WORKSPACE`, so path resolution in handlers can default to it.
+thread_local! {
+    static CURRENT_SESSION: std::cell::RefCell<Option<String>> = const {
+        std::cell::RefCell::new(None)
+    };
+    static CURRENT_WORKSPACE: std::cell::RefCell<Option<std::path::PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// The session id of the tool call now running on this thread, if any.
+///
+/// Handlers that need to know *whose* conversation called them (job
+/// attribution, session-scoped pack state) read this. Absent outside an
+/// `execute`, or when the caller set no session.
+pub fn current_session() -> Option<String> {
+    CURRENT_SESSION.with(|cell| cell.borrow().clone())
+}
+
+/// The working directory of the session whose tool call is running here.
+///
+/// `None` outside an `execute`, or when the session has no workspace bound;
+/// callers then use the process directory, which is the CLI behaviour.
+pub fn current_workspace() -> Option<std::path::PathBuf> {
+    CURRENT_WORKSPACE.with(|cell| cell.borrow().clone())
+}
+
+/// Scopes a session id and its workspace over every poll of an inner future.
+///
+/// A thread-local set around `handler(args)` alone is empty by the time an
+/// `async` body runs, because the body executes when it is first polled.
+/// Wrapping the future keeps the scope in force for each poll and restores
+/// the previous values after each one, so nested tool calls never leak.
+pub(crate) struct ScopedSession<F> {
+    pub(crate) session: Option<String>,
+    pub(crate) workspace: Option<std::path::PathBuf>,
+    pub(crate) inner: F,
+}
+
+impl<F: Future + Unpin> Future for ScopedSession<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        let this = &mut *self;
+        let prev_session = CURRENT_SESSION.with(|cell| cell.replace(this.session.clone()));
+        let prev_workspace = CURRENT_WORKSPACE.with(|cell| cell.replace(this.workspace.clone()));
+        let polled = Pin::new(&mut this.inner).poll(cx);
+        CURRENT_SESSION.with(|cell| *cell.borrow_mut() = prev_session);
+        CURRENT_WORKSPACE.with(|cell| *cell.borrow_mut() = prev_workspace);
+        polled
+    }
+}
+
 /// The kernel's mutable tool table.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, ToolDef>,
     overrides: Vec<OverrideRecord>,
@@ -151,7 +214,53 @@ pub struct ToolRegistry {
     /// execution happens, so it is where the bus lives, and the kernel hands
     /// out clones of it (`kernel.events()`).
     events: crate::events::EventBus,
+    /// The session whose turn calls into this table.
+    ///
+    /// The desktop swaps sessions in place (one `AppState`, one registry), so
+    /// the id moves here rather than living in the session struct; `execute`
+    /// reads it and pins the thread-local for the duration of each handler.
+    caller: std::sync::Arc<std::sync::RwLock<Option<String>>>,
+    /// Working directory of the pinned session; `None` means the process
+    /// directory. Set together with `caller` by [`ToolRegistry::set_session`].
+    workspace: std::sync::Arc<std::sync::RwLock<Option<std::path::PathBuf>>>,
 }
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self {
+            tools: HashMap::new(),
+            overrides: Vec::new(),
+            events: crate::events::EventBus::default(),
+            caller: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            workspace: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        }
+    }
+}
+
+impl ToolRegistry {
+    /// Pin the session whose turn will call into this table, with its
+    /// working directory.
+    ///
+    /// Called when the desktop switches conversations: from then on every
+    /// `execute` through this registry is attributed to `session`, and
+    /// path-taking tools without an explicit directory resolve under
+    /// `workspace`.
+    pub fn set_session(&self, session: Option<String>, workspace: Option<std::path::PathBuf>) {
+        *self.caller.write().expect("registry caller") = session;
+        *self.workspace.write().expect("registry workspace") = workspace;
+    }
+
+    /// The session currently pinned to this table, if any.
+    pub fn session(&self) -> Option<String> {
+        self.caller.read().expect("registry caller").clone()
+    }
+
+    /// The working directory currently pinned to this table, if any.
+    pub fn workspace(&self) -> Option<std::path::PathBuf> {
+        self.workspace.read().expect("registry workspace").clone()
+    }
+}
+
 
 impl ToolRegistry {
     /// An empty registry.
@@ -278,7 +387,14 @@ impl ToolRegistry {
             }),
         );
         let started = std::time::Instant::now();
-        let result = (def.handler)(args).await;
+        let caller = self.caller.read().expect("registry caller").clone();
+        let workspace = self.workspace.read().expect("registry workspace").clone();
+        let result = ScopedSession {
+            session: caller,
+            workspace,
+            inner: (def.handler)(args),
+        }
+        .await;
         let duration_ms = started.elapsed().as_millis() as u64;
         match &result {
             Ok(output) => self.events.emit(

@@ -168,7 +168,11 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<()> {
     Ok(())
 }
 
-/// Resolve a caller-supplied path against the process working directory.
+/// Resolve a caller-supplied path against the session working directory.
+///
+/// Relative paths resolve under the current session's workspace when one is
+/// bound, else under the process directory (CLI use). Absolute paths are
+/// returned unchanged.
 ///
 /// On Windows this also accepts the POSIX form a shell reports. Git Bash mounts
 /// drives as `/c/...`, `/i/...`, and `pwd` prints exactly that — so a model that
@@ -183,6 +187,17 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<()> {
 /// absolute path. On Unix a leading `/i` is a genuine directory and is left
 /// alone.
 fn resolve_path(raw: &str) -> PathBuf {
+    resolve_path_in(raw, default_base_dir())
+}
+
+/// The directory relative paths resolve against for the current tool call.
+fn default_base_dir() -> PathBuf {
+    super::current_workspace()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+/// Resolve `raw` against `base`, applying the POSIX drive translation first.
+fn resolve_path_in(raw: &str, base: PathBuf) -> PathBuf {
     let path = Path::new(raw);
     if path.is_absolute() {
         return path.to_path_buf();
@@ -193,8 +208,9 @@ fn resolve_path(raw: &str) -> PathBuf {
         return drive;
     }
 
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(path)
+    base.join(path)
 }
+
 
 /// Translate `/c/Users/x` into `C:\Users\x`, when that is what it means.
 ///
@@ -491,7 +507,10 @@ async fn bash_tool(args: Value) -> Result<String> {
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_BASH_TIMEOUT_MS),
     );
-    let cwd = args.get("cwd").and_then(|c| c.as_str()).map(resolve_path);
+    let cwd = match args.get("cwd").and_then(|c| c.as_str()) {
+        Some(explicit) => Some(resolve_path(explicit)),
+        None => super::current_workspace(),
+    };
 
     let shell = detect_shell();
     let (program, program_args) = shell.invocation(command);
@@ -551,7 +570,10 @@ async fn bash_tool(args: Value) -> Result<String> {
         Ok(result) => result.context("waiting for command")?,
         Err(_) => {
             super::jobs::kill_tree(&mut child);
-            let _ = child.wait().await;
+            // kill_tree only sends the signal. A descendant (a `ping` under
+            // `cmd`) outlives the shell on Windows, so this reap must have its
+            // own bound too: an unbounded wait here is the 60-second stall.
+            let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
             stdout_task.abort();
             stderr_task.abort();
             let stdout = std::mem::take(&mut *stdout_buf.lock().expect("stdout buffer"));
@@ -951,4 +973,35 @@ mod path_tests {
         assert!(relative.ends_with("a.txt"));
         assert!(relative.is_absolute(), "joined onto the working directory");
     }
+
+    #[test]
+    fn relative_paths_resolve_under_the_given_base() {
+        let base = PathBuf::from("ws-base");
+        assert_eq!(resolve_path_in("notes/a.txt", base.clone()), base.join("notes/a.txt"));
+        // An absolute path ignores the base entirely.
+        let absolute = std::env::temp_dir().join("abs.txt");
+        assert_eq!(
+            resolve_path_in(&absolute.display().to_string(), base),
+            absolute
+        );
+    }
+
+    #[test]
+    fn default_base_prefers_the_bound_session_workspace() {
+        use futures_util::FutureExt;
+
+        let ws = PathBuf::from("ws-bound");
+        let observed = super::super::ScopedSession {
+            session: Some("s".to_string()),
+            workspace: Some(ws.clone()),
+            inner: Box::pin(async { super::super::current_workspace() }),
+        }
+        .now_or_never()
+        .expect("ready future");
+        assert_eq!(observed, Some(ws));
+        // The scope ends with the poll: nothing is bound afterwards.
+        assert_eq!(super::super::current_workspace(), None);
+    }
 }
+
+

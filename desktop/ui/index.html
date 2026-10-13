@@ -151,6 +151,15 @@
   }
 
   /* ---- session list ---- */
+  .sess-group {
+    padding: 8px 8px 2px; color: var(--dim); font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.04em;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .sess-group button {
+    background: none; border: 0; color: var(--dim); cursor: pointer; font-size: 11px; padding: 0 4px;
+  }
+  .sess-group button:hover { color: var(--text); }
   .sess {
     display: flex; align-items: center; gap: 6px;
     padding: 6px 8px; border-radius: 6px; cursor: default;
@@ -390,12 +399,15 @@
     }
   }
 
+  /* Phone-only controls stay out of the desktop layout entirely. */
+  .phone-only { display: none !important; }
+
   /* ---------- phones: one column, sessions become a chip strip ---------- */
   @media (max-width: 860px) {
     body {
       grid-template-columns: 1fr;
       /* sessions strip | conversation | composer | status */
-      grid-template-rows: auto minmax(0, 1fr) auto 26px;
+      grid-template-rows: 56px minmax(0, 1fr) auto auto 40px;
       font-size: 14px;
     }
     #sessions {
@@ -403,14 +415,22 @@
       border-bottom: 1px solid var(--line);
       padding: 7px 10px;
       display: flex; align-items: center; gap: 8px;
-      overflow-x: auto; overflow-y: hidden;
+      height: 56px; max-height: 56px; overflow: hidden;
       -webkit-overflow-scrolling: touch;
       scrollbar-width: none;
     }
     #sessions::-webkit-scrollbar { display: none; }
     #sessions h2, #sessions #slot-sidebar-top, #sessions #slot-sidebar-bottom { display: none; }
     #new-session { flex: 0 0 auto; white-space: nowrap; min-height: 40px; }
-    #session-list { display: flex; gap: 6px; flex: 1 1 auto; min-width: 0; }
+    #session-list { display: flex; gap: 6px; flex: 1 1 auto; min-width: 0; overflow-x: auto; overflow-y: hidden; }
+    /* Explicit rows: the session strip, conversation, slot, composer, status.
+       Without them the sidebar's full height took row 1 and the composer row
+       shrank below its 61px content, covering the bottom of the conversation. */
+    #sessions { grid-row: 1; }
+    #stream { grid-row: 2; }
+    #slot-above-composer { grid-row: 3; }
+    #composer { grid-row: 4; }
+    #status { grid-row: 5; max-height: 40px; overflow: hidden; }
     #session-list .sess {
       flex: 0 0 auto; white-space: nowrap; max-width: 58vw;
       border: 1px solid var(--line); border-radius: 20px;
@@ -418,7 +438,24 @@
     }
     #session-list .sess .del { display: none; }          /* delete from a phone chip is an accident waiting to happen */
     #session-list .sess.active { border-color: var(--accent); }
-    #details { display: none; }                          /* settings panel off the phone grid */
+    /* Settings stay reachable: a full-height sheet over the conversation,
+       opened from the status strip and closed from its own header. */
+    #details {
+      position: fixed; inset: 0; z-index: 20;
+      border-left: none; padding: 12px 14px calc(14px + env(safe-area-inset-bottom, 0px));
+      display: none;
+    }
+    #details.open { display: block; }
+    #toggle-settings.phone-only { display: inline-block !important; }
+    .sheet-head.phone-only { display: flex !important; }
+    .sheet-head {
+      align-items: center; justify-content: space-between;
+      margin-bottom: 8px;
+    }
+    .sheet-head .sheet-title {
+      font-size: 10px; text-transform: uppercase; letter-spacing: .09em;
+      color: var(--dim); font-weight: 600;
+    }
     #composer { padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px)); }
     #main, main { min-width: 0; }
   }
@@ -441,6 +478,10 @@
 
   <aside id="details" class="panel">
     <div id="slot-details-top"></div>
+    <div class="phone-only sheet-head">
+      <span class="sheet-title">Settings</span>
+      <button class="small ghost" id="close-settings" type="button">Close</button>
+    </div>
     <h2 id="sec-settings">Settings</h2>
     <div id="settings">
       <div class="warn" id="not-configured" hidden></div>
@@ -572,6 +613,7 @@
     <span id="stats"></span>
     <span id="timing"></span>
     <span id="slot-status-bar"></span>
+    <button class="tiny phone-only" id="toggle-settings" type="button" aria-controls="details" aria-expanded="false">Settings</button>
     <label style="margin-left:auto; cursor:pointer; display:flex; gap:4px; align-items:center;">
       <input type="checkbox" id="show-reasoning"> <span id="cap-reasoning">show thinking</span>
     </label>
@@ -590,6 +632,24 @@
 // Everything below treats them as the same shell — same commands out, same
 // events in — because the server runs the same `dispatch`.
 const onServer = typeof window.ipc === "undefined" || window.ipc === null;
+// Top-level and declared before any stream callback can run `receive`.
+const handlers = new Map();   // 事件名 -> 处理函数
+const anyHandlers = [];       // 收全部的处理函数
+let latest = {};              // 最近一次状态快照,给 state() 用
+// Events that arrive before the page script has finished declaring its state
+// are queued and replayed by flushPendingEvents().
+let pageReady = false;
+const pendingEvents = [];
+// Absolute index of the earliest entry drawn; 0 means the whole log is shown.
+let olderFirst = 0;
+let loadingOlder = false;
+// The session this page is showing; only its turn events are drawn.
+let currentSessionId = null;
+const turnEvents = new Set([
+  "turn_start", "text", "reasoning", "tool_start", "tool_end",
+  "step", "step_retry", "continuation", "turn_end", "error",
+  "compaction_start", "compaction", "injection", "steer",
+]);
 const serveToken = new URLSearchParams(location.search).get("token") || "";
 const toShell = onServer
   ? (payload) =>
@@ -633,6 +693,14 @@ if (onServer) {
       console.error("事件解析失败", error, message.data);
     }
   };
+  // A backgrounded tab can lose its stream and miss pushes while hidden. On
+  // return, re-send `ready` so the server pushes the current state again
+  // instead of leaving the page on whatever it last drew.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") toShell({ cmd: "ready" });
+  });
+  // Scrolling to the top asks for the page of history just above what is drawn.
+  // Attached below, after `stream` is declared; see the scroll listener there.
 
   // Attachments go the way the window’s file dialog goes, minus the dialog:
   // bytes to `POST /upload`, then the path into the composer so the human can
@@ -713,6 +781,13 @@ if (onServer) {
 // ---------------------------------------------------------------- elements
 
 const stream = document.getElementById("stream");
+// Scrolling to the top asks for the page of history just above what is drawn.
+// A flag keeps one request in flight; the reply clears it.
+stream.addEventListener("scroll", () => {
+  if (stream.scrollTop > 80 || loadingOlder || olderFirst <= 0) return;
+  loadingOlder = true;
+  toShell({ cmd: "load_older", before: olderFirst });
+});
 const sessionList = document.getElementById("session-list");
 const logInfo = document.getElementById("log-info");
 const runtimeInfo = document.getElementById("runtime-info");
@@ -777,8 +852,25 @@ function el(tag, cls, text) {
   return node;
 }
 
+// Follow the stream only while the reader is already at the bottom. A streamed
+// delta that yanked the view back down would make long answers unreadable:
+// the user scrolls up, and the next frame jumps them to the end again.
+const FOLLOW_THRESHOLD_PX = 48;
+let forceFollow = false;
 function scrollToEnd() {
+  const distance = stream.scrollHeight - stream.scrollTop - stream.clientHeight;
+  if (!forceFollow && distance > FOLLOW_THRESHOLD_PX) return;
   stream.scrollTop = stream.scrollHeight;
+}
+// Jump to the end unconditionally: the reader just sent a prompt or switched
+// session, so the view must show where the new content lands.
+function scrollToEndForced() {
+  forceFollow = true;
+  try {
+    scrollToEnd();
+  } finally {
+    forceFollow = false;
+  }
 }
 
 // ---------------------------------------------------------------- markdown
@@ -1009,7 +1101,21 @@ function clearStream(entries) {
     return;
   }
   for (const entry of entries) renderEntry(entry);
-  scrollToEnd();
+  scrollToEndForced();
+}
+
+// Older history goes above what is already drawn, so nothing is re-rendered.
+// renderEntry appends to the end of the stream, so the nodes it adds are
+// collected and moved to the top in their original order. The reader's
+// distance from the bottom is kept, so the visible line does not jump.
+function prependStream(entries) {
+  if (!entries || entries.length === 0) return;
+  const before = stream.childElementCount;
+  for (const entry of entries) renderEntry(entry);
+  const added = Array.from(stream.children).slice(before);
+  const distanceFromBottom = stream.scrollHeight - stream.scrollTop;
+  stream.prepend(...added);
+  stream.scrollTop = stream.scrollHeight - distanceFromBottom;
 }
 
 function renderEntry(entry) {
@@ -1220,7 +1326,7 @@ function startAssistantTurn() {
   turn.append(el("div", "who", "kernel"));
   stream.append(turn);
   live = { turn, seg: null };
-  scrollToEnd();
+  scrollToEndForced();
 }
 
 /// The segment the current step writes into, created on first content.
@@ -1349,7 +1455,7 @@ function appendUserTurn(text) {
   turn.append(el("div", "who", "you"));
   turn.append(el("div", "body", text));
   stream.append(turn);
-  scrollToEnd();
+  scrollToEndForced();
 }
 
 // ---------------------------------------------------------------- panels
@@ -1673,33 +1779,80 @@ function renderPacks(list) {
   }
 }
 
+function sessionGroupMap() {
+  try {
+    return JSON.parse(localStorage.getItem("sessionGroups") || "{}") || {};
+  } catch (error) {
+    // Corrupt JSON in localStorage: start with no groups rather than failing
+    // the whole session list.
+    console.warn("sessionGroups is not valid JSON; ignoring it", error);
+    return {};
+  }
+}
+
+function setSessionGroup(id, group) {
+  const map = sessionGroupMap();
+  if (group) map[id] = group; else delete map[id];
+  localStorage.setItem("sessionGroups", JSON.stringify(map));
+}
+
 function renderSessions(list) {
   sessionList.replaceChildren();
+  const groups = sessionGroupMap();
+  const buckets = new Map();
   for (const s of list || []) {
-    const row = el("div", "sess" + (s.current ? " active" : ""));
-    row.append(el("span", "title", s.title || s.id));
-    row.append(el("span", "n", String(s.messages === undefined ? 0 : s.messages)));
-    if (s.running) {
-      // A session working in the background shows it here: switching away
-      // from a running conversation must not hide that it is still running.
-      const badge = el("span", "run", "● working");
-      badge.title = "A turn is running in this session";
-      row.append(badge);
-    }
-
-    const del = el("button", "del", "\u00d7");
-    del.title = "Delete this session";
-    del.addEventListener("click", (event) => {
-      event.stopPropagation();
-      toShell({ cmd: "delete_session", id: s.id });
-    });
-    row.append(del);
-
-    if (!s.current) {
-      row.addEventListener("click", () => toShell({ cmd: "open_session", id: s.id }));
-    }
-    sessionList.append(row);
+    const name = groups[s.id] || "";
+    if (!buckets.has(name)) buckets.set(name, []);
+    buckets.get(name).push(s);
   }
+  // Named groups first, in first-seen order; ungrouped sessions last.
+  const ordered = [...buckets.keys()].filter((k) => k !== "");
+  if (buckets.has("")) ordered.push("");
+  for (const name of ordered) {
+    const header = el("div", "sess-group");
+    header.append(el("span", "", name || "Ungrouped"));
+    const rename = el("button", "", "+ group");
+    rename.title = "Move the active session into a group";
+    rename.addEventListener("click", () => {
+      const active = (list || []).find((s) => s.current);
+      if (!active) return;
+      const next = window.prompt("Group name (empty to ungroup)", name) ?? null;
+      if (next === null) return;
+      setSessionGroup(active.id, next.trim());
+      renderSessions(list);
+    });
+    header.append(rename);
+    sessionList.append(header);
+    for (const s of buckets.get(name)) {
+      sessionList.append(renderSessionRow(s));
+    }
+  }
+}
+
+function renderSessionRow(s) {
+  const row = el("div", "sess" + (s.current ? " active" : ""));
+  row.append(el("span", "title", s.title || s.id));
+  row.append(el("span", "n", String(s.messages === undefined ? 0 : s.messages)));
+  if (s.running) {
+    // A session working in the background shows it here: switching away
+    // from a running conversation must not hide that it is still running.
+    const badge = el("span", "run", "● working");
+    badge.title = "A turn is running in this session";
+    row.append(badge);
+  }
+
+  const del = el("button", "del", "\u00d7");
+  del.title = "Delete this session";
+  del.addEventListener("click", (event) => {
+    event.stopPropagation();
+    toShell({ cmd: "delete_session", id: s.id });
+  });
+  row.append(del);
+
+  if (!s.current) {
+    row.addEventListener("click", () => toShell({ cmd: "open_session", id: s.id }));
+  }
+  return row;
 }
 
 function renderSettings(status) {
@@ -1856,20 +2009,6 @@ function setBusy(value) {
 //
 // 事件按名字分发;`onAny` 收全部。命令原样送给壳。
 
-const handlers = new Map();   // 事件名 -> 处理函数
-const anyHandlers = [];       // 收全部的处理函数
-let latest = {};              // 最近一次状态快照,给 state() 用
-// The session this page is showing. Turn events carry the session they belong
-// to, and only the shown session's stream is drawn.
-let currentSessionId = null;
-
-/// Events that belong to one session's running turn.
-const turnEvents = new Set([
-  "turn_start", "text", "reasoning", "tool_start", "tool_end",
-  "step", "step_retry", "continuation", "turn_end", "error",
-  "compaction_start", "compaction", "injection", "steer",
-]);
-
 /// Steering messages already drawn when they were queued.
 ///
 /// A message claimed mid-turn never starts a turn of its own, but a late one
@@ -1907,7 +2046,22 @@ function state() {
 }
 
 /// 壳把事件送进来。内置界面自己也是通过 on/onAny 收的,没有私线。
+// Events that arrive before the page script has finished declaring its state
+// are queued and replayed in order once it has. Without this, an early event
+// reads a `const` that is still in its temporal dead zone and is dropped.
 function receive(event) {
+  if (!pageReady) {
+    pendingEvents.push(event);
+    return;
+  }
+  dispatchEvent_(event);
+}
+function flushPendingEvents() {
+  pageReady = true;
+  while (pendingEvents.length > 0) dispatchEvent_(pendingEvents.shift());
+}
+
+function dispatchEvent_(event) {
   const name = event.ev;
   if (name === "status") {
     latest = event.status || {};
@@ -1999,7 +2153,16 @@ onAny((name, event) => {
         renderSessions(event.list);
         break;
       case "transcript":
-        clearStream(event.entries);
+        clearStream(event.entries.entries);
+        // The first page is the tail of the log; `first` is how far back it
+        // reaches. Older history is requested as the reader scrolls up.
+        olderFirst = event.entries.first;
+        loadingOlder = false;
+        break;
+      case "older":
+        prependStream(event.page.entries);
+        olderFirst = event.page.first;
+        loadingOlder = false;
         break;
       case "status":
         renderStatus(event.status);
@@ -2199,6 +2362,19 @@ function saveSettings() {
 }
 
 document.getElementById("save-settings").addEventListener("click", saveSettings);
+
+// Phone: settings are a sheet over the conversation, opened from the status strip.
+(() => {
+  const details = document.getElementById("details");
+  const toggle = document.getElementById("toggle-settings");
+  const setOpen = (open) => {
+    details.classList.toggle("open", open);
+    toggle.setAttribute("aria-expanded", String(open));
+  };
+  toggle.addEventListener("click", () => setOpen(!details.classList.contains("open")));
+  document.getElementById("close-settings").addEventListener("click", () => setOpen(false));
+})();
+
 setApiKey.addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
     event.preventDefault();
@@ -2218,6 +2394,8 @@ document.getElementById("btn-verify").addEventListener("click", () => toShell({ 
 
 // The page is loaded and listening; ask the shell for initial state.
 ngu.send({ cmd: "list_packs" });
+// Every declaration above has run now, so queued events can be drawn.
+flushPendingEvents();
 </script>
 </body>
 </html>

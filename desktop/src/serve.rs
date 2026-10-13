@@ -77,6 +77,36 @@ pub fn serve(
         // notify-jobs wake their session over the same event stream.
         crate::state::install_job_wake(Arc::clone(&state), Arc::clone(&sink));
 
+        // Outbound remote control, same as the window: the process dials the
+        // relay and every command still passes the allow-list in `remote`.
+        {
+            let (url, relay_token) = {
+                let guard = state.lock().expect("state lock");
+                (guard.settings.relay_url.clone(), guard.settings.relay_token.clone())
+            };
+            match crate::remote::disabled_reason(Some(&url), Some(&relay_token)) {
+                Some(reason) => eprintln!("[remote] {reason}"),
+                None => {
+                    let config = crate::remote::RelayConfig { url, token: relay_token };
+                    let relay_state = Arc::clone(&state);
+                    let relay_sink = Arc::clone(&sink);
+                    tokio::spawn(crate::remote::run_relay(config, move |body: String| {
+                        let state = Arc::clone(&relay_state);
+                        let sink = Arc::clone(&relay_sink);
+                        Box::pin(async move {
+                            match crate::dispatch(state, &body, sink, None).await {
+                                Ok(()) => r#"{"ok":true}"#.to_string(),
+                                Err(error) => {
+                                    serde_json::json!({ "ok": false, "error": format!("{error:#}") })
+                                        .to_string()
+                                }
+                            }
+                        })
+                    }));
+                }
+            }
+        }
+
         // Two lanes, split by what a command touches. Short commands and turn
         // claims go straight to their own task — the window's IPC handler has
         // always worked this way, and a ten-minute turn must not freeze
@@ -272,7 +302,7 @@ async fn handle(
                 plain(400, "empty upload")
             } else {
                 let name = sanitize_name(query.get("name").map(String::as_str).unwrap_or(""));
-                let workdir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let workdir = session_workdir(&state);
                 let directory = workdir.join("uploads");
                 match tokio::fs::create_dir_all(&directory).await {
                     Err(error) => plain(500, &format!("cannot create uploads: {error}")),
@@ -308,7 +338,7 @@ async fn handle(
                     return;
                 };
                 let decoded = percent_decode(raw_path);
-                let workdir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let workdir = session_workdir(&state);
                 let candidate = if std::path::Path::new(&decoded).is_absolute() {
                     std::path::PathBuf::from(&decoded)
                 } else {
@@ -757,6 +787,21 @@ async fn sse(stream: &mut TcpStream, bus: broadcast::Sender<String>) {
                     break;
                 }
             }
+        }
+    }
+}
+
+/// The directory uploads and downloads are rooted in: the current session's
+/// own working directory, so one conversation's files stay out of another's.
+/// Falls back to the process directory only for a session that has no cwd
+/// recorded, and says so rather than hiding the fallback.
+fn session_workdir(state: &Arc<Mutex<AppState>>) -> std::path::PathBuf {
+    let cwd = state.lock().expect("state lock").session.cwd.clone();
+    match cwd {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => {
+            eprintln!("[serve] session has no cwd; using the process directory");
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
         }
     }
 }

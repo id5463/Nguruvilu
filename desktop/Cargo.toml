@@ -11,6 +11,8 @@ path = "src/main.rs"
 [dependencies]
 nguruvilu = { path = ".." }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
 serde_json = "1"
 anyhow = "1"
 # Fresh bearer token per `--serve` run.

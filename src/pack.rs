@@ -690,6 +690,16 @@ pub struct ModelsFile {
     /// Reasoning effort.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// How the answer is delivered: `stream` or `buffered`.
+    ///
+    /// A pack property rather than a user one, because the thing it describes is
+    /// the gateway: a pack that ships against an endpoint whose stream never
+    /// completes has to say so, or every install of it hangs on the first turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<String>,
+    /// Whether a stalled stream switches this route to buffered delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degrade_on_stall: Option<bool>,
     /// Proxy; empty means direct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,

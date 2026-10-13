@@ -31,21 +31,31 @@ pub struct Session {
     /// Model route used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Packs this session has loaded, by pack label. Persisted so that a
+    /// restart still knows which sessions depend on a pack: an unload in one
+    /// conversation must not remove a pack another conversation still uses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packs: Vec<String>,
     /// Conversation history.
     #[serde(default)]
     pub messages: Vec<Message>,
 }
 
 impl Session {
-    /// Start a new session with a generated id.
+    /// Start a new session with a generated id and no working directory.
+    ///
+    /// The caller assigns [`Session::cwd`] once it has created the session's
+    /// workspace with [`ensure_workspace`]. Leaving it unset here means a
+    /// session never inherits the process directory by accident.
     pub fn new(model: Option<String>) -> Self {
         let now = now_iso();
         Self {
             id: new_id(),
             created_at: now.clone(),
             updated_at: now,
-            cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
+            cwd: None,
             model,
+            packs: Vec::new(),
             messages: Vec::new(),
         }
     }
@@ -98,6 +108,11 @@ pub trait SessionStore: Send + Sync {
     /// Record what was injected into a request, so the log explains what the
     /// model was actually sent.
     fn append_injection(&self, _id: &str, _record: &InjectionRecord) -> Result<()> {
+        Ok(())
+    }
+    /// Record the full set of packs this session has loaded. The latest set
+    /// recorded is the current one; a store without pack tracking keeps none.
+    fn append_packs(&self, _id: &str, _packs: &[String]) -> Result<()> {
         Ok(())
     }
     /// Load a session, or `None` when it does not exist.
@@ -153,6 +168,13 @@ enum JsonlLine {
     /// store is append-only so that an interrupted write cannot corrupt it.
     /// Rewriting history to compact it would give that up.
     Compaction(crate::compaction::Compaction),
+    /// The packs this session has loaded, as a full set.
+    ///
+    /// The latest such line is the current set. Recorded as a line rather than
+    /// a header field because the store is append-only: changing a header would
+    /// mean rewriting the file. A full set (not a delta) keeps a replay correct
+    /// even when an earlier line was lost to an interrupted write.
+    Packs { packs: Vec<String> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -219,8 +241,8 @@ impl JsonlStore {
             match serde_json::from_str::<JsonlLine>(&line) {
                 Ok(JsonlLine::Header(h)) => header = Some(h),
                 Ok(JsonlLine::Message(_)) => count += 1,
-                // Neither a compaction nor an injection carries a message.
-                Ok(JsonlLine::Compaction(_)) | Ok(JsonlLine::Injection(_)) => {}
+                // None of these carries a message.
+                Ok(JsonlLine::Compaction(_)) | Ok(JsonlLine::Injection(_)) | Ok(JsonlLine::Packs { .. }) => {}
                 Err(_) => continue,
             }
         }
@@ -307,6 +329,19 @@ impl SessionStore for JsonlStore {
         Ok(())
     }
 
+    fn append_packs(&self, id: &str, packs: &[String]) -> Result<()> {
+        Self::validate_id(id)?;
+        let path = self.path_for(id);
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening {} for append", path.display()))?;
+        writeln!(file, "{}", serde_json::to_string(&JsonlLine::Packs { packs: packs.to_vec() })?)?;
+        file.flush()?;
+        self.touch(id)?;
+        Ok(())
+    }
+
     fn load(&self, id: &str) -> Result<Option<Session>> {
         Self::validate_id(id)?;
         let path = self.path_for(id);
@@ -320,6 +355,8 @@ impl SessionStore for JsonlStore {
         let mut header: Option<SessionHeader> = None;
         let mut messages = Vec::new();
         let mut compactions = Vec::new();
+        // The last full set wins: each `Packs` line replaces the one before it.
+        let mut packs: Vec<String> = Vec::new();
         for line in reader.lines() {
             let line = line?;
             if line.trim().is_empty() {
@@ -332,6 +369,7 @@ impl SessionStore for JsonlStore {
                 // An injection record is evidence, not history: it is not
                 // replayed into the conversation.
                 Ok(JsonlLine::Injection(_)) => {}
+                Ok(JsonlLine::Packs { packs: set }) => packs = set,
                 // A corrupt line is skipped rather than failing the load: an
                 // interrupted append must not cost the whole conversation.
                 Err(_) => continue,
@@ -354,6 +392,7 @@ impl SessionStore for JsonlStore {
             updated_at: header.updated_at,
             cwd: header.cwd,
             model: header.model,
+            packs,
             messages,
         }))
     }
@@ -375,6 +414,7 @@ impl SessionStore for JsonlStore {
                 updated_at: header.updated_at.clone(),
                 cwd: header.cwd.clone(),
                 model: header.model.clone(),
+                packs: Vec::new(),
                 messages: Vec::new(),
             };
             // Title needs the first user message; read it lazily from the file.
@@ -461,4 +501,72 @@ pub fn new_id() -> String {
     let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     format!("{stamp}-{}", &suffix[..6])
+}
+
+/// The private working directory of one session: `<root>/workspaces/<id>`.
+///
+/// `root` is chosen by the caller (the desktop derives it from its data
+/// directory). This function only joins path segments; it does not touch
+/// the filesystem. Ids that would escape `root` are rejected, the same rule
+/// the session store applies to file stems.
+pub fn workspace_dir(root: &Path, id: &str) -> Result<PathBuf> {
+    JsonlStore::validate_id(id)?;
+    Ok(root.join("workspaces").join(id))
+}
+
+/// Create the working directory of session `id` and return its path.
+///
+/// Fails when the directory cannot be created. Callers must not fall back to
+/// another directory on failure: a session that silently ran in a shared or
+/// process directory is the bug this function exists to prevent.
+pub fn ensure_workspace(root: &Path, id: &str) -> Result<PathBuf> {
+    let dir = workspace_dir(root, id)?;
+    fs::create_dir_all(&dir).with_context(|| format!("creating workspace {}", dir.display()))?;
+    Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_dir_nests_under_workspaces_and_session_id() {
+        let root = Path::new("data");
+        let dir = workspace_dir(root, "20260101-000000-abc123").expect("valid id");
+        assert_eq!(dir, root.join("workspaces").join("20260101-000000-abc123"));
+    }
+
+    #[test]
+    fn workspace_dir_rejects_ids_that_escape_the_root() {
+        let root = Path::new("data");
+        for bad in ["", "../x", "a/b", "a\\b", "c:x"] {
+            assert!(workspace_dir(root, bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn ensure_workspace_creates_the_directory_and_is_idempotent() {
+        let root = std::env::temp_dir().join(format!("ngu-ws-test-{}", uuid::Uuid::new_v4()));
+        let id = new_id();
+        let first = ensure_workspace(&root, &id).expect("create");
+        assert!(first.is_dir());
+        let second = ensure_workspace(&root, &id).expect("idempotent");
+        assert_eq!(first, second);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ensure_workspace_fails_loudly_when_the_path_is_a_file() {
+        let root = std::env::temp_dir().join(format!("ngu-ws-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("workspaces")).expect("root");
+        let id = "blocked";
+        fs::write(root.join("workspaces").join(id), b"not a dir").expect("blocker");
+        assert!(ensure_workspace(&root, id).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn new_session_has_no_inherited_working_directory() {
+        assert!(Session::new(None).cwd.is_none());
+    }
 }

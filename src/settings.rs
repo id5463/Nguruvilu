@@ -43,6 +43,21 @@ pub struct Settings {
     /// real endpoint, `minimal` cut one answer from 137 output tokens to 69.
     #[serde(default)]
     pub reasoning_effort: String,
+    /// How the answer is delivered: `stream`, `buffered`, or empty for `stream`.
+    ///
+    /// `buffered` exists for gateways that accept a streaming request, open the
+    /// response, and then never write the answer — see the module docs in
+    /// [`crate::llm`]. On such an endpoint the only alternative is a turn that
+    /// hangs until the whole-request timeout.
+    #[serde(default)]
+    pub delivery: String,
+    /// Whether a stalled stream switches this route to buffered delivery.
+    ///
+    /// Absent means yes: one stalled step is enough evidence to stop paying the
+    /// stall bound on every later step. Set to `false` to keep asking the stream
+    /// regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degrade_on_stall: Option<bool>,
     /// Proxy for all requests, e.g. `http://127.0.0.1:7890`.
     ///
     /// Empty means direct, and — more importantly — it means the process's
@@ -65,6 +80,15 @@ pub struct Settings {
     /// Recent messages kept verbatim when compacting.
     #[serde(default = "default_keep_recent")]
     pub compact_keep_recent: usize,
+
+    /// Cloud relay URL the local app dials out to for remote control.
+    ///
+    /// Empty leaves remote control off. No default host is assumed.
+    #[serde(default)]
+    pub relay_url: String,
+    /// Bearer token presented to the relay. Empty leaves remote control off.
+    #[serde(default)]
+    pub relay_token: String,
 
     /// Output token ceiling, when the provider accepts one.
     ///
@@ -237,6 +261,12 @@ impl Settings {
             }
         }
 
+        if let Ok(value) = std::env::var("NGU_DELIVERY") {
+            if !value.trim().is_empty() {
+                settings.delivery = value;
+            }
+        }
+
         if let Ok(value) = std::env::var("NGU_REASONING_EFFORT") {
             if !value.trim().is_empty() {
                 settings.reasoning_effort = value;
@@ -327,10 +357,14 @@ mod tests {
             api_key: "sk-test".into(),
             model: "m".into(),
             reasoning_effort: String::new(),
+            delivery: String::new(),
+            degrade_on_stall: None,
             proxy: String::new(),
             context_window: None,
             compact_percent: 75,
             compact_keep_recent: 8,
+            relay_url: String::new(),
+            relay_token: String::new(),
             max_output_tokens: None,
             network: crate::network::NetworkSettings::default(),
             search: None,
@@ -348,10 +382,14 @@ mod tests {
             api_key: "sk-test".into(),
             model: String::new(),
             reasoning_effort: String::new(),
+            delivery: String::new(),
+            degrade_on_stall: None,
             proxy: String::new(),
             context_window: None,
             compact_percent: 75,
             compact_keep_recent: 8,
+            relay_url: String::new(),
+            relay_token: String::new(),
             max_output_tokens: None,
             network: crate::network::NetworkSettings::default(),
             search: None,
@@ -398,10 +436,14 @@ mod tests {
             api_key: "sk-round-trip".into(),
             model: "test-model".into(),
             reasoning_effort: "low".into(),
+            delivery: "buffered".into(),
+            degrade_on_stall: Some(false),
             proxy: String::new(),
             context_window: None,
             compact_percent: 75,
             compact_keep_recent: 8,
+            relay_url: String::new(),
+            relay_token: String::new(),
             max_output_tokens: None,
             network: crate::network::NetworkSettings::default(),
             search: None,

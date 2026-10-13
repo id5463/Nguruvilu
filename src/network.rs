@@ -51,6 +51,30 @@ pub struct NetworkSettings {
     /// Milliseconds before the first retry. Each further retry doubles it.
     #[serde(default = "default_retry_backoff")]
     pub retry_backoff_ms: u64,
+    /// How long a streaming answer may go without a single SSE frame before the
+    /// turn is abandoned, in seconds.
+    ///
+    /// Without it, a provider that accepts the request and then stops writing
+    /// holds the turn for the whole request timeout, which reads to the user as
+    /// a hung agent rather than a failed request. Measured against a real
+    /// endpoint that emits the opening frame and then goes silent, the first
+    /// frame arrives in under a second, so this only has to outpace a slow
+    /// start, not a long answer.
+    #[serde(default = "default_stream_idle")]
+    pub stream_idle_secs: u64,
+    /// How long a catalog request may go unanswered, in seconds.
+    ///
+    /// The model list is fetched to fill a picker, so the alternative to a bound
+    /// is not a later answer but a settings panel that sits showing nothing.
+    /// Measured against a real gateway that answers `chat/completions` and never
+    /// answers `GET /models`, the request held the whole request timeout — three
+    /// hundred seconds of a frozen picker for a list that was never coming.
+    #[serde(default = "default_catalog_timeout")]
+    pub catalog_timeout_secs: u64,
+}
+
+fn default_catalog_timeout() -> u64 {
+    20
 }
 
 fn default_request_timeout() -> u64 {
@@ -69,6 +93,10 @@ fn default_retry_backoff() -> u64 {
     200
 }
 
+fn default_stream_idle() -> u64 {
+    45
+}
+
 impl Default for NetworkSettings {
     fn default() -> Self {
         Self {
@@ -76,6 +104,8 @@ impl Default for NetworkSettings {
             pool_idle_timeout_secs: default_pool_idle(),
             retry_attempts: default_retry_attempts(),
             retry_backoff_ms: default_retry_backoff(),
+            stream_idle_secs: default_stream_idle(),
+            catalog_timeout_secs: default_catalog_timeout(),
         }
     }
 }
@@ -86,9 +116,27 @@ impl NetworkSettings {
         Duration::from_secs(self.request_timeout_secs.max(1))
     }
 
+    /// How long the model catalog may go unanswered.
+    ///
+    /// Clamped below the whole-request timeout for the same reason as
+    /// [`NetworkSettings::stream_idle`]: a bound that outlives the request it
+    /// guards is not a bound.
+    pub fn catalog_timeout(&self) -> Duration {
+        Duration::from_secs(self.catalog_timeout_secs.clamp(1, self.request_timeout_secs.max(1)))
+    }
+
     /// How long an idle connection is kept.
     pub fn pool_idle_timeout(&self) -> Duration {
         Duration::from_secs(self.pool_idle_timeout_secs.max(1))
+    }
+
+    /// How long a streaming answer may stay silent before the turn is abandoned.
+    ///
+    /// Clamped below the whole-request timeout: an idle bound that outlives the
+    /// request it guards can never fire, so it would restore the hang this
+    /// exists to remove.
+    pub fn stream_idle(&self) -> Duration {
+        Duration::from_secs(self.stream_idle_secs.clamp(1, self.request_timeout_secs.max(1)))
     }
 
     /// How long to wait before retry number `attempt` (1-based).
@@ -112,6 +160,12 @@ impl NetworkSettings {
                 pool_idle_timeout_secs: 10,
                 retry_attempts: 2,
                 retry_backoff_ms: 500,
+                // A reasoning model can spend minutes deciding before it writes
+                // anything, so the silence bound is generous rather than tight.
+                stream_idle_secs: 180,
+                // The catalog is one small JSON body either way; a reasoning
+                // model's patience says nothing about how long a list takes.
+                catalog_timeout_secs: 20,
             }),
             // Nothing to retry and nothing to wait for.
             "local" => Some(Self {
@@ -119,6 +173,8 @@ impl NetworkSettings {
                 pool_idle_timeout_secs: 60,
                 retry_attempts: 1,
                 retry_backoff_ms: 50,
+                stream_idle_secs: 15,
+                catalog_timeout_secs: 5,
             }),
             // A gateway that reaps idle connections aggressively, behind a
             // network that drops them.
@@ -127,6 +183,8 @@ impl NetworkSettings {
                 pool_idle_timeout_secs: 10,
                 retry_attempts: 5,
                 retry_backoff_ms: 300,
+                stream_idle_secs: 30,
+                catalog_timeout_secs: 15,
             }),
             "default" => Some(Self::default()),
             _ => None,
@@ -157,6 +215,18 @@ impl NetworkSettings {
             problems.push(format!(
                 "retryAttempts is {}; against a provider that is down this is a long wait",
                 self.retry_attempts
+            ));
+        }
+        if self.stream_idle_secs >= self.request_timeout_secs {
+            problems.push(format!(
+                "streamIdleSecs is {} but requestTimeoutSecs is {}; the stall detector would only ever fire after the request itself is gone",
+                self.stream_idle_secs, self.request_timeout_secs
+            ));
+        }
+        if self.catalog_timeout_secs >= self.request_timeout_secs {
+            problems.push(format!(
+                "catalogTimeoutSecs is {} but requestTimeoutSecs is {}; a model list that never arrives would still wait for the whole request timeout, which is the hang this bound exists to remove",
+                self.catalog_timeout_secs, self.request_timeout_secs
             ));
         }
         problems
@@ -258,6 +328,24 @@ mod tests {
         assert_eq!(settings.pool_idle_timeout_secs, 30);
         assert_eq!(settings.retry_attempts, 3);
         assert_eq!(settings.retry_backoff_ms, 200);
+        assert_eq!(settings.stream_idle_secs, 45);
+    }
+
+    #[test]
+    fn the_stream_idle_bound_can_never_outlive_the_request_it_guards() {
+        // A stall detector that fires after the whole request would never fire.
+        let settings = NetworkSettings {
+            request_timeout_secs: 10,
+            stream_idle_secs: 600,
+            ..Default::default()
+        };
+        assert_eq!(settings.stream_idle(), Duration::from_secs(10));
+        // And it never reaches zero, which would abandon every frame unheard.
+        let zero = NetworkSettings {
+            stream_idle_secs: 0,
+            ..Default::default()
+        };
+        assert_eq!(zero.stream_idle(), Duration::from_secs(1));
     }
 
     #[test]
@@ -300,6 +388,8 @@ mod tests {
             pool_idle_timeout_secs: 5,
             retry_attempts: 7,
             retry_backoff_ms: 50,
+            stream_idle_secs: 33,
+            catalog_timeout_secs: 12,
         };
         let text = serde_json::to_string(&settings).unwrap();
         let back: NetworkSettings = serde_json::from_str(&text).unwrap();

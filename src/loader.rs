@@ -313,6 +313,20 @@ impl Loader {
 
         let client = Arc::new(McpClient::connect(&spec).await?);
         let owner = format!("mcp:{}", step.id);
+
+        // The server is already registered under this owner (another
+        // conversation loaded the same pack). Its tools are live, so this new
+        // process is redundant: drop it and reuse the existing registration.
+        let already: Vec<String> = client.tools().iter().map(|t| client.exposed_name(&t.name)).collect();
+        if !already.is_empty()
+            && already
+                .iter()
+                .all(|name| self.kernel.tools().owner(name) == Some(owner.as_str()))
+        {
+            client.shutdown().await;
+            return Ok(Outcome::Reused);
+        }
+
         let mut registered: Vec<String> = Vec::new();
 
         for tool in client.tools() {

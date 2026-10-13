@@ -62,6 +62,13 @@ pub struct Job {
     pub id: String,
     /// The command line as it was started.
     pub command: String,
+    /// The session whose turn spawned this job (`None` if the caller set no
+    /// session — CLI/headless, or a spawn outside any execute).
+    ///
+    /// Attribution lives here, where spawn happens, because that is the only
+    /// moment the caller identity is unambiguous: `current_session()` reads it
+    /// from the execute-pinned thread-local.
+    owner: Option<String>,
     /// When it started, for age reporting.
     pub started: Instant,
     /// Whether the settlement hook should wake the model when this job ends.
@@ -81,6 +88,17 @@ impl Job {
     /// The job's current state.
     pub fn state(&self) -> JobState {
         self.state.lock().expect("job state").clone()
+    }
+
+    /// The session that spawned this job, when known.
+    pub fn owner(&self) -> Option<&str> {
+        self.owner.as_deref()
+    }
+
+    /// Whether a session may see this job: its own jobs, plus any job spawned
+    /// without an owner (nothing to attribute — CLI, or a call outside execute).
+    pub fn belongs_to(&self, session: &str) -> bool {
+        self.owner.as_deref().map_or(true, |o| o == session)
     }
 
     /// Whether the job has not settled yet.
@@ -225,9 +243,11 @@ impl JobRegistry {
         let stderr = child.stderr.take();
 
         let id = format!("job-{}", self.next.fetch_add(1, Ordering::Relaxed) + 1);
+        let owner = super::current_session();
         let job = Arc::new(Job {
             id: id.clone(),
             command,
+            owner,
             started: Instant::now(),
             notify: AtomicU8::new(u8::from(notify)),
             state: Mutex::new(JobState::Running),
@@ -298,6 +318,30 @@ impl JobRegistry {
         self.jobs.lock().expect("job registry").get(id).cloned()
     }
 
+    /// Look a job up by id, but only if `session` may see it.
+    pub fn get_visible(&self, id: &str, session: Option<&str>) -> Option<Arc<Job>> {
+        let job = self.get(id)?;
+        match session {
+            None => Some(job),
+            Some(s) if job.belongs_to(s) => Some(job),
+            _ => None,
+        }
+    }
+
+    /// Every job `session` may see (its own, plus ownerless), oldest first.
+    pub fn list_visible(&self, session: Option<&str>) -> Vec<Arc<Job>> {
+        let mut jobs: Vec<Arc<Job>> = self
+            .jobs
+            .lock()
+            .expect("job registry")
+            .values()
+            .filter(|job| session.map_or(true, |s| job.belongs_to(s)))
+            .cloned()
+            .collect();
+        jobs.sort_by_key(|job| job.started);
+        jobs
+    }
+
     /// Every job, oldest first.
     pub fn list(&self) -> Vec<Arc<Job>> {
         let mut jobs: Vec<Arc<Job>> = self.jobs.lock().expect("job registry").values().cloned().collect();
@@ -333,14 +377,14 @@ pub fn spawn_background(command: &str, cmd: Command, notify: bool) -> Result<Arc
     registry().spawn(command.to_string(), cmd, notify)
 }
 
-/// Look up a job by id.
+/// Look up a job by id, restricted to the caller's session when one is pinned.
 pub fn get(id: &str) -> Option<Arc<Job>> {
-    registry().get(id)
+    registry().get_visible(id, super::current_session().as_deref())
 }
 
-/// Every job, oldest first.
+/// Every job the caller's session may see (its own, plus ownerless).
 pub fn list() -> Vec<Arc<Job>> {
-    registry().list()
+    registry().list_visible(super::current_session().as_deref())
 }
 
 /// Register the job tools next to the base tools they extend.

@@ -225,6 +225,35 @@ ngu config path                  # 只打印设置文件路径
 发送的是**扁平顶层字段** `reasoning_effort` —— 这是 Chat Completions 的规范写法。
 嵌套的 `reasoning: {effort: ...}` 属于 Responses API,不是同一个接口,不要混用。
 
+### 传输模式(delivery)
+
+默认 `stream`(SSE 增量)。但**有些网关的流式是坏的**:它接受 `stream: true`,回 200 与
+`text/event-stream`,写下一两个空 `delta` 帧,然后不再写任何东西 —— 既不给答案,也不发 `[DONE]`。
+对流式-only 的客户端来说这不是「慢」,而是这一回合永远结束不了。
+
+实测这样一个端点:10 次流式请求 **0 次完成**,首帧 2–6 秒到达此后再无动静,连接在约 70 秒被切断;
+而**同一个请求体**改成 `stream: false`,2–6 秒返回完整答案,工具调用照常带回
+(`finish_reason: tool_calls`)。
+
+| 位置 | 用法 |
+|---|---|
+| 命令行 | `ngu config set --delivery buffered`,或单次 `ngu --delivery buffered -p "..."` |
+| 环境变量 | `NGU_DELIVERY=buffered` |
+| 设置文件 | `"delivery": "buffered"`(与 `"degrade_on_stall": false` 同为顶层蛇形键) |
+| 包 `models.json` | `"delivery": "buffered"`(网关的毛病属于包,不该要用户重新发现一次) |
+
+两种模式喂给主循环的是**同一串 `LlmEvent`** —— 完整答案被拆成一次 `TextDelta` 加一次
+`ToolCallDelta`,差别只在网络上,`agent.rs` 与 `compaction.rs` 都不分支。
+
+**卡死自动降级**:即便没有上面任何设置,一次「流已打开、但在吐出任何内容之前就没声了」的失败,会把该
+路由切成 `buffered` 并在后续步骤保持。不这么做的代价是每一步都要重新白等一遍 `streamIdleSecs`,而
+每一步都会得到同一个答案:坏掉的流不会因为再问一次就变好。已经吐出内容之后**不会**降级重发 ——
+那会让一回合变成两回合。想关掉:`"degrade_on_stall": false` / `models.json` 的
+`"degradeOnStall": false`。
+
+> `extraBody` 里写 `"stream": false` 同样有效:模式是从**成形后的请求体**读回来的,而不是只看设置 ——
+> shaper 对请求体有最后决定权,如果发送和解析各按各的来判断,它说的话就不算数了。
+
 ### 模型列表
 
 `GET /v1/models` 是事实标准,所以不必手填模型名:
@@ -233,6 +262,11 @@ ngu config path                  # 只打印设置文件路径
 * **命令行**:`ngu models`
 
 实测一个网关返回了 48 个模型,并附带 `owned_by` 与 `supported_endpoint_types`。
+
+目录请求受 `network.catalogTimeoutSecs` 约束(默认 20 秒),而不是整个 `requestTimeoutSecs`:
+上面那个流式坏掉的网关同时**从不回答 `GET /v1/models`**,而列表是为了填一个选择框存在的 —— 让它按住
+300 秒的请求超时不放,用户看到的是界面冻在那里,而不是一句「这个端点不给模型列表」。
+`ngu models` 因此会在 20 秒内报错,桌面的 `fetch list` 按钮同理。
 
 ### 兼容性说明
 
@@ -547,9 +581,9 @@ stages:
 
 全局选项(节选):`-p <prompt>` 一次性提问、`-s <id>` 续接会话、`--new-session`、
 `--json`、`-q`、`--max-steps`、`--system`、`--cwd`、`--home`、`--skill-dir`、
-`--reasoning-effort`、`--persona`、`--cache-policy`、`--git-snapshot`、
+`--reasoning-effort`、`--delivery`、`--persona`、`--cache-policy`、`--git-snapshot`、
 `--assembly <file>`;环境变量 `NGU_API_KEY` / `NGU_BASE_URL` / `NGU_MODEL` /
-`NGU_REASONING_EFFORT` / `NGU_HOME` / `NGU_JUDGE_API_KEY` / `NGU_JUDGE_ENDPOINT` /
+`NGU_REASONING_EFFORT` / `NGU_DELIVERY` / `NGU_HOME` / `NGU_JUDGE_API_KEY` / `NGU_JUDGE_ENDPOINT` /
 `NGU_JUDGE_MODEL`。**优先级:命令行 > 环境变量 > 设置文件。**
 
 ## 构建、测试与发布
@@ -591,6 +625,7 @@ pwsh -File release.ps1
 | **宿主内置工具** | ✅ | `pack` 打包安装、`search_web`(Tavily/Brave/Exa,**由 `starter` 的插件声明启用**,未配 key 不出现)、`delegate` 子代理、`judge` 判官(**由 `judge` 包的插件启用**,未配 key 不出现) |
 | **子代理** | ✅ | `delegate`:同路由同工具表同提示词,空历史起步;步数上限 12,深度上限 2 |
 | **网络调节** | ✅ | 设置 / 包 `models.json` / 插件 `network` 服务三条路径,统一进路由后才建客户端 |
+| **传输模式** | ✅ | `stream` / `buffered` 两种,同一串 `LlmEvent` 进主循环;流式卡死自动降级并记住 |
 | 工具注册表 | ✅ | 冲突默认 fail loud,覆盖记录可查 |
 | 会话持久化 | ✅ | JSONL 追加写 + `SessionStore` trait;损坏行容错 |
 | **插件机制** | ✅ | 隔离域(realm)、epoch 自动重载、effect 逆序撤销、依赖等待、失败回滚 |

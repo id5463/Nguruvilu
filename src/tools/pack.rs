@@ -30,10 +30,12 @@ use crate::tools::{ConflictPolicy, ToolDef, ToolFuture, ToolOutput};
 /// is the next moment the tool table is read anyway.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pending {
-    /// Bring an installed pack into this conversation.
-    Load(String),
-    /// Take it out of this conversation, keeping its files.
-    Unload(String),
+    /// Bring an installed pack into this conversation. The session is the one
+    /// that asked, so the host can record the pack against it.
+    Load { name: String, session: Option<String> },
+    /// Take it out of this conversation, keeping its files. Removed from the
+    /// kernel only when no other conversation still uses the pack.
+    Unload { name: String, session: Option<String> },
 }
 
 /// What the tool hands the host, drained once the turn is over.
@@ -317,10 +319,11 @@ fn set_loaded(
     let label = matches[0].manifest.name.clone();
     match pending {
         Some(queue) => {
+            let session = super::current_session();
             queue.push(if enable {
-                Pending::Load(label)
+                Pending::Load { name: label, session }
             } else {
-                Pending::Unload(label)
+                Pending::Unload { name: label, session }
             });
             text.push_str(if enable {
                 "\nThis conversation picks it up at the end of this turn."
@@ -369,7 +372,7 @@ fn apply(path: Option<&str>, pending: Option<&Arc<PendingQueue>>) -> Result<Tool
         if let Ok(was) = crate::pack::set_enabled(&dir, true) {
             let _ = was;
         }
-        queue.push(Pending::Load(name.clone()));
+        queue.push(Pending::Load { name: name.clone(), session: super::current_session() });
         return Ok(ToolOutput::text(format!(
             "Queued {name}: it loads into this conversation at the end of this turn."
         )));

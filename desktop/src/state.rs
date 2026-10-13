@@ -19,7 +19,7 @@ use nguruvilu::agent::{Agent, AgentObserver, TurnConfig, TurnSettings};
 use nguruvilu::hotreload::{Change, ChangePayload, ModelRoute, Runtime};
 use nguruvilu::llm::LlmClient;
 use nguruvilu::plugin::Kernel;
-use nguruvilu::session::{JsonlStore, Session, SessionStore};
+use nguruvilu::session::{ensure_workspace, JsonlStore, Session, SessionStore};
 use nguruvilu::settings::Settings;
 use nguruvilu::window::ContextPolicy;
 use nguruvilu::skills::{register_skill_tool, SkillRegistry};
@@ -30,6 +30,47 @@ use crate::sink::EventSink;
 pub const BASE_PROMPT: &str = "You are a coding agent. Use the tools to inspect and change \
 files and to run commands. Prefer `read` over shelling out to view files, and `edit` for \
 surgical changes. Keep answers short and concrete.";
+
+/// Newest transcript entries sent to the page on connect and on each refresh.
+/// Older history is fetched on demand as the page scrolls up.
+const TRANSCRIPT_PAGE: usize = 40;
+
+/// The `[first, end)` range of the page that ends just before `before`, for a
+/// transcript of `total` entries. `before` is clamped to `total`, so a stale
+/// request cannot index past the log.
+fn page_before(total: usize, before: usize) -> (usize, usize) {
+    let end = before.min(total);
+    let first = end.saturating_sub(TRANSCRIPT_PAGE);
+    (first, end)
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::{page_before, TRANSCRIPT_PAGE};
+
+    #[test]
+    fn the_first_page_before_the_tail_is_the_page_just_above_it() {
+        // A 100-entry log: the page shown starts at 60, so the next page up
+        // covers 20..60.
+        assert_eq!(page_before(100, 60), (20, 60));
+    }
+
+    #[test]
+    fn the_page_at_the_start_of_the_log_is_shorter_than_a_full_page() {
+        assert_eq!(page_before(100, 10), (0, 10));
+    }
+
+    #[test]
+    fn an_out_of_range_offset_clamps_to_the_log_instead_of_panicking() {
+        assert_eq!(page_before(5, 999), (0, 5));
+    }
+
+    #[test]
+    fn a_full_page_is_always_the_page_size() {
+        let (first, end) = page_before(500, 400);
+        assert_eq!(end - first, TRANSCRIPT_PAGE);
+    }
+}
 
 /// The session's route, published so a plugin can build a subagent on it.
 ///
@@ -101,6 +142,16 @@ pub struct SharedConfig {
     pub policy: Arc<Mutex<Arc<dyn ContextPolicy>>>,
     /// Extra fragments to place in each request.
     pub injection: Mutex<Arc<nguruvilu::context::InjectionEngine>>,
+    /// Working directory of the session the next turn runs in. Changed on
+    /// session switch so the model is told where it is, and the tools agree.
+    pub cwd: Mutex<Option<String>>,
+}
+
+impl SharedConfig {
+    /// Point the model's stated working directory at the given session directory.
+    pub fn set_cwd(&self, cwd: Option<String>) {
+        *self.cwd.lock().expect("cwd lock") = cwd;
+    }
 }
 
 impl TurnConfig for SharedConfig {
@@ -108,6 +159,12 @@ impl TurnConfig for SharedConfig {
         let runtime = self.runtime.lock().expect("runtime lock");
         let snapshot = runtime.snapshot();
         let mut system_prompt = snapshot.system_prompt(&self.base_prompt);
+        if let Some(cwd) = self.cwd.lock().expect("cwd lock").as_deref() {
+            system_prompt.push_str(&format!(
+                "\n\nYour working directory for this conversation is {cwd}. \
+                 Relative paths resolve against it, and files the user uploads land in its uploads/ folder."
+            ));
+        }
         if let Some(catalog) = self.skills.lock().expect("skills lock").catalog() {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&catalog);
@@ -125,6 +182,19 @@ impl TurnConfig for SharedConfig {
 }
 
 /// Everything the shell knows.
+/// One notify job's owner and the event stream of that owner's session.
+///
+/// Stored per job so the settlement hook can wake the right session through the
+/// right sink (the install-time sink is only correct for the window/headless
+/// paths; for SSE it serves just the viewing client), and so cross-session
+/// reads/kills against the process-global kernel registry can be filtered here.
+pub struct AppJob {
+    /// The session whose turn started the job (its wake target).
+    pub session: String,
+    /// That session's live event stream.
+    pub sink: Arc<dyn crate::sink::EventSink>,
+}
+
 pub struct AppState {
     /// The plugin kernel, owning the tool table.
     pub kernel: Kernel,
@@ -161,6 +231,17 @@ pub struct AppState {
     /// The settlement hook looks the session up here and removes the entry; a
     /// job without one never asked to be woken.
     pub job_sessions: HashMap<String, String>,
+    /// Every notify job's owner and that owner's live event stream.
+    ///
+    /// Written where attribution already happens (the turn's `UiObserver`, the
+    /// only place that knows both the session and its sink) and read by the
+    /// settlement hook. The kernel's job registry is process-global — jobs from
+    /// every session land in one table — so cross-session reads and kills are
+    /// filtered by this map, and the wake uses the *owner's* sink rather than
+    /// whatever sink happened to install the hook (which is wrong for the
+    /// multi-session SSE path, where one sink serves only the viewing client).
+    pub app_jobs: HashMap<String, AppJob>,
+
     /// Effective settings, as the settings panel should display them.
     pub settings: Settings,
     /// Prompt tokens the provider last reported, for the context readout.
@@ -262,18 +343,23 @@ impl AppState {
             skills,
             policy,
             injection: Mutex::new(Arc::new(nguruvilu::context::InjectionEngine::load_default())),
+            cwd: Mutex::new(None),
         });
 
         let store = JsonlStore::open(sessions_root())?;
 
         // Resume the most recent session when there is one: a desktop app that
         // forgets the conversation on every launch is not much of a desktop app.
-        let session = match store.latest()? {
+        let mut session = match store.latest()? {
             Some(summary) => store.load(&summary.id)?.unwrap_or_else(|| Session::new(Some(model.clone()))),
             None => Session::new(Some(model.clone())),
         };
-        if !store.root().join(format!("{}.jsonl", session.id)).exists() {
+        let stored = store.root().join(format!("{}.jsonl", session.id)).exists();
+        if !stored {
+            session.cwd = Some(ensure_workspace(&workspaces_root()?, &session.id)?.display().to_string());
             store.create(&session)?;
+        } else {
+            session.cwd = Some(adopt_workspace_for(&session)?);
         }
 
         // The state of the configuration belongs on stderr at startup: it is
@@ -297,6 +383,8 @@ impl AppState {
             eprintln!("[skills] scan failed: {error:#}");
         }
 
+        config.set_cwd(session.cwd.clone());
+
         let state = Self {
             kernel,
             config,
@@ -307,6 +395,7 @@ impl AppState {
             cancels: HashMap::new(),
             inboxes: HashMap::new(),
             job_sessions: HashMap::new(),
+            app_jobs: HashMap::new(),
             settings,
             last_error: None,
             last_prompt_tokens: None,
@@ -316,11 +405,10 @@ impl AppState {
             judge_cell,
         };
         // The session this process boots into is already current: its start
-        // belongs to bootstrap, not to the first prompt.
-        state.kernel.events().emit(
-            nguruvilu::events::SESSION_START,
-            &serde_json::json!({ "session": &state.session.id }),
-        );
+        // belongs to bootstrap, not to the first prompt. The switch pins its
+        // workspace on the tool table; the same id means no SESSION_END.
+        let boot_workspace = session_workspace(&state.session)?;
+        state.session_switch(&state.session.id.clone(), &boot_workspace);
         Ok(state)
     }
 
@@ -339,6 +427,9 @@ impl AppState {
             "messages": self.session.messages.len(),
             "model": snapshot.model_route.model,
             "reasoning_effort": self.settings.reasoning_effort,
+            // The word the settings use for how an answer is carried; empty
+            // means the default, `stream`.
+            "delivery": self.settings.delivery,
             "proxy": self.settings.proxy,
             "max_output_tokens": self.settings.max_output_tokens.map(nguruvilu::size::format_size),
             "network": json!({
@@ -421,10 +512,10 @@ impl AppState {
             .collect::<Vec<_>>()))
     }
 
-    /// The transcript of the current session, as renderable entries.
-    pub fn transcript(&self) -> Value {
-        let mut entries: Vec<Value> = self
-            .session
+    /// Every stored message of the current session as renderable entries,
+    /// oldest first. Pagination slices this list; it is not sent whole.
+    fn all_entries(&self) -> Vec<Value> {
+        self.session
             .messages
             .iter()
             .map(|message| {
@@ -447,7 +538,20 @@ impl AppState {
                     })).collect::<Vec<_>>(),
                 })
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    /// The newest page of the transcript, plus the failure line if one is set.
+    ///
+    /// Only the newest `TRANSCRIPT_PAGE` entries cross to the page: re-rendering
+    /// a whole long session on every reconnect is the stall. `total` is the
+    /// number of stored entries and `first` the absolute index of the first
+    /// entry returned, so the page can request earlier history by `first`.
+    pub fn transcript(&self) -> Value {
+        let all = self.all_entries();
+        let total = all.len();
+        let first = total.saturating_sub(TRANSCRIPT_PAGE);
+        let mut entries: Vec<Value> = all[first..].to_vec();
 
         // A failure belongs in the transcript, not only in a status line: it is
         // what a user scrolls back to read, and re-rendering the session must
@@ -459,27 +563,72 @@ impl AppState {
                 "tool_calls": [],
             }));
         }
-        json!(entries)
+        json!({
+            "entries": entries,
+            "total": total,
+            "first": first,
+        })
+    }
+
+    /// One page of history that ends just before absolute index `before`.
+    ///
+    /// Returns the same shape as [`transcript`](Self::transcript) without the
+    /// failure line: an older page is history, not the current error. An
+    /// out-of-range `before` clamps to the stored length, so a stale page
+    /// request cannot panic or return entries that do not exist.
+    pub fn transcript_before(&self, before: usize) -> Value {
+        let all = self.all_entries();
+        let total = all.len();
+        let (first, end) = page_before(total, before);
+        json!({
+            "entries": all[first..end].to_vec(),
+            "total": total,
+            "first": first,
+        })
     }
 
     /// Start a fresh session.
     pub fn new_session(&mut self) -> Result<()> {
-        let session = Session::new(Some(self.route.model.clone()));
+        let session = self.new_session_record()?;
         self.store.create(&session)?;
-        self.session_switch(&session.id);
+        let workspace = session_workspace(&session)?;
+        self.session_switch(&session.id, &workspace);
         self.session = session;
         Ok(())
     }
 
+    /// Build a session with its own workspace directory.
+    ///
+    /// The directory is created before the session is stored, so a failure
+    /// here aborts the new session instead of leaving one with no directory.
+    fn new_session_record(&self) -> Result<Session> {
+        let mut session = Session::new(Some(self.route.model.clone()));
+        let dir = ensure_workspace(&workspaces_root()?, &session.id)?;
+        session.cwd = Some(dir.display().to_string());
+        Ok(session)
+    }
+
     /// Switch to a stored session.
     pub fn open_session(&mut self, id: &str) -> Result<()> {
-        let session = self
+        let mut session = self
             .store
             .load(id)?
             .ok_or_else(|| anyhow!("session not found: {id}"))?;
-        self.session_switch(&session.id);
+        session.cwd = Some(self.adopt_workspace(&session)?);
+        let workspace = session_workspace(&session)?;
+        self.session_switch(&session.id, &workspace);
         self.session = session;
         Ok(())
+    }
+
+    /// The workspace directory of an existing session.
+    ///
+    /// A session stored before per-session workspaces records the process
+    /// directory (or nothing). Keep the recorded `cwd` when it exists, and
+    /// otherwise create the session's own workspace, so that no old session
+    /// keeps running in a shared directory after the upgrade.
+    fn adopt_workspace(&self, session: &Session) -> Result<String> {
+        adopt_workspace_for(session)
     }
 
     /// Emit the session boundary for a switch: the old id ends (when there
@@ -488,8 +637,18 @@ impl AppState {
     /// These belong at the switch itself, not at process exit — a process can
     /// change sessions several times, and the audit log joins each turn to
     /// its session through this pair.
-    fn session_switch(&self, next: &str) {
+    fn session_switch(&self, next: &str, workspace: &str) {
         let events = self.kernel.events();
+        // Pin the new conversation onto the shared tool table: from here on,
+        // every tool call through this registry is attributed to `next` (job
+        // spawn/list/kill filtering, and pack-scoped state read via the
+        // execute-pinned thread-local), and relative paths and the default
+        // bash directory resolve under its own workspace. The registry is
+        // process-wide for the desktop's single AppState, so this swap is what
+        // makes jobs, packs, and file tools conversation-scoped.
+        self.kernel.set_session(Some(next.to_string()), Some(PathBuf::from(workspace)));
+        // The model is told the same directory the tools resolve against.
+        self.config.set_cwd(Some(workspace.to_string()));
         if self.session.id != next {
             events.emit(
                 nguruvilu::events::SESSION_END,
@@ -557,10 +716,21 @@ impl AppState {
             api_key: api_key.trim().to_string(),
             model: model.trim().to_string(),
             reasoning_effort: reasoning_effort.trim().to_string(),
+            // The delivery mode is not a panel field: it is a property of the
+            // gateway rather than of the conversation, and `ngu config set
+            // --delivery buffered` or the settings file is where it is written.
+            // Preserving it here is what stops an unrelated save from quietly
+            // putting a route that cannot stream back into streaming mode.
+            delivery: self.settings.delivery.clone(),
+            degrade_on_stall: self.settings.degrade_on_stall,
             proxy: proxy.trim().to_string(),
             context_window: context_window.filter(|t| *t > 0),
             compact_percent,
             compact_keep_recent: compact_keep_recent.max(1),
+            // Not panel fields: a save from the panel must keep the stored relay
+            // settings instead of clearing them.
+            relay_url: self.settings.relay_url.clone(),
+            relay_token: self.settings.relay_token.clone(),
             max_output_tokens: max_output_tokens.filter(|t| *t > 0),
             network: self.settings.network.clone(),
             // A section the page does not show (its pack is unloaded) is not a
@@ -639,6 +809,14 @@ impl AppState {
             }
             if let Some(effort) = &models.reasoning_effort {
                 self.settings.reasoning_effort = effort.clone();
+            }
+            // Same rule as the kernel: the pack that names the gateway names
+            // how its answers are delivered.
+            if let Some(delivery) = &models.delivery {
+                self.settings.delivery = delivery.clone();
+            }
+            if let Some(degrade) = models.degrade_on_stall {
+                self.settings.degrade_on_stall = Some(degrade);
             }
             if let Some(proxy) = &models.proxy {
                 self.settings.proxy = proxy.clone();
@@ -925,6 +1103,46 @@ fn resolve_judge(
     Ok(Some(merged))
 }
 
+/// The recorded working directory of a session, which must be present.
+///
+/// A session without one has no workspace to run its tools in, so the switch
+/// is refused instead of binding some other directory.
+fn session_workspace(session: &Session) -> Result<String> {
+    session
+        .cwd
+        .clone()
+        .ok_or_else(|| anyhow!("session {} has no working directory", session.id))
+}
+
+/// Where per-session working directories live: `<data dir>/workspaces`.
+///
+/// Derived from the same base as [`sessions_root`], so the session store and
+/// the workspaces share one data directory.
+fn workspaces_root() -> Result<PathBuf> {
+    // `ensure_workspace` adds the `workspaces/` segment itself, so this is the
+    // data root, not the workspaces directory.
+    sessions_root()
+        .parent()
+        .map(|dir| dir.to_path_buf())
+        .ok_or_else(|| anyhow!("sessions root has no parent directory to hold workspaces"))
+}
+
+/// The workspace directory an existing session should run in.
+///
+/// A recorded `cwd` that still exists is kept. A session stored before
+/// per-session workspaces (or whose directory was removed) gets its own
+/// `workspaces/<id>` directory. Creation failure is returned, never replaced
+/// with another directory.
+fn adopt_workspace_for(session: &Session) -> Result<String> {
+    if let Some(recorded) = &session.cwd {
+        if Path::new(recorded).is_dir() {
+            return Ok(recorded.clone());
+        }
+    }
+    let dir = ensure_workspace(&workspaces_root()?, &session.id)?;
+    Ok(dir.display().to_string())
+}
+
 /// Where sessions live for the desktop shell.
 ///
 /// Deliberately not the current directory: a windowed app is launched from
@@ -1040,11 +1258,20 @@ impl AgentObserver for UiObserver {
             // flag with it here, where the session is known.
             if notify && ok {
                 if let Some(job_id) = result.split_whitespace().find(|t| t.starts_with("job-")) {
-                    self.state
-                        .lock()
-                        .expect("state lock")
+                    let mut guard = self.state.lock().expect("state lock");
+                    guard
                         .job_sessions
                         .insert(job_id.to_string(), self.session.clone());
+                    // The owner's sink, captured where both session and sink are
+                    // known - this is the only place the pairing happens, so it
+                    // is also the right place to remember which stream to wake on.
+                    guard.app_jobs.insert(
+                        job_id.to_string(),
+                        AppJob {
+                            session: self.session.clone(),
+                            sink: Arc::clone(&self.sink),
+                        },
+                    );
                 }
             }
         }
@@ -1420,29 +1647,59 @@ pub async fn run_turn_cascading(
 /// and the work continues without anyone pressing anything.
 pub fn install_job_wake(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
     nguruvilu::tools::jobs::set_settlement_hook(Arc::new(move |job_id, label| {
+        // A job that never asked to notify (or ran in a host without an
+        // observer) has nobody to wake -- leave it to job_list.
+        let registered = {
+            let guard = state.lock().expect("state lock");
+            guard.app_jobs.get(job_id).map(|job| (job.session.clone(), Arc::clone(&job.sink)))
+        };
+        let Some((session, owner_sink)) = registered else {
+            let _ = sink; // install-time sink unused when nothing is registered
+            return;
+        };
+        // Drop the attribution: one settlement, one wake.
+        {
+            let mut guard = state.lock().expect("state lock");
+            guard.app_jobs.remove(job_id);
+            guard.job_sessions.remove(job_id);
+        }
+
         let text = format!(
             "Background job {job_id} finished: {label}. Its output is ready — \
              collect it with job_output, then continue the task."
         );
-        let mut guard = state.lock().expect("state lock");
-        let Some(session) = guard.job_sessions.remove(job_id) else {
-            // A job that never asked to notify (or ran in a host without an
-            // observer) has nobody to wake.
-            return;
+        // Queue as steering first: while the owner's turn runs, the next step
+        // boundary claims it -- the same path a user prompt takes.
+        let steered = {
+            let mut guard = state.lock().expect("state lock");
+            let is_running = guard.running.contains(&session);
+            if is_running {
+                let queue = guard
+                    .inboxes
+                    .entry(session.clone())
+                    .or_insert_with(|| Arc::new(std::sync::Mutex::new(VecDeque::new())));
+                queue.lock().expect("inbox").push_back(text.clone());
+            }
+            is_running
         };
-        if guard.running.contains(&session) {
-            let queue = guard
-                .inboxes
-                .entry(session.clone())
-                .or_insert_with(|| Arc::new(std::sync::Mutex::new(VecDeque::new())));
-            queue.lock().expect("inbox").push_back(text.clone());
-            drop(guard);
-            sink.emit(json!({ "ev": "steer", "text": text, "session": session }));
+        if steered {
+            // A live turn claims it at the next step; announce the steering so
+            // the page shows it (only a real steer reaches the model this way).
+            owner_sink.emit(json!({ "ev": "steer", "text": text, "session": session }));
         } else {
-            drop(guard);
+            // Idle: open its own turn through the same entry a prompt uses, on
+            // the *owner's* sink (the install-time sink is only correct for
+            // window/headless, not the multi-session SSE path). A distinct
+            // event -- not "steer" -- so the page does not render the wake as
+            // if the user had typed it.
             let wake_state = Arc::clone(&state);
-            let wake_sink = Arc::clone(&sink);
-            tokio::spawn(run_turn_cascading(wake_state, text, wake_sink));
+            tokio::spawn(run_turn_cascading(wake_state, text.clone(), owner_sink.clone()));
+            owner_sink.emit(json!({
+                "ev": "job_wake",
+                "job": job_id,
+                "text": text,
+                "session": session
+            }));
         }
     }));
 }

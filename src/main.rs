@@ -105,6 +105,11 @@ struct Cli {
     #[arg(long, env = "NGU_REASONING_EFFORT", global = true)]
     reasoning_effort: Option<String>,
 
+    /// How the answer is delivered: stream, or buffered for a gateway whose
+    /// stream never completes. Overrides the stored setting for this run.
+    #[arg(long, env = "NGU_DELIVERY", global = true)]
+    delivery: Option<String>,
+
     /// Persona text, applied as a session-scoped hot change.
     #[arg(long)]
     persona: Option<String>,
@@ -282,6 +287,10 @@ enum ConfigAction {
         /// Reasoning effort: none, minimal, low, medium, high, xhigh, or max.
         #[arg(long)]
         reasoning_effort: Option<String>,
+        /// How the answer is delivered: `stream` (the default), or `buffered`
+        /// for a gateway whose stream never completes.
+        #[arg(long)]
+        delivery: Option<String>,
         /// Proxy URL, e.g. http://127.0.0.1:7890. Pass an empty string to clear
         /// it and go direct.
         #[arg(long)]
@@ -2705,6 +2714,7 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             api_key,
             model,
             reasoning_effort,
+            delivery,
             proxy,
             context_window,
             compact_percent,
@@ -2733,6 +2743,24 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             }
             if let Some(value) = reasoning_effort {
                 settings.reasoning_effort = value.trim().to_string();
+            }
+            if let Some(value) = delivery {
+                // Refused at the point of writing: a mode the client cannot
+                // parse would otherwise sit in the file until a turn hung on it.
+                let word = value.trim();
+                if word.is_empty() {
+                    settings.delivery = String::new();
+                } else {
+                    let parsed = nguruvilu::llm::Delivery::parse(word).ok_or_else(|| {
+                        anyhow!(
+                            "unknown delivery mode '{word}'; expected one of {}",
+                            nguruvilu::llm::Delivery::names().join(", ")
+                        )
+                    })?;
+                    // Stored as the canonical word, so what `config show` prints
+                    // is what the client reads back.
+                    settings.delivery = parsed.as_str().to_string();
+                }
             }
             if let Some(value) = proxy {
                 settings.proxy = value.trim().to_string();
@@ -2854,6 +2882,10 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
                 println!("  key:      {}", if settings.api_key.is_empty() { "(not set)" } else { "(stored)" });
                 println!("  model:    {}", settings.model_or_default());
                 println!(
+                    "  delivery: {}",
+                    nguruvilu::llm::Delivery::parse(&settings.delivery).unwrap_or_default().as_str()
+                );
+                println!(
                     "  thinking: {}",
                     if settings.reasoning_effort.trim().is_empty() {
                         "(provider default)"
@@ -2925,6 +2957,19 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
                     "(direct; HTTP_PROXY/HTTPS_PROXY ignored)"
                 } else {
                     &effective.proxy
+                }
+            );
+            // Read back as the mode a request will actually use: an empty
+            // setting is the default rather than a third state, and the auto
+            // fallback is worth naming because it changes what a stall costs.
+            let mode = nguruvilu::llm::Delivery::parse(&effective.delivery).unwrap_or_default();
+            println!(
+                "delivery:      {}{}",
+                mode.as_str(),
+                if effective.degrade_on_stall == Some(false) {
+                    ""
+                } else {
+                    "  (a stalled stream switches this route to buffered)"
                 }
             );
             let window = effective
@@ -3092,6 +3137,15 @@ fn adopt_content(
         }
         if let Some(effort) = &models.reasoning_effort {
             settings.reasoning_effort = effort.clone();
+        }
+        // The delivery mode belongs to the gateway, so the pack that names the
+        // gateway names the mode too: an endpoint whose stream never completes
+        // is not a preference a user can be assumed to have discovered.
+        if let Some(delivery) = &models.delivery {
+            settings.delivery = delivery.clone();
+        }
+        if let Some(degrade) = models.degrade_on_stall {
+            settings.degrade_on_stall = Some(degrade);
         }
         if let Some(proxy) = &models.proxy {
             settings.proxy = proxy.clone();
@@ -3347,6 +3401,20 @@ fn model_route(cli: &Cli, settings: &Settings, kernel: Option<&Kernel>) -> Model
         } else {
             Some(effort.clone())
         };
+    }
+    if let Some(delivery) = &cli.delivery {
+        // Checked here rather than passed through as a string: a mistyped mode
+        // on the command line should say so before the first request, not after
+        // a turn has hung for the whole request timeout.
+        let word = delivery.trim();
+        if !word.is_empty() && nguruvilu::llm::Delivery::parse(word).is_none() {
+            eprintln!(
+                "warning: unknown delivery mode {word:?}; expected one of {}. Keeping the configured mode.",
+                nguruvilu::llm::Delivery::names().join(", ")
+            );
+        } else {
+            route.delivery = if word.is_empty() { None } else { Some(word.to_string()) };
+        }
     }
     if let Some(kernel) = kernel {
         let view = kernel.service_view(nguruvilu::plugin::RealmMap::new());

@@ -12,6 +12,7 @@
 //! * they meet at one seam: [`UserEvent::ToUi`] carries JSON to evaluate in the
 //!   page, and the webview's IPC handler carries commands the other way.
 
+mod remote;
 mod serve;
 mod sink;
 mod state;
@@ -38,6 +39,7 @@ use wry::WebViewBuilder;
 use nguruvilu::assembly::Assembly;
 use nguruvilu::ledger::default_ledger_path;
 use nguruvilu::loader::Loader;
+use nguruvilu::session::SessionStore;
 
 #[cfg(windows)]
 use sink::WindowSink;
@@ -46,6 +48,9 @@ use state::AppState;
 
 /// The interface, embedded at compile time.
 const UI_HTML: &str = include_str!("../ui/index.html");
+
+/// Set once the installed packs have been loaded for this process.
+static PACKS_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Events the loop delivers to the page.
 pub enum UserEvent {
@@ -275,6 +280,37 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
         .build()?;
     let handle = runtime.handle().clone();
 
+    // Outbound remote control. Starts only when both relay values are set, and
+    // every command still passes the allow-list before reaching `dispatch`.
+    {
+        let (url, token) = {
+            let guard = state.lock().expect("state lock");
+            (guard.settings.relay_url.clone(), guard.settings.relay_token.clone())
+        };
+        match remote::disabled_reason(Some(&url), Some(&token)) {
+            Some(reason) => eprintln!("[remote] {reason}"),
+            None => {
+                let config = remote::RelayConfig { url, token };
+                let state = Arc::clone(&state);
+                handle.spawn(remote::run_relay(config, move |body: String| {
+                    let state = Arc::clone(&state);
+                    Box::pin(async move {
+                        // Results reach the cloud through the UI event stream, so
+                        // the reply here only acknowledges acceptance.
+                        let sink: Arc<dyn sink::EventSink> = Arc::new(sink::StdoutSink);
+                        match dispatch(state, &body, sink, None).await {
+                            Ok(()) => r#"{"ok":true}"#.to_string(),
+                            Err(error) => {
+                                serde_json::json!({ "ok": false, "error": format!("{error:#}") })
+                                    .to_string()
+                            }
+                        }
+                    })
+                }));
+            }
+        }
+    }
+
     // Before the interface is chosen: which interface runs is a pack's
     // decision, so the packs this build ships have to be there first. Without
     // this the very first launch would fall back to the built-in one and the
@@ -486,14 +522,21 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
                 for client in &clients {
                     client.force_kill();
                 }
+                // The kills above are already sent, so the servers close in
+                // parallel with one shared budget: N servers cost at most this
+                // window, not N windows. On expiry the process exits anyway.
                 runtime.block_on(async {
-                    for client in &clients {
-                        client
-                            .shutdown_within(std::time::Duration::from_millis(500))
-                            .await;
-                    }
+                    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                        for client in &clients {
+                            client.shutdown().await;
+                        }
+                    })
+                    .await;
                 });
-                *control_flow = ControlFlow::Exit;
+                // Every close step above is bounded and finished. Exit the
+                // process here: leaving it to tao's event-loop teardown is what
+                // hung the window after the close was accepted.
+                std::process::exit(0);
             }
             Event::UserEvent(UserEvent::ToUi(value)) => {
                 let script = format!("window.ngu && window.ngu.receive({value})");
@@ -527,8 +570,12 @@ pub(crate) async fn dispatch(
             eprintln!("[ui] page ready; pushing initial state");
 
             // Load every installed pack before the first paint. A pack the user
-            // installed but cannot see is a pack they will install again.
-            load_installed_packs(Arc::clone(&state), Arc::clone(&sink)).await;
+            // installed but cannot see is a pack they will install again. Only
+            // the first ready loads them: a re-push after a backgrounded tab
+            // returns must not repeat the load.
+            if !PACKS_LOADED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                load_installed_packs(Arc::clone(&state), Arc::clone(&sink)).await;
+            }
 
             let (sessions, transcript, status) = {
                 let guard = state.lock().expect("state lock");
@@ -834,11 +881,15 @@ pub(crate) async fn dispatch(
             } else {
                 // The state is written; now the conversation itself has to
                 // follow, or a loaded pack would keep working until a restart.
-                state.lock().expect("state lock").pending.push(if enable {
-                    nguruvilu::tools::pack::Pending::Load(name.clone())
-                } else {
-                    nguruvilu::tools::pack::Pending::Unload(name.clone())
-                });
+                {
+                    let guard = state.lock().expect("state lock");
+                    let session = Some(guard.session.id.clone());
+                    guard.pending.push(if enable {
+                        nguruvilu::tools::pack::Pending::Load { name: name.clone(), session }
+                    } else {
+                        nguruvilu::tools::pack::Pending::Unload { name: name.clone(), session }
+                    });
+                }
                 drain_packs(Arc::clone(&state), Arc::clone(&sink)).await;
                 emit(
                     &sink,
@@ -871,8 +922,10 @@ pub(crate) async fn dispatch(
             };
             // Unload first, then delete: removing files under a live kernel
             // would leave tools whose backing directory no longer exists.
+            // Deleting removes the files, so the kernel must drop the pack for
+            // every conversation. No session is passed: that is the forced path.
             state.lock().expect("state lock").pending.push(
-                nguruvilu::tools::pack::Pending::Unload(name.clone()),
+                nguruvilu::tools::pack::Pending::Unload { name: name.clone(), session: None },
             );
             drain_packs(Arc::clone(&state), Arc::clone(&sink)).await;
             match remove_pack(&target) {
@@ -914,6 +967,17 @@ pub(crate) async fn dispatch(
 
         "ui_panels" => {
             emit_panels(&state, &sink);
+        }
+
+        // Older history, one page before the offset the page already holds.
+        // `before` is the absolute index of the earliest entry on the page.
+        "load_older" => {
+            let before = command
+                .get("before")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let page = state.lock().expect("state lock").transcript_before(before);
+            emit(&sink, json!({ "ev": "older", "page": page }));
         }
 
         "status" => {
@@ -1047,12 +1111,36 @@ async fn drain_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
     let mut changed = false;
     for action in actions {
         match action {
-            nguruvilu::tools::pack::Pending::Unload(name) => {
+            nguruvilu::tools::pack::Pending::Unload { name, session } => {
                 // The guard lives inside this block and the kill happens
                 // outside it: a guard held across an await would make the whole
                 // future non-Send, and the UI thread would wait on it.
                 let (found, to_stop) = {
                     let mut guard = state.lock().expect("state lock");
+                    // Another conversation still using the pack keeps it loaded:
+                    // only this conversation's record is removed. Summaries carry
+                    // no pack set, so each candidate is loaded to read its packs.
+                    let still_used_elsewhere = match (&session, guard.store.list()) {
+                        (Some(current), Ok(all)) => all
+                            .iter()
+                            .filter(|s| s.id != *current)
+                            .any(|s| match guard.store.load(&s.id) {
+                                Ok(Some(other)) => other.packs.iter().any(|p| p == &name),
+                                _ => false,
+                            }),
+                        _ => false,
+                    };
+                    if let Some(current) = &session {
+                        if let Ok(Some(owned)) = guard.store.load(current) {
+                            let next: Vec<String> =
+                                owned.packs.iter().filter(|p| *p != &name).cloned().collect();
+                            let _ = guard.store.append_packs(current, &next);
+                        }
+                    }
+                    if still_used_elsewhere {
+                        eprintln!("[pack] {name} stays loaded: another conversation still uses it");
+                        continue;
+                    }
                     let packs =
                         match nguruvilu::pack::installed(&nguruvilu::pack::default_packs_dir()) {
                             Ok(packs) => packs,
@@ -1128,7 +1216,7 @@ async fn drain_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
                     );
                 }
             }
-            nguruvilu::tools::pack::Pending::Load(name) => {
+            nguruvilu::tools::pack::Pending::Load { name, session } => {
                 let targets: Vec<(String, PathBuf, PathBuf)> = {
                     match nguruvilu::pack::installed(&nguruvilu::pack::default_packs_dir()) {
                         Ok(packs) => packs
@@ -1198,6 +1286,32 @@ async fn drain_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
                                 report.loaded.len(),
                                 report.failed.len()
                             );
+                            for failed in &report.failed {
+                                eprintln!(
+                                    "[pack] failed {} '{}': {}",
+                                    failed.kind, failed.id, failed.error
+                                );
+                            }
+                            // Record the pack against the conversation that asked for
+                            // it, so a later unload there knows whether another one
+                            // still depends on it.
+                            eprintln!("[pack] record {name}: session={:?}", session);
+                            if let Some(current) = &session {
+                                match guard.store.load(current) {
+                                    Ok(Some(owned)) => {
+                                        if !owned.packs.iter().any(|p| p == &name) {
+                                            let mut next = owned.packs.clone();
+                                            next.push(name.clone());
+                                            match guard.store.append_packs(current, &next) {
+                                                Ok(()) => eprintln!("[pack] recorded {name} for {current}"),
+                                                Err(error) => eprintln!("[pack] record failed: {error:#}"),
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => eprintln!("[pack] record skipped: session {current} not found"),
+                                    Err(error) => eprintln!("[pack] record load failed: {error:#}"),
+                                }
+                            }
                             // Skips are decisions too: a silently skipped entry
                             // is how a pack ends up "installed, nothing happened".
                             for entry in &report.skipped {

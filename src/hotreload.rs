@@ -46,6 +46,17 @@ pub struct ModelRoute {
     /// Reasoning effort for this route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// How the answer is delivered: `stream` or `buffered`.
+    ///
+    /// Carried on the route like `extra_body` and `network`, because a subagent
+    /// that streams while its session buffers is a difference the user never
+    /// chose — and on a gateway whose stream never completes, it is a
+    /// subagent that cannot answer at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<String>,
+    /// Whether a stalled stream may switch this route to buffered delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degrade_on_stall: Option<bool>,
     /// Proxy for requests on this route; empty means direct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
@@ -74,6 +85,8 @@ impl Default for ModelRoute {
             temperature: None,
             max_tokens: None,
             reasoning_effort: None,
+            delivery: None,
+            degrade_on_stall: None,
             proxy: None,
             extra_body: serde_json::Map::new(),
             network: crate::network::NetworkSettings::default(),
@@ -106,6 +119,12 @@ impl ModelRoute {
             } else {
                 Some(effort.to_string())
             },
+            delivery: if settings.delivery.trim().is_empty() {
+                None
+            } else {
+                Some(settings.delivery.trim().to_string())
+            },
+            degrade_on_stall: settings.degrade_on_stall,
             proxy: Some(settings.proxy.clone()),
             extra_body: settings.extra_body.clone(),
             network: settings.network.clone(),
@@ -136,6 +155,21 @@ impl ModelRoute {
             Some(effort.to_string())
         };
         config.max_tokens = self.max_tokens;
+        // An unknown mode is refused rather than defaulted: silently streaming
+        // when the user wrote a word meaning the opposite is how a route that
+        // cannot stream keeps being asked to.
+        let word = self.delivery.as_deref().unwrap_or_default().trim();
+        config.delivery = if word.is_empty() {
+            crate::llm::Delivery::default()
+        } else {
+            crate::llm::Delivery::parse(word).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown delivery mode {word:?}; expected one of {}",
+                    crate::llm::Delivery::names().join(", ")
+                )
+            })?
+        };
+        config.degrade_on_stall = self.degrade_on_stall.unwrap_or(true);
         config.network = self.network.clone();
         Ok(crate::llm::LlmClient::new(config)?
             .with_shaper(crate::request::from_extra_fields(self.extra_body.clone())))
@@ -1002,6 +1036,8 @@ mod tests {
         settings.model = "session-model".into();
         settings.max_output_tokens = Some(4096);
         settings.reasoning_effort = "high".into();
+        settings.delivery = "buffered".into();
+        settings.degrade_on_stall = Some(false);
         settings.proxy = "http://127.0.0.1:7890".into();
         settings
             .extra_body
@@ -1017,8 +1053,53 @@ mod tests {
         assert_eq!(route.api_key, "sk-secret");
         assert_eq!(route.max_tokens, Some(4096));
         assert_eq!(route.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(route.delivery.as_deref(), Some("buffered"));
+        assert_eq!(route.degrade_on_stall, Some(false));
         assert_eq!(route.network.retry_attempts, 5);
         assert_eq!(route.extra_body["thinking"]["type"], "enabled");
+    }
+
+    #[test]
+    fn a_buffered_route_reaches_the_wire_as_one_body() {
+        // The mode is only real if the request stops asking for a stream. A route
+        // that stores "buffered" while still sending `"stream": true` would keep
+        // the original failure and report it as a provider problem.
+        let route = ModelRoute::from_settings(&distinctive_settings());
+        let body = route.client().unwrap().preview_body(
+            &[crate::message::Message::user("hi")],
+            &[],
+        );
+        assert_eq!(body["stream"], false, "{body}");
+    }
+
+    #[test]
+    fn a_subagent_inherits_its_sessions_delivery_mode() {
+        // A subtask that streams while its parent buffers is a difference the
+        // user never chose, and on a gateway whose stream never completes it is a
+        // subtask that cannot answer.
+        let route = ModelRoute::from_settings(&distinctive_settings());
+        let child = route.client_for("cheaper-model").unwrap();
+        let body = child.preview_body(&[crate::message::Message::user("hi")], &[]);
+        assert_eq!(body["stream"], false, "{body}");
+    }
+
+    #[test]
+    fn an_unknown_delivery_word_is_refused_rather_than_streamed() {
+        // Defaulting here would silently do the opposite of what was written.
+        let mut route = ModelRoute::from_settings(&distinctive_settings());
+        route.delivery = Some("streaming".into());
+        let error = match route.client() {
+            Err(error) => error,
+            Ok(_) => panic!("an unreadable mode must not quietly become a stream"),
+        };
+        assert!(
+            format!("{error:#}").contains("streaming"),
+            "the refusal names what was wrong: {error}"
+        );
+        assert!(
+            format!("{error:#}").contains("buffered"),
+            "and offers the words that work: {error}"
+        );
     }
 
     #[test]

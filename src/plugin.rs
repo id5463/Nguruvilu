@@ -499,6 +499,16 @@ impl Kernel {
         &self.tools
     }
 
+    /// Pin the session whose turn will call into this kernel's tool table.
+    ///
+    /// The desktop swaps sessions in place - one kernel, one registry - so the
+    /// id moves here rather than being threaded through every tool signature.
+    /// Jobs and session-scoped pack state read it via the thread-local that
+    /// `ToolRegistry::execute` pins for the duration of each handler call.
+    pub fn set_session(&self, session: Option<String>, workspace: Option<std::path::PathBuf>) {
+        self.tools.set_session(session, workspace);
+    }
+
     /// The kernel's event bus (shared with every clone of the tool table).
     ///
     /// Observational only: subscribers watch facts; vetoes belong to the
