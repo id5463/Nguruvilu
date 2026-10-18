@@ -6,15 +6,31 @@
 //! it wants it (optionally waiting). `job_list` shows what is running;
 //! `job_kill` stops one.
 //!
-//! One registry per shell process. A job *is* a child process of this
-//! process: its id, output, and handle all die here, so a process-global
-//! registry is the honest scope — there is no second reader a per-session
-//! registry would serve.
+//! # Output lives on disk
+//!
+//! Every job appends to `<data>/jobs/<id>.log` as it runs; `job_output` reads
+//! the tail of that file. Nothing the job printed exists only in this
+//! process's memory, so a long run's early output is still there later, and a
+//! restart does not erase what a job said. One view is capped (256 KB handed
+//! to the model per call) and the file itself stops growing at 32 MB so a
+//! runaway printer cannot fill the disk — both caps are about reading, not
+//! about what the job produced up to that point.
+//!
+//! # The registry is an index; the process is the truth
+//!
+//! `<data>/jobs/<id>.json` records what a job *is* — command, pid, owner,
+//! start time, log path — and the last state anyone observed. The in-memory
+//! map is only a cache of that index, rebuilt from it when the process starts:
+//! a job started before a restart still lists, and its output still reads.
+//! Whether it is *running* is never taken from the record — it is asked of the
+//! process (the child handle when this process owns it, the pid otherwise), so
+//! a job whose process died reads as finished with no bookkeeping required.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -23,9 +39,13 @@ use tokio::process::Command;
 
 use super::{ConflictPolicy, ToolDef, ToolFuture, ToolRegistry};
 
-/// Output bytes kept per job. Past this the oldest half is dropped, so a
-/// runaway printer cannot grow without bound.
+/// Output bytes one reader is handed: the tail of the log, newest kept.
 const MAX_JOB_OUTPUT: usize = 256 * 1024;
+
+/// Bytes one job's log file may reach. Past this the job keeps running and the
+/// file records that it stopped growing — the alternative is a runaway
+/// printer filling the data disk.
+const MAX_JOB_LOG: u64 = 32 * 1024 * 1024;
 
 /// Longest `job_output` will block waiting for a job to finish.
 const MAX_WAIT_MS: u64 = 30_000;
@@ -42,6 +62,10 @@ pub enum JobState {
     Exited(Option<i32>),
     /// Stopped by `job_kill`.
     Killed,
+    /// Not running any more, and nothing recorded how it ended — a job from a
+    /// previous process whose pid is gone. Said plainly instead of guessing an
+    /// exit code nobody saw.
+    Gone,
 }
 
 impl JobState {
@@ -52,6 +76,30 @@ impl JobState {
             JobState::Exited(Some(code)) => format!("exited with code {code}"),
             JobState::Exited(None) => "exited".to_string(),
             JobState::Killed => "killed".to_string(),
+            JobState::Gone => "finished (exit code not recorded; the process that started it is gone)"
+                .to_string(),
+        }
+    }
+
+    /// The short tag the index file stores.
+    fn tag(&self) -> &'static str {
+        match self {
+            JobState::Running => "running",
+            JobState::Exited(_) => "exited",
+            JobState::Killed => "killed",
+            JobState::Gone => "gone",
+        }
+    }
+
+    /// Rebuild from an index entry, if it names a settled state.
+    fn from_index(tag: &str, code: Option<i32>) -> Option<Self> {
+        match tag {
+            "exited" => Some(JobState::Exited(code)),
+            "killed" => Some(JobState::Killed),
+            "gone" => Some(JobState::Gone),
+            // `running` is deliberately not a state: liveness is asked of the
+            // process, never read off the record.
+            _ => None,
         }
     }
 }
@@ -71,23 +119,85 @@ pub struct Job {
     owner: Option<String>,
     /// When it started, for age reporting.
     pub started: Instant,
+    /// The same moment as wall-clock, which is what the index stores.
+    started_ms: u64,
     /// Whether the settlement hook should wake the model when this job ends.
     notify: AtomicU8,
-    state: Mutex<JobState>,
-    output: Mutex<Vec<u8>>,
+    /// Settled state, once observed. `None` means "not settled as far as this
+    /// process knows" — which is not the same as running; see [`Job::state`].
+    settled: Mutex<Option<JobState>>,
     /// Set once `job_kill` asked; the waiter reports `Killed` instead of the
     /// exit code a forced termination happens to produce.
     killed: AtomicU8,
     /// stdout and stderr readers still draining.
     readers: AtomicU8,
-    /// The child itself, held for `job_kill`; never across an await.
+    /// The child itself, held for `job_kill`; never across an await. `None`
+    /// for an entry rebuilt from the index, whose process this one never owned.
     child: Mutex<Option<tokio::process::Child>>,
+    /// The pid, kept in the index so liveness can be asked after a restart.
+    pid: Option<u32>,
+    /// Whether this entry was rebuilt from the index rather than spawned here.
+    /// A process this one never owned cannot report an exit code, and saying
+    /// "exited" for it would invent one.
+    legacy: bool,
+    /// Where the log and the index entry live.
+    dir: PathBuf,
+    /// The append handle the pumps write through. The file is the output.
+    log: Mutex<std::fs::File>,
+    /// Bytes written so far, against [`MAX_JOB_LOG`].
+    written: AtomicU64,
 }
 
 impl Job {
-    /// The job's current state.
+    /// The job's current state, asked of the process rather than the record.
     pub fn state(&self) -> JobState {
-        self.state.lock().expect("job state").clone()
+        if let Some(settled) = self.settled.lock().expect("job state").clone() {
+            return settled;
+        }
+        self.ask_the_process().unwrap_or(JobState::Running)
+    }
+
+    /// Ask reality: the child handle when this process owns it, the pid
+    /// otherwise. `None` means still running.
+    fn ask_the_process(&self) -> Option<JobState> {
+        {
+            let mut guard = self.child.lock().expect("job child");
+            if let Some(child) = guard.as_mut() {
+                return match child.try_wait() {
+                    Ok(Some(status)) => Some(self.settle(status.code())),
+                    Ok(None) => None,
+                    // The handle cannot say; fall through to the pid.
+                    Err(_) => Some(self.settle(None)),
+                };
+            }
+        }
+        match self.pid {
+            Some(pid) if process_alive(pid) => None,
+            // No pid (never recorded) or a pid that is gone: finished, and
+            // this process never saw the exit code.
+            _ => Some(self.settle(None)),
+        }
+    }
+
+    /// Record a settled state once, and write it into the index.
+    fn settle(&self, code: Option<i32>) -> JobState {
+        let state = if self.killed.load(Ordering::Relaxed) == 1 {
+            JobState::Killed
+        } else if self.legacy {
+            // A job from a previous process: its exit code was never this
+            // process's to observe, so it is not invented.
+            JobState::Gone
+        } else {
+            JobState::Exited(code)
+        };
+        let mut guard = self.settled.lock().expect("job state");
+        if guard.is_none() {
+            *guard = Some(state.clone());
+            drop(guard);
+            self.write_index();
+            return state;
+        }
+        guard.clone().expect("settled")
     }
 
     /// The session that spawned this job, when known.
@@ -101,38 +211,127 @@ impl Job {
         self.owner.as_deref().map_or(true, |o| o == session)
     }
 
-    /// Whether the job has not settled yet.
+    /// Whether the job has not settled yet, by the process's own account.
     pub fn is_running(&self) -> bool {
         matches!(self.state(), JobState::Running)
     }
 
+    /// Where this job's output is kept. The file exists from the first byte on.
+    pub fn log_path(&self) -> PathBuf {
+        self.dir.join(format!("{}.log", self.id))
+    }
+
+    /// Where this job's index entry is kept.
+    fn index_path(&self) -> PathBuf {
+        self.dir.join(format!("{}.json", self.id))
+    }
+
+    /// Append what the job printed to its log.
+    ///
+    /// Writes stop at [`MAX_JOB_LOG`], with one line in the file saying so:
+    /// the job keeps running, the disk does not fill.
     fn push_output(&self, chunk: &[u8]) {
-        let mut buffer = self.output.lock().expect("job output");
-        buffer.extend_from_slice(chunk);
-        if buffer.len() > MAX_JOB_OUTPUT {
-            let keep = MAX_JOB_OUTPUT / 2;
-            let drop = buffer.len() - keep;
-            buffer.drain(..drop);
+        let written = self.written.load(Ordering::Relaxed);
+        if written >= MAX_JOB_LOG {
+            return;
+        }
+        let room = (MAX_JOB_LOG - written) as usize;
+        let (slice, capped) = if chunk.len() > room {
+            (&chunk[..room], true)
+        } else {
+            (chunk, false)
+        };
+        let mut file = self.log.lock().expect("job log");
+        use std::io::Write;
+        if file.write_all(slice).is_err() {
+            return;
+        }
+        let mut total = written + slice.len() as u64;
+        if capped {
+            let note = format!(
+                "\n… output capped at {} MB; the job keeps running …\n",
+                MAX_JOB_LOG / (1024 * 1024)
+            );
+            let _ = file.write_all(note.as_bytes());
+            total = MAX_JOB_LOG + note.len() as u64;
+        }
+        let _ = file.flush();
+        self.written.store(total, Ordering::Relaxed);
+    }
+
+    /// The tail of the job's output, as text.
+    ///
+    /// Read from the log file — the file is the output, so what a previous
+    /// process's job printed is still readable here.
+    pub fn output_text(&self) -> String {
+        let path = self.log_path();
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            return String::new();
+        };
+        let len = metadata.len();
+        let cap = MAX_JOB_OUTPUT as u64;
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(_) => return String::new(),
+        };
+        if len > cap {
+            use std::io::{Read, Seek, SeekFrom};
+            if file.seek(SeekFrom::Start(len - cap)).is_err() {
+                return String::new();
+            }
+            let mut tail = Vec::with_capacity(cap as usize);
+            if file.read_to_end(&mut tail).is_err() {
+                return String::new();
+            }
+            format!(
+                "… ({} bytes omitted; showing the last {}) …\n{}",
+                len - cap,
+                format_bytes(cap),
+                String::from_utf8_lossy(&tail)
+            )
+        } else {
+            std::fs::read(&path)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default()
         }
     }
 
-    /// Everything the job has printed so far, as text.
-    pub fn output_text(&self) -> String {
-        let buffer = self.output.lock().expect("job output");
-        String::from_utf8_lossy(&buffer).into_owned()
+    /// Write the index entry: what this job is, and the last state seen.
+    fn write_index(&self) {
+        let state = self.settled.lock().expect("job state").clone();
+        let payload = json!({
+            "id": self.id,
+            "command": self.command,
+            "pid": self.pid,
+            "owner": self.owner,
+            "started_ms": self.started_ms,
+            "notify": self.notify.load(Ordering::Relaxed) == 1,
+            "log": self.log_path().display().to_string(),
+            "state": state.as_ref().map(|s| s.tag()).unwrap_or("running"),
+            "exit_code": match state {
+                Some(JobState::Exited(code)) => code.map(Value::from).unwrap_or(Value::Null),
+                _ => Value::Null,
+            },
+        });
+        if let Ok(text) = serde_json::to_string_pretty(&payload) {
+            let _ = std::fs::write(self.index_path(), text);
+        }
     }
 
     /// Stop the job and return its settled state.
     ///
     /// The kill itself is instant; the short wait is only for the waiter
     /// thread to observe the exit and record it, so the caller can report the
-    /// outcome instead of "killed, probably".
+    /// outcome instead of "killed, probably". A job from a previous process
+    /// has no child handle here: its pid is signalled directly.
     pub async fn kill(&self) -> JobState {
         self.killed.store(1, Ordering::Relaxed);
         {
             let mut guard = self.child.lock().expect("job child");
             if let Some(child) = guard.as_mut() {
                 kill_tree(child);
+            } else if let Some(pid) = self.pid {
+                kill_pid(pid);
             }
         }
         // The settle path may observe the exit only after its 100ms poll and
@@ -150,8 +349,8 @@ impl Job {
     }
 }
 
-/// Drain one pipe into the job’s buffer until EOF.
-
+/// Drain one pipe into the job's log until EOF.
+///
 /// Generic because `ChildStdout` and `ChildStderr` are distinct types: on
 /// Windows they happen to collapse into one, which is how an array holding
 /// both compiled there and failed everywhere else.
@@ -172,6 +371,57 @@ where
     });
 }
 
+/// Whether a process is still there. Signal 0 asks without delivering.
+fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // A process this one started can be a zombie it has not reaped; the
+        // pid then still "exists". The child handle path answers for those,
+        // so a pid probe only ever sees somebody else's process here.
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        // No winapi dependency in this crate; `tasklist` is the portable
+        // question and this runs only when a job is inspected, never in a
+        // loop.
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .map(|output| {
+                let text = String::from_utf8_lossy(&output.stdout).to_lowercase();
+                text.contains(&pid.to_string())
+            })
+            .unwrap_or(false)
+    }
+}
+
+/// Stop a pid and the group it leads — for a job whose child handle this
+/// process does not hold (one rebuilt from the index).
+fn kill_pid(pid: u32) {
+    #[cfg(unix)]
+    {
+        let pid = pid as i32;
+        unsafe {
+            // The same guard `kill_tree` uses: only a group this code created
+            // is signalled as a group.
+            if libc::getpgid(pid) == pid {
+                libc::kill(-pid, libc::SIGKILL);
+            } else {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
+
 /// Stop a process and everything it started.
 ///
 /// The shell is never the only process that matters: a loop forks a child per
@@ -183,55 +433,63 @@ where
 /// `getpgid` guards the negative pid so a group this code did not create can
 /// never be signalled. Windows reaches the same end with `taskkill /T`.
 pub fn kill_tree(child: &mut tokio::process::Child) {
-    #[cfg(unix)]
     if let Some(pid) = child.id() {
-        let pid = pid as i32;
-        if unsafe { libc::getpgid(pid) } == pid {
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
-        }
-    }
-    // Fire and forget: waiting on taskkill cost 200-400ms of process
-    // creation + process-table scan while the caller held the child lock.
-    // The shell is stopped by `start_kill` below, taskkill /T hunts the
-    // tree in the background, and job_list reports only this job's own
-    // state -- so nothing here needs the exit code. If even the spawn is
-    // too slow, the right fix is a Windows Job Object at child creation;
-    // this path is only the fallback for jobs started outside one.
-    #[cfg(windows)]
-    if let Some(pid) = child.id() {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+        kill_pid(pid);
     }
     let _ = child.start_kill();
 }
 
-/// Every background job this shell process owns.
+/// Every background job this process knows, indexed by `<data>/jobs`.
 pub struct JobRegistry {
     next: AtomicU64,
+    dir: PathBuf,
     jobs: Mutex<HashMap<String, Arc<Job>>>,
 }
 
 impl JobRegistry {
-    fn new() -> Self {
+    /// Open the registry over a directory, rebuilding the index it finds.
+    ///
+    /// Entries from earlier processes come back as jobs: their output is still
+    /// on disk, and whether they run is asked of their pid. The counter starts
+    /// above every id already there, so a restart never reuses `job-3` and
+    /// overwrites its log.
+    fn open(dir: PathBuf) -> Self {
+        let mut jobs: HashMap<String, Arc<Job>> = HashMap::new();
+        let mut next = 1u64;
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Some(job) = load_index(&path, &dir) else {
+                    continue;
+                };
+                if let Some(number) = job
+                    .id
+                    .strip_prefix("job-")
+                    .and_then(|n| n.parse::<u64>().ok())
+                {
+                    next = next.max(number + 1);
+                }
+                jobs.insert(job.id.clone(), Arc::new(job));
+            }
+        }
         Self {
-            next: AtomicU64::new(0),
-            jobs: Mutex::new(HashMap::new()),
+            next: AtomicU64::new(next),
+            dir,
+            jobs: Mutex::new(jobs),
         }
     }
 
     /// Start `cmd` as a job labelled with `command`.
     ///
     /// The caller builds the command (it owns shell detection); this owns the
-    /// job's lifetime: two reader tasks drain the pipes into the job's buffer,
-    /// and one waiter polls for exit so the state settles without anyone
-    /// holding a lock across an await. `notify` marks the job so the shell's
+    /// job's lifetime: the log file, the index entry, two reader tasks, and one
+    /// waiter that observes the exit. `notify` marks the job so the shell's
     /// settlement hook — when one is installed — wakes the model on completion.
     pub fn spawn(&self, command: String, mut cmd: Command, notify: bool) -> Result<Arc<Job>> {
+        let _ = std::fs::create_dir_all(&self.dir);
         // The job leads its own process group: everything it forks inherits
         // the group, so one signal in `kill_tree` stops the whole tree.
         #[cfg(unix)]
@@ -241,21 +499,42 @@ impl JobRegistry {
             .map_err(|error| anyhow!("spawning background command: {error}"))?;
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
+        // The pid goes into the index now: it is how a later process asks
+        // whether this job is still running.
+        let pid = child.id();
 
-        let id = format!("job-{}", self.next.fetch_add(1, Ordering::Relaxed) + 1);
+        let id = format!("job-{}", self.next.fetch_add(1, Ordering::Relaxed));
         let owner = super::current_session();
+        let started_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let log_path = self.dir.join(format!("{id}.log"));
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&log_path)
+            .map_err(|error| anyhow!("opening {}: {error}", log_path.display()))?;
+
         let job = Arc::new(Job {
             id: id.clone(),
             command,
             owner,
             started: Instant::now(),
+            started_ms,
             notify: AtomicU8::new(u8::from(notify)),
-            state: Mutex::new(JobState::Running),
-            output: Mutex::new(Vec::new()),
+            settled: Mutex::new(None),
             killed: AtomicU8::new(0),
             readers: AtomicU8::new(0),
             child: Mutex::new(Some(child)),
+            pid,
+            legacy: false,
+            dir: self.dir.clone(),
+            log: Mutex::new(log),
+            written: AtomicU64::new(0),
         });
+        job.write_index();
 
         if let Some(pipe) = stdout {
             pump(pipe, Arc::clone(&job));
@@ -268,18 +547,11 @@ impl JobRegistry {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(WAIT_POLL_MS)).await;
-                let exited = {
-                    let mut guard = waiter_job.child.lock().expect("job child");
-                    match guard.as_mut() {
-                        Some(child) => match child.try_wait() {
-                            Ok(Some(status)) => Some(status.code()),
-                            Ok(None) => None,
-                            Err(_) => Some(None),
-                        },
-                        None => Some(None),
-                    }
+                // Ask the process, not the record. `ask_the_process` settles
+                // and writes the index entry the moment the child is gone.
+                let Some(settled) = waiter_job.ask_the_process() else {
+                    continue;
                 };
-                let Some(code) = exited else { continue };
                 // Give the readers a moment to drain what the process wrote
                 // before the pipes reported EOF.
                 for _ in 0..50 {
@@ -288,18 +560,8 @@ impl JobRegistry {
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                let state = if waiter_job.killed.load(Ordering::Relaxed) == 1 {
-                    JobState::Killed
-                } else {
-                    JobState::Exited(code)
-                };
-                let label = state.label(waiter_job.started.elapsed());
-                *waiter_job.state.lock().expect("job state") = state;
+                let label = settled.label(waiter_job.started.elapsed());
                 *waiter_job.child.lock().expect("job child") = None;
-                // A job that asked for it wakes the model: the shell's
-                // settlement hook delivers the message to the session that
-                // started this job — queued as steering if that turn still
-                // runs, a fresh turn if it has ended.
                 if waiter_job.notify.load(Ordering::Relaxed) == 1 {
                     if let Some(hook) = SETTLE.get() {
                         hook(&waiter_job.id, &label);
@@ -350,10 +612,105 @@ impl JobRegistry {
     }
 }
 
+/// Rebuild one job from its index entry. `None` when the entry is unreadable.
+fn load_index(path: &Path, dir: &Path) -> Option<Job> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    let id = value.get("id")?.as_str()?.to_string();
+    if !id.starts_with("job-") {
+        return None;
+    }
+    let command = value
+        .get("command")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    let owner = value
+        .get("owner")
+        .and_then(|o| o.as_str())
+        .map(str::to_string);
+    let pid = value
+        .get("pid")
+        .and_then(|p| p.as_u64())
+        .map(|p| p as u32);
+    let notify = value.get("notify").and_then(|n| n.as_bool()).unwrap_or(false);
+    let started_ms = value
+        .get("started_ms")
+        .and_then(|s| s.as_u64())
+        .unwrap_or(0);
+    // A settled state in the record is history worth keeping; `running` is not
+    // a state at all here — liveness is asked of the pid on every read.
+    let settled = value
+        .get("state")
+        .and_then(|s| s.as_str())
+        .and_then(|tag| {
+            let code = value.get("exit_code").and_then(|c| c.as_i64()).map(|c| c as i32);
+            JobState::from_index(tag, code)
+        });
+    // The log must exist for an entry to mean anything: an index whose log was
+    // cleaned away is not a job anyone can read.
+    let log_path = dir.join(format!("{id}.log"));
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .ok()?;
+    let written = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+    // Age is reported from the wall-clock start; `Instant` cannot be built for
+    // a past time, so an entry from an earlier run is anchored to now and its
+    // age comes from the stored timestamp.
+    let age = started_ms.max(1);
+    let started = Instant::now()
+        .checked_sub(Duration::from_millis(
+            now_ms().saturating_sub(age).min(u64::from(u32::MAX)),
+        ))
+        .unwrap_or_else(Instant::now);
+
+    Some(Job {
+        id,
+        command,
+        owner,
+        started,
+        started_ms,
+        notify: AtomicU8::new(u8::from(notify)),
+        settled: Mutex::new(settled),
+        killed: AtomicU8::new(0),
+        readers: AtomicU8::new(0),
+        child: Mutex::new(None),
+        pid,
+        legacy: true,
+        dir: dir.to_path_buf(),
+        log: Mutex::new(log),
+        written: AtomicU64::new(written),
+    })
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Where this process's jobs live: `<data>/jobs`.
+///
+/// Tests get their own directory: they spawn real processes, and writing those
+/// logs into a user's data directory would litter it.
+fn jobs_dir() -> PathBuf {
+    #[cfg(test)]
+    {
+        std::env::temp_dir().join(format!("ngu-jobs-test-{}", std::process::id()))
+    }
+    #[cfg(not(test))]
+    {
+        crate::settings::data_dir().join("jobs")
+    }
+}
+
 /// The shell process's job registry.
 fn registry() -> &'static JobRegistry {
     static REGISTRY: OnceLock<JobRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(JobRegistry::new)
+    REGISTRY.get_or_init(|| JobRegistry::open(jobs_dir()))
 }
 
 /// What runs when a job marked `notify` settles.
@@ -393,7 +750,8 @@ pub fn install(registry: &mut ToolRegistry) -> Result<()> {
         ToolDef::new(
             "job_list",
             "List background jobs: id, state, age, and command. Jobs come from \
-             bash calls with background: true.",
+             bash calls with background: true. State is read from the process \
+             itself, so a job whose process is gone reads as finished.",
             json!({ "type": "object", "properties": {} }),
             "kernel",
             |args| Box::pin(async move { list_tool(args).await.map(Into::into) }) as ToolFuture,
@@ -404,7 +762,8 @@ pub fn install(registry: &mut ToolRegistry) -> Result<()> {
         ToolDef::new(
             "job_output",
             "Read a background job's output and state. Set wait_ms to block until \
-             it finishes (or the wait elapses) instead of reading once.",
+             it finishes (or the wait elapses) instead of reading once. Output is \
+             read from the job's log file, so it survives a restart.",
             json!({
                 "type": "object",
                 "properties": {
@@ -474,8 +833,9 @@ async fn output_tool(args: Value) -> Result<String> {
     let output = job.output_text();
     let state = job.state().label(job.started.elapsed());
     Ok(format!(
-        "{} ({state})\n{}",
+        "{} ({state})\nlog: {}\n{}",
         job.id,
+        job.log_path().display(),
         if output.trim().is_empty() { "(no output)" } else { &output }
     ))
 }
@@ -519,6 +879,15 @@ fn format_age(age: Duration) -> String {
     }
 }
 
+/// `512 KB`, `2 MB` — for the truncation marker.
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{} MB", bytes / (1024 * 1024))
+    } else {
+        format!("{} KB", bytes / 1024)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,6 +927,82 @@ mod tests {
         .expect("output");
         assert!(output.contains("hello-from-job"), "{output}");
         assert!(output.contains("exited"), "{output}");
+        // The answer names where the output lives: the file *is* the output.
+        assert!(output.contains("log:"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn output_is_on_disk_and_a_rebuilt_registry_still_reads_it() {
+        let started = bash(json!({
+            "command": "echo persisted-line-1 && echo persisted-line-2",
+            "background": true
+        }))
+        .await
+        .expect("background start");
+        let id = id_from(&started);
+        // Let it finish.
+        let _ = tool("job_output", json!({ "id": &id, "wait_ms": 10_000 })).await;
+
+        let job = get(&id).expect("the job");
+        let log = job.log_path();
+        assert!(log.is_file(), "the log file exists: {}", log.display());
+        let text = std::fs::read_to_string(&log).expect("read the log");
+        assert!(text.contains("persisted-line-1"), "{text}");
+        assert!(text.contains("persisted-line-2"), "{text}");
+
+        // A second registry over the same directory is what a restart sees:
+        // the job is listed, its state is asked of the process, and its output
+        // still reads from the file.
+        let rebuilt = JobRegistry::open(jobs_dir());
+        let recovered = rebuilt.get(&id).expect("recovered from the index");
+        assert_eq!(recovered.command, job.command);
+        assert!(matches!(
+            recovered.state(),
+            JobState::Exited(_) | JobState::Gone
+        ));
+        assert!(recovered.output_text().contains("persisted-line-2"));
+        // And its id is never handed out again.
+        assert!(
+            recovered
+                .id
+                .strip_prefix("job-")
+                .and_then(|n| n.parse::<u64>().ok())
+                .map(|n| n < rebuilt.next.load(Ordering::Relaxed))
+                .unwrap_or(false),
+            "the counter starts above every id already on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_running_jobs_state_comes_from_the_process_not_the_record() {
+        let command = if cfg!(windows) {
+            "ping -n 60 127.0.0.1 >nul"
+        } else {
+            "sleep 60"
+        };
+        let started = bash(json!({ "command": command, "background": true }))
+            .await
+            .expect("background start");
+        let id = id_from(&started);
+        let job = get(&id).expect("the job");
+
+        assert!(job.is_running(), "the process is alive, so it is running");
+        // The index says running too — but the *check* is the process: kill it
+        // behind the registry's back and the state must follow.
+        let pid = job.pid.expect("the index records the pid");
+        kill_pid(pid);
+        let mut settled = false;
+        for _ in 0..100 {
+            if !job.is_running() {
+                settled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(settled, "a killed process is not 'running'");
+
+        let listed = tool("job_list", json!({})).await.expect("list");
+        assert!(!listed.contains(&format!("{id}  running")), "{listed}");
     }
 
     #[tokio::test]
