@@ -335,7 +335,7 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
             set_active_ui(directory);
         }
 
-        let ui_port = serve_interface_on_loopback()?;
+        let ui_port = serve_interface_on_loopback(Arc::clone(&state))?;
         WebViewBuilder::new()
             // The page is served over loopback HTTP rather than a custom
             // scheme: WebView2 refuses an unknown scheme as the document's own
@@ -587,6 +587,13 @@ pub(crate) async fn dispatch(
             // Plugin panels and the theme they imply, pushed with the rest of
             // the initial state so the page never paints the wrong palette.
             emit_panels(&state, &sink);
+            // The pack list rides the same push. It used to leave only through
+            // the page's own `list_packs` — a response that could broadcast
+            // before the page's EventSource had subscribed, after which the
+            // list stayed empty forever while the packs sat on disk. Every
+            // ready re-pushes it, so a slow connection and a tab returning to
+            // the foreground both repaint the list.
+            refresh_packs(&state, &sink);
 
             // A prompt given on the command line runs once the page can show it.
 
@@ -827,6 +834,21 @@ pub(crate) async fn dispatch(
                 count
             };
             sink.emit(json!({ "ev": "notice", "text": format!("Unloaded {removed} instance(s) of {name}") }));
+            // The runtime keeps its own copy of the tool table; recompute puts
+            // it, the route, and the status back in step with the kernel (the
+            // pack set did not change, so settings and persona recompute to
+            // the same values).
+            {
+                let mut guard = state.lock().expect("state lock");
+                if let Err(error) = guard.recompute_pack_content() {
+                    emit(
+                        &sink,
+                        json!({ "ev": "error", "message": format!("recomputing pack content: {error:#}") }),
+                    );
+                }
+            }
+            let status = state.lock().expect("state lock").describe();
+            emit(&sink, json!({ "ev": "status", "status": status }));
             // The panels and theme just changed, so the page has to be told.
             emit_panels(&state, &sink);
         }
@@ -930,6 +952,20 @@ pub(crate) async fn dispatch(
             drain_packs(Arc::clone(&state), Arc::clone(&sink)).await;
             match remove_pack(&target) {
                 Ok(()) => {
+                    // The files are gone; recompute once more so the adopted
+                    // state drops them too — the drain above ran while the
+                    // pack was still on disk.
+                    {
+                        let mut guard = state.lock().expect("state lock");
+                        if let Err(error) = guard.recompute_pack_content() {
+                            emit(
+                                &sink,
+                                json!({ "ev": "error", "message": format!("recomputing pack content: {error:#}") }),
+                            );
+                        }
+                    }
+                    let status = state.lock().expect("state lock").describe();
+                    emit(&sink, json!({ "ev": "status", "status": status }));
                     emit(&sink, json!({ "ev": "notice", "text": format!("Deleted {target}") }));
                 }
                 Err(error) => emit(
@@ -992,6 +1028,26 @@ pub(crate) async fn dispatch(
 
         "" => {
             emit(&sink, json!({ "ev": "error", "message": "empty command" }));
+        }
+
+        // The pickers' path form, for clients with no native file dialog: the
+        // web page uploads the archive (POST /upload) and hands its path back,
+        // so installing a pack from a browser follows the same verify-then-
+        // install steps the window's dialog runs.
+        other if other.starts_with("pick_") => {
+            let path = command
+                .get("path")
+                .and_then(|p| p.as_str())
+                .filter(|p| !p.trim().is_empty());
+            match path {
+                Some(path) => {
+                    dispatch_path(state, other, PathBuf::from(path), sink).await?;
+                }
+                None => emit(
+                    &sink,
+                    json!({ "ev": "error", "message": format!("{other} needs a path") }),
+                ),
+            }
         }
 
         other => {
@@ -1117,29 +1173,19 @@ async fn drain_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
                 // future non-Send, and the UI thread would wait on it.
                 let (found, to_stop) = {
                     let mut guard = state.lock().expect("state lock");
-                    // Another conversation still using the pack keeps it loaded:
-                    // only this conversation's record is removed. Summaries carry
-                    // no pack set, so each candidate is loaded to read its packs.
-                    let still_used_elsewhere = match (&session, guard.store.list()) {
-                        (Some(current), Ok(all)) => all
-                            .iter()
-                            .filter(|s| s.id != *current)
-                            .any(|s| match guard.store.load(&s.id) {
-                                Ok(Some(other)) => other.packs.iter().any(|p| p == &name),
-                                _ => false,
-                            }),
-                        _ => false,
-                    };
+                    // The record of *this* conversation is dropped: it no
+                    // longer claims the pack. Nothing else decides the load —
+                    // the toggle promises a global unload ("stop loading it,
+                    // keep the files"), and an earlier "another conversation
+                    // still uses it" check keyed on those records made the
+                    // button a no-op whenever an old session had once loaded
+                    // the pack. Files stay; the kernel drops it now.
                     if let Some(current) = &session {
                         if let Ok(Some(owned)) = guard.store.load(current) {
                             let next: Vec<String> =
                                 owned.packs.iter().filter(|p| *p != &name).cloned().collect();
                             let _ = guard.store.append_packs(current, &next);
                         }
-                    }
-                    if still_used_elsewhere {
-                        eprintln!("[pack] {name} stays loaded: another conversation still uses it");
-                        continue;
                     }
                     let packs =
                         match nguruvilu::pack::installed(&nguruvilu::pack::default_packs_dir()) {
@@ -1223,13 +1269,27 @@ async fn drain_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
                             .iter()
                             .filter(|pack| pack.manifest.name == name && pack.enabled)
                             .filter_map(|pack| {
-                                pack.assembly.clone().map(|assembly| {
-                                    (
-                                        format!("{}-{}", pack.manifest.name, pack.manifest.version_id),
+                                // A hand-placed pack carries no assembly and
+                                // would load nothing; render one from its
+                                // manifest instead of skipping it.
+                                match nguruvilu::pack::ensure_assembly(&pack.path) {
+                                    Ok(Some(assembly)) => Some((
+                                        format!(
+                                            "{}-{}",
+                                            pack.manifest.name, pack.manifest.version_id
+                                        ),
                                         assembly,
                                         pack.path.clone(),
-                                    )
-                                })
+                                    )),
+                                    Ok(None) => None,
+                                    Err(error) => {
+                                        emit(
+                                            &sink,
+                                            json!({ "ev": "error", "message": format!("{} assembly: {error:#}", pack.manifest.name) }),
+                                        );
+                                        None
+                                    }
+                                }
                             })
                             .collect(),
                         Err(_) => Vec::new(),
@@ -1274,12 +1334,26 @@ async fn drain_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
                             }
                             if let Ok(manifest) = nguruvilu::pack::read_manifest(&dir) {
                                 match nguruvilu::content::apply(&mut kernel, &dir, &manifest) {
-                                    Ok(content) => guard.adopt_pack_content(content),
+                                    // Appearance has landed on the kernel; the
+                                    // settings-side content is recomputed from
+                                    // the whole enabled set below, before the
+                                    // restore reads the settings.
+                                    Ok(content) => {
+                                        for line in content.summary() {
+                                            eprintln!("[pack] content: {line}");
+                                        }
+                                    }
                                     Err(error) => emit(
                                         &sink,
                                         json!({ "ev": "error", "message": format!("{label} content: {error:#}") }),
                                     ),
                                 }
+                            }
+                            if let Err(error) = guard.recompute_pack_content() {
+                                emit(
+                                    &sink,
+                                    json!({ "ev": "error", "message": format!("recomputing pack content: {error:#}") }),
+                                );
                             }
                             eprintln!(
                                 "[pack] loaded {label}: {} entr(ies), {} failed",
@@ -1317,6 +1391,18 @@ async fn drain_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
                             for entry in &report.skipped {
                                 eprintln!("[pack] skipped {}: {}", entry.id, entry.reason);
                             }
+                            // The page is told the same detail boot prints: a
+                            // count on stderr is invisible in the web UI, which
+                            // is how a load failure reads as a dead pack.
+                            emit(
+                                &sink,
+                                json!({
+                                    "ev": "pack_applied",
+                                    "loaded": report.loaded,
+                                    "failed": report.failed.iter().map(|f| json!({"id": f.id, "error": f.error})).collect::<Vec<_>>(),
+                                    "skipped": report.skipped.iter().map(|s| json!({"id": s.id, "reason": s.reason})).collect::<Vec<_>>(),
+                                }),
+                            );
                             changed = true;
                         }
                         Err(error) => emit(
@@ -1336,6 +1422,50 @@ async fn drain_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
     }
 
     if changed {
+        // Set-shaped adoption: every enabled pack recomputed from the user's
+        // own settings — a load and an unload converge on the state a fresh
+        // boot would produce. For an unload this is the pass that actually
+        // takes the pack's route, persona, rules, and tools away.
+        {
+            let mut guard = state.lock().expect("state lock");
+            let adopted = guard.recompute_pack_content();
+            if let Err(error) = adopted {
+                emit(
+                    &sink,
+                    json!({ "ev": "error", "message": format!("recomputing pack content: {error:#}") }),
+                );
+            }
+            // The cells follow the adopted settings, same as the CLI drain: a
+            // pack that configured search leaves the tool behind its key. One
+            // disjoint borrow of the state — a MutexGuard does not split into
+            // field borrows by itself.
+            let settings = guard.settings.clone();
+            let AppState {
+                kernel, search_cell, judge_cell, ..
+            } = &mut *guard;
+            let search = nguruvilu::tools::search::configure(
+                kernel,
+                search_cell,
+                settings.search.clone(),
+            );
+            if let Err(error) = search {
+                emit(
+                    &sink,
+                    json!({ "ev": "error", "message": format!("search config: {error:#}") }),
+                );
+            }
+            let judge = nguruvilu::tools::judge::configure(
+                kernel,
+                judge_cell,
+                settings.judge.clone(),
+            );
+            if let Err(error) = judge {
+                emit(
+                    &sink,
+                    json!({ "ev": "error", "message": format!("judge config: {error:#}") }),
+                );
+            }
+        }
         // Panels, theme, and labels move with the kernel, and the tool table
         // is what the next turn reads.
         emit_panels(&state, &sink);
@@ -1381,7 +1511,21 @@ async fn load_installed_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSi
             eprintln!("[pack] {} is unloaded; files kept", pack.manifest.name);
             continue;
         }
-        let Some(assembly) = pack.assembly.clone() else {
+        // A hand-placed pack carries no assembly and would silently load
+        // nothing — the dead-pack shape. Render one from its manifest; a
+        // failure here is reported and the other packs keep loading.
+        let assembly = match nguruvilu::pack::ensure_assembly(&pack.path) {
+            Ok(assembly) => assembly,
+            Err(error) => {
+                eprintln!("[pack] {} assembly: {error:#}", pack.manifest.name);
+                emit(
+                    &sink,
+                    json!({ "ev": "error", "message": format!("pack {}: {error:#}", pack.manifest.name) }),
+                );
+                None
+            }
+        };
+        let Some(assembly) = assembly else {
             continue;
         };
         let name = format!("{}-{}", pack.manifest.name, pack.manifest.version_id);
@@ -1437,32 +1581,35 @@ async fn apply_pack(
         nguruvilu::loader::merge_skills(&mut kernel, &mut host, pack_skills)?;
     }
     // Apply what the pack carries beyond its entries. Appearance lands on the
-    // kernel; the rest describes the session and is applied to the shell's
-    // settings, which the state owns.
+    // kernel; the settings-side content is recomputed from the enabled set
+    // below — the same pass a later unload runs, so load and unload converge.
     let pack_dir = assembly
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    let content = match nguruvilu::pack::read_manifest(&pack_dir) {
+    match nguruvilu::pack::read_manifest(&pack_dir) {
         Ok(manifest) => {
             let content = nguruvilu::content::apply(&mut kernel, &pack_dir, &manifest)?;
             for line in content.summary() {
                 eprintln!("[pack] content: {line}");
             }
-            Some(content)
         }
         Err(error) => {
             // An assembly with no manifest beside it is still loadable — it is
             // the offline shape from before packs had manifests.
             eprintln!("[pack] no manifest beside the assembly ({error:#})");
-            None
         }
-    };
+    }
 
     let status = {
         let mut guard = state.lock().expect("state lock");
-        if let Some(content) = content {
-            guard.adopt_pack_content(content);
+        // Before the restore: the restore installs network and search from
+        // whatever the settings say by then, so the adoption has to have run.
+        if let Err(error) = guard.recompute_pack_content() {
+            emit(
+                &sink,
+                json!({ "ev": "error", "message": format!("recomputing pack content: {error:#}") }),
+            );
         }
         guard.restore_kernel(kernel)?;
         guard.describe()
@@ -1688,7 +1835,16 @@ impl tao::rwh_06::HasDisplayHandle for DialogParent {
     }
 }
 
-fn serve_interface_on_loopback() -> std::io::Result<u16> {
+/// Serve the window's interface over loopback — and its uploads too.
+///
+/// GET serves interface files, exactly as before. `POST /upload` is the same
+/// door serve mode has: the page posts bytes, gets the absolute path back,
+/// and puts it in the composer. Until this existed the request fell through
+/// to `serve_ui`, which answered HTML with `200 OK` — the page then failed to
+/// parse it as JSON, so the upload button looked broken while nothing appeared
+/// in any log. Loopback only, no token: the same origin the window already
+/// trusts for its files.
+fn serve_interface_on_loopback(state: Arc<Mutex<AppState>>) -> std::io::Result<u16> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
     // Logged so a stalled page can be checked with one curl instead of a
@@ -1697,30 +1853,134 @@ fn serve_interface_on_loopback() -> std::io::Result<u16> {
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
-            let mut request = [0u8; 8192];
-            let read = stream.read(&mut request).unwrap_or(0);
-            let text = String::from_utf8_lossy(&request[..read]).to_string();
-            // GET <path> HTTP/1.1 — anything unparseable gets the entry page.
-            let path = text
-                .split_whitespace()
-                .nth(1)
-                .and_then(|target| target.split('?').next())
-                .map(|target| target.trim_start_matches('/').to_string())
-                .unwrap_or_default();
-            let (body, mime) = serve_ui(&path);
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\n\
-                 Cache-Control: no-store\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            if stream.write_all(head.as_bytes()).is_err() {
+            // Headers first: a POST body may begin in this same chunk and
+            // continue past it, so the head must be located before the rest
+            // of the body is read.
+            let mut buf = vec![0u8; 8192];
+            let mut read = stream.read(&mut buf).unwrap_or(0);
+            let header_end = loop {
+                if let Some(pos) = buf[..read].windows(4).position(|w| w == b"\r\n\r\n") {
+                    break Some(pos + 4);
+                }
+                if read >= buf.len() {
+                    break None;
+                }
+                match stream.read(&mut buf[read..]) {
+                    Ok(0) => break None,
+                    Ok(n) => read += n,
+                    Err(_) => break None,
+                }
+            };
+            let Some(header_end) = header_end else {
+                // Unparseable: the entry page, the old behaviour.
+                let (body, mime) = serve_ui("");
+                respond_loopback(&mut stream, "200 OK", mime, &body);
+                continue;
+            };
+            let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+            let (method, target) = {
+                let mut parts = head.split_whitespace();
+                (
+                    parts.next().unwrap_or("").to_string(),
+                    parts.next().unwrap_or("/").to_string(),
+                )
+            };
+            let (path, query) = crate::serve::split_target(&target);
+
+            if method == "POST" && path == "upload" {
+                let content_length: usize = head
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
+                    .and_then(|line| line.split(':').nth(1))
+                    .and_then(|value| value.trim().parse().ok())
+                    .unwrap_or(0);
+                let cap = crate::serve::max_body_bytes() as usize;
+                if content_length == 0 {
+                    respond_loopback(&mut stream, "400 Bad Request", "text/plain; charset=utf-8", b"empty upload");
+                    continue;
+                }
+                if content_length > cap {
+                    let message = format!(
+                        "payload too large: {content_length} bytes declared, this server \
+                         accepts up to {} MB. Set NGU_MAX_UPLOAD_MB to raise the limit.",
+                        cap / (1024 * 1024)
+                    );
+                    eprintln!("[ui] upload rejected: {content_length} bytes exceeds the cap");
+                    respond_loopback(&mut stream, "413 Payload Too Large", "text/plain; charset=utf-8", message.as_bytes());
+                    continue;
+                }
+                let mut body = buf[header_end..read].to_vec();
+                while body.len() < content_length {
+                    let mut chunk = vec![0u8; 64 * 1024];
+                    let want = (content_length - body.len()).min(chunk.len());
+                    match stream.read(&mut chunk[..want]) {
+                        Ok(0) => break,
+                        Ok(n) => body.extend_from_slice(&chunk[..n]),
+                        Err(_) => break,
+                    }
+                }
+                if body.len() != content_length {
+                    respond_loopback(&mut stream, "400 Bad Request", "text/plain; charset=utf-8", b"truncated upload body");
+                    continue;
+                }
+                let name = crate::serve::sanitize_name(
+                    query.get("name").map(String::as_str).unwrap_or(""),
+                );
+                let workdir = crate::serve::session_workdir(&state);
+                let directory = workdir.join("uploads");
+                let outcome = std::fs::create_dir_all(&directory).and_then(|()| {
+                    let file_path = directory.join(&name);
+                    std::fs::write(&file_path, &body).map(|()| file_path)
+                });
+                match outcome {
+                    Ok(file_path) => {
+                        eprintln!(
+                            "[ui] uploaded {} bytes → {}",
+                            body.len(),
+                            file_path.display()
+                        );
+                        let payload = serde_json::json!({
+                            "ok": true,
+                            "path": file_path.display().to_string(),
+                            "name": name,
+                            "size": body.len(),
+                        })
+                        .to_string();
+                        respond_loopback(&mut stream, "200 OK", "application/json", payload.as_bytes());
+                    }
+                    Err(error) => {
+                        eprintln!("[ui] upload failed: {error}");
+                        let message = format!("cannot write upload: {error}");
+                        respond_loopback(&mut stream, "500 Internal Server Error", "text/plain; charset=utf-8", message.as_bytes());
+                    }
+                }
                 continue;
             }
-            let _ = stream.write_all(&body);
-            let _ = stream.flush();
+
+            // GET (and anything else): the interface file, as always.
+            let (body, mime) = serve_ui(&path);
+            respond_loopback(&mut stream, "200 OK", mime, &body);
         }
     });
     Ok(port)
+}
+
+/// One loopback response, closed after — the style this little server always
+/// had (`Connection: close`), with the body length stated.
+fn respond_loopback(
+    stream: &mut std::net::TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) {
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+         Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(body);
+    let _ = stream.flush();
 }
 
 pub(crate) fn serve_ui(path: &str) -> (Vec<u8>, &'static str) {

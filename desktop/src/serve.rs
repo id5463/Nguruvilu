@@ -202,8 +202,34 @@ async fn handle(
     commands_tx: mpsc::UnboundedSender<String>,
     state: Arc<Mutex<AppState>>,
 ) {
-    let Some(request) = read_request(&mut stream).await else {
-        return;
+    let request = match read_request(&mut stream).await {
+        ReadOutcome::Request(request) => request,
+        ReadOutcome::TooLarge(declared) => {
+            let limit_mb = max_body_bytes() / (1024 * 1024);
+            // Rejections are logged too: a client that never appears in the
+            // log with a big file is otherwise indistinguishable from one
+            // that never tried.
+            eprintln!(
+                "[serve] {peer} rejected: {declared} bytes declared exceeds the \
+                 {limit_mb} MB upload limit"
+            );
+            // The one case where silence is worse than an error: the client
+            // picked a size this server refuses, and it deserves to hear that
+            // before retrying — a dropped connection reads as a network fault.
+            let body = format!(
+                "payload too large: {declared} bytes declared, this server accepts up to \
+                 {limit_mb} MB. Set NGU_MAX_UPLOAD_MB to raise the limit."
+            );
+            respond(
+                &mut stream,
+                413,
+                "text/plain; charset=utf-8",
+                body.as_bytes(),
+            )
+            .await;
+            return;
+        }
+        ReadOutcome::Malformed => return,
     };
     let (path, query) = split_target(&request.target);
 
@@ -296,20 +322,34 @@ async fn handle(
         // a token that did not earn the right to drive the shell has not
         // earned the right to read its disk either.
         ("POST", "upload") => {
+            // Logged before anything can reject it: every attempt leaves one
+            // line, success or not.
+            eprintln!(
+                "[serve] POST /upload from {peer}: {} bytes",
+                request.body.len()
+            );
             if !authorized(&request, &query, &token) {
+                eprintln!("[serve] upload from {peer}: unauthorized");
                 plain(401, "unauthorized")
             } else if request.body.is_empty() {
+                eprintln!("[serve] upload from {peer}: empty body");
                 plain(400, "empty upload")
             } else {
                 let name = sanitize_name(query.get("name").map(String::as_str).unwrap_or(""));
                 let workdir = session_workdir(&state);
                 let directory = workdir.join("uploads");
                 match tokio::fs::create_dir_all(&directory).await {
-                    Err(error) => plain(500, &format!("cannot create uploads: {error}")),
+                    Err(error) => {
+                        eprintln!("[serve] upload from {peer}: cannot create uploads: {error}");
+                        plain(500, &format!("cannot create uploads: {error}"))
+                    }
                     Ok(()) => {
                         let file_path = directory.join(&name);
                         match tokio::fs::write(&file_path, &request.body).await {
-                            Err(error) => plain(500, &format!("cannot write upload: {error}")),
+                            Err(error) => {
+                                eprintln!("[serve] upload from {peer}: cannot write: {error}");
+                                plain(500, &format!("cannot write upload: {error}"))
+                            }
                             Ok(()) => {
                                 eprintln!(
                                     "[serve] uploaded {} bytes → {}",
@@ -438,7 +478,7 @@ fn plain(status: u16, message: &str) -> (u16, &'static str, Vec<u8>) {
 
 /// An upload's name, stripped of anything that could make it a path: the
 /// file lands in `uploads/` and nowhere else, whatever the client sent.
-fn sanitize_name(name: &str) -> String {
+pub(crate) fn sanitize_name(name: &str) -> String {
     let base = std::path::Path::new(name)
         .file_name()
         .map(|part| part.to_string_lossy().into_owned())
@@ -602,7 +642,7 @@ async fn probe_upstream() -> bool {
 }
 
 /// `%XX` in a query value back to text, for file paths with spaces or CJK.
-fn percent_decode(value: &str) -> String {
+pub(crate) fn percent_decode(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -668,10 +708,40 @@ struct Request {
     body: Vec<u8>,
 }
 
+/// The largest body this server will read, in bytes.
+///
+/// A request body is buffered in memory here, so this one number is both the
+/// upload limit a user runs into and the answer to "how much RAM may one
+/// request ask for". It used to be a silent 64 MB drop — the client saw a
+/// connection with no reply and no reason. `NGU_MAX_UPLOAD_MB` overrides it
+/// per deployment; failures now answer `413` with the limit spelled out.
+pub(crate) fn max_body_bytes() -> u64 {
+    let megabytes = std::env::var("NGU_MAX_UPLOAD_MB")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(512);
+    megabytes.saturating_mul(1024 * 1024)
+}
+
+/// What reading one request produced.
+enum ReadOutcome {
+    /// A complete request.
+    Request(Request),
+    /// The declared `Content-Length` exceeds [`max_body_bytes`].
+    ///
+    /// The body is deliberately *not* read: the reply explains the limit and
+    /// the connection closes, rather than the server swallowing a payload it
+    /// is about to refuse anyway.
+    TooLarge(u64),
+    /// Malformed, truncated, or gone — dropped without a reply; an
+    /// unsolicited connection owes nobody an explanation.
+    Malformed,
+}
+
 /// Read one request off the socket: head until `\r\n\r\n`, then exactly
-/// `Content-Length` bytes of body. Anything malformed is dropped without a
-/// reply — an unsolicited connection owes nobody an explanation.
-async fn read_request(stream: &mut TcpStream) -> Option<Request> {
+/// `Content-Length` bytes of body.
+async fn read_request(stream: &mut TcpStream) -> ReadOutcome {
     let mut buffer = Vec::with_capacity(4096);
     let mut chunk = [0u8; 8192];
 
@@ -680,20 +750,29 @@ async fn read_request(stream: &mut TcpStream) -> Option<Request> {
             break position;
         }
         if buffer.len() > 64 * 1024 {
-            return None;
+            return ReadOutcome::Malformed;
         }
-        let read = stream.read(&mut chunk).await.ok()?;
-        if read == 0 {
-            return None;
-        }
+        let read = match stream.read(&mut chunk).await {
+            Ok(read) if read > 0 => read,
+            _ => return ReadOutcome::Malformed,
+        };
         buffer.extend_from_slice(&chunk[..read]);
     };
 
-    let head = std::str::from_utf8(&buffer[..head_end]).ok()?;
+    let head = match std::str::from_utf8(&buffer[..head_end]) {
+        Ok(head) => head,
+        Err(_) => return ReadOutcome::Malformed,
+    };
     let mut lines = head.split("\r\n");
-    let mut request_line = lines.next()?.split_whitespace();
-    let method = request_line.next()?.to_string();
-    let target = request_line.next()?.to_string();
+    let mut request_line = match lines.next().map(str::split_whitespace) {
+        Some(mut parts) => parts,
+        None => return ReadOutcome::Malformed,
+    };
+    let method = request_line.next().unwrap_or("").to_string();
+    let target = request_line.next().unwrap_or("").to_string();
+    if method.is_empty() || target.is_empty() {
+        return ReadOutcome::Malformed;
+    }
 
     let mut headers = HashMap::new();
     for line in lines {
@@ -702,27 +781,30 @@ async fn read_request(stream: &mut TcpStream) -> Option<Request> {
         }
     }
 
-    let content_length: usize = headers
+    let content_length: usize = match headers
         .get("content-length")
         .and_then(|value| value.parse().ok())
-        .unwrap_or(0);
-    // Wide enough for an uploaded file, narrow enough that a hostile length
-    // cannot ask a 2 GB box for memory it does not have.
-    if content_length > 64 * 1024 * 1024 {
-        return None;
+    {
+        Some(length) => length,
+        // No body declared: an empty one is the correct reading, so a missing
+        // or unparsable header is not an error.
+        None => 0,
+    };
+    if content_length as u64 > max_body_bytes() {
+        return ReadOutcome::TooLarge(content_length as u64);
     }
 
     let mut body_bytes = buffer[head_end + 4..].to_vec();
     while body_bytes.len() < content_length {
-        let read = stream.read(&mut chunk).await.ok()?;
-        if read == 0 {
-            return None;
-        }
+        let read = match stream.read(&mut chunk).await {
+            Ok(read) if read > 0 => read,
+            _ => return ReadOutcome::Malformed,
+        };
         body_bytes.extend_from_slice(&chunk[..read]);
     }
     body_bytes.truncate(content_length);
 
-    Some(Request {
+    ReadOutcome::Request(Request {
         method,
         target,
         headers,
@@ -740,6 +822,7 @@ async fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: 
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        413 => "Payload Too Large",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "",
@@ -795,7 +878,7 @@ async fn sse(stream: &mut TcpStream, bus: broadcast::Sender<String>) {
 /// own working directory, so one conversation's files stay out of another's.
 /// Falls back to the process directory only for a session that has no cwd
 /// recorded, and says so rather than hiding the fallback.
-fn session_workdir(state: &Arc<Mutex<AppState>>) -> std::path::PathBuf {
+pub(crate) fn session_workdir(state: &Arc<Mutex<AppState>>) -> std::path::PathBuf {
     let cwd = state.lock().expect("state lock").session.cwd.clone();
     match cwd {
         Some(dir) => std::path::PathBuf::from(dir),
@@ -818,7 +901,7 @@ fn authorized(request: &Request, query: &HashMap<String, String>, token: &str) -
 }
 
 /// Split `path?query` into both halves, query as a map.
-fn split_target(target: &str) -> (&str, HashMap<String, String>) {
+pub(crate) fn split_target(target: &str) -> (&str, HashMap<String, String>) {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let query = query
         .split('&')

@@ -2,6 +2,7 @@
   "formatVersion": 1,
   "game": "nguruvilu",
   "name": "documents",
+  "description": "文档读取：documents 插件，读不了的格式会自己装环境再试（PDF/Office 等）",
   "versionId": "1.0.0",
   "license": "MIT",
   "kernelVersion": "0.1.0",

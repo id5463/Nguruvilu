@@ -40,7 +40,8 @@ use nguruvilu::skills::{register_skill_tool, SkillRegistry};
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a coding agent. Your working directory is the \
 process working directory. Use the tools to inspect and change files, and to run commands. \
 Prefer `read` over shelling out to view files, and `edit` for surgical changes. Keep answers \
-short and concrete.";
+short and concrete. When you tell the user about a file, give its absolute path — a bare or \
+relative name is not something they can open.";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -784,7 +785,17 @@ async fn run() -> Result<()> {
             eprintln!("[pack] {} is unloaded; files kept", pack.manifest.name);
             continue;
         }
-        if let Some(assembly) = &pack.assembly {
+        // A hand-placed pack carries no assembly and would silently load
+        // nothing; render it from the manifest (reported, not fatal — one
+        // pack must not stop the session from starting).
+        let assembly = match nguruvilu::pack::ensure_assembly(&pack.path) {
+            Ok(assembly) => assembly,
+            Err(error) => {
+                eprintln!("[pack] {} assembly: {error:#}", pack.manifest.name);
+                None
+            }
+        };
+        if let Some(assembly) = &assembly {
             let label = format!("{}-{}", pack.manifest.name, pack.manifest.version_id);
             eprintln!("[pack] loading {label}");
             let (pack_skills, report, servers) = nguruvilu::loader::load_pack(
@@ -856,6 +867,10 @@ async fn run() -> Result<()> {
     let injection = Arc::new(Mutex::new(Arc::new(
         nguruvilu::context::InjectionEngine::load_default(),
     )));
+    // The user's own settings, before any pack folds over them: a drain's
+    // set-shaped recompute starts here, so unloading a pack takes back what
+    // it brought while the stored values come back with it.
+    let pack_baseline = settings.clone();
     let pack_ran = !contents.is_empty();
     for content in contents {
         adopt_content(content, &mut settings, &mut runtime, &injection)?;
@@ -1157,6 +1172,7 @@ async fn run() -> Result<()> {
                 search: &search_cell,
                 judge: &judge_cell,
                 persona_override: cli.persona.clone(),
+                baseline: pack_baseline,
             }
             .drain()
             .await?;
@@ -1232,6 +1248,7 @@ async fn run() -> Result<()> {
                     search: &search_cell,
                     judge: &judge_cell,
                     persona_override: cli.persona.clone(),
+                    baseline: pack_baseline,
                 },
             )
             .await?;
@@ -2163,17 +2180,59 @@ fn classify_server(
     let obj = entry
         .as_object()
         .ok_or_else(|| "entry is not an object".to_string())?;
+    let kind = obj
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| {
+            if obj.contains_key("url") { "http" } else { "unknown" }
+        });
     let command = obj
         .get("command")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|c| !c.is_empty());
     let Some(command) = command else {
-        let kind = obj.get("type").and_then(serde_json::Value::as_str).unwrap_or_else(|| {
-            if obj.contains_key("url") { "http" } else { "unknown" }
-        });
+        // No command: either an endpoint (a URL every message posts to) or
+        // something with nothing to run. An endpoint imports into our
+        // streamable-http form so it connects instead of being dropped.
+        let url = obj
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|url| !url.is_empty());
+        if let (true, Some(url)) = ((kind == "http" || kind == "unknown"), url) {
+            let headers = obj
+                .get("headers")
+                .and_then(serde_json::Value::as_object)
+                .map(|map| {
+                    map.iter()
+                        .filter_map(|(key, value)| {
+                            value
+                                .as_str()
+                                .map(|text| (key.clone(), text.to_string()))
+                        })
+                        .collect::<std::collections::BTreeMap<String, String>>()
+                })
+                .unwrap_or_default();
+            return Ok(nguruvilu::pack::McpServerDecl {
+                id: id.to_string(),
+                transport: "streamable-http".into(),
+                source: None,
+                sha256: None,
+                command: None,
+                args: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+                scope: Some("session".into()),
+                platforms: std::collections::BTreeMap::new(),
+                url: Some(url.to_string()),
+                headers,
+            });
+        }
+        if kind == "http" {
+            return Err("http transport declares no url".to_string());
+        }
         return Err(format!(
-            "'{kind}' transport is not supported yet (stdio only) — add it by hand when http lands"
+            "'{kind}' transport is not supported (stdio and streamable-http are)"
         ));
     };
     let args = obj
@@ -2210,6 +2269,8 @@ fn classify_server(
         env,
         scope: Some("session".into()),
         platforms: std::collections::BTreeMap::new(),
+        url: None,
+        headers: std::collections::BTreeMap::new(),
     })
 }
 
@@ -2347,6 +2408,7 @@ fn list_packs(as_json: bool) -> Result<()> {
                 "packs_dir": packs_dir.display().to_string(),
                 "packs": packs.iter().map(|p| serde_json::json!({
                     "name": p.manifest.name,
+                    "description": p.manifest.description,
                     "version": p.manifest.version_id,
                     "license": p.manifest.license,
                     "path": p.path.display().to_string(),
@@ -2375,6 +2437,9 @@ fn list_packs(as_json: bool) -> Result<()> {
             if pack.enabled { "yes" } else { "no" },
             if pack.assembly.is_some() { "yes" } else { "no" }
         );
+        if !pack.manifest.description.is_empty() {
+            println!("  {}", pack.manifest.description);
+        }
     }
     Ok(())
 }
@@ -3220,6 +3285,12 @@ struct PackHost<'a> {
     /// packs' souls, and this outranks them, so it goes back on top after
     /// every drain.
     persona_override: Option<String>,
+    /// The user's own settings before any pack folded over them.
+    ///
+    /// A drain recomputes the adopted state from this baseline plus the
+    /// enabled set, so an unload takes back its pack's route and window
+    /// while the stored values come back with it.
+    baseline: Settings,
 }
 
 impl PackHost<'_> {
@@ -3231,7 +3302,7 @@ impl PackHost<'_> {
         for action in self.queue.drain() {
             let packs = nguruvilu::pack::installed(&nguruvilu::pack::default_packs_dir())?;
             match action {
-                Pending::Unload(name) => {
+                Pending::Unload { name, session: _ } => {
                     let mut found = false;
                     for pack in packs.iter().filter(|pack| pack.manifest.name == name) {
                         let label = format!("{}-{}", pack.manifest.name, pack.manifest.version_id);
@@ -3273,13 +3344,22 @@ impl PackHost<'_> {
                         eprintln!("[pack] {name} is not installed; nothing was loaded to unload");
                     }
                 }
-                Pending::Load(name) => {
+                Pending::Load { name, session: _ } => {
                     for pack in packs
                         .iter()
                         .filter(|pack| pack.manifest.name == name && pack.enabled)
                     {
                         let label = format!("{}-{}", pack.manifest.name, pack.manifest.version_id);
-                        if let Some(assembly) = &pack.assembly {
+                        // Same repair as boot: a pack with no assembly gets
+                        // one rendered rather than loading nothing.
+                        let assembly = match nguruvilu::pack::ensure_assembly(&pack.path) {
+                            Ok(assembly) => assembly,
+                            Err(error) => {
+                                eprintln!("[pack] {} assembly: {error:#}", pack.manifest.name);
+                                None
+                            }
+                        };
+                        if let Some(assembly) = &assembly {
                             let (pack_skills, report, servers) = nguruvilu::loader::load_pack(
                                 self.kernel,
                                 &default_ledger_path(),
@@ -3301,6 +3381,15 @@ impl PackHost<'_> {
                                 report.loaded.len(),
                                 report.failed.len()
                             );
+                            // Failures name themselves, the same way boot
+                            // prints them: a count alone is how a pack ends
+                            // up "loaded but nothing works".
+                            for failed in &report.failed {
+                                eprintln!(
+                                    "[pack] failed {} '{}': {}",
+                                    failed.kind, failed.id, failed.error
+                                );
+                            }
                             for entry in &report.skipped {
                                 eprintln!("[pack] skipped {}: {}", entry.id, entry.reason);
                             }
@@ -3310,15 +3399,14 @@ impl PackHost<'_> {
                             Ok(manifest) => {
                                 match nguruvilu::content::apply(self.kernel, &pack.path, &manifest)
                                 {
+                                    // Appearance has landed on the kernel; the
+                                    // settings-side content is recomputed from
+                                    // the whole enabled set below, once the
+                                    // drain knows what changed.
                                     Ok(content) => {
-                                        let mut guard =
-                                            self.runtime.lock().expect("runtime lock");
-                                        adopt_content(
-                                            content,
-                                            self.settings,
-                                            &mut *guard,
-                                            self.injection,
-                                        )?;
+                                        for line in content.summary() {
+                                            eprintln!("pack content: {line}");
+                                        }
                                     }
                                     Err(error) => eprintln!(
                                         "[pack] {} content: {error:#}",
@@ -3336,6 +3424,18 @@ impl PackHost<'_> {
         }
 
         if changed {
+            // Set-shaped adoption: every enabled pack, recomputed from the
+            // user's own settings at once. A load and an unload converge on
+            // the state a fresh boot would produce — an unload has an inverse
+            // this way, where folding one pack at a time had none.
+            let adopted = nguruvilu::content::AdoptedContent::recompute(
+                &self.baseline,
+                &nguruvilu::pack::default_packs_dir(),
+            )?;
+            *self.settings = adopted.settings;
+            *self.injection
+                .lock()
+                .expect("injection lock") = Arc::new(adopted.injections);
             // A hot load may have configured search as well: the settings go
             // back into the plugin's cell and its fibers re-apply, so the tool
             // table is in step before it is published.
@@ -3354,12 +3454,18 @@ impl PackHost<'_> {
             // turn reads one consistent view.
             let route = model_route(self.cli, self.settings, Some(self.kernel));
             let mut guard = self.runtime.lock().expect("runtime lock");
+            // The joined persona of every enabled pack — cleared when none
+            // carries one, so an unloaded pack's voice leaves with it. A run
+            // started with `--persona` outranks packs and goes on top right
+            // after.
+            guard.apply(Change::session(
+                "pack",
+                ChangePayload::Persona(adopted.persona.unwrap_or_default()),
+            ))?;
             guard.apply(Change::session(
                 "pack",
                 ChangePayload::ModelRoute(route),
             ))?;
-            // The join inside adoption just rewrote the persona; a run started
-            // with `--persona` outranks packs, so it goes back on top here.
             if let Some(persona) = self.persona_override.as_ref() {
                 guard.apply(Change::session(
                     "cli",
@@ -3467,17 +3573,19 @@ mod tests {
     }
 
     #[test]
-    fn claude_config_converts_stdio_and_reports_the_rest() {
+    fn claude_config_converts_stdio_and_http_endpoints() {
         let doc = serde_json::json!({
             "mcpServers": {
                 "files": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."] },
                 "brave": { "type": "stdio", "command": "node", "args": ["brave.js"],
                            "env": { "BRAVE_API_KEY": "sekret" } },
-                "remote": { "type": "http", "url": "https://example.com/mcp" }
+                "remote": { "type": "http", "url": "https://example.com/mcp",
+                            "headers": { "Authorization": "Bearer x" } },
+                "legacy": { "type": "sse", "url": "https://old.example/sse" }
             }
         });
         let (servers, skipped) = convert_mcp_servers(&doc).expect("converts");
-        assert_eq!(servers.len(), 2);
+        assert_eq!(servers.len(), 3);
         let files = servers.iter().find(|s| s.id == "files").expect("files");
         assert_eq!(files.command.as_deref(), Some("npx"));
         assert_eq!(files.transport, "stdio");
@@ -3486,15 +3594,25 @@ mod tests {
         let brave = servers.iter().find(|s| s.id == "brave").expect("brave");
         assert_eq!(brave.env.get("BRAVE_API_KEY").unwrap(), "sekret");
 
-        // The url transport is reported, not smuggled into the pack.
+        // The endpoint transport imports as our streamable-http form, with
+        // its headers; the legacy `sse` transport still has no honest
+        // conversion and says so instead of entering the pack.
+        let remote = servers.iter().find(|s| s.id == "remote").expect("remote");
+        assert_eq!(remote.transport, "streamable-http");
+        assert_eq!(remote.url.as_deref(), Some("https://example.com/mcp"));
+        assert_eq!(
+            remote.headers.get("Authorization").map(String::as_str),
+            Some("Bearer x")
+        );
+        assert!(remote.command.is_none());
         assert_eq!(skipped.len(), 1);
-        assert_eq!(skipped[0].0, "remote");
-        assert!(skipped[0].1.contains("stdio only"), "{}", skipped[0].1);
+        assert_eq!(skipped[0].0, "legacy");
+        assert!(skipped[0].1.contains("sse"), "{}", skipped[0].1);
 
         // And the generated file must pass our own strict reader.
         let text = serde_json::to_string_pretty(&nguruvilu::pack::McpFile { servers }).unwrap();
         let back: nguruvilu::pack::McpFile = serde_json::from_str(&text).unwrap();
-        assert_eq!(back.servers.len(), 2);
+        assert_eq!(back.servers.len(), 3);
     }
 
     #[test]

@@ -3,6 +3,7 @@
     {
       "id": "chrome-devtools-mcp",
       "transport": "stdio",
+      "source": "npm:chrome-devtools-mcp",
       "command": "chrome-devtools-mcp",
       "args": ["--headless"],
       "scope": "session"

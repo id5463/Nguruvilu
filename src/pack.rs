@@ -106,6 +106,12 @@ pub struct PackManifest {
     /// Pack name.
     #[serde(default)]
     pub name: String,
+    /// One line saying what the pack is for, shown where packs are listed.
+    ///
+    /// Optional: an older pack without one still installs — it just lists as
+    /// name and version, the way every pack did before this field existed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
     /// Pack version.
     #[serde(alias = "version_id", default)]
     pub version_id: String,
@@ -315,6 +321,7 @@ impl PackManifest {
             format_version: FORMAT_VERSION,
             game: GAME.into(),
             name: name.into(),
+            description: String::new(),
             version_id: version_id.into(),
             license: "MIT".into(),
             kernel_version: kernel_version().into(),
@@ -813,7 +820,7 @@ pub struct McpFile {
 pub struct McpServerDecl {
     /// Identifier.
     pub id: String,
-    /// `stdio` today; `streamable-http` is declared but not connected.
+    /// `stdio` (the default) or `streamable-http`.
     #[serde(default = "default_transport")]
     pub transport: String,
     /// Where the server comes from, when it is fetched rather than installed.
@@ -852,6 +859,14 @@ pub struct McpServerDecl {
     /// does, never another platform's binary.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub platforms: BTreeMap<String, PlatformSource>,
+    /// The endpoint, for `transport: "streamable-http"`: the one URL every
+    /// message is `POST`ed to. Required there, ignored for stdio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Headers for `streamable-http` — `Authorization` and friends, sent on
+    /// every request. Ignored for stdio.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
 }
 
 /// One platform's source for an MCP server.
@@ -1445,6 +1460,157 @@ fn only_file(dir: &Path) -> Result<PathBuf> {
     }
 }
 
+/// Install an `npm:`-sourced MCP server into its directory under the pack and
+/// point `command` at the shim npm generated.
+///
+/// `npm install --prefix <dir>` builds the dependency tree inside the server's
+/// own directory, so nothing is installed globally and the pack runs offline
+/// afterwards. The command is written back absolute, exactly like a fetched
+/// server's: the loader spawns stdio commands against the caller's working
+/// directory rather than the pack's.
+///
+/// `bin_hint` is the pack's declared `command`, which selects among the
+/// executables the package exposes; when it matches none, the package's own
+/// name decides, and a single-executable package needs no hint at all.
+async fn install_npm_server(
+    local: &Path,
+    mcp_root: &Path,
+    server: &mut McpServerDecl,
+    package: &str,
+    version: Option<&str>,
+    bin_hint: Option<&str>,
+) -> Result<()> {
+    std::fs::create_dir_all(local)
+        .with_context(|| format!("creating {}", local.display()))?;
+
+    let spec = match version {
+        Some(version) => format!("{package}@{version}"),
+        None => package.to_string(),
+    };
+
+    // npm resolves through the same lookup `npx` does — on Windows it is
+    // `npm.cmd`, which `Command` needs spelled out.
+    let npm = crate::mcp::McpClient::resolve_program("npm");
+    let mut command = tokio::process::Command::new(&npm);
+    command
+        .arg("install")
+        .arg("--prefix")
+        .arg(local)
+        .arg("--no-audit")
+        .arg("--no-fund")
+        .arg(&spec)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(600),
+        command.output(),
+    )
+    .await
+    .map_err(|_| anyhow!("npm install {spec} timed out after 10 minutes"))?
+    .with_context(|| {
+        format!(
+            "running {} — an 'npm:' source needs Node.js/npm on PATH; \
+             install Node.js, or declare the server another way",
+            npm.display()
+        )
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail: Vec<&str> = stderr.lines().rev().take(15).collect();
+        let tail: Vec<&str> = tail.into_iter().rev().collect();
+        return Err(anyhow!(
+            "npm install {spec} failed ({}): {}",
+            output.status,
+            tail.join("\n")
+        ));
+    }
+
+    // Which executable the package exposes: `bin` is either one path (the
+    // command takes the package's unscoped name) or a map of names to paths.
+    let manifest_path = local
+        .join("node_modules")
+        .join(package)
+        .join("package.json");
+    let text = std::fs::read_to_string(&manifest_path).with_context(|| {
+        format!(
+            "reading {}; npm reported success installing {spec} but its \
+             package.json is missing",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("parsing {}", manifest_path.display()))?;
+    let unscoped = package.rsplit('/').next().unwrap_or(package);
+    let bin_name = match manifest.get("bin") {
+        Some(serde_json::Value::String(_)) => unscoped.to_string(),
+        Some(serde_json::Value::Object(map)) => {
+            let chosen = bin_hint
+                .filter(|hint| map.contains_key(*hint))
+                .map(str::to_string)
+                .or_else(|| map.contains_key(unscoped).then(|| unscoped.to_string()))
+                .or_else(|| {
+                    (map.len() == 1)
+                        .then(|| map.keys().next().expect("one key").clone())
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "npm package {spec} exposes several commands ({}) \
+                         and mcp '{}' declares no \"command\" naming which \
+                         one to run",
+                        map.keys().map(String::as_str).collect::<Vec<_>>().join(", "),
+                        server.id
+                    )
+                })?;
+            chosen
+        }
+        _ => {
+            return Err(anyhow!(
+                "npm package {spec} declares no \"bin\"; it cannot be run \
+                 as an MCP server"
+            ))
+        }
+    };
+
+    // The `.bin` shim: on Windows npm writes `<name>.cmd`, elsewhere an
+    // extensionless script with a shebang. Both launch directly.
+    #[cfg(windows)]
+    let shim = format!("{bin_name}.cmd");
+    #[cfg(not(windows))]
+    let shim = bin_name.clone();
+
+    let installed = local
+        .join("node_modules")
+        .join(".bin")
+        .join(&shim);
+    if !installed.is_file() {
+        let available = std::fs::read_dir(local.join("node_modules").join(".bin"))
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_else(|_| "(nothing)".into());
+        return Err(anyhow!(
+            "npm installed {spec} but produced no .bin/{shim}; it provides: {available}"
+        ));
+    }
+
+    server.command = Some(
+        mcp_root
+            .join(&server.id)
+            .join("node_modules")
+            .join(".bin")
+            .join(&shim)
+            .to_string_lossy()
+            .replace('\\', "/"),
+    );
+    Ok(())
+}
+
 // ------------------------------------------------------------------ install
 
 /// Install an archive into the packs directory.
@@ -1570,6 +1736,18 @@ async fn install_inner(
         // wholesale afterwards, so anything meant to survive must be here.
         let local = staging.join(FILES_DIR).join("mcp").join(&server.id);
         match &parsed {
+            // A dependency, not a download: npm builds the whole tree inside
+            // the server's own directory and the shim path is written back
+            // absolute, like every other fetched command. Handled here rather
+            // than fetched, because a tarball alone has no dependency tree.
+            Source::Npm { package, version } => {
+                install_npm_server(&local, &mcp_root, server, package, version.as_deref(), command.as_deref())
+                    .await
+                    .with_context(|| format!("installing mcp '{}' from {source}", server.id))?;
+                server.source = Some(source);
+                mcp_changed = true;
+                continue;
+            }
             Source::Url { url } if crate::fetch::is_archive_name(url) => {
                 let expect = sha256.as_deref().ok_or_else(|| {
                     anyhow!(
@@ -1604,20 +1782,31 @@ async fn install_inner(
         }
         mcp_changed = true;
     }
-    for server in &mcp_decls {
+    for server in &mut mcp_decls {
         if !server.platforms.is_empty() {
             continue; // fetched above, with this platform's source
         }
-        let Some(source) = &server.source else {
+        let Some(source) = server.source.clone() else {
             continue;
         };
-        let parsed = Source::parse(source)
+        let parsed = Source::parse(&source)
             .with_context(|| format!("mcp '{}' source", server.id))?;
+        let local = staging.join(FILES_DIR).join("mcp").join(&server.id);
+        // Same rule as the platform loop above: an npm source is installed by
+        // npm, never handed to the fetcher.
+        if let Source::Npm { package, version } = &parsed {
+            let hint = server.command.clone();
+            install_npm_server(&local, &mcp_root, server, package, version.as_deref(), hint.as_deref())
+                .await
+                .with_context(|| format!("installing mcp '{}' from {source}", server.id))?;
+            mcp_changed = true;
+            continue;
+        }
         let fetched = fetcher
             .fetch(&parsed, server.sha256.as_deref())
             .await
             .with_context(|| format!("fetching mcp '{}' from {source}", server.id))?;
-        copy_tree(&fetched.path, &staging.join(FILES_DIR).join("mcp").join(&server.id))?;
+        copy_tree(&fetched.path, &local)?;
     }
 
     // The assembly is rendered from this file and reads each server's
@@ -1712,6 +1901,10 @@ fn render_assembly(manifest: &PackManifest, staging: &Path) -> Result<String> {
         args: Vec<String>,
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         env: BTreeMap<String, String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        headers: BTreeMap<String, String>,
     }
     #[derive(Serialize)]
     struct OutSkill {
@@ -1805,10 +1998,40 @@ fn render_assembly(manifest: &PackManifest, staging: &Path) -> Result<String> {
                 .with_context(|| format!("reading {}", path.display()))?;
             let parsed: McpFile = serde_json::from_str(&text)
                 .with_context(|| format!("{} is not a valid mcp file", path.display()))?;
+            // An endpoint transport with no endpoint cannot connect, and an
+            // assembly that carried one would defer the complaint to load.
+            for server in &parsed.servers {
+                if server.transport == "streamable-http" && server.url.is_none() {
+                    return Err(anyhow!(
+                        "mcp '{}' uses streamable-http but declares no url",
+                        server.id
+                    ));
+                }
+            }
             parsed
                 .servers
                 .into_iter()
                 .map(|server| {
+                    if server.transport == "streamable-http" {
+                        // The URL is the source: everything the loader needs
+                        // to reach the server is the endpoint plus headers.
+                        return OutMcp {
+                            base: OutBase {
+                                id: server.id.clone(),
+                                source: format!(
+                                    "streamable-http:{}",
+                                    server.url.as_deref().unwrap_or_default()
+                                ),
+                                scope: server.scope.clone(),
+                            },
+                            transport: server.transport.clone(),
+                            command: None,
+                            args: Vec::new(),
+                            env: BTreeMap::new(),
+                            url: server.url.clone(),
+                            headers: server.headers.clone(),
+                        };
+                    }
                     // A fetched server runs from where it landed, so the
                     // command is resolved inside that directory. Without this
                     // the loader would look for it on PATH.
@@ -1832,12 +2055,14 @@ fn render_assembly(manifest: &PackManifest, staging: &Path) -> Result<String> {
                                 .unwrap_or_default()
                                 .trim()
                                 .to_string(),
-                            scope: server.scope,
+                            scope: server.scope.clone(),
                         },
-                        transport: server.transport,
+                        transport: server.transport.clone(),
                         command,
-                        args: server.args,
-                        env: server.env,
+                        args: server.args.clone(),
+                        env: server.env.clone(),
+                        url: None,
+                        headers: BTreeMap::new(),
                     }
                 })
                 .collect()
@@ -1924,10 +2149,38 @@ pub fn read_assembly(dir: &Path) -> Result<Option<crate::assembly::Assembly>> {
     Ok(Some(assembly))
 }
 
+/// The pack's assembly, rendering one when the directory carries none.
+///
+/// Install writes `assembly.yaml`; a directory placed by hand or by an older
+/// install has its manifest and content but no assembly, so every load skips
+/// it — the pack lists fine and does nothing. Rendering the document install
+/// would render (from the same manifest and content files) makes such a pack
+/// loadable without reinstalling it, and the repair is logged. A directory
+/// with no manifest has nothing to render from and keeps its `None`.
+pub fn ensure_assembly(dir: &Path) -> Result<Option<PathBuf>> {
+    let path = dir.join(ASSEMBLY_NAME);
+    if path.is_file() {
+        return Ok(Some(path));
+    }
+    let Ok(manifest) = read_manifest(dir) else {
+        return Ok(None);
+    };
+    let text = render_assembly(&manifest, dir)?;
+    std::fs::write(&path, &text).with_context(|| format!("writing {}", path.display()))?;
+    eprintln!(
+        "[pack] {} had no {}; rendered one from its manifest",
+        manifest.name, ASSEMBLY_NAME
+    );
+    Ok(Some(path))
+}
+
 /// A manifest as displayable pairs.
 pub fn describe(manifest: &PackManifest) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     out.insert("name".into(), manifest.name.clone());
+    if !manifest.description.is_empty() {
+        out.insert("description".into(), manifest.description.clone());
+    }
     out.insert("version".into(), manifest.version_id.clone());
     out.insert("license".into(), manifest.license.clone());
     out.insert("built against".into(), manifest.kernel_version.clone());
@@ -2768,6 +3021,8 @@ mod tests {
             env: BTreeMap::new(),
             scope: None,
             platforms: BTreeMap::new(),
+            url: None,
+            headers: BTreeMap::new(),
         };
 
         // Present: this machine's entry, with its command override.
@@ -2850,6 +3105,8 @@ mod tests {
                         command: Some("driver.exe".into()),
                     },
                 )]),
+                url: None,
+                headers: BTreeMap::new(),
             }],
         };
         std::fs::write(
@@ -2923,6 +3180,8 @@ mod tests {
                         command: None,
                     },
                 )]),
+                url: None,
+                headers: BTreeMap::new(),
             }],
         };
         std::fs::write(

@@ -2,6 +2,7 @@
   "formatVersion": 1,
   "game": "nguruvilu",
   "name": "moodle",
+  "description": "Moodle 学习平台（moodle.herzen.spb.ru）：采集作业/课程、看详情、下载附件、提交作业（需登录凭据）",
   "versionId": "1.0.0",
   "license": "MIT",
   "kernelVersion": "0.1.0",

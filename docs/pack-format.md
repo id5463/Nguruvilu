@@ -195,6 +195,29 @@ my-pack-1.0.0.dshpack          ← zip
 }
 ```
 
+**`transport: "streamable-http"` —— 直连远端 HTTP 端点**:
+
+```jsonc
+{
+  "servers": [
+    {
+      "id": "remote",
+      "transport": "streamable-http",
+      "url": "https://mcp.example.com/mcp",   // 必填:每条消息 POST 到这里
+      "headers": { "Authorization": "Bearer ${MCP_TOKEN}" },  // 每次请求都带上
+      "scope": "session"
+    }
+  ]
+}
+```
+
+- 不拉起子进程:`initialize` / `tools/list` / `tools/call` 全部走对 `url` 的
+  `POST`,响应可能是单条 JSON,也可能是 `text/event-stream`(取回带请求 id 的那条)。
+- 服务器在 `initialize` 响应头下发的 `Mcp-Session-Id` 会在后续每条请求上带回,
+  关闭时以 `DELETE` 结束会话。
+- 没有 `url` 是装载时的明确失败,不会静默跳过;`headers` 里的凭据只进包内容,
+  不出现在任何生成的说明文档里。
+
 **`source` / `platforms` —— 装包时自动取来的服务器**:
 
 ```jsonc
@@ -221,8 +244,9 @@ my-pack-1.0.0.dshpack          ← zip
 
 **`ngu mcp import <claude .mcp.json>`** 可以直接生成本节的声明:读 Claude Code /
 Claude Desktop 配置的 `mcpServers`,stdio 直通成 `servers`(并用**本格式的严格读取器**
-复核一遍再落盘),`http` / `sse` 等传输**如实列出并跳过** —— 不支持的东西进包,只会在
-装载时变成一条失败,不如在导入时说清。环境变量的值写进 `mcp.json`(那是包的正常
+复核一遍再落盘),`type: "http"`(带 `url` 和可选 `headers`)**转成
+`streamable-http` 声明**;旧式 `sse` 等仍**如实列出并跳过** —— 不支持的东西进包,
+只会在装载时变成一条失败,不如在导入时说清。环境变量的值写进 `mcp.json`(那是包的正常
 内容),但**不写进生成的 README**。
 - **`sha256` 是压缩包文件本身的 sha256** —— 上游 release 的 `checksums.txt` 里就是这个
   值,直接照抄;缓存按它寻址,第二次安装不再联网。目录来源用目录哈希。

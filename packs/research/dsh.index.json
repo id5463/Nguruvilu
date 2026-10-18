@@ -2,6 +2,7 @@
   "formatVersion": 1,
   "game": "nguruvilu",
   "name": "research",
+  "description": "深度研究：4 个技能（深度搜索、引用来源、草稿批评、出图发表）+ 研究员人格，做调研和写报告用",
   "versionId": "1.0.0",
   "license": "MIT",
   "kernelVersion": "0.1.0",

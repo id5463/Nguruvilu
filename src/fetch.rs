@@ -58,7 +58,7 @@ pub fn platform_tag() -> &'static str {
 ///
 /// A source naming anything else is kept and resolved by a registered handler;
 /// this list exists for diagnostics, not as a closed set.
-pub const KNOWN_SCHEMES: &[&str] = &["github", "https", "http", "builtin", "dylib"];
+pub const KNOWN_SCHEMES: &[&str] = &["github", "https", "http", "npm", "builtin", "dylib"];
 
 /// Every platform tag the format knows.
 pub const PLATFORMS: &[&str] = &[
@@ -90,6 +90,22 @@ pub enum Source {
     Url {
         /// The URL.
         url: String,
+    },
+    /// `npm:package@version` — a package installed from the npm registry into
+    /// the pack's own directory when the pack is installed.
+    ///
+    /// This is not fetched as a file: a tarball alone has no dependency tree,
+    /// so `pack::install` runs `npm install --prefix` and points the server at
+    /// the resulting `.bin` shim. The network moment is install, exactly like
+    /// every other remote source; after that the pack runs offline.
+    Npm {
+        /// Package name, possibly scoped (`@scope/name`).
+        package: String,
+        /// Exact version, or `None` for whatever the registry calls latest.
+        ///
+        /// An unpinned version installs — but says so, the way an unpinned git
+        /// ref does.
+        version: Option<String>,
     },
     /// A name the kernel already registered; nothing to fetch.
     Builtin {
@@ -128,6 +144,9 @@ impl Source {
             return Ok(Source::Builtin {
                 name: rest.trim().to_string(),
             });
+        }
+        if let Some(rest) = raw.strip_prefix("npm:") {
+            return Self::parse_npm(rest, raw);
         }
         if let Some(rest) = raw.strip_prefix("dylib:") {
             return Ok(Source::Local {
@@ -176,6 +195,38 @@ impl Source {
              or a plain https:// URL",
             KNOWN_SCHEMES.join(", ")
         ))
+    }
+
+    /// `package@version`, where the version is optional and a scope may carry
+    /// its own `@` (`@scope/name@1.2.3`).
+    ///
+    /// The version is split from the right: a package name can contain one `@`
+    /// (the scope marker) but the *last* `@` before the end is always the
+    /// version separator when there is one.
+    fn parse_npm(rest: &str, raw: &str) -> Result<Self> {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return Err(anyhow!("'{raw}' names no package"));
+        }
+        // Find the version separator: the last '@' that is not the leading
+        // scope marker of the name itself.
+        let (package, version) = match rest.rfind('@') {
+            Some(index) if index > 0 => {
+                let (name, version) = rest.split_at(index);
+                (name, Some(version[1..].to_string()))
+            }
+            _ => (rest, None),
+        };
+        if package.is_empty() {
+            return Err(anyhow!("'{raw}' names no package"));
+        }
+        if matches!(&version, Some(v) if v.trim().is_empty()) {
+            return Err(anyhow!("'{raw}' has an empty version after '@'"));
+        }
+        Ok(Source::Npm {
+            package: package.to_string(),
+            version,
+        })
     }
 
     /// `owner/repo@path@ref`, where `@path` and `@ref` are both optional.
@@ -230,6 +281,10 @@ impl Source {
                 git_ref,
             } => format!("{owner}/{repo}@{path}@{git_ref}"),
             Source::Url { url } => url.clone(),
+            Source::Npm { package, version } => match version {
+                Some(version) => format!("npm:{package}@{version}"),
+                None => format!("npm:{package}"),
+            },
             Source::Builtin { name } => format!("builtin:{name}"),
             Source::Local { path } => format!("dylib:{path}"),
             Source::Custom { scheme, rest } => format!("{scheme}:{rest}"),
@@ -774,6 +829,13 @@ impl Fetcher {
             } => self.download_github(owner, repo, path, git_ref, into).await,
             Source::Builtin { .. } | Source::Local { .. } => Err(anyhow!(
                 "{} is not a remote source and cannot be fetched",
+                source.describe()
+            )),
+            // npm is installed, not downloaded: a tarball has no dependency
+            // tree, so `pack::install` runs `npm install` for this variant
+            // before anything reaches the fetcher.
+            Source::Npm { .. } => Err(anyhow!(
+                "{} is installed by npm during pack install, never fetched directly",
                 source.describe()
             )),
             // A scheme the kernel does not handle. Resolved by a registered

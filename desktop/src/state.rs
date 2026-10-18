@@ -29,7 +29,8 @@ use crate::sink::EventSink;
 /// System prompt for the desktop shell.
 pub const BASE_PROMPT: &str = "You are a coding agent. Use the tools to inspect and change \
 files and to run commands. Prefer `read` over shelling out to view files, and `edit` for \
-surgical changes. Keep answers short and concrete.";
+surgical changes. Keep answers short and concrete. When you tell the user about a file, \
+give its absolute path — a bare or relative name is not something they can open.";
 
 /// Newest transcript entries sent to the page on connect and on each refresh.
 /// Older history is fetched on demand as the page scrolls up.
@@ -269,6 +270,14 @@ pub struct AppState {
     pub search_cell: nguruvilu::tools::search::SettingsCell,
     /// The judge plugin's settings cell — same contract as search.
     pub judge_cell: nguruvilu::tools::judge::SettingsCell,
+    /// The user's own settings, before any pack folded over them.
+    ///
+    /// [`recompute_pack_content`](Self::recompute_pack_content) starts from
+    /// this baseline on every load and unload, so an unloaded pack's route
+    /// and window leave with it while the user's stored values come back.
+    /// A save from the settings panel replaces it: what the user typed is
+    /// their own choice, and the next pack toggle must not undo it.
+    pub pack_baseline: Settings,
 }
 
 impl AppState {
@@ -385,6 +394,9 @@ impl AppState {
 
         config.set_cwd(session.cwd.clone());
 
+        // Before any pack folds: boot loads the packs after this point, so the
+        // snapshot is exactly the user's own state a recompute returns to.
+        let pack_baseline = settings.clone();
         let state = Self {
             kernel,
             config,
@@ -403,6 +415,7 @@ impl AppState {
             mcp: Vec::new(),
             search_cell,
             judge_cell,
+            pack_baseline,
         };
         // The session this process boots into is already current: its start
         // belongs to bootstrap, not to the first prompt. The switch pins its
@@ -678,6 +691,12 @@ impl AppState {
             route.base_url = url.to_string();
         }
         self.route = route.clone();
+        // The choice is the user's, so the baseline follows it too — a later
+        // pack recompute must not send the route back to the boot value.
+        self.pack_baseline.model = model.to_string();
+        if let Some(url) = base_url {
+            self.pack_baseline.base_url = url.to_string();
+        }
 
         let mut runtime = self.config.runtime.lock().expect("runtime lock");
         runtime.apply(Change::session(
@@ -755,6 +774,10 @@ impl AppState {
         };
         settings.save()?;
         self.settings = settings;
+        // The panel just wrote the user's own file, so what it shows is now
+        // their choice: the baseline follows, or the next pack toggle would
+        // recompute away the values they entered.
+        self.pack_baseline = self.settings.clone();
 
         // The context policy is derived from settings, so it has to be rebuilt
         // here too — otherwise the panel would save a window that only takes
@@ -795,115 +818,60 @@ impl AppState {
         Ok(())
     }
 
-    /// Adopt what a pack carried: persona, route, context policy, rules.
+    /// Adopt what the enabled packs carry, recomputed as one set.
     ///
-    /// A pack's settings replace the standing ones — the pack is the unit the
-    /// user chose, so it decides. The next turn reads them.
-    pub fn adopt_pack_content(&mut self, content: nguruvilu::content::PackContent) {
-        if let Some(models) = &content.models {
-            if let Some(url) = &models.base_url {
-                self.settings.base_url = url.clone();
-            }
-            if let Some(name) = &models.model {
-                self.settings.model = name.clone();
-            }
-            if let Some(effort) = &models.reasoning_effort {
-                self.settings.reasoning_effort = effort.clone();
-            }
-            // Same rule as the kernel: the pack that names the gateway names
-            // how its answers are delivered.
-            if let Some(delivery) = &models.delivery {
-                self.settings.delivery = delivery.clone();
-            }
-            if let Some(degrade) = models.degrade_on_stall {
-                self.settings.degrade_on_stall = Some(degrade);
-            }
-            if let Some(proxy) = &models.proxy {
-                self.settings.proxy = proxy.clone();
-            }
-            if let Some(ceiling) = &models.max_output_tokens {
-                self.settings.max_output_tokens = nguruvilu::size::parse_size(ceiling).ok();
-            }
-            for (key, value) in &models.extra_body {
-                self.settings.extra_body.insert(key.clone(), value.clone());
-            }
-            // The key itself is never in a pack; only the name of the variable
-            // holding it.
-            if let Some(var) = &models.api_key_env {
-                if let Ok(value) = std::env::var(var) {
-                    if !value.trim().is_empty() {
-                        self.settings.api_key = value;
-                    }
-                }
-            }
-        }
+    /// [`nguruvilu::content::AdoptedContent::recompute`] folds every enabled
+    /// pack over [`pack_baseline`](Self::pack_baseline) — the state a fresh
+    /// boot arrives at — so a load and an unload converge on the same result
+    /// instead of an unload having no inverse: the pack that brought a route
+    /// is gone and its route goes with it. Persona, injection rules, the
+    /// context policy, the route, and the tool table all move together, so
+    /// the next turn reads one consistent view.
+    pub fn recompute_pack_content(&mut self) -> Result<()> {
+        let adopted = nguruvilu::content::AdoptedContent::recompute(
+            &self.pack_baseline,
+            &nguruvilu::pack::default_packs_dir(),
+        )?;
+        self.settings = adopted.settings;
 
-        if let Some(models) = &content.models {
-            if let Some(network) = &models.network {
-                self.settings.network = network.clone();
-            }
-        }
-
-        if let Some(context) = &content.context {
-            if let Some(window) = &context.window {
-                self.settings.context_window = nguruvilu::size::parse_size(window).ok();
-            }
-            if let Some(percent) = context.compact_percent {
-                self.settings.compact_percent = percent.min(100);
-            }
-            if let Some(keep) = context.compact_keep_recent {
-                self.settings.compact_keep_recent = keep.max(1);
-            }
-        }
-
-        // The context policy is rebuilt from the settings that just changed, so
-        // a pack's window takes effect on the next turn rather than the next
-        // launch.
+        // The context policy is rebuilt from the settings that just changed,
+        // so a pack's window takes effect on the next turn rather than the
+        // next launch.
         if let Ok(mut policy) = self.config.policy.lock() {
             *policy = std::sync::Arc::new(self.settings.context_policy(None));
         }
-
-        // The persona is the joined soul of every installed pack — never this
-        // pack's alone: applied one by one, load order would decide who the
-        // model is. Best-effort here because adoption must not fail over the
-        // persona; `installed_persona` itself reports read errors upward.
-        match nguruvilu::content::installed_persona(
-            &nguruvilu::pack::default_packs_dir(),
-        ) {
-            Ok(Some(persona)) => {
-                if let Ok(mut runtime) = self.config.runtime.lock() {
-                    let _ = runtime.apply(nguruvilu::hotreload::Change::session(
-                        "pack",
-                        nguruvilu::hotreload::ChangePayload::Persona(persona),
-                    ));
-                }
-            }
-            Ok(None) => {}
-            Err(error) => eprintln!("[pack] persona: {error:#}"),
+        // Injection rules: the standing file with each pack's engine applied
+        // over it, the same composition a boot arrives at.
+        if let Ok(mut injection) = self.config.injection.lock() {
+            *injection = std::sync::Arc::new(adopted.injections);
         }
 
-        // The pack's settings replace the standing ones, so the route is
-        // rebuilt and published with them: a pack that names another endpoint
-        // or another output ceiling decides the next turn, not the next launch.
+        // The route is rebuilt from the adopted settings and folds in whatever
+        // network policy the kernel currently publishes — the truth after a
+        // pack's plugin loaded or unloaded.
         self.route = ModelRoute::from_settings(&self.settings);
+        let view = self
+            .kernel
+            .service_view(nguruvilu::plugin::RealmMap::new());
+        if let Some(network) = nguruvilu::network::NetworkHandle::from_view(&view) {
+            self.route.network = network;
+        }
+        let tools = Arc::new(self.kernel.tools().clone());
+
         if let Ok(mut runtime) = self.config.runtime.lock() {
+            // The joined persona — cleared when no enabled pack carries one,
+            // so an unloaded pack's voice leaves with it.
+            let _ = runtime.apply(nguruvilu::hotreload::Change::session(
+                "pack",
+                nguruvilu::hotreload::ChangePayload::Persona(adopted.persona.unwrap_or_default()),
+            ));
+            runtime.set_tools(tools);
             let _ = runtime.apply(nguruvilu::hotreload::Change::session(
                 "pack",
                 nguruvilu::hotreload::ChangePayload::ModelRoute(self.route.clone()),
             ));
         }
-
-        if let Some(rules) = content.injections {
-            if let Ok(mut injection) = self.config.injection.lock() {
-                *injection = std::sync::Arc::new(rules);
-            }
-        }
-
-        // A pack may be what configured search; the tool is put in step with
-        // the settings when the kernel comes back (see `restore_kernel`).
-        if let Some(search) = &content.search {
-            search.apply(&mut self.settings.search);
-        }
+        Ok(())
     }
 
     /// Installed packs.
@@ -914,6 +882,7 @@ impl AppState {
             "dir": dir.display().to_string(),
             "packs": packs.iter().map(|pack| json!({
                 "name": pack.manifest.name,
+                "description": pack.manifest.description,
                 "version": pack.manifest.version_id,
                 "license": pack.manifest.license,
                 // What the pack fetches, and what it carries itself.

@@ -2,6 +2,7 @@
   "formatVersion": 1,
   "game": "nguruvilu",
   "name": "browser-use",
+  "description": "浏览器自动化：通过 chrome-devtools MCP 打开网页、点击、截图、读取页面（需先 npm install -g chrome-devtools-mcp@1.10.1）",
   "versionId": "1.0.0",
   "license": "MIT",
   "kernelVersion": "0.1.0",

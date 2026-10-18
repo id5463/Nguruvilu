@@ -31,3 +31,28 @@ shots/
 # 绝不入库 —— 文件在工作文件夹里、可搜可读,只是不去 GitHub)
 笔记-*.md
 NOTES-*.md
+
+# 本地运维脚本与探针输出:部署脚本里是服务器明文密码,日志/转写里是私有会话
+# 内容与上传路径 —— 都不属于仓库
+__pycache__/
+deploy-cloud.py
+build-retry.py
+fix-restart.py
+probe-*.py
+read-*.py
+verify-*.py
+write-descriptions.py
+check-packs.py
+phone-layout.py
+*-check.txt
+*-log.txt
+prompts.txt
+transcript-snips.txt
+server-*.txt
+upload-log.txt
+log-tail.txt
+pack-timeline.txt
+multi-test/
+relay/
+nul
+test-*.txt

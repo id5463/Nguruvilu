@@ -47,6 +47,77 @@ impl PackContent {
             && self.search.is_none()
     }
 
+    /// Fold the settings-side content of this pack onto `settings`.
+    ///
+    /// Route, context window, and search — the host-owned fields a pack may
+    /// declare over the user's own. A field the pack does not carry keeps the
+    /// value already there, so packs compose in the order they are applied.
+    /// Persona and injections are deliberately *not* handled here: the persona
+    /// is a join over every enabled pack and the injection engine is replaced
+    /// as one unit, so both need the whole set rather than one pack.
+    pub fn fold_settings(&self, settings: &mut crate::settings::Settings) {
+        if let Some(models) = &self.models {
+            if let Some(url) = &models.base_url {
+                settings.base_url = url.clone();
+            }
+            if let Some(name) = &models.model {
+                settings.model = name.clone();
+            }
+            if let Some(effort) = &models.reasoning_effort {
+                settings.reasoning_effort = effort.clone();
+            }
+            if let Some(delivery) = &models.delivery {
+                settings.delivery = delivery.clone();
+            }
+            if let Some(degrade) = models.degrade_on_stall {
+                settings.degrade_on_stall = Some(degrade);
+            }
+            if let Some(proxy) = &models.proxy {
+                settings.proxy = proxy.clone();
+            }
+            match models
+                .max_output_tokens
+                .as_deref()
+                .map(crate::size::parse_size)
+            {
+                Some(Ok(tokens)) => settings.max_output_tokens = Some(tokens),
+                Some(Err(error)) => eprintln!("[pack] maxOutputTokens: {error}"),
+                None => {}
+            }
+            for (key, value) in &models.extra_body {
+                settings.extra_body.insert(key.clone(), value.clone());
+            }
+            if let Some(network) = &models.network {
+                settings.network = network.clone();
+            }
+            // The key itself is never in a pack; only the name of the variable
+            // holding it.
+            if let Some(var) = &models.api_key_env {
+                if let Ok(value) = std::env::var(var) {
+                    if !value.trim().is_empty() {
+                        settings.api_key = value;
+                    }
+                }
+            }
+        }
+
+        if let Some(context) = &self.context {
+            if let Some(window) = &context.window {
+                settings.context_window = crate::size::parse_size(window).ok();
+            }
+            if let Some(percent) = context.compact_percent {
+                settings.compact_percent = percent.min(100);
+            }
+            if let Some(keep) = context.compact_keep_recent {
+                settings.compact_keep_recent = keep.max(1);
+            }
+        }
+
+        if let Some(search) = &self.search {
+            search.apply(&mut settings.search);
+        }
+    }
+
     /// One line per part, for diagnostics.
     pub fn summary(&self) -> Vec<String> {
         let mut out = Vec::new();
@@ -102,16 +173,14 @@ impl PackContent {
     }
 }
 
-/// Read every content file a pack names, and install its appearance.
+/// Read every content file a pack names, without touching the kernel.
 ///
-/// Returns what the host still has to apply. A file that is named but missing
-/// is an error: a pack that silently loses its persona because of a typo is
-/// worse than one that refuses to load.
-pub fn apply(
-    kernel: &mut crate::plugin::Kernel,
-    dir: &Path,
-    manifest: &PackManifest,
-) -> Result<PackContent> {
+/// This is the read-only half of [`apply`]: persona, route, context, rules,
+/// search, MCP declarations — everything the *host* owns. Appearance is the
+/// one kernel-owned part and is deliberately left to `apply`, so a recomputation
+/// pass over the installed packs can re-read what they contribute without
+/// reinstalling appearance fibers that are already in place.
+pub fn read(dir: &Path, manifest: &PackManifest) -> Result<PackContent> {
     let mut content = PackContent::default();
 
     if let Some(file) = &manifest.soul {
@@ -164,6 +233,21 @@ pub fn apply(
         );
     }
 
+    Ok(content)
+}
+
+/// Read every content file a pack names, and install its appearance.
+///
+/// Returns what the host still has to apply. A file that is named but missing
+/// is an error: a pack that silently loses its persona because of a typo is
+/// worse than one that refuses to load.
+pub fn apply(
+    kernel: &mut crate::plugin::Kernel,
+    dir: &Path,
+    manifest: &PackManifest,
+) -> Result<PackContent> {
+    let mut content = read(dir, manifest)?;
+
     if let Some(file) = &manifest.look {
         let path = dir.join(file.path());
         let text = std::fs::read_to_string(&path)
@@ -176,8 +260,79 @@ pub fn apply(
     Ok(content)
 }
 
-/// The persona every installed pack contributes, joined into one replace.
+/// The content every **installed, enabled** pack declares, in name order.
 ///
+/// Recomputing a host's adopted state (after a load or an unload) needs exactly
+/// this set: what the packs currently say, not what each individual load last
+/// happened to fold in. Name order is `installed`'s own order, so the pass
+/// reproduces the sequence a boot performs.
+pub fn installed_content(packs_dir: &Path) -> Result<Vec<(String, PackContent)>> {
+    let mut packs = crate::pack::installed(packs_dir)?;
+    packs.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));
+    let mut out = Vec::new();
+    for pack in packs.iter().filter(|pack| pack.enabled) {
+        let Ok(manifest) = crate::pack::read_manifest(&pack.path) else {
+            // A manifest that cannot be read is reported by listing paths
+            // elsewhere; here it contributes nothing rather than aborting
+            // the recomputation of every other pack.
+            continue;
+        };
+        match read(&pack.path, &manifest) {
+            Ok(content) => out.push((manifest.name, content)),
+            Err(error) => eprintln!("[pack] {} content: {error:#}", manifest.name),
+        }
+    }
+    Ok(out)
+}
+
+/// The state a host adopts from packs, recomputed from the enabled set.
+///
+/// [`apply`] folds one pack's content into a host incrementally, which means an
+/// unload has no inverse: the pack that brought a route is gone but its route
+/// stays. This is the set-shaped answer — recompute everything from *every*
+/// enabled pack at once, so load and unload converge on the same state a fresh
+/// boot would produce:
+///
+/// * `settings` starts at `baseline` (the user's own stored settings) and each
+///   enabled pack folds over it in name order, exactly as boot does.
+/// * `injections` starts at the user's standing rules
+///   ([`InjectionEngine::load_default`]) and each pack's engine replaces it —
+///   the same last-in-name-order-wins rule a boot arrives at.
+/// * `persona` is the join over all enabled packs (see [`installed_persona`]).
+#[derive(Debug, Clone)]
+pub struct AdoptedContent {
+    /// Settings with every enabled pack's fold applied over the baseline.
+    pub settings: crate::settings::Settings,
+    /// Injection rules: the standing file with each pack's engine applied over it.
+    pub injections: crate::context::InjectionEngine,
+    /// Joined persona of every enabled pack, or `None` when none carries one.
+    pub persona: Option<String>,
+}
+
+impl AdoptedContent {
+    /// Recompute the adopted state from `baseline` and the enabled packs.
+    pub fn recompute(
+        baseline: &crate::settings::Settings,
+        packs_dir: &Path,
+    ) -> Result<Self> {
+        let mut settings = baseline.clone();
+        let mut injections = crate::context::InjectionEngine::load_default();
+        for (_, content) in installed_content(packs_dir)? {
+            content.fold_settings(&mut settings);
+            if let Some(rules) = content.injections {
+                injections = rules;
+            }
+        }
+        let persona = installed_persona(packs_dir)?;
+        Ok(Self {
+            settings,
+            injections,
+            persona,
+        })
+    }
+}
+
+/// The persona every installed pack contributes, joined into one replace.///
 /// The runtime holds a **single** persona slot. Applying each pack's soul
 /// one by one would make load order decide who the model is — the alphabet
 /// would decide it. The join is over the *set* of installed, enabled packs

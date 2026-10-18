@@ -2,6 +2,7 @@
   "formatVersion": 1,
   "game": "nguruvilu",
   "name": "judge",
+  "description": "决策评审员：用独立模型给结论第二意见（顾问式，只建议不拦截；需配置 endpoint 和 key）",
   "versionId": "1.0.0",
   "license": "MIT",
   "kernelVersion": "0.1.0",

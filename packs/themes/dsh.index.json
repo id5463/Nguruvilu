@@ -2,6 +2,7 @@
   "formatVersion": 1,
   "game": "nguruvilu",
   "name": "themes",
+  "description": "主题外观：一组可切换的界面配色（look.json）",
   "versionId": "1.0.0",
   "license": "MIT",
   "kernelVersion": "0.1.0",

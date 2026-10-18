@@ -3,8 +3,9 @@
     {
       "id": "vk-api",
       "transport": "stdio",
-      "command": "npx",
-      "args": ["-y", "vk-mcp-server"],
+      "source": "npm:vk-mcp-server",
+      "command": "vk-mcp-server",
+      "args": [],
       "scope": "session"
     }
   ]

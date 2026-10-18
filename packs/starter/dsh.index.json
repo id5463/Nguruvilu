@@ -2,6 +2,7 @@
   "formatVersion": 1,
   "game": "nguruvilu",
   "name": "starter",
+  "description": "起始包（预装）：中文人格与注入、主题外观、网页搜索、子代理、桌面驱动 cua-driver、可改的内置界面",
   "versionId": "1.0.0",
   "license": "MIT",
   "kernelVersion": "0.1.0",

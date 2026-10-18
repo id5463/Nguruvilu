@@ -280,35 +280,48 @@ impl Loader {
             .as_ref()
             .ok_or_else(|| anyhow!("mcp step '{}' has no server definition", step.id))?;
 
-        match entry.transport {
+        let spec = match entry.transport {
             Transport::StreamableHttp => {
-                // Declared but not connected: the HTTP transport is a separate
-                // piece of work, and silently pretending to load it would be
-                // worse than saying so.
-                return Ok(Outcome::Skipped(
-                    "streamable-http transport is not implemented yet".into(),
-                ));
+                // One URL carries every message; a declaration without one
+                // cannot be connected and says so instead of being skipped.
+                let url = entry.url.clone().ok_or_else(|| {
+                    anyhow!("mcp '{}' uses streamable-http but declares no url", step.id)
+                })?;
+                McpSpec {
+                    id: step.id.clone(),
+                    command: String::new(),
+                    args: Vec::new(),
+                    env: std::collections::HashMap::new(),
+                    cwd: None,
+                    timeout_ms: entry.timeout_ms.unwrap_or(60_000),
+                    url: Some(url),
+                    headers: entry.headers.clone(),
+                }
             }
-            Transport::Stdio => {}
-        }
-
-        let command = entry
-            .command
-            .clone()
-            .ok_or_else(|| anyhow!("mcp '{}' uses stdio but declares no command", step.id))?;
-
-        let spec = McpSpec {
-            id: step.id.clone(),
-            command,
-            args: entry.args.clone(),
-            env: entry.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-            cwd: entry
-                .base
-                .source
-                .is_empty()
-                .then(|| self.pack_dir.as_ref().map(|d| d.display().to_string()))
-                .flatten(),
-            timeout_ms: entry.timeout_ms.unwrap_or(60_000),
+            Transport::Stdio => {
+                let command = entry.command.clone().ok_or_else(|| {
+                    anyhow!("mcp '{}' uses stdio but declares no command", step.id)
+                })?;
+                McpSpec {
+                    id: step.id.clone(),
+                    command,
+                    args: entry.args.clone(),
+                    env: entry
+                        .env
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                    cwd: entry
+                        .base
+                        .source
+                        .is_empty()
+                        .then(|| self.pack_dir.as_ref().map(|d| d.display().to_string()))
+                        .flatten(),
+                    timeout_ms: entry.timeout_ms.unwrap_or(60_000),
+                    url: None,
+                    headers: std::collections::BTreeMap::new(),
+                }
+            }
         };
 
         let client = Arc::new(McpClient::connect(&spec).await?);
@@ -352,7 +365,7 @@ impl Loader {
                 move |args| {
                     let client = Arc::clone(&client_ref);
                     let name = remote_name.clone();
-                    Box::pin(async move { client.call(&name, args).await.map(Into::into) }) as ToolFuture
+                    Box::pin(async move { client.call(&name, args).await }) as ToolFuture
                 },
             );
 
@@ -1031,23 +1044,59 @@ stages:
     }
 
     #[tokio::test]
-    async fn streamable_http_mcp_is_declared_but_not_connected() {
-        let dir = temp_dir("mcp-http");
+    async fn streamable_http_without_a_url_fails_with_the_reason() {
+        let dir = temp_dir("mcp-http-no-url");
         let mut loader = loader_with(&dir, vec![]);
         let manifest = r#"
 version: 1
+defaults:
+  on_failure: skip
 stages:
   - name: services
     mcp:
       - id: remote-mcp
         transport: streamable-http
-        url: "https://example.invalid/mcp"
 "#;
         let plan = Assembly::parse(manifest).unwrap().plan("linux").unwrap();
         let report = loader.apply(&plan).await.unwrap();
 
-        assert_eq!(report.skipped.len(), 1);
-        assert!(report.skipped[0].reason.contains("not implemented"));
+        assert_eq!(report.failed.len(), 1);
+        assert!(
+            report.failed[0].error.contains("declares no url"),
+            "{}",
+            report.failed[0].error
+        );
+        assert!(loader.mcp_servers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn streamable_http_with_a_url_is_connected_not_skipped() {
+        let dir = temp_dir("mcp-http");
+        let mut loader = loader_with(&dir, vec![]);
+        // Port 9 on loopback: nothing listens there, so the connection fails
+        // fast and locally — the point is *which* failure: a connection
+        // attempt, never the old "not implemented" skip.
+        let manifest = r#"
+version: 1
+defaults:
+  on_failure: skip
+stages:
+  - name: services
+    mcp:
+      - id: remote-mcp
+        transport: streamable-http
+        url: "http://127.0.0.1:9/mcp"
+"#;
+        let plan = Assembly::parse(manifest).unwrap().plan("linux").unwrap();
+        let report = loader.apply(&plan).await.unwrap();
+
+        assert_eq!(report.failed.len(), 1, "{:?}", report.failed);
+        assert!(!report.failed[0].error.contains("not implemented"));
+        assert!(
+            report.failed[0].error.contains("MCP server"),
+            "{}",
+            report.failed[0].error
+        );
         assert!(loader.mcp_servers().is_empty());
     }
 

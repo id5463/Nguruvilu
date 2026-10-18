@@ -103,7 +103,7 @@ src/
   plugin.rs        插件内核(隔离域 / epoch 自动重载 / 依赖 / effect 撤销 / 权限接口)
   events.rs        事件总线(观察式订阅 / effect 退订 / 审计 JSONL 与 5MB 轮转)
   skills.rs        技能系统(目录扫描 / frontmatter 解析 / 目录注入 / 加载工具)
-  mcp.rs           MCP 客户端(stdio,JSON-RPC,并发安全)
+  mcp.rs           MCP 客户端(stdio + Streamable HTTP,JSON-RPC,并发安全)
   pack.rs          整合包(.dshpack zip:打包 / 校验 / 安装 / 清单;Carried 与 Fetched 两种内容形态)
   preinstall.rs    预装包(两个官方包:starter 五合一 + judge 嵌进二进制;已卸载不复活、已编辑不覆盖)
   dylib.rs         动态库插件(最小 C ABI + JSON API、ABI 校验、热更新)
@@ -528,7 +528,7 @@ stages:
 | 面 | 状态 | 细节 |
 |---|---|---|
 | **Skills**(`.claude/skills/**/SKILL.md`) | ✅ 直接可用 | 同为"目录 + frontmatter + 正文";frontmatter 支持 `>`/`\|` **块标量**与**带引号含冒号的值**(真实 Claude Code 技能常用这两种写法),未知字段(`allowed-tools`、`license`…)原样容忍;id 取目录名 |
-| **MCP**(`.mcp.json`) | ✅ `ngu mcp import` | 生成一个可审的本地包(清单 + mcp.json + 说明);stdio 直通并经**我们的严格读取器复核**;`http`/`sse` 等传输**如实列出并跳过**(本内核今天只连 stdio),不混进包里;环境变量**只写进包,值不出现在生成的 README 里** |
+| **MCP**(`.mcp.json`) | ✅ `ngu mcp import` | 生成一个可审的本地包(清单 + mcp.json + 说明);stdio 直通并经**我们的严格读取器复核**;`type: "http"`(url + headers)**转成 `streamable-http` 声明,装载时直连端点**;旧式 `sse` 等**如实列出并跳过**;环境变量**只写进包,值不出现在生成的 README 里** |
 | Slash commands / 子代理定义 | ⏳ 映射成技能(P1) | 纯提示词/persona 结构,风险低 |
 | Hooks | ⏳ 单独议题 | "事前拦截"与本内核"不设关卡 + 如实报告"的关系需要先设计(依赖插件事件系统,见下节) |
 
@@ -632,7 +632,7 @@ pwsh -File release.ps1
 | **动态库插件** | ✅ | 最小 C ABI(char* + i32)+ 全 JSON API;ABI 版本校验;库永不卸载;热更新用新文件名 |
 | **权限接口** | ✅ | 收集式 + deny-wins,顺序无关 |
 | **技能系统** | ✅ | 目录扫描、frontmatter、目录注入提示词、按需加载工具 |
-| **MCP** | ✅ | stdio JSON-RPC 客户端,工具自动注册与命名空间隔离 |
+| **MCP** | ✅ | stdio 与 Streamable HTTP 两种传输的 JSON-RPC 客户端,工具自动注册与命名空间隔离 |
 | **装配清单** | ✅ | 阶段 / 依赖拓扑 / order / 平台过滤 / 循环检测 |
 | **动态加载层** | ✅ | 插件·MCP·技能平级加载,台账去重,失败策略(abort/skip/retry) |
 | **整合包** | ✅ | .dshpack(zip):打包 / 校验 / 安装;身份与装配分离;路径逃逸防护 |
@@ -678,6 +678,10 @@ pwsh -File release.ps1
 * 移动端多标签会话(方案 C)
 * macOS / Linux 构建矩阵与发布产物(GitHub Actions)
 * `browser-use` 打磨:固定版本安装引导、会话内状态保留的边界说明
+
+## 包的许可
+
+所有包都必须是 MIT 许可。每个包的 `dsh.index.json` 中 `license` 字段须为 `"MIT"`,包内的每个插件、技能与组件也须声明 `"MIT"`。非 MIT 许可的包不属于本项目的分发范围,作者若要分发其他许可的包,请自行承担其许可义务。
 
 ## 许可
 

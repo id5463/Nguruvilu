@@ -2,6 +2,7 @@
   "formatVersion": 1,
   "game": "nguruvilu",
   "name": "vk",
+  "description": "VK（VKontakte）社群：读写帖子的 MCP 工具 + 使用技能（读需服务密钥，写需社群 token）",
   "versionId": "1.0.0",
   "license": "MIT",
   "kernelVersion": "0.1.0",

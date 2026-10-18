@@ -61,6 +61,7 @@
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .pack-meta { font-size: 10.5px; color: var(--dim); margin-top: 3px; }
+  .pack-desc { font-size: 12px; color: var(--text); margin-top: 4px; line-height: 1.45; }
   .notice {
     border-radius: 6px; padding: 7px 9px; margin-bottom: 8px;
     font-size: 11.5px; line-height: 1.5;
@@ -401,42 +402,92 @@
 
   /* Phone-only controls stay out of the desktop layout entirely. */
   .phone-only { display: none !important; }
+  /* The drawer backdrop: shown only while the phone drawer is open, never
+     anywhere else (a plain div would otherwise take grid space). */
+  #drawer-backdrop { display: none; }
 
-  /* ---------- phones: one column, sessions become a chip strip ---------- */
+  /* ---------- phones: one column, sessions in a sliding drawer ---------- */
   @media (max-width: 860px) {
     body {
-      grid-template-columns: 1fr;
-      /* sessions strip | conversation | composer | status */
-      grid-template-rows: 56px minmax(0, 1fr) auto auto 40px;
+      /* minmax(0, 1fr), not `1fr`: an auto minimum would let the top bar's
+         nowrap title set the column's min-content — every row stretching
+         wider than the screen, with the composer's Send button pushed off
+         the right edge. The column is the viewport, period. */
+      grid-template-columns: minmax(0, 1fr);
+      /* top bar | conversation | composer | status */
+      grid-template-rows: auto minmax(0, 1fr) auto auto 40px;
       font-size: 14px;
     }
-    #sessions {
-      border-right: none;
-      border-bottom: 1px solid var(--line);
-      padding: 7px 10px;
-      display: flex; align-items: center; gap: 8px;
-      height: 56px; max-height: 56px; overflow: hidden;
-      -webkit-overflow-scrolling: touch;
-      scrollbar-width: none;
+    /* One row with the menu button and the conversation in front of the
+       thumb; the session list slides in over the conversation from here. */
+    #topbar.phone-only {
+      display: flex !important; align-items: center; gap: 10px;
+      grid-row: 1;
+      padding: 4px 10px calc(4px + env(safe-area-inset-top, 0px));
+      border-bottom: 1px solid var(--line); background: var(--bg);
+      min-height: 48px; box-sizing: border-box;
     }
-    #sessions::-webkit-scrollbar { display: none; }
-    #sessions h2, #sessions #slot-sidebar-top, #sessions #slot-sidebar-bottom { display: none; }
-    #new-session { flex: 0 0 auto; white-space: nowrap; min-height: 40px; }
-    #session-list { display: flex; gap: 6px; flex: 1 1 auto; min-width: 0; overflow-x: auto; overflow-y: hidden; }
-    /* Explicit rows: the session strip, conversation, slot, composer, status.
-       Without them the sidebar's full height took row 1 and the composer row
-       shrank below its 61px content, covering the bottom of the conversation. */
-    #sessions { grid-row: 1; }
+    #drawer-toggle {
+      min-width: 44px; min-height: 44px; font-size: 18px; line-height: 1;
+      background: none; border: 1px solid var(--line); border-radius: 8px;
+      color: var(--text); cursor: pointer; touch-action: manipulation;
+    }
+    #topbar-title {
+      /* Fixed to the space the menu button leaves, whatever the title's
+         length: the box shrinks and the text ellipsizes inside it. */
+      flex: 1 1 auto; min-width: 0;
+      font-size: 13px; color: var(--dim);
+      overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+    }
+    /* The composer shrinks with the column instead of holding a min-content
+       width of its own (its placeholder is one long unwrapped line). */
+    #composer, #input { min-width: 0; }
+    /* The conversation list slides in from the left, over the conversation.
+       Vertical again inside: the drawer is full height, so a column of rows
+       reads the way a session list reads everywhere else. */
+    #sessions {
+      position: fixed; top: 0; left: 0; bottom: 0; z-index: 30;
+      width: min(86vw, 330px);
+      display: flex; flex-direction: column; align-items: stretch;
+      padding: calc(12px + env(safe-area-inset-top, 0px)) 10px 12px;
+      border-right: 1px solid var(--line); border-bottom: none;
+      overflow-y: auto; overflow-x: hidden;
+      transform: translateX(-104%);
+      transition: transform .22s ease;
+      height: auto; max-height: none;
+      background: var(--bg);
+    }
+    body.drawer-open #sessions {
+      transform: translateX(0);
+      box-shadow: 6px 0 24px rgba(0, 0, 0, .35);
+    }
+    body.drawer-open #drawer-backdrop {
+      display: block; position: fixed; inset: 0; z-index: 29;
+      background: rgba(0, 0, 0, .45);
+      -webkit-tap-highlight-color: transparent;
+    }
+    #new-session { position: sticky; top: 0; z-index: 3; white-space: nowrap; }
+    #session-list {
+      display: flex; flex-direction: column; gap: 6px;
+      flex: 1 1 auto; min-width: 0; min-height: 0;
+      overflow-x: hidden; overflow-y: auto;
+      touch-action: pan-y;
+    }
+    /* Explicit rows for the parts still in the grid: conversation, slot,
+       composer, status. Without them the sidebar's full height took row 1 and
+       the composer row shrank below its 61px content, covering the bottom of
+       the conversation. The drawer is fixed, so it owns no row. */
     #stream { grid-row: 2; }
     #slot-above-composer { grid-row: 3; }
     #composer { grid-row: 4; }
     #status { grid-row: 5; max-height: 40px; overflow: hidden; }
     #session-list .sess {
-      flex: 0 0 auto; white-space: nowrap; max-width: 58vw;
-      border: 1px solid var(--line); border-radius: 20px;
-      padding: 7px 13px; min-height: 40px; overflow: hidden;
+      flex: 0 0 auto; white-space: nowrap; max-width: none; width: 100%;
+      border: 1px solid var(--line); border-radius: 8px;
+      padding: 10px 13px; min-height: 44px; overflow: hidden;
+      touch-action: manipulation;
     }
-    #session-list .sess .del { display: none; }          /* delete from a phone chip is an accident waiting to happen */
+    #session-list .sess .del { display: none; }          /* delete from a phone row is an accident waiting to happen */
     #session-list .sess.active { border-color: var(--accent); }
     /* Settings stay reachable: a full-height sheet over the conversation,
        opened from the status strip and closed from its own header. */
@@ -463,6 +514,14 @@
 </style>
 </head>
 <body>
+  <!-- Phone only: the menu button and the conversation in front of the thumb.
+       The sessions sidebar slides in over the conversation from here. -->
+  <header id="topbar" class="phone-only">
+    <button id="drawer-toggle" type="button" aria-label="Sessions" aria-controls="sessions" aria-expanded="false">&#9776;</button>
+    <span id="topbar-title">Nguruvilu</span>
+  </header>
+  <!-- Phone only: taps anywhere outside the open drawer close it. -->
+  <div id="drawer-backdrop"></div>
   <aside id="sessions" class="panel">
     <div id="slot-sidebar-top"></div>
     <h2 id="sec-sessions">Sessions</h2>
@@ -601,7 +660,11 @@
   <div id="slot-above-composer"></div>
   <div id="composer">
     <button id="attach" title="上传文件给内核" hidden>&#128206;</button>
-    <input type="file" id="attach-input" hidden>
+    <input type="file" id="attach-input" multiple hidden>
+    <!-- Browser-only picker for installing a pack: the native dialog has no
+         door on the server, so the archive is uploaded and its server-side
+         path handed to the same verify-then-install command. -->
+    <input type="file" id="install-input" accept=".dshpack" hidden>
     <textarea id="input" rows="1" placeholder="Ask the kernel something&hellip;  (Enter to send, Shift+Enter for a newline)"></textarea>
     <button id="send">Send</button>
   </div>
@@ -704,34 +767,93 @@ if (onServer) {
 
   // Attachments go the way the window’s file dialog goes, minus the dialog:
   // bytes to `POST /upload`, then the path into the composer so the human can
-  // say what the file is for before anything reaches the shell.
+  // say what the file is for before anything reaches the shell. The picker
+  // takes many files at once — one dialog, one folder, every path listed — so
+  // a batch lands as a batch instead of N trips through the menu.
+  //
+  // Three ways in, one pipeline: the 📎 picker, paste (an image or file in
+  // the clipboard — the gesture people actually reach for), and drag-and-drop
+  // onto the composer. Before this was shared, paste and drop had no handler
+  // at all: the gesture did nothing, silently, forever.
+  async function uploadFiles(files) {
+    if (!files || files.length === 0) return;
+    const field = document.getElementById("input");
+    const uploaded = [];
+    const failed = [];
+    // Sequential, not parallel: upload order matches the order the files were
+    // picked, one slow file cannot starve the others of bandwidth, and the
+    // composer receives the paths in a stable order to talk about.
+    for (const file of files) {
+      try {
+        const response = await fetch("/upload?name=" + encodeURIComponent(file.name), {
+          method: "POST",
+          headers: { Authorization: "Bearer " + serveToken },
+          body: file,
+        });
+        if (!response.ok) {
+          const detail = await response.text().catch(() => "");
+          throw new Error("HTTP " + response.status + (detail ? " — " + detail.trim() : ""));
+        }
+        const result = await response.json();
+        uploaded.push(result);
+      } catch (error) {
+        failed.push(file.name + ": " + error.message);
+      }
+    }
+    if (uploaded.length > 0) {
+      const lines = uploaded.map((result) => "已上传: " + result.path);
+      field.value = (field.value ? field.value + "\n" : "") + lines.join("\n");
+      field.focus();
+      const total = uploaded.reduce((sum, result) => sum + result.size, 0);
+      notice(
+        "已上传 " + uploaded.length + " 个文件 · " + total + " bytes — 回车发给内核",
+        false
+      );
+    }
+    for (const failure of failed) {
+      notice("上传失败 — " + failure, true);
+    }
+  }
+
   const attach = document.getElementById("attach");
   const attachInput = document.getElementById("attach-input");
   attach.hidden = false;
   attach.addEventListener("click", () => attachInput.click());
   attachInput.addEventListener("change", () => {
-    const file = attachInput.files && attachInput.files[0];
-    if (!file) return;
-    fetch("/upload?name=" + encodeURIComponent(file.name), {
-      method: "POST",
-      headers: { Authorization: "Bearer " + serveToken },
-      body: file,
-    })
-      .then((response) => {
-        if (!response.ok) throw new Error("HTTP " + response.status);
-        return response.json();
-      })
-      .then((result) => {
-        const field = document.getElementById("input");
-        field.value = (field.value ? field.value + "\n" : "") + "已上传: " + result.path;
-        field.focus();
-        notice("已上传 " + result.name + " · " + result.size + " bytes — 回车发给内核");
-      })
-      .catch((error) => notice("上传失败: " + error.message, true))
-      .finally(() => {
-        attachInput.value = "";
-      });
+    const files = Array.from(attachInput.files || []);
+    attachInput.value = "";
+    if (files.length === 0) return;
+    notice("已选择 " + files.length + " 个文件，开始上传…", false);
+    uploadFiles(files);
   });
+
+  // Paste: an image or file from the clipboard uploads like the picker did.
+  // Text pastes are left alone — that is typing, not attaching.
+  document.addEventListener("paste", (event) => {
+    const items = Array.from((event.clipboardData && event.clipboardData.items) || []);
+    const files = items
+      .filter((item) => item.kind === "file")
+      .map((item) => item.getAsFile())
+      .filter(Boolean);
+    if (files.length === 0) return;
+    event.preventDefault();
+    notice("剪贴板里有 " + files.length + " 个文件，开始上传…", false);
+    uploadFiles(files);
+  });
+
+  // Drag-and-drop onto the composer, same pipeline. Without preventDefault
+  // on drop, a stray file let the browser navigate away from the app.
+  {
+    const composer = document.getElementById("composer");
+    composer.addEventListener("dragover", (event) => event.preventDefault());
+    composer.addEventListener("drop", (event) => {
+      event.preventDefault();
+      const files = Array.from((event.dataTransfer && event.dataTransfer.files) || []);
+      if (files.length === 0) return;
+      notice("拖入 " + files.length + " 个文件，开始上传…", false);
+      uploadFiles(files);
+    });
+  }
 
   // Link health, on the loop it was asked for: while the tunnel is up,
   // keep checking at a leisurely pace; while it is down, check again
@@ -885,7 +1007,11 @@ function scrollToEndForced() {
 function linkifyServerPaths(text) {
   if (typeof onServer === "undefined" || !onServer) return text;
   return text.replace(
-    /(^|[\s('"（(“])((?:\/|~\/|\.\/)(?:[\w\-.]+\/)*[\w\-.]+\.[A-Za-z0-9]{1,10})/g,
+    // Both slash styles match, because both are what agents print: the POSIX
+    // form (`/var/log/app.log`, `~/notes.md`) and the Windows drive form
+    // (`I:\nguruvilu\report.pdf`, `C:/temp/data.csv`). An extension is
+    // required — a bare directory is not a file anyone can download.
+    /(^|[\s('"（(“])((?:\/|~\/|\.[/]|[A-Za-z]:[\\/])(?:[\w\-.]+[\\/])*[\w\-.]+\.[A-Za-z0-9]{1,10})/g,
     (_, lead, path) => lead + '<a class="file-link" href="/file?path=' +
       encodeURIComponent(path) + "&token=" + encodeURIComponent(serveToken) +
       '" download>' + path + "</a>"
@@ -919,8 +1045,11 @@ function inlineMarkdown(escaped) {
     .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
       '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
   text = linkifyServerPaths(text);
+  // Code spans are restored last so nothing else can reach inside them — but
+  // a path inside backticks is still a path the human may want to download,
+  // so the linkifier runs over each span content on the way back out.
   return text.replace(/\u0000(\d+)\u0000/g,
-    (_, n) => '<code class="md-inline">' + codes[+n - 1] + "</code>");
+    (_, n) => '<code class="md-inline">' + linkifyServerPaths(codes[+n - 1]) + "</code>");
 }
 
 /// The `| --- | :---: |` line that separates a table's header from its body.
@@ -988,7 +1117,10 @@ function renderMarkdown(source) {
         body.push(lines[i]);
         i += 1;
       }
-      html.push('<pre class="md-code"><code>' + body.join("\n") + "</code></pre>");
+      // What the agent prints in a block — build output, tool results, a
+      // "saved to …" line — is where a file name is most often spelled out,
+      // so blocks get the same download link prose gets.
+      html.push('<pre class="md-code"><code>' + linkifyServerPaths(body.join("\n")) + "</code></pre>");
       continue;
     }
 
@@ -1765,6 +1897,12 @@ function renderPacks(list) {
     head.append(del);
     box.append(head);
 
+    // What the pack is for, in the author's own words — without it a list of
+    // names is a list of names, and none of them can be told apart.
+    if (pack.description) {
+      box.append(el("div", "pack-desc", pack.description));
+    }
+
     const meta = [
       pack.license || "no license",
       pack.assembly ? "assembly yes" : "no assembly",
@@ -1925,6 +2063,9 @@ function renderStatus(status) {
   if (!status) return;
 
   document.getElementById("model").textContent = status.model || "";
+  // The phone top bar names the conversation in front of the thumb.
+  document.getElementById("topbar-title").textContent =
+    status.title || status.session || "Nguruvilu";
   document.getElementById("stats").textContent =
     (status.messages === undefined ? 0 : status.messages) + " messages \u00b7 " +
     (status.tools || []).length + " tools";
@@ -2375,6 +2516,30 @@ document.getElementById("save-settings").addEventListener("click", saveSettings)
   document.getElementById("close-settings").addEventListener("click", () => setOpen(false));
 })();
 
+// Phone: the session list is a drawer over the conversation — opened from the
+// top bar, closed by the backdrop, the menu button, Escape, or a switch.
+(() => {
+  const toggle = document.getElementById("drawer-toggle");
+  const backdrop = document.getElementById("drawer-backdrop");
+  const setOpen = (open) => {
+    document.body.classList.toggle("drawer-open", open);
+    backdrop.hidden = !open;
+    toggle.setAttribute("aria-expanded", String(open));
+    toggle.textContent = open ? "\u2715" : "\u2630";
+  };
+  toggle.addEventListener("click", () => setOpen(!document.body.classList.contains("drawer-open")));
+  backdrop.addEventListener("click", () => setOpen(false));
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") setOpen(false);
+  });
+  // Switching conversations from inside the drawer closes it: the point of
+  // the switch is to see the conversation it picked. Starting one does too.
+  document.getElementById("session-list").addEventListener("click", (event) => {
+    if (event.target.closest(".sess")) setOpen(false);
+  });
+  document.getElementById("new-session").addEventListener("click", () => setOpen(false));
+})();
+
 setApiKey.addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
     event.preventDefault();
@@ -2384,7 +2549,41 @@ setApiKey.addEventListener("keydown", (event) => {
 
 // ---------------------------------------------------------------- packages
 
-document.getElementById("btn-install").addEventListener("click", () => toShell({ cmd: "pick_install" }));
+document.getElementById("btn-install").addEventListener("click", () => {
+  if (typeof onServer !== "undefined" && onServer) {
+    // No native dialog over HTTP: pick the .dshpack, upload it, install from
+    // the path the server just wrote — the same steps the window's dialog
+    // runs, with the browser's picker in front.
+    document.getElementById("install-input").click();
+    return;
+  }
+  toShell({ cmd: "pick_install" });
+});
+(() => {
+  const installInput = document.getElementById("install-input");
+  installInput.addEventListener("change", async () => {
+    const file = (installInput.files || [])[0];
+    installInput.value = "";
+    if (!file) return;
+    notice("上传 " + file.name + " …", false);
+    try {
+      const response = await fetch("/upload?name=" + encodeURIComponent(file.name), {
+        method: "POST",
+        headers: { Authorization: "Bearer " + serveToken },
+        body: file,
+      });
+      if (!response.ok) {
+        const detail = await response.text().catch(() => "");
+        throw new Error("HTTP " + response.status + (detail ? " — " + detail.trim() : ""));
+      }
+      const result = await response.json();
+      notice("已上传 " + result.path + " — 校验并安装…", false);
+      toShell({ cmd: "pick_install", path: result.path });
+    } catch (error) {
+      notice("上传失败 — " + error.message, true);
+    }
+  });
+})();
 document.getElementById("btn-fetch-models").addEventListener("click", () => {
   notice("Fetching the model list\u2026", false);
   toShell({ cmd: "fetch_models" });
