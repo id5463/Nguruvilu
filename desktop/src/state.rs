@@ -300,6 +300,11 @@ impl AppState {
         // Available to a pack, not loaded by the kernel: `packs/subagent` asks
         // for `builtin:delegate` and it appears.
         nguruvilu::tools::subagent::define(&mut kernel);
+        // Same rule for long tasks (长程任务): `packs/long-horizon` asks for
+        // `builtin:long-horizon` and the mission tools appear — missions,
+        // recall, mailboxes, and the tick that runs one step of one in a
+        // fresh worker.
+        nguruvilu::tools::longhorizon::define(&mut kernel);
         // Same for document reading (读不了就装包): `packs/documents` asks for
         // `builtin:documents` and `read` learns PDF/Office.
         nguruvilu::tools::documents::define(&mut kernel);

@@ -56,3 +56,12 @@ multi-test/
 relay/
 nul
 test-*.txt
+# 本会话的调研/探针产物:读凭据的脚本与查询结果,不属于仓库
+cloud_ssh.py
+arxiv_scan.py
+gh-*.txt
+arxiv-scan.txt
+api-debug.txt
+deploy-verify.txt
+jobs-e2e.txt
+tmp-jobs-e2e/

@@ -688,6 +688,9 @@ async fn run() -> Result<()> {
     // `packs/starter` asks for `builtin:delegate` and it appears, and without
     // that pack the kernel has no such tool.
     nguruvilu::tools::subagent::define(&mut kernel);
+    // Available to a pack, not loaded by the kernel: `packs/long-horizon` asks
+    // for `builtin:long-horizon` and the mission tools appear.
+    nguruvilu::tools::longhorizon::define(&mut kernel);
     // Same for document reading (读不了就装包): `packs/documents` asks for
     // `builtin:documents` and `read` learns PDF/Office; without the pack,
     // `read` says so and names what is installed.
@@ -992,6 +995,16 @@ async fn run() -> Result<()> {
         Session::new(Some(route.model.clone()))
     };
     let is_new = !store.root().join(format!("{}.jsonl", session.id)).exists();
+
+    // Pin this session and its workspace to the tool table — the same thing
+    // the desktop does on open_session. Path-taking tools (missions, and any
+    // workspace-relative resolution) ask `current_workspace()` at call time;
+    // without this pin a one-shot CLI turn has no workspace at all and every
+    // workspace tool refuses to run.
+    let workspace =
+        nguruvilu::session::ensure_workspace(&nguruvilu::settings::data_dir(), &session.id)?;
+    session.cwd = Some(workspace.display().to_string());
+    kernel.set_session(Some(session.id.clone()), Some(workspace));
 
     // The session file is created on first write, never here. Creating it up
     // front leaves an empty file behind whenever a run produces nothing — a

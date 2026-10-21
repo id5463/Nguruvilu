@@ -1,0 +1,16 @@
+{
+  "formatVersion": 1,
+  "game": "nguruvilu",
+  "name": "long-horizon",
+  "description": "长程任务：任务实体(目标/完成判据/下一步)落盘在会话工作区、只追加的日志、可按行检索的记忆(recall)、检查点回滚、代理信箱(横向聊天)、以及在全新 worker 里跑一步的 mission_tick。给超过上下文窗口几百倍、跑上百小时的任务用；界面带任务条。",
+  "versionId": "1.0.0",
+  "license": "MIT",
+  "kernelVersion": "0.1.0",
+  "dependencies": { "nguruvilu": ">=0.1.0" },
+  "plugins": [
+    { "id": "long-horizon", "source": "builtin:long-horizon", "license": "MIT" }
+  ],
+  "skills": [
+    { "id": "mission-protocol", "source": "./skills/mission-protocol", "license": "MIT" }
+  ]
+}
