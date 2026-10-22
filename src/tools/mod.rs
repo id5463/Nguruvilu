@@ -143,17 +143,17 @@ pub struct OverrideRecord {
     pub new_owner: String,
 }
 
-/// The session the current tool call belongs to, for the duration of one
-/// `execute`.
-///
-/// A thread-local rather than a parameter because the tool handler signature
-/// carries only the arguments — threading a session id through it would change
-/// every tool for the sake of jobs and packs, which need it to tell one
-/// conversation's work from another's. Set by `execute` around each handler
-/// call; handlers read it via `current_session`.
-///
-/// The working directory of the same session travels alongside it in
-/// `CURRENT_WORKSPACE`, so path resolution in handlers can default to it.
+// The session the current tool call belongs to, for the duration of one
+// `execute`.
+//
+// A thread-local rather than a parameter because the tool handler signature
+// carries only the arguments — threading a session id through it would change
+// every tool for the sake of jobs and packs, which need it to tell one
+// conversation's work from another's. Set by `execute` around each handler
+// call; handlers read it via `current_session`.
+//
+// The working directory of the same session travels alongside it in
+// `CURRENT_WORKSPACE`, so path resolution in handlers can default to it.
 thread_local! {
     static CURRENT_SESSION: std::cell::RefCell<Option<String>> = const {
         std::cell::RefCell::new(None)

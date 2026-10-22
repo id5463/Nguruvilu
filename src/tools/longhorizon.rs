@@ -35,7 +35,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
-use crate::tools::{ToolDef, ToolFuture, ToolOutput};
+use crate::tools::{ToolDef, ToolFuture};
 
 /// The plugin name a pack asks for with `builtin:long-horizon`.
 pub const PLUGIN: &str = "long-horizon";

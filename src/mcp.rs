@@ -672,11 +672,6 @@ fn flatten_result(result: &Value) -> crate::tools::ToolOutput {
     out
 }
 
-/// The text of an MCP result, images dropped — the pre-attachment view.
-fn flatten_content(result: &Value) -> String {
-    flatten_result(result).text
-}
-
 /// Make a string safe for use inside a tool name.
 fn sanitize(value: &str) -> String {
     value
@@ -740,6 +735,13 @@ fn body_tail(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The text-only view of a result: the pre-attachment behavior the test
+    /// below pins. Production code reads images too (flatten_result), so this
+    /// helper lives with the test that asks for the old contract.
+    fn flatten_content(result: &Value) -> String {
+        flatten_result(result).text
+    }
 
     #[test]
     fn tool_names_are_namespaced_and_sanitized() {

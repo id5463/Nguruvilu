@@ -128,6 +128,8 @@ pub fn register_with(
     Ok(())
 }
 
+/// Test helper: a call with no host attached (disk-only actions).
+#[cfg(test)]
 async fn run(args: Value) -> Result<ToolOutput> {
     run_with(args, None).await
 }
