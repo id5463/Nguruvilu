@@ -40,6 +40,7 @@ pub mod model;
 pub mod plugin;
 pub mod preinstall;
 pub mod request;
+pub mod routes;
 pub mod session;
 pub mod window;
 pub mod settings;

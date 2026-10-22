@@ -123,9 +123,6 @@ pub struct InjectionEntry {
     pub enabled: bool,
 }
 
-fn default_position() -> Position {
-    Position::HistoryTail
-}
 fn default_role() -> Role {
     Role::System
 }

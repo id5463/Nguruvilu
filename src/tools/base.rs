@@ -238,10 +238,6 @@ fn posix_drive_path(raw: &str) -> Option<PathBuf> {
     )))
 }
 
-async fn read_tool(args: Value) -> Result<String> {
-    read_any(args).await.map(|output| output.text)
-}
-
 /// Read a file, attaching it as an image when it is one.
 ///
 /// Text is read as lines. An image cannot be read as lines at all — decoding it

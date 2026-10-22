@@ -341,6 +341,18 @@ enum ConfigAction {
     },
     /// Print the settings file path.
     Path,
+    /// List the saved API profiles, marking the active one.
+    Routes,
+    /// Point the stored settings at a saved profile — the next start uses it.
+    Use {
+        /// Profile name, as shown by `config routes`.
+        name: String,
+    },
+    /// Save the current stored settings as a named profile.
+    SaveRoute {
+        /// Profile name. An existing profile of this name is replaced.
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2986,6 +2998,67 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
                     println!("\nstill missing: {}", settings.missing().join(", "));
                 }
             }
+            Ok(())
+        }
+        Some(ConfigAction::Routes) => {
+            let routes = nguruvilu::routes::Routes::load();
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "path": nguruvilu::routes::Routes::path().display().to_string(),
+                        "active": routes.active,
+                        "profiles": routes.profiles.iter().map(|p| serde_json::json!({
+                            "name": p.name, "base_url": p.base_url, "model": p.model,
+                            "has_key": !p.api_key.trim().is_empty(),
+                        })).collect::<Vec<_>>(),
+                    }))?
+                );
+                return Ok(());
+            }
+            if routes.profiles.is_empty() {
+                println!(
+                    "no saved profiles. `ngu config save-route <name>` stores the current settings as one."
+                );
+                return Ok(());
+            }
+            for profile in &routes.profiles {
+                let mark = if routes.active == profile.name { "*" } else { " " };
+                println!(
+                    "{mark} {:<18} {:<28} {}",
+                    profile.name, profile.model, profile.base_url
+                );
+            }
+            Ok(())
+        }
+        Some(ConfigAction::SaveRoute { name }) => {
+            let name = name.trim();
+            anyhow::ensure!(!name.is_empty(), "save-route needs a profile name");
+            let mut routes = nguruvilu::routes::Routes::load();
+            let stored = Settings::load()?;
+            routes.upsert(nguruvilu::routes::Routes::capture(&stored, name));
+            // The stored settings are exactly this profile, so it is the active
+            // line until something else is switched to.
+            routes.active = name.to_string();
+            routes.save()?;
+            println!(
+                "saved profile '{name}' → {} [{}]",
+                stored.base_url,
+                stored.model_or_default()
+            );
+            Ok(())
+        }
+        Some(ConfigAction::Use { name }) => {
+            let mut routes = nguruvilu::routes::Routes::load();
+            let mut settings = Settings::load()?;
+            routes.apply(name, &mut settings)?;
+            routes.active = name.trim().to_string();
+            routes.save()?;
+            settings.save()?;
+            println!(
+                "settings now point at profile '{}' → {} [{}]",
+                name, settings.base_url, settings.model
+            );
             Ok(())
         }
         None | Some(ConfigAction::Show) => {

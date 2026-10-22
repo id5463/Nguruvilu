@@ -141,6 +141,17 @@
   }
   .picker .item:hover { background: color-mix(in srgb, var(--accent) 22%, var(--panel)); color: var(--text); }
   .picker .item.current { background: color-mix(in srgb, var(--accent) 40%, var(--panel)); color: var(--text); }
+  /* Saved API profiles, one chip each; the active one is the accent pill. */
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 6px; }
+  .chip-wrap { display: inline-flex; align-items: stretch; }
+  button.chip { border-radius: 9px 0 0 9px; background: var(--panel); color: var(--dim); padding: 3px 10px; }
+  button.chip:hover { background: color-mix(in srgb, var(--accent) 22%, var(--panel)); color: var(--text); }
+  button.chip.current { background: color-mix(in srgb, var(--accent) 40%, var(--panel)); color: var(--text); }
+  button.chip-x { border-radius: 0 9px 9px 0; border-left: 1px solid var(--line); padding: 3px 7px; }
+  .row-inline { display: flex; gap: 6px; margin: 2px 0 6px; }
+  .row-inline input { flex: 1 1 auto; min-width: 0; background: var(--panel); color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+  .dim-line { color: var(--dim); font-size: 12px; }
   .picker .owner { color: var(--dim); font-size: 10px; }
   .hint { color: var(--dim); font-size: 10.5px; margin-top: 6px; overflow-wrap: break-word; line-height: 1.5; }
   .saved { color: var(--ok); font-size: 10.5px; }
@@ -547,6 +558,18 @@
 
       <div class="group" id="group-connect">
         <div class="group-title" id="title-connect">Connection</div>
+        <!-- Named API profiles: the live endpoint/key/model stays one line,
+             but it can be kept under a name and recalled without retyping —
+             and switching never overwrites another provider's bookmark. -->
+        <div class="field">
+          <span class="cap" id="cap-routes">API profiles</span>
+          <div id="route-chips" class="chips"></div>
+          <div id="route-save-row" class="row-inline" hidden>
+            <input id="set-route-name" placeholder="profile name, e.g. tierflow" spellcheck="false">
+            <button class="tiny" id="btn-route-save" type="button">Save</button>
+          </div>
+          <button class="tiny ghost" id="btn-route-new" type="button">＋ 把当前存为档案</button>
+        </div>
         <label class="field">
           <span class="cap" id="cap-endpoint">API endpoint</span>
           <input id="set-base-url" placeholder="https://your-host/v1" spellcheck="false">
@@ -2256,6 +2279,9 @@ onAny((name, event) => {
       case "packs":
         renderPacks(event.list);
         break;
+      case "routes":
+        renderRoutes(event.routes);
+        break;
       case "pack_installed":
         notice("Installed " + event.pack.name + " " + event.pack.version + "\n" + event.pack.path, false);
         break;
@@ -2588,11 +2614,65 @@ document.getElementById("btn-fetch-models").addEventListener("click", () => {
   notice("Fetching the model list\u2026", false);
   toShell({ cmd: "fetch_models" });
 });
+
+// ------------------------------------------------------------ API profiles
+// One chip per saved profile. A chip's name switches to it; its ✕ deletes it,
+// armed once so a single mis-tap cannot drop a stored key. The key itself
+// never travels to the page: the chip shows whether one is saved.
+const routeChips = document.getElementById("route-chips");
+function renderRoutes(routes) {
+  routeChips.replaceChildren();
+  const profiles = (routes && routes.profiles) || [];
+  if (profiles.length === 0) {
+    routeChips.append(el("span", "dim-line", "\u8fd8\u6ca1\u4fdd\u5b58\u8fc7\u2014\u2014\u586b\u597d\u4e0b\u9762\u7684\u5730\u5740/\u5bc6\u94a5/\u6a21\u578b\u540e\u70b9\u300c\u628a\u5f53\u524d\u5b58\u4e3a\u6863\u6848\u300d"));
+  }
+  for (const profile of profiles) {
+    const wrap = el("span", "chip-wrap");
+    const chip = el("button", "tiny chip" + (profile.name === routes.active ? " current" : ""), profile.name);
+    chip.type = "button";
+    chip.title = profile.model + " \u00b7 " + profile.base_url + (profile.has_key ? "" : " \u00b7 \u6ca1\u5b58\u5bc6\u94a5");
+    chip.addEventListener("click", () => {
+      document.getElementById("set-base-url").value = profile.base_url || "";
+      document.getElementById("set-model").value = profile.model || "";
+      document.getElementById("set-proxy").value = profile.proxy || "";
+      toShell({ cmd: "switch_route", name: profile.name });
+    });
+    const drop = el("button", "tiny chip-x", "\u2715");
+    drop.type = "button";
+    drop.title = "\u5220\u9664\u6863\u6848 " + profile.name;
+    let armed = false;
+    drop.addEventListener("click", () => {
+      if (!armed) {
+        armed = true;
+        drop.textContent = "?";
+        setTimeout(() => { armed = false; drop.textContent = "\u2715"; }, 2500);
+      } else {
+        toShell({ cmd: "delete_route", name: profile.name });
+      }
+    });
+    wrap.append(chip, drop);
+    routeChips.append(wrap);
+  }
+}
+document.getElementById("btn-route-new").addEventListener("click", () => {
+  const row = document.getElementById("route-save-row");
+  row.hidden = !row.hidden;
+  if (!row.hidden) document.getElementById("set-route-name").focus();
+});
+document.getElementById("btn-route-save").addEventListener("click", () => {
+  const input = document.getElementById("set-route-name");
+  const name = input.value.trim();
+  if (!name) { notice("\u5148\u7ed9\u6863\u6848\u8d77\u4e2a\u540d\u5b57\u3002", true); return; }
+  toShell({ cmd: "save_route", name });
+  document.getElementById("route-save-row").hidden = true;
+  input.value = "";
+});
 document.getElementById("btn-pack").addEventListener("click", () => toShell({ cmd: "pick_pack" }));
 document.getElementById("btn-verify").addEventListener("click", () => toShell({ cmd: "pick_verify" }));
 
 // The page is loaded and listening; ask the shell for initial state.
 ngu.send({ cmd: "list_packs" });
+ngu.send({ cmd: "list_routes" });
 // Every declaration above has run now, so queued events can be drawn.
 flushPendingEvents();
 </script>

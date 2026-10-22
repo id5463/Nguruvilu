@@ -246,7 +246,7 @@ pub fn apply(
     dir: &Path,
     manifest: &PackManifest,
 ) -> Result<PackContent> {
-    let mut content = read(dir, manifest)?;
+    let content = read(dir, manifest)?;
 
     if let Some(file) = &manifest.look {
         let path = dir.join(file.path());

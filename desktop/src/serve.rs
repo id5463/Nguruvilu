@@ -765,7 +765,7 @@ async fn read_request(stream: &mut TcpStream) -> ReadOutcome {
     };
     let mut lines = head.split("\r\n");
     let mut request_line = match lines.next().map(str::split_whitespace) {
-        Some(mut parts) => parts,
+        Some(parts) => parts,
         None => return ReadOutcome::Malformed,
     };
     let method = request_line.next().unwrap_or("").to_string();
@@ -940,6 +940,7 @@ fn is_concurrent(body: &str) -> bool {
                     | "open_session"
                     | "delete_session"
                     | "list_packs"
+                    | "list_routes"
                     | "fetch_models"
                     | "ui_panels"
                     | "save_settings"

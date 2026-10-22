@@ -65,3 +65,7 @@ api-debug.txt
 deploy-verify.txt
 jobs-e2e.txt
 tmp-jobs-e2e/
+
+fix-starter-paged.py
+
+verify-server.py

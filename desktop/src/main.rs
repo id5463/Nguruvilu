@@ -594,6 +594,10 @@ pub(crate) async fn dispatch(
             // ready re-pushes it, so a slow connection and a tab returning to
             // the foreground both repaint the list.
             refresh_packs(&state, &sink);
+            // The API profiles ride the same push: the chips must show what is
+            // saved the moment the page can show anything.
+            let routes = state.lock().expect("state lock").routes_snapshot();
+            emit(&sink, json!({ "ev": "routes", "routes": routes }));
 
             // A prompt given on the command line runs once the page can show it.
 
@@ -799,6 +803,66 @@ pub(crate) async fn dispatch(
 
         "list_packs" => {
             refresh_packs(&state, &sink);
+        }
+
+        "list_routes" => {
+            let snapshot = state.lock().expect("state lock").routes_snapshot();
+            emit(&sink, json!({ "ev": "routes", "routes": snapshot }));
+        }
+
+        "save_route" => {
+            let name = command.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let outcome = state.lock().expect("state lock").save_route(name);
+            match outcome {
+                Ok(()) => {
+                    eprintln!("[routes] saved profile {name}");
+                    emit(
+                        &sink,
+                        json!({ "ev": "routes", "routes": state.lock().expect("state lock").routes_snapshot() }),
+                    );
+                    emit(
+                        &sink,
+                        json!({ "ev": "notice", "text": format!("Saved the current API as profile '{name}'.") }),
+                    );
+                }
+                Err(error) => emit(&sink, json!({ "ev": "error", "message": format!("{error:#}") })),
+            }
+        }
+
+        "switch_route" => {
+            let name = command.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let outcome = state.lock().expect("state lock").switch_route(name);
+            match outcome {
+                Ok(()) => {
+                    eprintln!("[routes] switched to profile {name}");
+                    emit(
+                        &sink,
+                        json!({ "ev": "routes", "routes": state.lock().expect("state lock").routes_snapshot() }),
+                    );
+                    let status = state.lock().expect("state lock").describe();
+                    emit(&sink, json!({ "ev": "status", "status": status }));
+                    emit(
+                        &sink,
+                        json!({ "ev": "notice", "text": format!("Switched to '{name}' — the next turn goes through it.") }),
+                    );
+                }
+                Err(error) => emit(&sink, json!({ "ev": "error", "message": format!("switching API: {error:#}") })),
+            }
+        }
+
+        "delete_route" => {
+            let name = command.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let outcome = state.lock().expect("state lock").delete_route(name);
+            match outcome {
+                Ok(()) => {
+                    eprintln!("[routes] deleted profile {name}");
+                    emit(
+                        &sink,
+                        json!({ "ev": "routes", "routes": state.lock().expect("state lock").routes_snapshot() }),
+                    );
+                }
+                Err(error) => emit(&sink, json!({ "ev": "error", "message": format!("{error:#}") })),
+            }
         }
 
         "apply_pack" => {

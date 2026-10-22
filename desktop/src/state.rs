@@ -823,6 +823,72 @@ impl AppState {
         Ok(())
     }
 
+    /// A snapshot of the saved API profiles for the settings page.
+    ///
+    /// Keys are not part of it: the page sees whether a profile has one, and a
+    /// switch needs a name. The key lives on this machine only.
+    pub fn routes_snapshot(&self) -> Value {
+        let routes = nguruvilu::routes::Routes::load();
+        json!({
+            "active": routes.active,
+            "profiles": routes.profiles.iter().map(|profile| json!({
+                "name": profile.name,
+                "base_url": profile.base_url,
+                "model": profile.model,
+                "proxy": profile.proxy,
+                "has_key": !profile.api_key.trim().is_empty(),
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// Bookmark the live settings as a named profile. Saving under a name that
+    /// already exists rewrites that profile: two chips the panel cannot tell
+    /// apart are one chip updated.
+    pub fn save_route(&mut self, name: &str) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(anyhow!("save_route needs a profile name"));
+        }
+        let mut routes = nguruvilu::routes::Routes::load();
+        routes.upsert(nguruvilu::routes::Routes::capture(&self.settings, name));
+        // The live settings are exactly this profile now, so the bookmark
+        // marks the active line.
+        routes.active = name.to_string();
+        routes.save()
+    }
+
+    /// Switch to a saved profile: the profile becomes the live settings, and
+    /// the current session takes the new route on its next turn — the same
+    /// apply path a panel save uses, so settings become real exactly one way.
+    pub fn switch_route(&mut self, name: &str) -> Result<()> {
+        let name = name.trim();
+        let mut routes = nguruvilu::routes::Routes::load();
+        routes.apply(name, &mut self.settings)?;
+        routes.active = name.to_string();
+        routes.save()?;
+        self.settings.save()?;
+        // The user's own choice moved the route: a later pack recompute must
+        // not send it back to the boot value.
+        self.pack_baseline = self.settings.clone();
+
+        self.route = ModelRoute::from_settings(&self.settings);
+        let mut runtime = self.config.runtime.lock().expect("runtime lock");
+        runtime.apply(Change::session(
+            self.session.id.clone(),
+            ChangePayload::ModelRoute(self.route.clone()),
+        ))?;
+        Ok(())
+    }
+
+    /// Remove a saved profile. If it was the active line, the live settings
+    /// stay as they are: deleting a bookmark does not disconnect the route it
+    /// described.
+    pub fn delete_route(&mut self, name: &str) -> Result<()> {
+        let mut routes = nguruvilu::routes::Routes::load();
+        routes.remove(name)?;
+        routes.save()
+    }
+
     /// Adopt what the enabled packs carry, recomputed as one set.
     ///
     /// [`nguruvilu::content::AdoptedContent::recompute`] folds every enabled
