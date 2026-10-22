@@ -1165,8 +1165,15 @@ async fn drain_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
     }
 
     let mut changed = false;
+    // The agent's own install lands files without touching the kernel; the one
+    // thing its turn changed is what the pack list should show.
+    let mut announced = false;
     for action in actions {
         match action {
+            nguruvilu::tools::pack::Pending::Installed { name, version } => {
+                eprintln!("[pack] installed {name} {version}");
+                announced = true;
+            }
             nguruvilu::tools::pack::Pending::Unload { name, session } => {
                 // The guard lives inside this block and the kill happens
                 // outside it: a guard held across an await would make the whole
@@ -1475,6 +1482,13 @@ async fn drain_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
             &sink,
             json!({ "ev": "notice", "text": "The next turn sees the new tool table." }),
         );
+    }
+    // A pack list is a snapshot the page took at load; every queue entry here
+    // — an install, a load, an unload — changes a row in it. Without this the
+    // agent's own install reads as "said installed, list shows nothing", and a
+    // load leaves its row's button pointing the wrong way.
+    if changed || announced {
+        refresh_packs(&state, &sink);
     }
 }
 

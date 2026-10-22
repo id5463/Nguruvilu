@@ -3315,6 +3315,11 @@ impl PackHost<'_> {
         for action in self.queue.drain() {
             let packs = nguruvilu::pack::installed(&nguruvilu::pack::default_packs_dir())?;
             match action {
+                // The files already landed from the tool call itself; the CLI
+                // has no page to refresh, so the log line is the report.
+                Pending::Installed { name, version } => {
+                    eprintln!("[pack] installed {name} {version}");
+                }
                 Pending::Unload { name, session: _ } => {
                     let mut found = false;
                     for pack in packs.iter().filter(|pack| pack.manifest.name == name) {

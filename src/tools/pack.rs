@@ -36,6 +36,11 @@ pub enum Pending {
     /// Take it out of this conversation, keeping its files. Removed from the
     /// kernel only when no other conversation still uses the pack.
     Unload { name: String, session: Option<String> },
+    /// An archive just landed on disk. The tool installs it itself — the
+    /// kernel is not touched — but the host's pack list is a snapshot the page
+    /// took at load time, and without this notice a pack the agent installed
+    /// reads as "the agent said installed, the list shows nothing".
+    Installed { name: String, version: String },
 }
 
 /// What the tool hands the host, drained once the turn is over.
@@ -139,7 +144,7 @@ async fn run_with(args: Value, pending: Option<Arc<PendingQueue>>) -> Result<Too
         "build" => build(path, args.get("out").and_then(|o| o.as_str())),
         "verify" => verify(path),
         "list" => list(),
-        "install" => install(path).await,
+        "install" => install(path, pending.as_ref()).await,
         "load" => set_loaded(name, true, pending.as_ref()),
         "unload" => set_loaded(name, false, pending.as_ref()),
         "apply" => apply(path, pending.as_ref()),
@@ -391,7 +396,7 @@ fn apply(path: Option<&str>, pending: Option<&Arc<PendingQueue>>) -> Result<Tool
     )))
 }
 
-async fn install(path: Option<&str>) -> Result<ToolOutput> {
+async fn install(path: Option<&str>, pending: Option<&Arc<PendingQueue>>) -> Result<ToolOutput> {
     let path = path.ok_or_else(|| anyhow!("install needs a path: the .dshpack archive"))?;
     let archive = PathBuf::from(path);
 
@@ -409,12 +414,25 @@ async fn install(path: Option<&str>) -> Result<ToolOutput> {
     // is a pack the user just asked for.
     crate::pack::set_enabled(&placed.path, true)?;
 
+    // The host's pack list is a snapshot; without this it keeps showing the
+    // state from before the install, which reads as an install that never
+    // happened.
+    if let Some(queue) = pending {
+        queue.push(Pending::Installed {
+            name: placed.manifest.name.clone(),
+            version: placed.manifest.version_id.clone(),
+        });
+    }
+
     let mut text = format!(
         "Installed {} {} → {}",
         placed.manifest.name,
         placed.manifest.version_id,
         placed.path.display()
     );
+    if pending.is_some() {
+        text.push_str("\nThe host was told; its pack list now includes it.");
+    }
     match &placed.assembly {
         Some(assembly) => {
             text.push_str(&format!(
@@ -472,6 +490,44 @@ mod tests {
 
         let verified = run(json!({ "action": "verify", "path": archive })).await.unwrap();
         assert!(verified.text.contains("no problems found"), "{}", verified.text);
+    }
+
+    #[tokio::test]
+    async fn agent_install_tells_the_host_so_the_pack_list_can_refresh() {
+        // The tool installs to disk itself; the one thing its host must hear
+        // about is that the list it shows is now stale.
+        let dir = scratch("install-notify");
+        crate::pack::write_manifest(&dir, &crate::pack::PackManifest::new("tool-ping", "1.0.0"))
+            .unwrap();
+        let built = run(json!({ "action": "build", "path": dir })).await.unwrap();
+        assert!(built.text.contains("tool-ping"), "{}", built.text);
+        let archive = dir.join("tool-ping-1.0.0.dshpack");
+
+        // The install goes to the default packs directory, so the test keeps
+        // it inside a scratch home rather than the user's.
+        let home = scratch("install-notify-home");
+        std::env::set_var("NGU_HOME", &home);
+        let queue = Arc::new(PendingQueue::new());
+        let installed = run_with(
+            json!({ "action": "install", "path": archive.display().to_string() }),
+            Some(Arc::clone(&queue)),
+        )
+        .await
+        .unwrap();
+        std::env::remove_var("NGU_HOME");
+
+        assert!(installed.text.contains("Installed tool-ping"), "{}", installed.text);
+        let pending = queue.drain();
+        assert!(
+            pending.iter().any(|item| matches!(
+                item,
+                Pending::Installed { name, version }
+                    if name == "tool-ping" && version == "1.0.0"
+            )),
+            "{pending:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[tokio::test]
