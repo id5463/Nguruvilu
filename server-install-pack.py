@@ -29,21 +29,25 @@ except Exception:
     raise SystemExit("upload did not return a path")
 
 # 2) the same verify-then-install the Install button triggers
-payload = json.dumps({"cmd": "pick_install", "path": path}).replace('"', '\\"')
+# Inside single quotes bash passes the JSON through untouched — an extra
+# backslash here would reach the server as literal `\"` and fail to parse.
+payload = json.dumps({"cmd": "pick_install", "path": path})
 out = run(
     ssh,
     f"curl -s -X POST 'http://127.0.0.1:8088/cmd' -H 'Authorization: Bearer {TOKEN}' "
-    f"-H 'Content-Type: application/json' -d '{payload}'",
+    f"-H 'Content-Type: application/json' --data '{payload}'",
     timeout=60,
 )
 print("pick_install ->", out[:200])
+if not out or "body" in out or "error" in out:
+    raise SystemExit("pick_install did not take")
 
 # 3) activate it (load_pack): plugin fibers + tools + the mission bar
-cmd = json.dumps({"cmd": "load_pack", "name": "long-horizon", "version": "1.0.0"}).replace('"', '\\"')
+cmd = json.dumps({"cmd": "load_pack", "name": "long-horizon", "version": "1.0.0"})
 out = run(
     ssh,
     f"curl -s -X POST 'http://127.0.0.1:8088/cmd' -H 'Authorization: Bearer {TOKEN}' "
-    f"-H 'Content-Type: application/json' -d '{cmd}'",
+    f"-H 'Content-Type: application/json' --data '{cmd}'",
     timeout=60,
 )
 print("load_pack ->", out[:200])

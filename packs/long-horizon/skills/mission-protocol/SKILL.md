@@ -43,6 +43,10 @@ description: >
 2. **推进一步**:要么自己干,要么 `mission_tick` 让一个**全新 worker** 干
    ——worker 没有这段对话的记忆,所以它拿到的是 objective + done_when +
    STATE.md + 这一步的完整描述。**把一步写成 worker 能独立完成的粒度**。
+   **这一步的描述里不得要求 worker 再调 `mission_tick`**:它已经在 tick 里,
+   再调就是套娃;想继续推进,让它做完这步,由外面再发一次。盘上的
+   `next step` 若写着"调用 tick",在 advance 时把它改写成这一步的**实质**
+   (做什么、留下什么),而不是动作菜单。
 3. **干完立刻记账**:`mission_advance(summary, next, status?)`。
    `next` 要写成下一个 worker 能直接接手的样子;**它能独立开工,才算写好了**。
 4. **里程碑打卡**:`mission_checkpoint(label)` —— 回滚点和交接点都在这。
