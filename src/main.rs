@@ -515,7 +515,8 @@ impl AgentObserver for PrettyObserver {
 ///
 /// The runtime owns persona, route, and tools; the catalog is composed here
 /// because it belongs to the CLI's view of the prompt rather than to the
-/// runtime's state.
+/// runtime's state. The mission block is here for the same reason: it describes
+/// this session's workspace, which the runtime knows nothing about.
 struct CliConfig {
     runtime: Arc<Mutex<Runtime>>,
     base_prompt: String,
@@ -527,6 +528,12 @@ struct CliConfig {
     /// Behind a lock and shared with the pack host, so a pack hot-loaded
     /// between turns replaces them for the next turn rather than the next run.
     injection: Arc<Mutex<Arc<nguruvilu::context::InjectionEngine>>>,
+    /// The workspace whose mission board the prompt should name, once known.
+    ///
+    /// A cell rather than a plain path because the turn settings are assembled
+    /// before the session is resolved: the workspace does not exist until then,
+    /// and a resumed session's mission must be named from its very first turn.
+    session_workspace: Arc<Mutex<Option<PathBuf>>>,
 }
 
 /// The session's route, published so a plugin can build a subagent on it.
@@ -583,6 +590,22 @@ impl TurnConfig for CliConfig {
     fn settings(&self) -> TurnSettings {
         let snapshot = self.runtime.lock().expect("runtime lock").snapshot();
         let mut system_prompt = snapshot.system_prompt(&self.base_prompt);
+
+        // A mission lives on disk, and nothing else in the request says one
+        // exists: without this block a turn starts with the model remembering
+        // only what the transcript says, and a long-horizon mission reads as
+        // dead until something happens to call `mission_status`. The path is
+        // cloned out before the scan, so a slow disk holds no lock.
+        let workspace = self
+            .session_workspace
+            .lock()
+            .expect("workspace lock")
+            .clone();
+        if let Some(workspace) = workspace {
+            if let Some(block) = active_mission_block(&workspace) {
+                system_prompt.push_str(&block);
+            }
+        }
 
         if let Some(catalog) = self.skills.lock().expect("skills lock").catalog() {
             system_prompt.push_str("\n\n");
@@ -1118,12 +1141,17 @@ async fn run() -> Result<()> {
         return result;
     }
 
+    // Filled once the session's workspace is resolved, below: the turn settings
+    // are assembled before that, so this cell is how the workspace reaches them.
+    let session_workspace: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
+
     let config: Arc<dyn TurnConfig> = Arc::new(CliConfig {
         runtime: Arc::clone(&runtime),
         base_prompt,
         skills: Arc::clone(&skills),
         policy: Arc::clone(&policy),
         injection: Arc::clone(&injection),
+        session_workspace: Arc::clone(&session_workspace),
     });
 
     let snapshotter = if cli.git_snapshot {
@@ -1160,6 +1188,11 @@ async fn run() -> Result<()> {
     let workspace =
         nguruvilu::session::ensure_workspace(&nguruvilu::settings::data_dir(), &session.id)?;
     session.cwd = Some(workspace.display().to_string());
+    // The workspace the tools resolve against is also the board the prompt
+    // reads; set from one path so the model can never be told about a mission
+    // this turn cannot advance. `/new` starts a fresh session but does not move
+    // this pin, so the cell is written once per process.
+    *session_workspace.lock().expect("workspace lock") = Some(workspace.clone());
     kernel.set_session(Some(session.id.clone()), Some(workspace));
 
     // The session file is created on first write, never here. Creating it up
@@ -1484,6 +1517,161 @@ fn record_turn_stats(store: &JsonlStore, id: &str, stats: &TurnStats) {
     if let Err(error) = store.append_stats(id, stats) {
         eprintln!("[stats] {error:#}");
     }
+}
+
+/// Most mission text one prompt row may carry.
+///
+/// The block rides in every request of the session, so this is a context budget
+/// rather than a display preference: the whole record is still one
+/// `mission_status` call away.
+const MISSION_TEXT_CLIP: usize = 160;
+
+/// Most missions one prompt block lists, the active one included.
+///
+/// Enough to say "there is other work on this board", few enough that a long
+/// history cannot take over the prompt.
+const MISSION_PROMPT_ROWS: usize = 5;
+
+/// One mission field as a single prompt-safe line.
+///
+/// Whitespace is flattened because a row that wraps breaks the list the block
+/// is. The cut counts characters, not bytes: objectives here are Chinese as
+/// often as not, and a byte budget would clip them at a third of the English
+/// length — or slice a character in half, which panics.
+fn clip_mission_text(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = flat.chars().take(MISSION_TEXT_CLIP).collect();
+    if flat.chars().nth(MISSION_TEXT_CLIP).is_some() {
+        out.push('…');
+    }
+    out
+}
+
+/// The mission this session is working on, as a prompt block; `None` when there
+/// is none.
+///
+/// A **mirror** of `desktop/src/state.rs::active_mission_block`, and it has to
+/// stay one: the CLI cannot call the desktop crate (the dependency points the
+/// other way), and the product promises the same answer in the window and in a
+/// terminal. Same `<workspace>/missions/*/mission.json` layout, same
+/// `active.json` pointer, same 160-character clip and five-row cap — a change to
+/// one belongs in both. Drift shows up as a mission the CLI invents or forgets.
+///
+/// Everything here is best-effort. This runs on the turn path, and a prompt that
+/// names the newest mission is better than a turn that dies over a stray byte in
+/// a half-written record, so unreadable files are skipped rather than reported.
+fn active_mission_block(workspace: &Path) -> Option<String> {
+    let root = workspace.join("missions");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return None;
+    };
+    // Ids are time-ordered (`m-YYYYmmdd-HHMMSS`), so sorting the directory names
+    // newest-first gives the order a reader expects.
+    let mut board: Vec<(String, serde_json::Value)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(path.join("mission.json")) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        board.push((name, record));
+    }
+    if board.is_empty() {
+        return None;
+    }
+    board.sort_by(|a, b| b.0.cmp(&a.0));
+
+    // The row id the board reports: the record's own `id`, falling back to the
+    // directory name, exactly as the desktop's board does.
+    let id_of = |name: &str, record: &serde_json::Value| -> String {
+        record
+            .get("id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| name.to_string())
+    };
+    let field = |record: &serde_json::Value, key: &str| -> Option<String> {
+        record
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(clip_mission_text)
+            .filter(|text| !text.trim().is_empty())
+    };
+
+    // The pointer the mission tools follow, so the prompt cannot name one
+    // mission while the tools advance another. A pointer that is missing,
+    // unreadable, or naming a record that is gone falls back to the newest.
+    let pointed = std::fs::read_to_string(root.join("active.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| {
+            value
+                .get("mission")
+                .and_then(|id| id.as_str())
+                .map(str::to_string)
+        });
+    let index = pointed
+        .as_deref()
+        .and_then(|id| {
+            board
+                .iter()
+                .position(|(name, record)| id_of(name, record) == id)
+        })
+        .unwrap_or(0);
+
+    let (name, record) = &board[index];
+    let status = record
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("?");
+    let mut block =
+        String::from("\n\n## 当前任务（长程任务包；状态在磁盘上，本回合开始时如实读取）\n\n");
+    block.push_str(&format!(
+        "- {} [{status}] {}\n",
+        id_of(name, record),
+        field(record, "objective").unwrap_or_else(|| "（未写目标）".to_string())
+    ));
+    block.push_str(&format!(
+        "  下一步：{}\n",
+        field(record, "step").unwrap_or_else(|| "（未设下一步）".to_string())
+    ));
+    block.push_str(&format!(
+        "  完成判据：{}\n",
+        field(record, "done_when").unwrap_or_else(|| "（未设完成判据）".to_string())
+    ));
+    // The rest of the board, so the model knows the active mission is not the
+    // only work in flight — capped, so it never becomes the prompt.
+    let mut listed = 1;
+    for (position, (name, record)) in board.iter().enumerate() {
+        if position == index {
+            continue;
+        }
+        if listed >= MISSION_PROMPT_ROWS {
+            break;
+        }
+        listed += 1;
+        let status = record
+            .get("status")
+            .and_then(|value| value.as_str())
+            .unwrap_or("?");
+        block.push_str(&format!(
+            "- {} [{status}] {}\n",
+            id_of(name, record),
+            field(record, "objective").unwrap_or_else(|| "（未写目标）".to_string())
+        ));
+    }
+    block.push_str(
+        "\n任务未结束不拦着回合结束：回合可以正常收尾；要推进就调用 mission_tick / mission_advance。",
+    );
+    Some(block)
 }
 
 async fn interactive(
@@ -4326,5 +4514,59 @@ mod tests {
         assert_eq!(sanitize_pack_name(".mcp"), "mcp");
         assert_eq!(sanitize_pack_name("Claude_Desktop Config"), "claude-desktop-config");
         assert_eq!(sanitize_pack_name("--weird--name--"), "weird-name");
+    }
+
+    /// The CLI's mission block says what the desktop's says.
+    ///
+    /// `active_mission_block` here is a deliberate copy of the desktop's reader
+    /// (the dependency points the other way), so this is the test that keeps the
+    /// copy honest: no mission adds nothing to the prompt, and one mission is
+    /// named with its objective, next step, test for being done, and the
+    /// sentence saying a mission does not hold the turn open.
+    #[test]
+    fn the_cli_prompt_names_the_active_mission() {
+        let root = std::env::temp_dir().join(format!(
+            "ngu-mission-block-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        // A session that never started a mission has no `missions/` at all: the
+        // ordinary machine, and the block must be nothing rather than a heading.
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(active_mission_block(&empty), None);
+
+        let workspace = root.join("workspace");
+        let dir = workspace.join("missions").join("m-20260101-000000");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("mission.json"),
+            serde_json::json!({
+                "id": "m-20260101-000000",
+                "objective": "把爬虫跑通",
+                "status": "running",
+                "step": "先写一个失败的重试测试",
+                "done_when": "重试测试通过",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // A directory without a readable record is not a mission: it is skipped
+        // instead of becoming a nameless row in the prompt.
+        std::fs::create_dir_all(workspace.join("missions").join("broken")).unwrap();
+
+        let block = active_mission_block(&workspace).expect("a block");
+        for expected in [
+            "m-20260101-000000",
+            "把爬虫跑通",
+            "先写一个失败的重试测试",
+            "重试测试通过",
+            "任务未结束不拦着回合结束",
+            "mission_tick / mission_advance",
+        ] {
+            assert!(block.contains(expected), "missing {expected:?} in {block}");
+        }
+        assert!(!block.contains("broken"), "{block}");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

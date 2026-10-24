@@ -126,7 +126,7 @@ impl crate::plugin::Plugin for LongHorizon {
 
 // ---------------------------------------------------------------- the board
 
-/// The mission bar: objective, status, current step, and two buttons.
+/// The mission bar: the task card, drawn to match the harness's own todo strip.
 ///
 /// It repaints whenever a tool result carries a `<!--mission-state …-->`
 /// marker, which is how the mission tools report themselves. That alone leaves the
@@ -140,44 +140,498 @@ impl crate::plugin::Plugin for LongHorizon {
 /// The script is a bare document of its own sandboxed iframe: it has no access
 /// to the page's bus, only to `window.ngu` from the panel SDK, so everything here
 /// goes through that and through `document`, never through page globals.
+///
+/// The look is copied from the harness's own todo strip (its `TodoPanel`): one
+/// card, and a header row that reads as a single line while collapsed — leading
+/// checklist glyph, the label, a counts summary, a chevron — which opens into the
+/// mission's id and status pill, its objective and current step, the board of
+/// every mission on disk, and the two buttons. Each board row carries one of the
+/// strip's three status glyphs (completed check, spinning fraction ring, dashed
+/// unstarted ring), so a mission list and a todo list read as one component, and
+/// the summary in the header is worded the same way ("1 进行中 · 2 待办 · 1 已完成",
+/// en-space separated, zero-count segments dropped as noise).
+///
+/// It carries its own `<style>` block — the iframe inherits no CSS variables from
+/// the page — so the harness's design tokens are transcribed into local `--mp-*`
+/// properties, light block and dark block, switched by `prefers-color-scheme`; a
+/// reader whose engine knows neither still gets the light block. It defines no
+/// body height, because the panel SDK measures `body` and reports it through
+/// `panel:resize`, so the content has to keep sizing the document.
 fn panel() -> crate::ui::UiPanel {
-    let html = r#"<div id="mission-bar" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:6px 10px;font-size:12px;color:var(--text)">
-  <span style="color:var(--accent);font-weight:600">任务</span>
-  <span data-f="id" style="font-family:var(--mono,monospace);color:var(--dim)">—</span>
-  <span data-f="status" style="padding:1px 6px;border:1px solid var(--line);border-radius:4px;color:var(--dim)">idle</span>
-  <span data-f="step" style="color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:46vw">没有进行中的任务</span>
-  <span data-f="counts" style="font-family:var(--mono,monospace);color:var(--dim)"></span>
-  <span style="flex:1 1 auto"></span>
-  <button class="tiny" data-act="status" type="button">刷新</button>
-  <button class="tiny" data-act="tick" type="button">推进一步</button>
-</div>
-<ul id="mission-list" style="list-style:none;margin:0;padding:0 10px 6px;font-size:11.5px;color:var(--dim);display:flex;flex-direction:column;gap:2px"></ul>"#;
+    let html = r##"<style>
+  /* Palette: the harness's design-platform tokens transcribed into local
+     properties. The panel document cannot see `--dsw-*` (opaque origin, no host
+     CSS), so every colour it needs is restated here from the same source values:
+     light first, then the dark block in the media query. */
+  :root {
+    color-scheme: light dark;
+    --mp-surface: rgb(245, 246, 247);
+    --mp-border: rgba(0, 0, 0, 0.04);
+    --mp-border-strong: rgba(0, 0, 0, 0.1);
+    --mp-hover: rgba(38, 49, 72, 0.06);
+    --mp-label-primary: rgb(15, 17, 21);
+    --mp-label-secondary: rgb(97, 102, 107);
+    --mp-label-tertiary: rgb(129, 133, 140);
+    --mp-label-caption: rgb(173, 178, 184);
+    --mp-business: rgb(65, 118, 230);
+    --mp-business-soft: rgba(65, 118, 230, 0.1);
+    --mp-success: rgb(34, 197, 94);
+    --mp-success-soft: rgba(34, 197, 94, 0.14);
+    --mp-warn: rgb(221, 134, 41);
+    --mp-warn-soft: rgba(221, 134, 41, 0.14);
+    --mp-scrollbar: rgb(229, 229, 229);
+    --mp-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --mp-surface: rgb(53, 54, 56);
+      --mp-border: rgba(255, 255, 255, 0.06);
+      --mp-border-strong: rgba(255, 255, 255, 0.12);
+      --mp-hover: rgba(255, 255, 255, 0.08);
+      --mp-label-primary: rgb(249, 250, 251);
+      --mp-label-secondary: rgb(207, 211, 214);
+      --mp-label-tertiary: rgb(173, 178, 184);
+      --mp-label-caption: rgb(129, 133, 140);
+      --mp-business: rgb(103, 158, 254);
+      --mp-business-soft: rgba(103, 158, 254, 0.16);
+      --mp-success: rgb(34, 197, 94);
+      --mp-success-soft: rgba(34, 197, 94, 0.18);
+      --mp-warn: rgb(247, 173, 49);
+      --mp-warn-soft: rgba(247, 173, 49, 0.16);
+      --mp-scrollbar: rgb(84, 85, 87);
+    }
+  }
+  /* The card: the todo strip's surface — tip fill, hairline border, 12px radius,
+     clipped so the header highlight never bleeds past the corner. No fixed
+     height: the panel SDK measures this document and sizes the frame to it. */
+  #mission-bar {
+    box-sizing: border-box;
+    width: 100%;
+    overflow: hidden;
+    border: 1px solid var(--mp-border);
+    border-radius: 12px;
+    background: var(--mp-surface);
+    color: var(--mp-label-primary);
+    font: 13px/1.45 system-ui, -apple-system, 'Segoe UI', sans-serif;
+  }
+  #mission-bar .mp-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 6px 12px;
+  }
+  /* The resting state: one row. Everything else lives in .mp-detail. */
+  #mission-bar .mp-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #mission-bar .mp-head:focus-visible {
+    border-radius: 6px;
+    outline: 2px solid var(--mp-business);
+    outline-offset: 2px;
+  }
+  #mission-bar .mp-lead,
+  #mission-bar .mp-chevron {
+    display: grid;
+    flex: none;
+    place-items: center;
+    color: var(--mp-label-tertiary);
+  }
+  #mission-bar .mp-lead svg,
+  #mission-bar .mp-chevron svg {
+    display: block;
+  }
+  #mission-bar .mp-title {
+    flex: none;
+    color: var(--mp-label-primary);
+    font-size: 13px;
+    line-height: 24px;
+    font-weight: 500;
+  }
+  /* The counts line: DSH's .progress — takes the slack, ellipsizes at the end. */
+  #mission-bar .mp-progress {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    color: var(--mp-label-tertiary);
+    font-size: 13px;
+    line-height: 20px;
+    font-weight: 400;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* Collapsed shows the up chevron, expanded the down one — same choice the
+     todo strip makes, so the two cards flip the same way. */
+  #mission-bar .mp-chevron .mp-chev-down {
+    display: none;
+  }
+  #mission-bar .mp-head[aria-expanded="true"] .mp-chevron .mp-chev-up {
+    display: none;
+  }
+  #mission-bar .mp-head[aria-expanded="true"] .mp-chevron .mp-chev-down {
+    display: block;
+  }
+  #mission-bar .mp-detail {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+  }
+  /* Explicit, because a `display` on this class would outrank the UA's
+     `[hidden] { display: none }` and the panel would never collapse. */
+  #mission-bar .mp-detail[hidden] {
+    display: none;
+  }
+  #mission-bar .mp-current {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+  #mission-bar .mp-id {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--mp-label-secondary);
+    font-family: var(--mp-mono);
+    font-size: 12px;
+    line-height: 20px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  #mission-bar .mp-pill {
+    display: inline-block;
+    flex: none;
+    padding: 0 7px;
+    border-radius: 999px;
+    background: var(--mp-hover);
+    color: var(--mp-label-secondary);
+    font-size: 11px;
+    line-height: 18px;
+    white-space: nowrap;
+  }
+  #mission-bar .mp-pill[data-s="running"] {
+    background: var(--mp-business-soft);
+    color: var(--mp-business);
+  }
+  #mission-bar .mp-pill[data-s="done"] {
+    background: var(--mp-success-soft);
+    color: var(--mp-success);
+  }
+  #mission-bar .mp-pill[data-s="blocked"] {
+    background: var(--mp-warn-soft);
+    color: var(--mp-warn);
+  }
+  /* The loudest line of the card; clamped to two lines so one long objective
+     cannot push the board and the buttons out of the frame. */
+  #mission-bar .mp-objective {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    margin: 0;
+    overflow: hidden;
+    overflow-wrap: anywhere;
+    color: var(--mp-label-primary);
+    font-size: 13px;
+    line-height: 20px;
+  }
+  #mission-bar .mp-step {
+    margin: 0;
+    min-width: 0;
+    overflow: hidden;
+    color: var(--mp-label-secondary);
+    font-size: 13px;
+    line-height: 20px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* The board: the todo strip's .list, one glyph + one line per mission. */
+  #mission-bar .mp-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 180px;
+    margin: 0;
+    padding: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    list-style: none;
+  }
+  #mission-bar .mp-list:empty {
+    display: none;
+  }
+  #mission-bar .mp-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    color: var(--mp-label-secondary);
+    font-size: 13px;
+    line-height: 20px;
+  }
+  #mission-bar .mp-glyph {
+    display: grid;
+    flex: none;
+    place-items: center;
+    width: 16px;
+    height: 16px;
+  }
+  #mission-bar .mp-glyph svg {
+    display: block;
+  }
+  /* The three status glyphs, coloured the way the todo strip colours them. */
+  #mission-bar .mp-glyph-completed {
+    color: var(--mp-success);
+  }
+  #mission-bar .mp-glyph-progress {
+    color: var(--mp-business);
+    animation: mp-spin 1s linear infinite;
+  }
+  #mission-bar .mp-glyph-pending {
+    color: var(--mp-label-caption);
+  }
+  @keyframes mp-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  /* One copy line per mission: ellipsized, never wrapped. */
+  #mission-bar .mp-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* The mission the card is describing reads in primary ink; the strip has no
+     other marker for "this one", and a filled row would be louder than DSH. */
+  #mission-bar .mp-item[data-current="1"] .mp-text {
+    color: var(--mp-label-primary);
+  }
+  /* The empty-board line is a sentence, not a mission: it wraps instead of
+     ellipsizing, so the whole hint survives a narrow panel. */
+  #mission-bar .mp-empty {
+    color: var(--mp-label-caption);
+    overflow-wrap: anywhere;
+    white-space: normal;
+  }
+  /* The two buttons: quiet, hairline, secondary ink — they sit under the list
+     rather than competing with the header row. */
+  #mission-bar .mp-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  #mission-bar .mp-action {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    height: 24px;
+    padding: 0 10px;
+    border: 1px solid var(--mp-border-strong);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--mp-label-secondary);
+    font: inherit;
+    font-size: 12px;
+    line-height: 20px;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  #mission-bar .mp-action:hover {
+    background: var(--mp-hover);
+    color: var(--mp-label-primary);
+  }
+  #mission-bar .mp-action:active {
+    background: var(--mp-hover);
+  }
+  #mission-bar .mp-action:focus-visible {
+    outline: 2px solid var(--mp-business);
+    outline-offset: 1px;
+  }
+  /* Scrollbar skin, following the harness: an 8px thumb on a transparent track,
+     with the standard properties only where the pseudo-elements are missing. */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    border-radius: 4px;
+    background: var(--mp-scrollbar);
+  }
+  @supports not selector(::-webkit-scrollbar) {
+    #mission-bar * {
+      scrollbar-width: thin;
+      scrollbar-color: var(--mp-scrollbar) transparent;
+    }
+  }
+</style>
+<section id="mission-bar" class="mp-root" aria-label="任务">
+  <div class="mp-body">
+    <button class="mp-head" type="button" aria-expanded="false" aria-controls="mission-detail">
+      <span class="mp-lead" aria-hidden="true">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M13.3277 9.69629V10.976H7.28086V9.69629H13.3277Z" fill="currentColor"/>
+          <path d="M13.3277 2.97256V4.25225H7.28086V2.97256H13.3277Z" fill="currentColor"/>
+          <path d="M4.64512 10.336C4.64505 9.62755 4.07081 9.05322 3.3623 9.05322C2.65386 9.05329 2.07956 9.62759 2.07949 10.336C2.07949 11.0445 2.65382 11.6188 3.3623 11.6188C4.07085 11.6188 4.64512 11.0446 4.64512 10.336ZM5.92559 10.336C5.92559 11.7515 4.77777 12.8993 3.3623 12.8993C1.94689 12.8993 0.799805 11.7515 0.799805 10.336C0.799871 8.92066 1.94693 7.7736 3.3623 7.77354C4.77773 7.77354 5.92552 8.92062 5.92559 10.336Z" fill="currentColor"/>
+          <path d="M4.64531 3.6123C4.6453 2.90382 4.07098 2.32949 3.3625 2.32949C2.65403 2.32951 2.0797 2.90383 2.07969 3.6123C2.07969 4.32079 2.65402 4.8951 3.3625 4.89512C4.07099 4.89512 4.64531 4.3208 4.64531 3.6123ZM5.925 3.6123C5.925 5.02772 4.77792 6.1748 3.3625 6.1748C1.9471 6.17479 0.8 5.02771 0.8 3.6123C0.800013 2.19691 1.9471 1.04982 3.3625 1.0498C4.77791 1.0498 5.92499 2.1969 5.925 3.6123Z" fill="currentColor"/>
+        </svg>
+      </span>
+      <span class="mp-title">任务</span>
+      <span class="mp-progress" data-f="counts">还没有任务</span>
+      <span class="mp-chevron" aria-hidden="true">
+        <svg class="mp-chev-up" width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M2.15137 8.5L2.57617 8.07617L5.30273 5.34863C5.55843 5.09294 5.78438 4.86618 5.98828 4.70215C6.20088 4.53117 6.44405 4.38244 6.75 4.33398C6.91565 4.30778 7.08435 4.30778 7.25 4.33398C7.55595 4.38244 7.79912 4.53117 8.01172 4.70215C8.21561 4.86618 8.44157 5.09294 8.69727 5.34863L11.4238 8.07617L11.8486 8.5L11 9.34863L10.5762 8.92383L7.84863 6.19727C7.57405 5.92269 7.40124 5.75152 7.25977 5.6377C7.12709 5.53096 7.07728 5.52187 7.0625 5.51953C7.02105 5.51297 6.97895 5.51297 6.9375 5.51953C6.92272 5.52187 6.87291 5.53096 6.74023 5.6377C6.59876 5.75152 6.42595 5.92268 6.15137 6.19727L3.42383 8.92383L3 9.34863L2.15137 8.5Z" fill="currentColor"/>
+        </svg>
+        <svg class="mp-chev-down" width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M11.8486 5.5L11.4238 5.92383L8.69727 8.65137C8.44157 8.90706 8.21562 9.13382 8.01172 9.29785C7.79912 9.46883 7.55595 9.61756 7.25 9.66602C7.08435 9.69222 6.91565 9.69222 6.75 9.66602C6.44405 9.61756 6.20088 9.46883 5.98828 9.29785C5.78438 9.13382 5.55843 8.90706 5.30273 8.65137L2.57617 5.92383L2.15137 5.5L3 4.65137L3.42383 5.07617L6.15137 7.80273C6.42595 8.07732 6.59876 8.24849 6.74023 8.3623C6.87291 8.46904 6.92272 8.47813 6.9375 8.48047C6.97895 8.48703 7.02105 8.48703 7.0625 8.48047C7.07728 8.47813 7.12709 8.46904 7.25977 8.3623C7.40124 8.24849 7.57405 8.07732 7.84863 7.80273L10.5762 5.07617L11 4.65137L11.8486 5.5Z" fill="currentColor"/>
+        </svg>
+      </span>
+    </button>
+    <div class="mp-detail" id="mission-detail" hidden>
+      <div class="mp-current">
+        <span class="mp-id" data-f="id">—</span>
+        <span class="mp-pill" data-f="status" data-s="idle">idle</span>
+      </div>
+      <p class="mp-objective" data-f="objective">还没有进行中的任务</p>
+      <p class="mp-step" data-f="step">没有进行中的任务</p>
+      <ul id="mission-list" class="mp-list"><li class="mp-item mp-empty">还没有任务（让模型调用 mission_start 建一个）</li></ul>
+      <div class="mp-actions">
+        <button class="mp-action" data-act="status" type="button">刷新</button>
+        <button class="mp-action" data-act="tick" type="button">推进一步</button>
+      </div>
+    </div>
+  </div>
+</section>"##;
 
     let script = r##"
 const bar = document.getElementById("mission-bar");
 const list = document.getElementById("mission-list");
+const head = bar ? bar.querySelector(".mp-head") : null;
+const detail = document.getElementById("mission-detail");
 const ngu = window.ngu;
 // Whether a tool answer has painted the bar. The board can arrive first (the page
 // feeds the cached status on load), and a board alone must not look like a report
 // of the active mission.
 let sawMarker = false;
+// The mission id the bar is showing. The board marks that row, and paintBoard()
+// runs after whichever reporter set the id, so the id is kept here rather than
+// read back out of the DOM.
+let shownId = "";
+// The board of the missions on disk: an array once one has been reported, null
+// while it is still unknown. The summary in the header is drawn from it, and the
+// panel has to tell "no mission yet" apart from "nobody has said yet".
+let board = null;
+// The active mission's own counters, as the marker reported them. Only used
+// while the board is still unknown.
+let counters = "";
+const EMPTY = "还没有任务";
+// En spaces (U+2002) separate the counts: HTML collapses runs of ASCII spaces, so
+// widening the separator's breathing room needs a literal wide space.
+const SEP = "\u2002\u00b7\u2002";
 function put(field, text) {
   if (!bar) return;
   const node = bar.querySelector('[data-f="' + field + '"]');
   if (node) node.textContent = text;
 }
-function paint(state) {
-  if (!state || typeof state !== "object") return;
-  sawMarker = true;
-  put("id", state.id || "—");
-  put("status", state.status || "?");
-  put("step", state.step || (state.done_when ? "完成判据: " + state.done_when : "（未设下一步）"));
+function setId(id) {
+  const value = id ? String(id) : "—";
+  shownId = value === "—" ? "" : value;
+  put("id", value);
+}
+// The status is written twice on purpose: as the pill's text, and as its data-s
+// variant, which is what the stylesheet colours. One writer keeps the two in step.
+function setStatus(status) {
+  const value = status ? String(status) : "?";
+  if (!bar) return;
+  const node = bar.querySelector('[data-f="status"]');
+  if (!node) return;
+  node.textContent = value;
+  node.setAttribute("data-s", value.toLowerCase());
+}
+// The objective is the line a reader came for. The marker carries it; a marker
+// from an older build does not, so fall back to the board row for the same id.
+function objectiveOf(state) {
+  if (state && typeof state.objective === "string" && state.objective.trim()) {
+    return state.objective;
+  }
+  if (state && Array.isArray(state.missions)) {
+    for (const row of state.missions) {
+      if (row && row.id === state.id && typeof row.objective === "string" && row.objective.trim()) {
+        return row.objective;
+      }
+    }
+  }
+  return "";
+}
+// The board row a mission status maps onto: the todo strip's three glyphs are
+// completed / in progress / pending, and everything else on disk (blocked, idle,
+// a status from a newer build) draws as not started.
+function variant(status) {
+  const value = String(status || "").toLowerCase();
+  if (value === "done" || value === "completed") return "completed";
+  if (value === "running" || value === "in_progress") return "in_progress";
+  return "pending";
+}
+// Header summary, worded like the todo strip's: counts joined by an en space and
+// a middle dot, with zero-count segments dropped as noise.
+function boardSummary(missions) {
+  let done = 0;
+  let active = 0;
+  for (const row of missions) {
+    const kind = variant(row && row.status);
+    if (kind === "completed") done += 1;
+    else if (kind === "in_progress") active += 1;
+  }
+  const pending = missions.length - done - active;
+  const bits = [];
+  if (active > 0) bits.push(active + " 进行中");
+  if (pending > 0) bits.push(pending + " 待办");
+  if (done > 0) bits.push(done + " 已完成");
+  return bits.join(SEP);
+}
+// The fallback summary, for a shell whose status carries no board: the active
+// mission's own counters, exactly as the marker reported them.
+function missionCounts(state) {
   const bits = [];
   bits.push((state.checkpoints || 0) + " 检查点");
   if (state.advances) bits.push(state.advances + " 推进");
   if (state.unread) bits.push(state.unread + " 未读信件");
-  put("counts", bits.join(" · "));
+  return bits.join(" \u00b7 ");
+}
+// One writer for the header summary, so the board and the counters cannot
+// overwrite each other out of order: a known board always wins, an empty one
+// says so, and only an unknown board falls back to the mission's counters.
+function renderCounts() {
+  if (Array.isArray(board)) {
+    put("counts", board.length ? boardSummary(board) : EMPTY);
+    return;
+  }
+  put("counts", counters || EMPTY);
+}
+function paint(state) {
+  if (!state || typeof state !== "object") return;
+  sawMarker = true;
+  setId(state.id);
+  setStatus(state.status);
+  put("objective", objectiveOf(state) || "（未写目标）");
+  put("step", state.step || (state.done_when ? "完成判据: " + state.done_when : "（未设下一步）"));
+  counters = missionCounts(state);
   paintBoard(state.missions);
+  renderCounts();
 }
 function scan(text) {
   if (typeof text !== "string") return;
@@ -185,8 +639,86 @@ function scan(text) {
   if (!found) return;
   try { paint(JSON.parse(found[1])); } catch (error) { /* a marker we cannot read is ignored */ }
 }
+// The status glyphs, drawn as inline SVG on the todo strip's 14×14 artboard and
+// centered by the 16×16 .mp-glyph cell. Same art as TodoPanel, built here because
+// the panel is a script and has no component library.
+const SVG_NS = "http://www.w3.org/2000/svg";
+// The completed glyph's check, copied from the strip's CompletedGlyph path.
+const CHECK_PATH = "M10.9631 5.71411L7.70154 8.97571C7.48011 9.19714 7.27736 9.40099 7.09229 9.54993C6.89742 9.70669 6.66314 9.85279 6.3634 9.90027C6.2049 9.92534 6.04339 9.92534 5.88489 9.90027C5.58515 9.85279 5.35087 9.70669 5.15601 9.54993C4.97093 9.40099 4.76818 9.19714 4.54675 8.97571L3.03516 7.46411L3.96313 6.53613L5.47473 8.04773C5.7169 8.28989 5.86196 8.43389 5.97888 8.52795C6.08597 8.61409 6.10875 8.60701 6.08997 8.604C6.11259 8.60758 6.13571 8.60758 6.15833 8.604C6.13954 8.60701 6.16232 8.61409 6.26941 8.52795C6.38633 8.43389 6.53139 8.28989 6.77356 8.04773L10.0352 4.78613L10.9631 5.71411Z";
+// Every in-progress ring needs a gradient, and a gradient reference is an id
+// lookup in this document: two rows sharing one id would draw two identical
+// rings off whichever <linearGradient> the engine found first. So each glyph
+// takes the next number instead of a fixed name, and a repaint starts a fresh
+// set after the old rows are gone.
+let gradientSeq = 0;
+function svgEl(name, attrs) {
+  const node = document.createElementNS(SVG_NS, name);
+  for (const key in attrs) {
+    if (Object.prototype.hasOwnProperty.call(attrs, key)) node.setAttribute(key, attrs[key]);
+  }
+  return node;
+}
+function glyphShell(cls) {
+  return svgEl("svg", {
+    width: "14",
+    height: "14",
+    viewBox: "0 0 14 14",
+    fill: "none",
+    "class": cls,
+    "aria-hidden": "true",
+    "focusable": "false",
+  });
+}
+// Completed: filled check inside the ring, in the success colour.
+function completedGlyph() {
+  const svg = glyphShell("mp-glyph-completed");
+  svg.append(svgEl("circle", { cx: "7", cy: "7", r: "6.4", stroke: "currentColor", "stroke-width": "1.2" }));
+  svg.append(svgEl("path", { d: CHECK_PATH, fill: "currentColor" }));
+  return svg;
+}
+// In progress: the ring fades from the business colour to transparent along a
+// diagonal, and the stylesheet spins the whole svg.
+function progressGlyph() {
+  gradientSeq += 1;
+  const id = "mp-g" + gradientSeq;
+  const svg = glyphShell("mp-glyph-progress");
+  const defs = svgEl("defs");
+  const gradient = svgEl("linearGradient", {
+    id: id,
+    x1: "2.5",
+    y1: "12",
+    x2: "10.5",
+    y2: "3.5",
+    gradientUnits: "userSpaceOnUse",
+  });
+  gradient.append(svgEl("stop", { "stop-color": "currentColor" }));
+  gradient.append(svgEl("stop", { offset: "1", "stop-color": "currentColor", "stop-opacity": "0" }));
+  defs.append(gradient);
+  svg.append(defs);
+  svg.append(svgEl("circle", { cx: "7", cy: "7", r: "6.4", stroke: "url(#" + id + ")", "stroke-width": "1.2" }));
+  return svg;
+}
+// Pending: the dashed, unstarted ring in the caption colour.
+function pendingGlyph() {
+  const svg = glyphShell("mp-glyph-pending");
+  svg.append(svgEl("circle", {
+    cx: "7",
+    cy: "7",
+    r: "6.4",
+    stroke: "currentColor",
+    "stroke-width": "1.2",
+    "stroke-dasharray": "2.4 2.4",
+  }));
+  return svg;
+}
+function glyphFor(status) {
+  const kind = variant(status);
+  if (kind === "completed") return completedGlyph();
+  if (kind === "in_progress") return progressGlyph();
+  return pendingGlyph();
+}
 // The board: every mission on disk, not just the one this tool just touched.
-// Without it the bar can only ever say "here is the current step", and a reader
+// Without it the card can only ever say "here is the current step", and a reader
 // looking for the task they started sees nothing.
 //
 // A missing list and an empty one are different facts. Missing (an older shell's
@@ -194,37 +726,75 @@ function scan(text) {
 // list says "no missions yet". Printing that over a board that exists is the
 // complaint this panel was reported for.
 function paintBoard(missions) {
-  if (!list) return;
   if (!Array.isArray(missions)) return;
+  board = missions.slice();
+  if (!list) return;
   list.replaceChildren();
-  if (!missions.length) {
+  if (!board.length) {
     const empty = document.createElement("li");
+    empty.className = "mp-item mp-empty";
     empty.textContent = "还没有任务（让模型调用 mission_start 建一个）";
     list.append(empty);
     return;
   }
-  for (const row of missions) {
+  // Newest first is the order the board hands over. The mission the card is
+  // describing is the one a reader looks for first, and it is not always the
+  // newest — a tick on an older mission is exactly that case — so it is hoisted.
+  const rows = board.slice();
+  const at = shownId ? rows.findIndex((row) => row && row.id === shownId) : -1;
+  if (at > 0) rows.unshift(rows.splice(at, 1)[0]);
+  for (const row of rows) {
+    const status = (row && row.status) || "?";
+    const id = (row && row.id) || "";
+    const objective = (row && row.objective) || "";
     const item = document.createElement("li");
-    item.textContent = "· " + (row.id || "?") + "  [" + (row.status || "?") + "]  " + (row.objective || "");
-    if (row.status === "running") item.style.color = "var(--text)";
+    item.className = "mp-item";
+    item.setAttribute("data-status", variant(status));
+    if (id) item.setAttribute("data-id", String(id));
+    if (shownId && id === shownId) item.setAttribute("data-current", "1");
+    // The row is one line of text, so the id it belongs to rides in the tooltip
+    // instead of taking a column of its own.
+    item.title = id ? id + " — " + (objective || "（未写目标）") : objective;
+    const glyph = document.createElement("span");
+    glyph.className = "mp-glyph";
+    glyph.setAttribute("aria-hidden", "true");
+    glyph.append(glyphFor(status));
+    const text = document.createElement("span");
+    text.className = "mp-text";
+    text.textContent = objective || id || "?";
+    item.append(glyph, text);
     list.append(item);
   }
 }
 // The page hands every panel the status it already holds the moment the frame
 // loads, so the list can be painted before any tool has answered. On its own that
-// would put a list of missions under a bar still reading "idle / no mission in
+// would put a list of missions under a card still reading "idle / no mission in
 // progress", which is the same complaint in another shape — so until a marker has
-// been seen the newest mission stands in for the bar. A tool answer wins over it:
+// been seen the newest mission stands in for the card. A tool answer wins over it:
 // that one is the more specific report.
 function paintStatus(event) {
   const status = (event && event.status) || {};
   if (!Array.isArray(status.missions)) return;
+  // The card's id is set before the board is drawn: paintBoard() marks the row
+  // whose id is showing, and reading it back out of the DOM here would only ever
+  // describe the previous paint.
+  if (!sawMarker && status.missions.length) {
+    const newest = status.missions[0] || {};
+    setId(newest.id);
+    setStatus(newest.status);
+    put("objective", newest.objective || "（未写目标）");
+    // The board carries no step, and the objective now has a line of its own, so
+    // this one says the step is unknown instead of repeating the objective.
+    put("step", "（未设下一步）");
+  }
   paintBoard(status.missions);
-  if (sawMarker || !status.missions.length) return;
-  const newest = status.missions[0] || {};
-  put("id", newest.id || "—");
-  put("status", newest.status || "?");
-  put("step", newest.objective || "（未设下一步）");
+  renderCounts();
+}
+// Collapsed is the resting state — the same choice the todo strip makes, so the
+// dock holds one 36px row until a reader asks for the rest.
+function setExpanded(open) {
+  if (head) head.setAttribute("aria-expanded", open ? "true" : "false");
+  if (detail) detail.hidden = !open;
 }
 function send(text) {
   if (!ngu || typeof ngu.call !== "function") return;
@@ -238,6 +808,11 @@ if (ngu && typeof ngu.on === "function") {
   ngu.on("tool_end", (event) => scan(event && event.result));
   ngu.on("status", paintStatus);
 }
+if (head) {
+  head.addEventListener("click", () => {
+    setExpanded(head.getAttribute("aria-expanded") !== "true");
+  });
+}
 if (bar) {
   const refresh = bar.querySelector('[data-act="status"]');
   if (refresh) refresh.addEventListener("click", () => send("调用 mission_status，把当前长程任务的状态原样报告给我。"));
@@ -247,7 +822,6 @@ if (bar) {
 "##;
 
     crate::ui::UiPanel::new("mission-bar", crate::ui::UiSlot::AboveComposer, html)
-        .titled("长程任务")
         .with_script(script)
         .ordered(-10)
 }
@@ -604,6 +1178,10 @@ fn board_json() -> Value {
 fn marker(record: &Value, extra: Value) -> String {
     let mut state = json!({
         "id": record.get("id").cloned().unwrap_or(Value::Null),
+        // The bar's largest line is the objective, so the marker carries it: the
+        // board's copy belongs to a row, and a marker can be painted before any
+        // board arrives (a tool answer out of the gate).
+        "objective": record.get("objective").cloned().unwrap_or(Value::Null),
         "status": record.get("status").cloned().unwrap_or(Value::Null),
         "step": record.get("step").cloned().unwrap_or(Value::Null),
         "done_when": record.get("done_when").cloned().unwrap_or(Value::Null),

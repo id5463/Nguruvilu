@@ -282,12 +282,24 @@ pub struct SharedConfig {
     /// Working directory of the session the next turn runs in. Changed on
     /// session switch so the model is told where it is, and the tools agree.
     pub cwd: Mutex<Option<String>>,
+    /// Which session's mission board the prompt should name: the sessions
+    /// store root plus the session id.
+    ///
+    /// Stored beside the cwd because a mission lives in the session workspace,
+    /// and resolving that board needs the id and the working directory
+    /// together. A pair taken from two different sessions would describe a
+    /// board whose mission tools this turn cannot reach — worse than naming no
+    /// mission at all — so both are written by one setter.
+    pub mission_scope: Mutex<Option<(PathBuf, String)>>,
 }
 
 impl SharedConfig {
-    /// Point the model's stated working directory at the given session directory.
-    pub fn set_cwd(&self, cwd: Option<String>) {
+    /// Point the next turn at a session: where it runs, and whose mission board
+    /// the prompt should read.
+    pub fn set_session_scope(&self, store_root: &Path, session_id: &str, cwd: Option<String>) {
         *self.cwd.lock().expect("cwd lock") = cwd;
+        *self.mission_scope.lock().expect("mission scope lock") =
+            Some((store_root.to_path_buf(), session_id.to_string()));
     }
 }
 
@@ -301,6 +313,25 @@ impl TurnConfig for SharedConfig {
                 "\n\nYour working directory for this conversation is {cwd}. \
                  Relative paths resolve against it, and files the user uploads land in its uploads/ folder."
             ));
+        }
+        // The mission board lives on disk, and nothing else in the request says a
+        // mission exists: without this block the model learns about one only by
+        // happening to call `mission_status`. Reading it here is what makes the
+        // long-horizon pack visible at the start of a turn instead of only to a
+        // model that already suspected something was running.
+        //
+        // The scope is cloned out rather than held while the board is read: the
+        // read touches the disk, and a session switch must never wait on it.
+        let scope = self
+            .mission_scope
+            .lock()
+            .expect("mission scope lock")
+            .clone();
+        if let Some((store_root, session_id)) = scope {
+            let cwd = self.cwd.lock().expect("cwd lock").clone();
+            if let Some(block) = active_mission_block(&store_root, &session_id, cwd.as_deref()) {
+                system_prompt.push_str(&block);
+            }
         }
         if let Some(catalog) = self.skills.lock().expect("skills lock").catalog() {
             system_prompt.push_str("\n\n");
@@ -494,6 +525,10 @@ impl AppState {
             policy,
             injection: Mutex::new(Arc::new(nguruvilu::context::InjectionEngine::load_default())),
             cwd: Mutex::new(None),
+            // Filled below, once the session and its workspace are known: the
+            // prompt names a mission from the first turn, not from the first
+            // switch.
+            mission_scope: Mutex::new(None),
         });
 
         let store = JsonlStore::open(sessions_root())?;
@@ -543,7 +578,7 @@ impl AppState {
             Err(error) => eprintln!("[skills] scan failed: {error:#}"),
         }
 
-        config.set_cwd(session.cwd.clone());
+        config.set_session_scope(store.root(), &session.id, session.cwd.clone());
 
         // Before any pack folds: boot loads the packs after this point, so the
         // snapshot is exactly the user's own state a recompute returns to.
@@ -924,8 +959,12 @@ impl AppState {
         // process-wide for the desktop's single AppState, so this swap is what
         // makes jobs, packs, and file tools conversation-scoped.
         self.kernel.set_session(Some(next.to_string()), Some(PathBuf::from(workspace)));
-        // The model is told the same directory the tools resolve against.
-        self.config.set_cwd(Some(workspace.to_string()));
+        // The model is told the same directory the tools resolve against, and
+        // which session's mission board the next turn should name — both from
+        // this one switch, so the prompt can never describe one session's
+        // mission while the tools write into another's workspace.
+        self.config
+            .set_session_scope(self.store.root(), next, Some(workspace.to_string()));
         if self.session.id != next {
             events.emit(
                 nguruvilu::events::SESSION_END,
@@ -1475,6 +1514,12 @@ fn adopt_workspace_for(session: &Session) -> Result<String> {
 /// `AppState::describe` under the state lock, where a half-readable board must
 /// never turn a status push into an error. A record that does not parse is skipped
 /// rather than reported as a nameless mission.
+///
+/// `step` and `done_when` are clipped: this same array is what
+/// [`active_mission_block`] renders into every turn's prompt, and a mission whose
+/// notes run to a page must not spend a page of context on each request. The
+/// panel ignores both keys, and the mission tools answer the full text when the
+/// model actually asks.
 fn missions_under(workspace: &Path) -> Value {
     let root = workspace.join("missions");
     let Ok(entries) = std::fs::read_dir(&root) else {
@@ -1496,6 +1541,12 @@ fn missions_under(workspace: &Path) -> Value {
         let Ok(record) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
+        // Absent stays absent rather than becoming an empty string: the prompt
+        // says "next step: not set" only for a mission that really has none.
+        let clipped = |key: &str| match record.get(key).and_then(Value::as_str) {
+            Some(text) => Value::String(clip_mission_text(text)),
+            None => Value::Null,
+        };
         let row = json!({
             "id": record
                 .get("id")
@@ -1503,11 +1554,137 @@ fn missions_under(workspace: &Path) -> Value {
                 .unwrap_or_else(|| Value::String(name.clone())),
             "objective": record.get("objective").cloned().unwrap_or(Value::Null),
             "status": record.get("status").cloned().unwrap_or(Value::Null),
+            "step": clipped("step"),
+            "done_when": clipped("done_when"),
         });
         rows.push((name, row));
     }
     rows.sort_by(|a, b| b.0.cmp(&a.0));
     Value::Array(rows.into_iter().map(|(_, row)| row).collect())
+}
+
+/// Most mission text one prompt row may carry.
+///
+/// The block sits in every request of the conversation, so this is a context
+/// budget, not a display preference: the model can always read a whole record
+/// through `mission_status`.
+const MISSION_TEXT_CLIP: usize = 160;
+
+/// One mission field as a single prompt-safe line.
+///
+/// Newlines are flattened, because a row that wraps silently breaks the list the
+/// block is. The cut is by characters rather than bytes: objectives here are
+/// Chinese as often as not, and a byte budget would clip them at a third of the
+/// English length — or slice a character in half, which panics.
+fn clip_mission_text(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = flat.chars().take(MISSION_TEXT_CLIP).collect();
+    if flat.chars().nth(MISSION_TEXT_CLIP).is_some() {
+        out.push('…');
+    }
+    out
+}
+
+/// Most missions one prompt block lists, the active one included.
+///
+/// A cap, not a page: the block exists so the model knows work is waiting, and a
+/// board of thirty missions read into every request would cost more than it tells.
+const MISSION_PROMPT_ROWS: usize = 5;
+
+/// The mission the model is working on, as a prompt block; `None` when there is
+/// none.
+///
+/// This is the whole reason the long-horizon pack reads as alive or dead: until a
+/// turn says a mission exists, the model has to guess that `mission_status` is
+/// worth calling. The state is on disk, so the block states a fact true at the
+/// start of the turn and says where it came from.
+///
+/// The active mission is the one `active.json` points at — the same pointer the
+/// mission tools follow, so the prompt and the tools cannot disagree — falling
+/// back to the newest record, which is the mission a reader would call current
+/// when no pointer was written or it names a record that is gone. At most
+/// [`MISSION_PROMPT_ROWS`] rows are listed: the point is for the model to know
+/// work exists, not to mirror the board into the context window.
+fn active_mission_block(store_root: &Path, session_id: &str, cwd: Option<&str>) -> Option<String> {
+    let workspace = missions_workspace(store_root, session_id, cwd)?;
+    let board = missions_under(&workspace);
+    let rows = board.as_array()?;
+    // No record at all is the ordinary machine: there is nothing to say, and a
+    // heading announcing an empty board would only spend context.
+    if rows.is_empty() {
+        return None;
+    }
+    // A pointer file that cannot be read is not an error here: this runs on the
+    // turn path, and a prompt that names the newest mission is better than a
+    // turn that fails over a stray byte.
+    let pointed = std::fs::read_to_string(workspace.join("missions").join("active.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| {
+            value
+                .get("mission")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let index = pointed
+        .as_deref()
+        .and_then(|id| {
+            rows.iter()
+                .position(|row| row.get("id").and_then(Value::as_str) == Some(id))
+        })
+        // The board is newest first, so 0 is the fallback a reader would pick.
+        .unwrap_or(0);
+
+    let field = |row: &Value, key: &str| -> Option<String> {
+        row.get(key)
+            .and_then(Value::as_str)
+            .map(clip_mission_text)
+            .filter(|text| !text.trim().is_empty())
+    };
+    // Owned rather than a borrowed `&str`: a closure cannot spell the lifetime
+    // that would tie the answer back to the row, and one short status word per
+    // row is not worth arguing with the compiler about.
+    let status_of = |row: &Value| -> String {
+        row.get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_string()
+    };
+    let active = &rows[index];
+    let id = active.get("id").and_then(Value::as_str).unwrap_or("?");
+    let objective = field(active, "objective").unwrap_or_else(|| "（未写目标）".to_string());
+
+    let mut block = String::from(
+        "\n\n## 当前任务（长程任务包；状态在磁盘上，本回合开始时如实读取）\n\n",
+    );
+    block.push_str(&format!("- {id} [{}] {objective}\n", status_of(active)));
+    block.push_str(&format!(
+        "  下一步：{}\n",
+        field(active, "step").unwrap_or_else(|| "（未设下一步）".to_string())
+    ));
+    block.push_str(&format!(
+        "  完成判据：{}\n",
+        field(active, "done_when").unwrap_or_else(|| "（未设完成判据）".to_string())
+    ));
+    // The rest of the board, so the model knows the active mission is not the
+    // only work in flight — capped, so a long history cannot take over the prompt.
+    let mut listed = 1;
+    for (position, row) in rows.iter().enumerate() {
+        if position == index {
+            continue;
+        }
+        if listed >= MISSION_PROMPT_ROWS {
+            break;
+        }
+        listed += 1;
+        let id = row.get("id").and_then(Value::as_str).unwrap_or("?");
+        let objective = field(row, "objective").unwrap_or_else(|| "（未写目标）".to_string());
+        block.push_str(&format!("- {id} [{}] {objective}\n", status_of(row)));
+    }
+    block.push_str(
+        "\n任务未结束不拦着回合结束：回合可以正常收尾；要推进就调用 mission_tick / mission_advance。",
+    );
+    Some(block)
 }
 
 /// The directory whose `missions/` this session's tools wrote into.
@@ -3267,6 +3444,112 @@ mod tests {
         // are the ordinary case on a machine that never started a mission.
         std::fs::create_dir_all(home.join("missions")).unwrap();
         assert_eq!(missions_under(&home), json!([]));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The prompt names the mission being worked on, every turn.
+    ///
+    /// This is what the pack was missing: the board is on disk, so a model that
+    /// never calls `mission_status` sees a mission-less conversation. The block
+    /// asserted here is the whole delivery of that fact — id, status, objective,
+    /// next step, the test for being done, and the sentence saying a mission does
+    /// not hold the turn open — so a change that quietly drops one of them fails
+    /// here rather than in a user's conversation.
+    #[test]
+    fn the_prompt_names_the_active_mission() {
+        let home = std::env::temp_dir().join(format!("ngu-state-test-{}", uuid::Uuid::new_v4()));
+        // `store_root` is the sessions directory; the state home is its parent.
+        let sessions = home.join("sessions");
+        let workspace = missions_workspace(&sessions, "s-1", None).expect("a workspace path");
+
+        // No mission at all is the ordinary machine, and the block must be
+        // nothing rather than a heading saying the mission list is empty.
+        assert_eq!(active_mission_block(&sessions, "s-1", None), None);
+
+        let write = |id: &str, objective: &str, step: &str, done_when: &str| {
+            let dir = workspace.join("missions").join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("mission.json"),
+                json!({
+                    "id": id,
+                    "objective": objective,
+                    "status": "running",
+                    "step": step,
+                    "done_when": done_when,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        // The older mission is written first and then pointed at, so the pointer
+        // has to win over "newest" for this to pass: the prompt must describe the
+        // mission the tools will advance, not merely the latest one on the board.
+        write(
+            "m-20260101-000000",
+            "把爬虫跑通",
+            "先写一个失败的重试测试",
+            "重试测试通过",
+        );
+        write(
+            "m-20260102-000000",
+            "ship the crawler",
+            "write the failing test",
+            "the tests pass",
+        );
+        std::fs::write(
+            workspace.join("missions").join("active.json"),
+            json!({ "mission": "m-20260101-000000" }).to_string(),
+        )
+        .unwrap();
+
+        let block = active_mission_block(&sessions, "s-1", None).expect("a block");
+        for expected in [
+            "m-20260101-000000",
+            "把爬虫跑通",
+            "先写一个失败的重试测试",
+            "重试测试通过",
+            // The owner's other question, answered in the prompt: a mission that
+            // outlives the turn does not keep the turn open.
+            "任务未结束不拦着回合结束",
+            "mission_tick / mission_advance",
+        ] {
+            assert!(block.contains(expected), "missing {expected:?} in {block}");
+        }
+        // The other mission is a plain row: it is visible, but its step is not
+        // described — one mission's detail is all the block carries.
+        assert!(
+            block.contains("- m-20260102-000000 [running] ship the crawler"),
+            "{block}"
+        );
+        assert!(!block.contains("write the failing test"), "{block}");
+
+        // A pointer naming a record that is gone falls back to the newest
+        // mission instead of leaving the model with a nameless heading.
+        std::fs::write(
+            workspace.join("missions").join("active.json"),
+            json!({ "mission": "m-does-not-exist" }).to_string(),
+        )
+        .unwrap();
+        let block = active_mission_block(&sessions, "s-1", None).expect("a block");
+        assert!(block.contains("ship the crawler"), "{block}");
+
+        // A page-long objective cannot take the prompt with it: the block stays
+        // one small block however much the record holds.
+        write(
+            "m-20260103-000000",
+            &"很长的目标，".repeat(300),
+            "next",
+            "done when it is done",
+        );
+        let block = active_mission_block(&sessions, "s-1", None).expect("a block");
+        assert!(
+            block.chars().count() < 800,
+            "{} characters is too long a prompt block",
+            block.chars().count()
+        );
+        assert!(block.contains('…'), "{block}");
+
         let _ = std::fs::remove_dir_all(&home);
     }
 }
