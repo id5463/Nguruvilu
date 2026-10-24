@@ -156,6 +156,11 @@ pub fn serve(
         let sink: Arc<dyn EventSink> = Arc::new(SseSink { bus: bus.clone() });
         // notify-jobs wake their session over the same event stream.
         crate::state::install_job_wake(Arc::clone(&state), Arc::clone(&sink));
+        // Packs before the first request, not on a page's `ready`: a served
+        // shell may be driven by a phone that never sends one, and a
+        // conversation with only the base tools is indistinguishable from a
+        // missing feature. `ready` still asks; the flag makes it a no-op.
+        crate::load_packs_once(Arc::clone(&state), Arc::clone(&sink)).await;
 
         // Outbound remote control, same as the window: the process dials the
         // relay and every command still passes the allow-list in `remote`.

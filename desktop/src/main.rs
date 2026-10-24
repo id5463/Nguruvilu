@@ -169,6 +169,10 @@ fn headless(startup_prompt: Option<String>) -> anyhow::Result<()> {
     state::install_job_wake(Arc::clone(&state), Arc::clone(&sink));
 
     let result = runtime.block_on(async {
+        // Packs first, for the same reason the window loads them at boot: the
+        // ready command below also loads them, but a store that depends on one
+        // synthesised command is one refactor away from a shell with no tools.
+        load_packs_once(Arc::clone(&state), Arc::clone(&sink)).await;
         // The windowed path starts from the page's "ready"; headless has no page,
         // so the shell announces itself the same way.
         dispatch(
@@ -331,6 +335,18 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
         Ok(_) => {}
         Err(error) => eprintln!("[preinstall] {error:#}"),
     }
+
+    // Load the installed packs before anything can start a turn.
+    //
+    // They used to load only when the page announced itself (`ready`), which
+    // keeps the first paint fast but means every session that starts earlier
+    // runs with just the base tools: a startup prompt, a `--serve` or headless
+    // process with no page at all, and a page that never loads each got a
+    // conversation without the packs. The mission tools, the subagent, document
+    // reading and search all live in packs, so "the model never uses the task
+    // feature" was really "the tool was never in the table". `ready` still asks
+    // — the same flag makes that call a no-op, so nothing loads twice.
+    runtime.block_on(load_packs_once(Arc::clone(&state), Arc::clone(&sink)));
 
     let webview = {
         let state = Arc::clone(&state);
@@ -619,6 +635,7 @@ pub(crate) async fn dispatch(
             if !PACKS_LOADED.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 load_installed_packs(Arc::clone(&state), Arc::clone(&sink)).await;
             }
+
 
             let (sessions, transcript, status) = {
                 let guard = state.lock().expect("state lock");
@@ -1824,8 +1841,25 @@ fn claim_loaded_fibers(kernel: &mut Kernel, before: &BTreeSet<u64>, session: &st
     }
 }
 
-/// Load an installed pack's plugins, MCP servers, and skills into the kernel.
-/// Load every installed pack, in name order.
+/// Load the installed packs once per process, whichever path gets there first.
+///
+/// This used to happen only when the page announced itself (`ready`): the
+/// window relied on it, headless synthesized the same command, and `--serve`
+/// never sent one at all — so a conversation served to a phone, or one that
+/// started from a startup prompt before the page finished loading, ran with
+/// only the base tools. The mission tools, the subagent, document reading and
+/// search all arrive through packs, so "the model never uses that feature" was
+/// really "that tool was never in the table". One function and one flag make
+/// every front end agree, and the flag keeps `ready` from loading twice.
+pub(crate) async fn load_packs_once(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
+    if PACKS_LOADED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    load_installed_packs(state, sink).await;
+}
+
+/// Load an installed pack's plugins, MCP servers, and skills into the kernel:
+/// every installed pack, in name order.
 ///
 /// A pack is a thing the user chose to install, so it loads without being asked
 /// again. Failures are reported and do not stop the others: one pack with a
@@ -1888,6 +1922,23 @@ async fn load_installed_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSi
             }
         }
     }
+
+    // What the conversations actually got.
+    //
+    // A pack can report "applied 2 entries" while its plugin sits waiting for a
+    // service that never arrives, and then the tools are simply absent — which
+    // from the outside looks exactly like "the model never uses that feature".
+    // The tool table is the only place that difference is visible, so it is
+    // printed once, at boot, where someone debugging can see it.
+    let tool_names = {
+        let guard = state.lock().expect("state lock");
+        guard.kernel.tools().names()
+    };
+    eprintln!(
+        "[pack] {} tool(s) in the table after boot: {}",
+        tool_names.len(),
+        tool_names.join(", ")
+    );
 }
 
 /// Apply a pack's assembly and content.

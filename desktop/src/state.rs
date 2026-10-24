@@ -762,6 +762,10 @@ impl AppState {
     pub fn doctor(&self) -> Value {
         let options = nguruvilu::doctor::Options {
             sessions: self.store.root().to_path_buf(),
+            // The cap this shell's turns actually use, so the report answers the
+            // question a user has ("why did my turn stop?") instead of repeating
+            // a default they never chose.
+            max_steps: Some(self.settings.max_steps()),
             ..nguruvilu::doctor::Options::default()
         };
         let report = nguruvilu::doctor::run(&options);
@@ -1003,6 +1007,10 @@ impl AppState {
             context_window: context_window.filter(|t| *t > 0),
             compact_percent,
             compact_keep_recent: compact_keep_recent.max(1),
+            // Not a panel field: the shell's settings panel has no control for
+            // the step cap, and a save from it must not reset what the file or
+            // the command line chose.
+            max_steps: self.settings.max_steps,
             // Not panel fields: a save from the panel must keep the stored relay
             // settings instead of clearing them.
             relay_url: self.settings.relay_url.clone(),
@@ -1797,7 +1805,7 @@ pub async fn run_turn(
     // One turn per session, decided under the lock so two prompts racing for
     // the same history cannot both pass the check.
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let (session_id, client, config, messages, events, inbox, workspace) = {
+    let (session_id, client, config, messages, events, inbox, workspace, max_steps) = {
         let mut guard = state.lock().expect("state lock");
         // The conversation this turn belongs to, resolved once under the lock:
         // an explicit target wins, without one the conversation on screen. A
@@ -1865,6 +1873,11 @@ pub async fn run_turn(
             guard.kernel.events(),
             inbox,
             guard.session.cwd.clone(),
+            // The step cap is a setting, not a constant of the shell: a machine
+            // whose turns are long-running work needs a different number than one
+            // answering short questions, and hard-coding 50 meant the desktop was
+            // the one front end that could not be told.
+            guard.settings.max_steps(),
         )
     };
     let observer = Arc::new(UiObserver::new(
@@ -1873,7 +1886,7 @@ pub async fn run_turn(
         session_id.clone(),
     ));
     let mut agent = Agent::new(client, config, messages)
-        .with_max_steps(50)
+        .with_max_steps(max_steps)
         .with_observer(Arc::clone(&observer) as Arc<dyn AgentObserver>)
         .with_cancel(stop_rx)
         .with_inbox(inbox)

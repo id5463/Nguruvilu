@@ -211,6 +211,18 @@ const MAX_CONTINUATIONS: usize = 3;
 /// What a stopped turn reports as its error.
 const STOPPED: &str = "stopped by the user";
 
+/// Extra batches of steps granted after a batch spends `max_steps`, each as long
+/// as the cap itself.
+///
+/// Hitting the cap does not mean the turn failed: a genuinely long task can
+/// need more rounds than one batch holds, and ending there abandons the work
+/// half-done with nothing to answer. So a spent batch asks the model whether a
+/// round count this long is normal and earns one more batch. The number is
+/// finite because the renewal is the easiest place for a runaway to hide — a
+/// model that never concludes would act and bill forever — and two renewals are
+/// enough for a real task to either finish or say that it cannot.
+pub const CONTINUATION_BATCHES: usize = 2;
+
 /// How much of a tool's failure is sent back to the model.
 ///
 /// `{error:#}` is the whole anyhow cause chain, written for a developer sitting
@@ -363,7 +375,11 @@ impl Agent {
         )
     }
 
-    /// Cap the number of model steps in one turn.
+    /// Cap the number of model steps in one batch.
+    ///
+    /// A turn may run up to `1 + CONTINUATION_BATCHES` batches of this length:
+    /// a batch that spends its steps asks the model whether to continue instead
+    /// of ending the turn, so `steps` bounds one batch and not the whole turn.
     pub fn with_max_steps(mut self, steps: usize) -> Self {
         self.max_steps = steps.max(1);
         self
@@ -425,7 +441,12 @@ impl Agent {
         self.config.settings().version
     }
 
-    /// Run one turn: append `prompt` and loop until the model stops calling tools.
+    /// Run one turn: append `prompt` and loop until the model stops calling
+    /// tools, a stop is requested, or the step budget is spent.
+    ///
+    /// The budget is `max_steps` per batch for `1 + CONTINUATION_BATCHES`
+    /// batches: a spent batch asks the model whether to continue rather than
+    /// ending the turn.
     pub async fn run(&mut self, prompt: &str) -> Result<AgentOutcome> {
         let user_message = Message::user(prompt);
         self.messages.push(user_message.clone());
@@ -486,7 +507,23 @@ impl Agent {
         let network = self.client.network().clone();
         let max_attempts = 1 + network.retry_attempts;
 
-        for step in 1..=self.max_steps {
+        // The cap bounds one batch of steps, not the whole turn. Spending a
+        // batch without a final answer asks the model whether a round count
+        // this long is normal, tells it to keep working, and earns another
+        // batch — see [`CONTINUATION_BATCHES`] for why that is bounded.
+        //
+        // One counter drives both. `step` is the global index, so `outcome.steps`
+        // and the observer report the work the turn actually did instead of
+        // restarting at 1 with every batch and hiding two of them from the
+        // ledger.
+        //
+        // `saturating_mul` rather than `*`: a caller passing a nonsensical cap
+        // must get a very long turn, not a panic in the multiplication before
+        // the first step.
+        let step_budget = self.max_steps.saturating_mul(1 + CONTINUATION_BATCHES);
+        let mut renewals: usize = 0;
+
+        for step in 1..=step_budget {
             // A stop between steps ends the turn here: everything committed
             // so far is already in the history and is reported with it.
             if self.stop_requested() {
@@ -519,6 +556,8 @@ impl Agent {
                 }
             }
 
+            // The global step index, not the batch's: a caller reading
+            // `steps` must see the turn's whole work.
             outcome.steps = step;
             self.observer.on_step(step);
 
@@ -853,11 +892,43 @@ impl Agent {
                 outcome.error = Some(STOPPED.to_string());
                 return Ok(outcome);
             }
+
+            // A multiple of the cap is a batch boundary: the batch that just
+            // ended spent its last step without a final answer, and every
+            // `return` above would already have ended the turn. Ask once, then
+            // carry on with the next batch.
+            if step % self.max_steps == 0 && step < step_budget {
+                renewals += 1;
+                let ask = format!(
+                    "本回合已经连续 {total} 轮（单批上限 {max}）没有给出最终答复。\
+                     对话轮数过长是否正常？如果还需要继续，就继续工作；如果已经可以收尾，请现在直接给出结论。",
+                    total = step,
+                    max = self.max_steps,
+                );
+                // Also on stderr: without it, a turn that keeps running past its
+                // cap is indistinguishable from a stuck one in a terminal or a
+                // desktop log.
+                eprintln!(
+                    "[steps] {step} steps without a final answer; asking the model whether to continue"
+                );
+                // Committed exactly like steering: this is a user-role message,
+                // so the model reads it on the next request and the transcript
+                // shows it rather than leaving the turn inexplicably longer.
+                let message = Message::user(ask);
+                self.messages.push(message.clone());
+                outcome.new_messages.push(message.clone());
+                self.observer.on_message(&message);
+            }
         }
 
+        // Every batch is spent. The turn stops — that bound is what keeps a
+        // model that never concludes from acting and billing forever — and it
+        // says how many steps it really took and how often it was asked, so a
+        // capped turn is distinguishable from a finished one and greppable in a
+        // log.
         outcome.text = format!(
-            "stopped after {} steps without a final answer",
-            self.max_steps
+            "stopped after {} steps without a final answer ({} continuation(s) asked)",
+            step_budget, renewals
         );
         Ok(outcome)
     }
@@ -1617,7 +1688,12 @@ mod tests {
         )
     }
 
-    /// An agent against `base`, with `tools` and a single step per turn.
+    /// An agent against `base`, with `tools` and a cap of one step per batch.
+    ///
+    /// The mock provider repeats its last response, so a script that ends on a
+    /// tool call keeps the model asking for tools until the whole step budget
+    /// is spent. A test that wants one tool round and then an end scripts a
+    /// final answer as the last response.
     fn agent_with_tools(base: String, tools: Arc<ToolRegistry>) -> Agent {
         let config: Arc<dyn TurnConfig> = Arc::new(StaticConfig::new("SYS", tools, "test-model"));
         let client = LlmClient::new(crate::llm::LlmConfig::new(base, "k", "test-model"))
@@ -1647,7 +1723,15 @@ mod tests {
                 panic!("the tool went down");
             })
         });
-        let (base, hits) = provider(vec![sse_tool_call("call_1", "boom", "{}")]).await;
+        // The script ends on a final answer. The provider repeats its last
+        // response, and the cap is one step per batch, so a script that ended on
+        // the tool call would keep the model calling it until the whole step
+        // budget was spent — this test is about the panic, not the budget.
+        let (base, hits) = provider(vec![
+            sse_tool_call("call_1", "boom", "{}"),
+            sse_answer("done", "stop"),
+        ])
+        .await;
         let mut agent = agent_with_tools(base, tools);
 
         let outcome = agent
@@ -1657,7 +1741,11 @@ mod tests {
 
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
         assert_eq!(outcome.tool_calls, 1);
-        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the tool round, then the answer that follows the ask to continue"
+        );
 
         // The pairing, asserted where a request builder looks for it: the call
         // is immediately followed by its result, and the result names the call.
@@ -1696,7 +1784,14 @@ mod tests {
                 failed
             })
         });
-        let (base, _) = provider(vec![sse_tool_call("call_2", "explode", "{}")]).await;
+        // One tool round, then a final answer: the failure summary is what this
+        // test measures, so the turn is allowed to end after the call instead of
+        // running the whole step budget.
+        let (base, _) = provider(vec![
+            sse_tool_call("call_2", "explode", "{}"),
+            sse_answer("done", "stop"),
+        ])
+        .await;
         let mut agent = agent_with_tools(base, tools);
 
         let outcome = agent.run("go").await.expect("the turn finishes");
@@ -1731,5 +1826,204 @@ mod tests {
         // A short failure passes through untouched, newlines collapsed.
         let short = summarize_tool_error(&anyhow::anyhow!("line one\nline two"));
         assert_eq!(short, "line one line two");
+    }
+
+    /// A tool that only returns, so a script that keeps calling it spends steps
+    /// instead of measuring a tool's behaviour.
+    fn tick_tools() -> Arc<ToolRegistry> {
+        registry_with("tick", |_arguments| -> crate::tools::ToolFuture {
+            Box::pin(async move {
+                let answered: Result<crate::tools::ToolOutput> =
+                    Ok(crate::tools::ToolOutput::text("tick"));
+                answered
+            })
+        })
+    }
+
+    /// The part of the continuation ask a test matches on.
+    ///
+    /// A fragment rather than the whole sentence, so rewording the question the
+    /// model is asked does not break the tests that only care that it was asked.
+    const CONTINUATION_FRAGMENT: &str = "对话轮数过长是否正常";
+
+    /// How many of `messages` carry the continuation ask.
+    fn continuation_asks<'a>(messages: impl IntoIterator<Item = &'a Message>) -> usize {
+        messages
+            .into_iter()
+            .filter(|message| message.text().contains(CONTINUATION_FRAGMENT))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn the_step_cap_asks_the_model_to_continue_instead_of_ending_the_turn() {
+        // A model that only ever asks for tools never produces a final answer.
+        // The cap used to end the turn there, abandoning a long task mid-work
+        // with nothing but a note saying it had been abandoned. Reaching it now
+        // asks whether a round count this long is normal, tells the model to
+        // keep working, and grants a bounded number of batches of the same
+        // length.
+        let (base, hits) = provider(vec![sse_tool_call("call_1", "tick", "{}")]).await;
+        let mut agent = agent_with_tools(base, tick_tools()).with_max_steps(2);
+
+        let outcome = agent.run("go").await.expect("the loop finishes");
+
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(
+            continuation_asks(&outcome.new_messages),
+            CONTINUATION_BATCHES,
+            "one ask per spent batch, and no more: {:?}",
+            outcome
+                .new_messages
+                .iter()
+                .map(Message::text)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            outcome.steps,
+            2 * (1 + CONTINUATION_BATCHES),
+            "each renewal grants another full cap of steps"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::Relaxed),
+            outcome.steps,
+            "every one of those steps was a real request"
+        );
+        assert_eq!(
+            outcome.text,
+            format!(
+                "stopped after {} steps without a final answer ({} continuation(s) asked)",
+                2 * (1 + CONTINUATION_BATCHES),
+                CONTINUATION_BATCHES
+            ),
+            "the report is honest about the real total and what was asked"
+        );
+        // The ask is a request, not a remark: it has to say what to do next.
+        assert!(
+            outcome
+                .new_messages
+                .iter()
+                .any(|message| message.text().contains("如果已经可以收尾，请现在直接给出结论")),
+            "the ask carries the instruction to keep working"
+        );
+
+        // Committed to the conversation, not merely reported: a message the
+        // model never reads is not a request to continue.
+        assert_eq!(continuation_asks(agent.messages()), CONTINUATION_BATCHES);
+    }
+
+    #[tokio::test]
+    async fn the_continuation_message_reaches_the_observer() {
+        // Hosts persist the conversation from `on_message`, and that is what the
+        // user reads as the transcript. An ask the model receives but the
+        // transcript never shows makes a turn that overran its cap look like one
+        // that hung.
+        #[derive(Default)]
+        struct Recorder {
+            seen: std::sync::Mutex<Vec<String>>,
+        }
+
+        impl AgentObserver for Recorder {
+            fn on_message(&self, message: &Message) {
+                self.seen
+                    .lock()
+                    .expect("the recorder lock is not poisoned")
+                    .push(message.text().to_string());
+            }
+        }
+
+        let (base, _) = provider(vec![sse_tool_call("call_1", "tick", "{}")]).await;
+        let recorder = Arc::new(Recorder::default());
+        // Cloned through the binding, not `Arc::clone(&recorder)`: the turbofish
+        // is inferred from the argument, so the unsizing to `dyn AgentObserver`
+        // has to happen where the expected type is known.
+        let observing: Arc<dyn AgentObserver> = recorder.clone();
+        let mut agent = agent_with_tools(base, tick_tools())
+            .with_max_steps(1)
+            .with_observer(observing);
+
+        let outcome = agent.run("go").await.expect("the loop finishes");
+
+        let seen = recorder
+            .seen
+            .lock()
+            .expect("the recorder lock is not poisoned")
+            .clone();
+        assert_eq!(
+            seen.iter()
+                .filter(|text| text.contains(CONTINUATION_FRAGMENT))
+                .count(),
+            CONTINUATION_BATCHES,
+            "the transcript shows every ask: {seen:?}"
+        );
+        // The prompt is observed too, so the count above is not simply "every
+        // committed message".
+        assert_eq!(seen.first().map(String::as_str), Some("go"));
+        assert_eq!(outcome.steps, 1 + CONTINUATION_BATCHES);
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_finishes_early_never_asks_for_a_continuation() {
+        // The renewal must be invisible to a turn that ends on its own: asking a
+        // finished model whether to keep working would invite it to invent more
+        // work.
+        let (base, hits) = provider(vec![sse_answer("all done", "stop")]).await;
+        let mut agent = agent_against(base).with_max_steps(2);
+
+        let outcome = agent.run("go").await.expect("the loop finishes");
+
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(outcome.text, "all done");
+        assert!(
+            outcome.steps < 2,
+            "a finished turn leaves the rest of its batch unused"
+        );
+        assert_eq!(continuation_asks(&outcome.new_messages), 0, "nothing to renew");
+        assert_eq!(continuation_asks(agent.messages()), 0);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stop_during_the_second_batch_ends_the_turn_without_another_ask() {
+        // A renewal must not outlive the user's decision to stop. The stop lands
+        // while the second batch is running, so the ask that authorized that
+        // batch is already committed — and nothing may be appended after it.
+        struct StopAtStep {
+            at: usize,
+            cancel: tokio::sync::watch::Sender<bool>,
+        }
+
+        impl AgentObserver for StopAtStep {
+            fn on_step(&self, step: usize) {
+                if step == self.at {
+                    let _ = self.cancel.send(true);
+                }
+            }
+        }
+
+        let (base, hits) = provider(vec![sse_tool_call("call_1", "tick", "{}")]).await;
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        // Step 3 is the first step of the second batch, so batch one is spent
+        // and its ask is in the history when the stop is requested.
+        let stopper: Arc<dyn AgentObserver> = Arc::new(StopAtStep { at: 3, cancel });
+        let mut agent = agent_with_tools(base, tick_tools())
+            .with_max_steps(2)
+            .with_observer(stopper)
+            .with_cancel(cancelled);
+
+        let outcome = agent.run("go").await.expect("the loop still answers");
+
+        assert_eq!(outcome.error.as_deref(), Some(STOPPED), "{:?}", outcome.error);
+        assert_eq!(outcome.steps, 3, "the stop lands before that step's request");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "no request is made for the step the user stopped"
+        );
+        assert_eq!(
+            continuation_asks(&outcome.new_messages),
+            1,
+            "the ask that started batch two, and none after the stop"
+        );
+        assert_eq!(continuation_asks(agent.messages()), 1);
     }
 }

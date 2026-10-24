@@ -186,6 +186,9 @@ pub struct Options {
     pub prices: PathBuf,
     /// Extra skill roots, before the built-in ones.
     pub skill_dirs: Vec<PathBuf>,
+    /// The step cap in force for a turn, when the caller knows which settings
+    /// produced the report. `None` reads as the built-in default.
+    pub max_steps: Option<usize>,
 }
 
 impl Default for Options {
@@ -197,6 +200,7 @@ impl Default for Options {
             ledger: default_ledger_path(),
             prices: PriceTable::default_path(),
             skill_dirs: Vec::new(),
+            max_steps: None,
         }
     }
 }
@@ -224,6 +228,7 @@ pub fn run(options: &Options) -> Report {
     check_packs(options, &mut report);
     check_ledger(options, &mut report);
     check_prices(options, &mut report);
+    check_steps(options, &mut report);
     report
 }
 
@@ -551,6 +556,27 @@ fn check_prices(options: &Options, report: &mut Report) {
     }
 }
 
+/// Report the step cap a turn is given.
+///
+/// This is a fact about the machine, not a finding: a low cap is a choice (a
+/// cheap, quick turn) and a high one is a choice too, so neither is a warning.
+/// It is here because "why did my turn stop after N steps" is otherwise
+/// answerable only by reading the source.
+fn check_steps(options: &Options, report: &mut Report) {
+    // The loop's own default, repeated rather than imported: `Agent` builds
+    // itself with 50 and keeps that number private, so a diagnostic that
+    // invented a second default would print a cap the turn does not have.
+    const DEFAULT_MAX_STEPS: usize = 50;
+    let detail = match options.max_steps {
+        Some(steps) => format!("at most {steps} model step(s) in one turn, from the settings file"),
+        None => format!(
+            "at most {DEFAULT_MAX_STEPS} model step(s) in one turn \
+             (built-in default; no settings were read)"
+        ),
+    };
+    report.add(Level::Ok, "steps", detail);
+}
+
 /// Whether a diagnostic's exit code should be non-zero.
 ///
 /// Warnings do not fail the command: a missing price file is not a broken
@@ -600,6 +626,7 @@ mod doctor_tests {
             ledger: dir.join("ledger.json"),
             prices: dir.join("prices.json"),
             skill_dirs: vec![dir.join("skills")],
+            max_steps: None,
         }
     }
 
@@ -741,6 +768,39 @@ mod doctor_tests {
         let ledger = check(&report, "ledger");
         assert_eq!(ledger.level, Level::Warn, "{:?}", ledger);
         assert!(ledger.detail.contains("gone"), "{}", ledger.detail);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_step_cap_in_force_is_reported_as_a_fact() {
+        let dir = temp_dir("steps");
+        let options = Options {
+            max_steps: Some(12),
+            ..options_under(&dir)
+        };
+        let report = run(&options);
+        let steps = check(&report, "steps");
+        assert_eq!(steps.level, Level::Ok, "{:?}", steps);
+        assert!(steps.detail.contains("12"), "the cap is named: {}", steps.detail);
+        assert!(
+            steps.detail.contains("settings file"),
+            "and so is where it came from: {}",
+            steps.detail
+        );
+        assert_eq!(exit_code(&report), 0, "a step cap is a choice, not a fault");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unknown_step_cap_reads_as_the_loops_default() {
+        let dir = temp_dir("steps-default");
+        // `options_under` leaves `max_steps` unset: the report must then say
+        // the default rather than pretend it read a settings file.
+        let report = run(&options_under(&dir));
+        let steps = check(&report, "steps");
+        assert_eq!(steps.level, Level::Ok, "{:?}", steps);
+        assert!(steps.detail.contains("50"), "{}", steps.detail);
+        assert!(steps.detail.contains("default"), "{}", steps.detail);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

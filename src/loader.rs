@@ -1480,7 +1480,16 @@ stages:
         let mut kernel = Kernel::new();
         let mut skills = SkillRegistry::new();
 
-        let (child, pid) = stub_server();
+        let (mut child, pid) = stub_server();
+        // Live, not listed: this test needs a server that is running, and asking
+        // the child is the direct answer. Whether the operating system's process
+        // table shows it is a second question that `tasklist` answers slowly
+        // under a parallel suite — measuring that would make the test about the
+        // machine instead of about the unload.
+        assert!(
+            child.try_wait().expect("asking about the stub").is_none(),
+            "the stub server is up before the unload"
+        );
         let client = Arc::new(McpClient::from_child_for_tests(child, "demo-server"));
 
         // One tool, holding one handle, registered exactly the way the loader
@@ -1508,8 +1517,6 @@ stages:
         let mut ledger = Ledger::new();
         ledger.record(ledger_entry("mcp", "demo-server", "stdio:x", None));
         ledger.save(&ledger_path).unwrap();
-
-        assert!(wait_for(pid, true), "the stub server is up before the unload");
 
         // The handle the caller keeps. With this alive, no drop of the tool can
         // be what ends the process — so the unload has to end it by name.

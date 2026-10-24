@@ -89,6 +89,12 @@ pub struct Settings {
     /// Recent messages kept verbatim when compacting.
     #[serde(default = "default_keep_recent")]
     pub compact_keep_recent: usize,
+    /// Most model steps one turn may take before the loop stops and reports.
+    ///
+    /// Defaults to the loop's own 50 rather than to `0`: a file that never
+    /// mentions this key must not describe a turn that is not allowed to run.
+    #[serde(default = "default_max_steps")]
+    pub max_steps: u32,
 
     /// Cloud relay URL the local app dials out to for remote control.
     ///
@@ -168,6 +174,7 @@ impl std::fmt::Debug for Settings {
             .field("context_window", &self.context_window)
             .field("compact_percent", &self.compact_percent)
             .field("compact_keep_recent", &self.compact_keep_recent)
+            .field("max_steps", &self.max_steps)
             .field("relay_url", &self.relay_url)
             .field("relay_token", &mask(&self.relay_token))
             .field("max_output_tokens", &self.max_output_tokens)
@@ -230,6 +237,10 @@ fn default_keep_recent() -> usize {
     8
 }
 
+fn default_max_steps() -> u32 {
+    50
+}
+
 impl Settings {
     /// Whether the settings are complete enough to make a request.
     pub fn is_configured(&self) -> bool {
@@ -278,6 +289,22 @@ impl Settings {
             // whole window leaves no room for the answer, and the provider
             // rejects the request instead of compacting.
             reserve: self.max_output_tokens.unwrap_or(0),
+        }
+    }
+
+    /// The step cap one turn may use, in the range the loop can honour.
+    ///
+    /// `0` reads as "not set" and means the default, not "no steps": this type
+    /// derives `Default`, so every numeric field starts at zero and the field
+    /// defaults only exist inside serde — a fresh install with no file would
+    /// otherwise get a cap of one step, i.e. a turn that cannot finish a single
+    /// tool round. Above the ceiling the value is clamped, because a turn bills
+    /// for every step it takes and the loop's continuation behaviour already
+    /// multiplies whatever is asked for here.
+    pub fn max_steps(&self) -> usize {
+        match self.max_steps {
+            0 => default_max_steps() as usize,
+            steps => (steps as usize).min(200),
         }
     }
 
@@ -529,6 +556,7 @@ mod tests {
             context_window: None,
             compact_percent: 75,
             compact_keep_recent: 8,
+            max_steps: 50,
             relay_url: String::new(),
             relay_token: String::new(),
             max_output_tokens: None,
@@ -555,6 +583,7 @@ mod tests {
             context_window: None,
             compact_percent: 75,
             compact_keep_recent: 8,
+            max_steps: 50,
             relay_url: String::new(),
             relay_token: String::new(),
             max_output_tokens: None,
@@ -753,6 +782,7 @@ mod tests {
         assert_eq!(reloaded.max_output_tokens, before.max_output_tokens);
         assert_eq!(reloaded.compact_percent, before.compact_percent);
         assert_eq!(reloaded.compact_keep_recent, before.compact_keep_recent);
+        assert_eq!(reloaded.max_steps, before.max_steps, "a set keeps the step cap");
         assert_eq!(reloaded.network.retry_attempts, before.network.retry_attempts);
     }
 
@@ -779,5 +809,38 @@ mod tests {
         let policy = settings.context_policy(None);
         assert_eq!(policy.threshold_percent, 95, "100% would mean never compact");
         assert_eq!(policy.reserve, 8192, "the answer needs room inside the window");
+    }
+
+    #[test]
+    fn the_step_cap_defaults_to_fifty() {
+        // The product decision, in one line: a file that says nothing about
+        // steps behaves exactly as the desktop always has.
+        assert_eq!(Settings::default().max_steps(), 50);
+    }
+
+    #[test]
+    fn the_step_cap_is_read_from_the_file() {
+        let (_dir, path) = scratch("step-cap");
+        std::fs::write(&path, r#"{"model": "m", "max_steps": 12}"#).unwrap();
+        let settings = Settings::load_from(&path).unwrap();
+        assert_eq!(settings.max_steps, 12);
+        assert_eq!(settings.max_steps(), 12);
+    }
+
+    #[test]
+    fn an_absurd_step_cap_is_clamped_rather_than_trusted() {
+        // 0 reads as "not set", not as "no steps": `Settings` derives `Default`,
+        // so a build with no settings file has zero here and would otherwise
+        // start every turn with a cap of one.
+        assert_eq!(
+            Settings { max_steps: 0, ..Default::default() }.max_steps(),
+            50
+        );
+        // The other end is a runaway turn: a file edited to a huge number is
+        // cheap to write and expensive to watch, so the ceiling wins.
+        assert_eq!(
+            Settings { max_steps: 100_000, ..Default::default() }.max_steps(),
+            200
+        );
     }
 }

@@ -1146,6 +1146,23 @@ pub fn read_manifest(dir: &Path) -> Result<PackManifest> {
         .with_context(|| format!("reading {} (a pack needs one)", path.display()))?;
     let manifest: PackManifest = serde_json::from_str(&text)
         .with_context(|| format!("{} is not readable as a manifest", path.display()))?;
+    // A manifest that parses but names nothing is not a pack. With an empty name
+    // and version the installed set sorts under the empty string and every label
+    // reads "-", which is how a leftover directory becomes a thing the startup
+    // log claims to have loaded. Refused here, the directory is reported and
+    // left out instead.
+    if manifest.name.trim().is_empty() {
+        return Err(anyhow!(
+            "{} names no pack: `name` is empty",
+            path.display()
+        ));
+    }
+    if manifest.version_id.trim().is_empty() {
+        return Err(anyhow!(
+            "{} names no version: `version` is empty",
+            path.display()
+        ));
+    }
     Ok(manifest)
 }
 
@@ -2313,9 +2330,16 @@ pub fn installed(packs_dir: &Path) -> Result<Vec<InstalledPack>> {
             continue;
         }
         // A pack with a broken manifest is reported rather than skipped: a
-        // silent omission looks like the pack was never installed.
-        let manifest = read_manifest(&path)
-            .with_context(|| format!("reading the pack at {}", path.display()))?;
+        // silent omission looks like the pack was never installed. Reported
+        // means printed and left out of the list — failing the whole listing
+        // would let one leftover directory stop every other pack from loading.
+        let manifest = match read_manifest(&path) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                eprintln!("[pack] ignoring {}: {error:#}", path.display());
+                continue;
+            }
+        };
         let assembly = path.join(ASSEMBLY_NAME);
         let enabled = is_enabled(&path);
         out.push(InstalledPack {
@@ -3080,6 +3104,32 @@ mod tests {
         let listed = installed(&packs).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].manifest.name, "demo");
+    }
+
+    #[test]
+    fn a_manifest_that_names_no_pack_is_refused_and_its_directory_left_out() {
+        // The shape a leftover directory takes: a manifest that parses but has
+        // no identity. Loaded, it sorts under the empty string and every label in
+        // the log reads "-", so the pack "loads" and does nothing — which is
+        // exactly what a person debugging cannot tell apart from a pack that is
+        // broken in some other way.
+        let dir = scratch("nameless");
+        let packs = dir.join("packs");
+        let junk = packs.join("-");
+        std::fs::create_dir_all(&junk).unwrap();
+        std::fs::write(junk.join(MANIFEST_NAME), "{\"formatVersion\":1}").unwrap();
+        let good = packs.join("real-1.0.0");
+        std::fs::create_dir_all(&good).unwrap();
+        write_manifest(&good, &PackManifest::new("real", "1.0.0")).unwrap();
+
+        let error = read_manifest(&junk).expect_err("a pack must name itself");
+        assert!(format!("{error:#}").contains("name"), "{error:#}");
+
+        // Reported and left out, never fatal: one junk directory must not stop
+        // every other pack from loading.
+        let listed = installed(&packs).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].manifest.name, "real");
     }
 
     #[test]

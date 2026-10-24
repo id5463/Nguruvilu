@@ -83,8 +83,13 @@ struct Cli {
     quiet: bool,
 
     /// Maximum model steps in one turn.
-    #[arg(long, default_value_t = 50)]
-    max_steps: usize,
+    ///
+    /// Unset means the settings file's `max_steps`, which is 50 when the file
+    /// says nothing. The flag wins when it is given, so one long session does
+    /// not have to rewrite the file — and `ngu config set max_steps` is what
+    /// makes the number stick.
+    #[arg(long)]
+    max_steps: Option<usize>,
 
     /// System prompt override.
     #[arg(long)]
@@ -352,6 +357,9 @@ enum ConfigAction {
         /// Recent messages kept verbatim when compacting.
         #[arg(long)]
         compact_keep_recent: Option<usize>,
+        /// Most model steps one turn may take, 1..=200.
+        #[arg(long)]
+        max_steps: Option<u32>,
         /// Output token ceiling: 8K, 32K, or a plain count. Pass 0 to clear.
         #[arg(long)]
         max_output_tokens: Option<String>,
@@ -701,6 +709,9 @@ async fn run() -> Result<()> {
             // warnings is a successful run and a report with a failure is not.
             let options = nguruvilu::doctor::Options {
                 sessions: store.root().to_path_buf(),
+                // The cap this invocation would actually use, so the report
+                // answers "why did my turn stop?" with the real number.
+                max_steps: Some(cli.max_steps.unwrap_or_else(|| settings.max_steps())),
                 skill_dirs: cli.skill_dirs.clone(),
                 ..nguruvilu::doctor::Options::default()
             };
@@ -1219,7 +1230,7 @@ async fn run() -> Result<()> {
             let turn_started = std::time::Instant::now();
             let original_len = session.messages.len();
             let mut agent = Agent::new(client, Arc::clone(&config), session.messages.clone())
-                .with_max_steps(cli.max_steps)
+                .with_max_steps(cli.max_steps.unwrap_or_else(|| settings.max_steps()))
                 .with_observer(observer)
                 // This CLI turn's session, fixed for the turn: a plugin that
                 // re-pins the registry mid-turn (or a second process) cannot
@@ -1422,7 +1433,7 @@ async fn run() -> Result<()> {
                 config,
                 session,
                 &store,
-                cli.max_steps,
+                cli.max_steps.unwrap_or_else(|| settings.max_steps()),
                 snapshotter,
                 PackHost {
                     cli: &cli,
@@ -3362,6 +3373,7 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             context_window,
             compact_percent,
             compact_keep_recent,
+            max_steps,
             max_output_tokens,
             network,
             request_timeout,
@@ -3419,6 +3431,12 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             }
             if let Some(value) = compact_keep_recent {
                 settings.compact_keep_recent = (*value).max(1);
+            }
+            if let Some(value) = max_steps {
+                // Stored as written: the clamping belongs to `Settings::max_steps`,
+                // which is where every reader goes, so a value that can never be
+                // honoured is reported once rather than silently rewritten here.
+                settings.max_steps = *value;
             }
             if let Some(value) = max_output_tokens {
                 let tokens = nguruvilu::size::parse_size(value)?;
@@ -3692,6 +3710,11 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             println!(
                 "compaction:    at {}% of the window, keeping {} recent messages",
                 effective.compact_percent, effective.compact_keep_recent
+            );
+            println!(
+                "steps:         at most {} model step(s) per batch; the cap is asked about {} more time(s), each granting another batch",
+                effective.max_steps(),
+                nguruvilu::agent::CONTINUATION_BATCHES
             );
             println!(
                 "network:       request {}s, pool idle {}s, {} retry(ies) from {}ms",
