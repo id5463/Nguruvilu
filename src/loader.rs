@@ -436,6 +436,13 @@ impl Loader {
             }
         }
 
+        // A manifest that says `./skills` means the same directory as `skills`,
+        // but the two spellings are different strings — and the ledger stores the
+        // string. Left alone, a diagnostic reads `...\packs\x\./skills`, which
+        // looks like a bug in the path rather than a style in the manifest, and
+        // the same root can be added twice under two spellings.
+        let candidate = tidy(candidate);
+
         if !candidate.exists() {
             return Err(anyhow!(
                 "skill source '{}' does not exist (resolved to {})",
@@ -744,6 +751,23 @@ pub async fn load_pack(
 
 /// Merge a pack's skill roots into the standing catalog and rebuild the tool.
 ///
+/// A path with its `.` components dropped.
+///
+/// Only `.` is removed. `..` is left alone on purpose: resolving it is a decision
+/// about where a pack is allowed to point, and that decision is not this
+/// function's to make — a `..` that escapes the pack directory has to stay
+/// visible for whatever checks it rather than being silently folded here.
+fn tidy(path: PathBuf) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// The `skill` tool holds a snapshot of the registry, so a root that arrives
 /// or leaves only reaches the model once the tool is registered over what is
 /// there now. Without this, a pack's skills would *replace* the host's instead
@@ -1039,6 +1063,43 @@ stages:
 
         // The skill body is not in the standing catalog.
         assert!(!catalog.contains("Body of pdf-tools"));
+    }
+
+    #[tokio::test]
+    async fn a_manifest_path_with_a_dot_component_is_recorded_without_it() {
+        // A pack ships `./skills`; the ledger must not end up holding
+        // `...\pack\./skills`, both because the string is what every diagnostic
+        // prints and because the same root added twice under two spellings would
+        // scan the same skills twice.
+        let dir = temp_dir("skill-dot");
+        let pack = dir.join("pack");
+        write_skill(&pack.join("skills"), "pdf-tools");
+        let mut loader = loader_with(&dir, vec![]).with_pack_dir(&pack);
+        let manifest = r#"
+version: 1
+stages:
+  - name: extensions
+    skills:
+      - id: pdf
+        source: "./skills"
+"#;
+        let plan = Assembly::parse(manifest).unwrap().plan("linux").unwrap();
+        loader.apply(&plan).await.unwrap();
+
+        let recorded = loader
+            .ledger()
+            .find("skill", "pdf")
+            .and_then(|entry| entry.path.clone())
+            .expect("the skill was recorded with its path");
+        assert!(
+            !recorded.contains("./") && !recorded.contains(".\\"),
+            "the recorded path keeps the manifest's dot component: {recorded}"
+        );
+        assert_eq!(
+            recorded,
+            pack.join("skills").display().to_string(),
+            "the recorded path is the one the scan actually used"
+        );
     }
 
     #[tokio::test]
@@ -1369,22 +1430,35 @@ stages:
     }
 
     /// Whether the operating system lists this process right now.
+    ///
+    /// `None` when the question could not be asked at all. Under load `tasklist`
+    /// can fail to start, and "the tool that answers failed" is not the same
+    /// answer as "the process is gone": a caller waiting for a process to appear
+    /// must not read a broken query as a completed disappearance, or this test
+    /// fails for a reason that has nothing to do with the code it checks.
     #[cfg(windows)]
-    fn listed(pid: u32) -> bool {
+    fn listed(pid: u32) -> Option<bool> {
         let output = std::process::Command::new("tasklist")
             .args(["/NH", "/FI", &format!("PID eq {pid}")])
             .output()
-            .expect("running tasklist");
-        String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
     }
 
     /// Wait for the process list to agree with what was asked of it: a spawn is
     /// not instant, and neither is a kill.
+    ///
+    /// The window is wide because the machine running the suite may be running
+    /// four tests at once, each spawning its own children; a tight bound here
+    /// measures the test harness rather than the behaviour under test.
     #[cfg(windows)]
     fn wait_for(pid: u32, want_running: bool) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            if listed(pid) == want_running {
+            if listed(pid) == Some(want_running) {
                 return true;
             }
             if std::time::Instant::now() >= deadline {
