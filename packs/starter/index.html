@@ -1485,10 +1485,13 @@ const PANEL_BASE_CSS = [
   "a { color: inherit; }",
 ].join("\n");
 
-/// 面板侧的最小 SDK：`window.ngu.call(cmd, args)` 返回 Promise。
+/// 面板侧的最小 SDK：`window.ngu.call(cmd, args)` 返回 Promise，
+/// `window.ngu.on(name, handler)` / `window.ngu.onAny(handler)` 订阅页面转进来的事件。
 ///
-/// 它自己只做一件事 —— 把请求交给父窗口，再等一条带 requestId 的回复；超时自己
-/// 收尾，免得面板永久挂着。不是 `panel-reply` 的消息一律不看。
+/// `call` 只做一件事 —— 把请求交给父窗口，再等一条带 requestId 的回复；超时自己
+/// 收尾，免得面板永久挂着。不是 `panel-reply` 的消息一律不看。事件是另一条窄缝：
+/// 面板拿不到本页的事件总线，父窗口把壳送进来的每个事件单独再发一遍，这里按 `ev`
+/// 分发 —— 没有这一半，面板的 `on("tool_end")` 永远不会响。
 function panelSdk(panelId) {
   return [
     "(function () {",
@@ -1496,6 +1499,8 @@ function panelSdk(panelId) {
     "  var panelId = " + JSON.stringify(String(panelId)).replace(/</g, "\\u003c") + ";",
     "  var waiting = Object.create(null);",
     "  var seq = 0;",
+    "  var handlers = Object.create(null);",
+    "  var anyHandlers = [];",
     '  window.addEventListener("message", function (event) {',
     "    var data = event.data;",
     '    if (!data || data.ngu !== "panel-reply" || typeof data.requestId !== "string") return;',
@@ -1506,6 +1511,45 @@ function panelSdk(panelId) {
     "    if (data.ok) waiter.resolve(data.data === undefined ? null : data.data);",
     '    else waiter.reject(new Error(data.error || "panel command failed"));',
     "  });",
+    // 页面 -> 面板的事件。panelId 对不上、形状不对的消息一律丢弃：这条缝只认本页
+    // 转进来的那一种消息体。
+    '  window.addEventListener("message", function (event) {',
+    "    var data = event.data;",
+    '    if (!data || typeof data !== "object" || data.ngu !== "panel-event") return;',
+    '    if (typeof data.panelId === "string" && data.panelId !== panelId) return;',
+    "    fire(data.event);",
+    "  });",
+    "  function fire(event) {",
+    '    if (!event || typeof event !== "object") return;',
+    "    var name = event.ev;",
+    '    var list = typeof name === "string" ? handlers[name] : null;',
+    "    if (list) {",
+    "      for (var i = 0; i < list.length; i += 1) {",
+    "        try { list[i](event); } catch (error) { /* 一个处理函数出错不该带塌别的 */ }",
+    "      }",
+    "    }",
+    "    for (var j = 0; j < anyHandlers.length; j += 1) {",
+    "      try { anyHandlers[j](name, event); } catch (error) { /* 同上 */ }",
+    "    }",
+    "  }",
+    "  function on(name, handler) {",
+    '    if (typeof name !== "string" || typeof handler !== "function") return function () {};',
+    "    if (!handlers[name]) handlers[name] = [];",
+    "    handlers[name].push(handler);",
+    "    return function () {",
+    "      var list = handlers[name] || [];",
+    "      var at = list.indexOf(handler);",
+    "      if (at >= 0) list.splice(at, 1);",
+    "    };",
+    "  }",
+    "  function onAny(handler) {",
+    '    if (typeof handler !== "function") return function () {};',
+    "    anyHandlers.push(handler);",
+    "    return function () {",
+    "      var at = anyHandlers.indexOf(handler);",
+    "      if (at >= 0) anyHandlers.splice(at, 1);",
+    "    };",
+    "  }",
     "  function call(cmd, args) {",
     "    return new Promise(function (resolve, reject) {",
     "      seq += 1;",
@@ -1522,7 +1566,7 @@ function panelSdk(panelId) {
     '      }, "*");',
     "    });",
     "  }",
-    "  window.ngu = { call: call };",
+    "  window.ngu = { call: call, on: on, onAny: onAny };",
     "  var reported = 0;",
     "  function reportHeight() {",
     "    if (!document.body) return;",
@@ -1560,47 +1604,6 @@ function panelDocument(panel, panelId) {
 
 // panelId -> iframe。这份表就是白名单：不在表里的 panelId 说什么都不转。
 let panelFrames = new Map();
-// What the last ui_panels push held, so a panel can be re-rendered in place when
-// the user changes their mind about it (see the re-ask button in renderSlots).
-let lastPanels = [];
-
-// 装了一个带界面的包，等于让一段别人写的代码在本页里画东西、并经由宿主发命令。
-// 问一次，答一次，把答复记在 localStorage 里：每次启动都重问是噪音，从来不说
-// 是另一种隐瞒。
-const PANEL_CONSENT_TEXT =
-  "此包会在沙箱面板里运行代码，可用于显示界面；它不能读写你的文件，除非你批准它发起的命令。";
-
-function panelPackKey(panel) {
-  const id = String(panel.id || "");
-  const sep = id.indexOf(":");
-  return sep > 0 ? id.slice(0, sep) : id || "unknown";
-}
-
-function panelConsentKey(panel) {
-  return "ngu.panel-consent." + panelPackKey(panel);
-}
-
-function panelConsented(panel) {
-  const key = panelConsentKey(panel);
-  let answer = null;
-  try {
-    answer = localStorage.getItem(key);
-  } catch (error) {
-    answer = null;   // 无痕窗口里 localStorage 会抛，那就每次都问
-  }
-  if (answer === "allow") return true;
-  if (answer === "deny") return false;
-  const allowed = window.confirm(
-    PANEL_CONSENT_TEXT + "\n\n包: " + panelPackKey(panel) + "\n\n允许它的面板运行吗？"
-  );
-  try {
-    localStorage.setItem(key, allowed ? "allow" : "deny");
-  } catch (error) {
-    // 记不住就下次再问 —— 这比不问安全。
-  }
-  return allowed;
-}
-
 // 面板 -> shell 的唯一通道。三条都成立才转：消息来自我们注册过的那一帧、panelId
 // 在白名单里、cmd 是个字符串。别的窗口、别的形状、别的消息体一律丢弃。
 window.addEventListener("message", (event) => {
@@ -1648,6 +1651,26 @@ window.addEventListener("message", (event) => {
   );
 });
 
+/// 页面 -> 面板的窄缝。
+///
+/// 面板是另一个不透明来源的文档，拿不到本页的事件总线：壳送进来的每个事件都得
+/// 在这条路上再过一遍，面板那边按 `ev` 自己分发。收件人只有 `panelFrames` 里的那
+/// 几帧 —— 不广播给 `window.parent`，也不发给没建过的窗口，方向和面板 -> 壳那条
+/// 一样窄。
+function postToPanel(frame, panelId, event) {
+  if (!frame || !frame.contentWindow) return;
+  frame.contentWindow.postMessage({
+    ngu: "panel-event",
+    panelId: panelId,
+    event: event,
+  }, "*");
+}
+
+/// 把同一个事件发给所有活着的面板。
+function postToPanels(event) {
+  for (const [panelId, entry] of panelFrames) postToPanel(entry.frame, panelId, event);
+}
+
 /// Render the panels plugins contributed.
 ///
 /// Rebuilt wholesale on every update rather than diffed: a panel is a small
@@ -1656,7 +1679,6 @@ window.addEventListener("message", (event) => {
 /// sandboxed document (see above), so a rebuild costs one iframe load per panel
 /// and its script runs inside that document, once, with its own fragment there.
 function renderSlots(panels) {
-  lastPanels = panels || [];
   panelFrames = new Map();
   for (const slot of ["sidebar-top", "sidebar-bottom", "details-top", "details-bottom", "status-bar", "above-composer"]) {
     const container = document.getElementById("slot-" + slot);
@@ -1672,40 +1694,29 @@ function renderSlots(panels) {
     if (panel.title) box.append(el("h2", null, panel.title));
 
     if (panel.html || panel.script) {
-      if (!panelConsented(panel)) {
-        const empty = el("div", "empty",
-          "这个包的面板没有运行（拒绝过一次，记在 localStorage 的 " +
-          panelConsentKey(panel) + "）");
-        // A refusal is a decision, not a verdict: without a way back, the only
-        // recovery is knowing which localStorage key to delete, so the panel
-        // stays dark forever and looks like a broken feature.
-        const again = el("button", "tiny", "重新询问并允许");
-        again.addEventListener("click", () => {
-          try {
-            localStorage.removeItem(panelConsentKey(panel));
-          } catch (error) {
-            // 无痕模式：没有可删的记录，重新渲染就会再问一次
-          }
-          renderSlots(lastPanels);
-        });
-        empty.append(again);
-        box.append(empty);
-      } else {
-        const frame = document.createElement("iframe");
-        // 只给 allow-scripts。多给 allow-same-origin 就等于什么都没做：同源沙箱里
-        // 的脚本可以把自己的 sandbox 属性摘掉。
-        frame.setAttribute("sandbox", "allow-scripts");
-        frame.setAttribute("title", panel.title || ("panel " + panel.id));
-        frame.style.width = "100%";
-        frame.style.height = "120px";
-        frame.style.border = "0";
-        frame.style.background = "transparent";
-        frame.style.display = "block";
-        // srcdoc 用属性赋值，不拼 innerHTML：面板的 HTML 到这块文档为止。
-        frame.setAttribute("srcdoc", panelDocument(panel, panel.id));
-        box.append(frame);
-        panelFrames.set(panel.id, { frame: frame });
-      }
+      // 面板直接运行，不再弹“同意”。一次模态确认要用户在页面能用之前先点掉；
+      // 拒绝过一次还会把面板永久关黑，看起来就像功能坏了。装这个包本来就是
+      // 这个人的决定，沙箱 iframe 是真正的执行边界，保留；弹窗只是摩擦。
+      const frame = document.createElement("iframe");
+      // 只给 allow-scripts。多给 allow-same-origin 就等于什么都没做：同源沙箱里
+      // 的脚本可以把自己的 sandbox 属性摘掉。
+      frame.setAttribute("sandbox", "allow-scripts");
+      frame.setAttribute("title", panel.title || ("panel " + panel.id));
+      frame.style.width = "100%";
+      frame.style.height = "120px";
+      frame.style.border = "0";
+      frame.style.background = "transparent";
+      frame.style.display = "block";
+      // srcdoc 用属性赋值，不拼 innerHTML：面板的 HTML 到这块文档为止。
+      frame.setAttribute("srcdoc", panelDocument(panel, panel.id));
+      // 帧是每次重画时新建的，它不知道页面此前发生过什么：不补这一下，面板就要
+      // 一直空到下一个不相干的工具调用，任务列表在打开时根本不会出现。加载完先
+      // 喂一次缓存的状态 —— 只这一条，别的一概不编。
+      frame.addEventListener("load", () => {
+        postToPanel(frame, panel.id, { ev: "status", status: latest });
+      });
+      box.append(frame);
+      panelFrames.set(panel.id, { frame: frame });
     }
     container.append(box);
   }
@@ -2589,6 +2600,9 @@ function dispatchEvent_(event) {
       notice("界面处理 " + name + " 时出错: " + error.message, true);
     }
   }
+  // 面板也要收一份：它拿不到这条总线，任务面板正是靠 `tool_end` 才知道工具结果
+  // 到了。放在本页处理函数之后 —— 内置界面先画，面板是补充信息。
+  postToPanels(event);
 }
 
 window.ngu = { on, onAny, send: sendCommand, state, receive };

@@ -189,12 +189,12 @@ function ReadEventAfterTrigger(
 }
 
 try {
-    # --- authentication ----------------------------------------------------
-    # The token is the lock on every endpoint, and the loopback page loads
-    # without one only when the request says it is this machine.
-    Check "GET / with the token" ((Send "GET" "$base/?token=$token").Status -eq 200)
-    Check "GET / from a loopback peer naming this server" ((Send "GET" "$base/" @{ Host = "127.0.0.1:$Port" }).Status -eq 200)
-    Check "GET / from a foreign Host header is refused" ((Send "GET" "$base/" @{ Host = "evil.example:$Port" }).Status -eq 401)
+    # --- no authentication -------------------------------------------------
+    # The owner's call: the served shell answers everyone, because a page that
+    # demanded a token answered 401 to the person who started it. What is left to
+    # check is routing: the doors still answer by method and path alone.
+    Check "GET / answers without a token" ((Send "GET" "$base/").Status -eq 200)
+    Check "GET / answers any Host header" ((Send "GET" "$base/" @{ Host = "evil.example:$Port" }).Status -eq 200)
     Check "GET /cmd is not a page" ((Send "GET" "$base/cmd?token=$token").Status -eq 405)
 
     # --- URL-path traversal (the high-severity hole) -----------------------
@@ -209,9 +209,10 @@ try {
     Check "GET /..%5C..%5Cx is refused" ((SendRaw "/..%5C..%5Cx?token=$token") -eq 404)
 
     # --- query handling ----------------------------------------------------
-    # A repeated credential is a request that means two things; refusing is the
-    # only answer that does not pick one for the caller.
-    Check "a repeated token query is refused" ((Send "GET" "$base/?token=$token&token=$token").Status -eq 400)
+    # A repeated `token=` used to mean "two credentials in one request" and was
+    # refused; with no credential in play it is ordinary query data, and the page
+    # must still load.
+    Check "a repeated token query is ordinary data" ((Send "GET" "$base/?token=$token&token=$token").Status -eq 200)
 
     # --- method and framing ------------------------------------------------
     $chunked = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, "$base/cmd?token=$token")
@@ -231,17 +232,17 @@ try {
     $events = ReadEventAfterTrigger "$base/events?token=$token" "$base/cmd?token=$token" '{"cmd":"status"}'
     Check "GET /events streams" ($events.Status -eq 200) ("status " + $events.Status + " " + $events.Error)
     Check "GET /events delivers the event a command produced" ($events.Text.Contains('"ev"')) ("first bytes: " + $events.Text)
-    Check "GET /events without a token is refused" ((Send "GET" "$base/events").Status -eq 401)
+    $noToken = ReadEventAfterTrigger "$base/events" "$base/cmd" '{"cmd":"status"}'
+    Check "GET /events streams without a token" ($noToken.Status -eq 200) ("status " + $noToken.Status + " " + $noToken.Error)
 
     # --- trailing detail ---------------------------------------------------
     # An unknown page path is answered with the page, because the shell is a
-    # single page that routes on its own. The credential still decides who gets
-    # it: a peer that cannot prove it is this machine gets nothing without the
-    # token, and the difference between those two answers is the check.
+    # single page that routes on its own. That is true for every caller now: the
+    # path decides, not who is asking.
     $loopback = Send "GET" "$base/nope" @{ Host = "127.0.0.1:$Port" }
     Check "an unknown path serves the page to this machine" ($loopback.Status -eq 200) ("status " + $loopback.Status)
-    $unauthorized = Send "GET" "$base/nope" @{ Host = "evil.example:$Port" }
-    Check "an unknown path answers 401 to anyone else" ($unauthorized.Status -eq 401) ("status " + $unauthorized.Status)
+    $foreign = Send "GET" "$base/nope" @{ Host = "evil.example:$Port" }
+    Check "an unknown path serves the page to any Host too" ($foreign.Status -eq 200) ("status " + $foreign.Status)
 } finally {
     $http.Dispose()
     Stop-Server

@@ -129,8 +129,17 @@ impl crate::plugin::Plugin for LongHorizon {
 /// The mission bar: objective, status, current step, and two buttons.
 ///
 /// It repaints whenever a tool result carries a `<!--mission-state …-->`
-/// marker, which is how the mission tools report themselves. The buttons send
-/// a prompt through the same channel the built-in panels use.
+/// marker, which is how the mission tools report themselves. That alone leaves the
+/// bar idle until the next mission call, so it also listens to the page's `status`
+/// event: every panel is handed the status the page already holds the moment its
+/// frame loads, and that status carries the board of the missions on disk (the
+/// desktop shell reads the workspace's `missions/` directories for it). Without
+/// both halves a reader who starts a mission and looks at the bar sees "no mission
+/// in progress".
+///
+/// The script is a bare document of its own sandboxed iframe: it has no access
+/// to the page's bus, only to `window.ngu` from the panel SDK, so everything here
+/// goes through that and through `document`, never through page globals.
 fn panel() -> crate::ui::UiPanel {
     let html = r#"<div id="mission-bar" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:6px 10px;font-size:12px;color:var(--text)">
   <span style="color:var(--accent);font-weight:600">任务</span>
@@ -145,13 +154,21 @@ fn panel() -> crate::ui::UiPanel {
 <ul id="mission-list" style="list-style:none;margin:0;padding:0 10px 6px;font-size:11.5px;color:var(--dim);display:flex;flex-direction:column;gap:2px"></ul>"#;
 
     let script = r##"
-const bar = panel.querySelector("#mission-bar");
-const list = panel.querySelector("#mission-list");
+const bar = document.getElementById("mission-bar");
+const list = document.getElementById("mission-list");
+const ngu = window.ngu;
+// Whether a tool answer has painted the bar. The board can arrive first (the page
+// feeds the cached status on load), and a board alone must not look like a report
+// of the active mission.
+let sawMarker = false;
 function put(field, text) {
+  if (!bar) return;
   const node = bar.querySelector('[data-f="' + field + '"]');
   if (node) node.textContent = text;
 }
 function paint(state) {
+  if (!state || typeof state !== "object") return;
+  sawMarker = true;
   put("id", state.id || "—");
   put("status", state.status || "?");
   put("step", state.step || (state.done_when ? "完成判据: " + state.done_when : "（未设下一步）"));
@@ -171,31 +188,62 @@ function scan(text) {
 // The board: every mission on disk, not just the one this tool just touched.
 // Without it the bar can only ever say "here is the current step", and a reader
 // looking for the task they started sees nothing.
+//
+// A missing list and an empty one are different facts. Missing (an older shell's
+// status, a marker without a board) leaves whatever is drawn alone; only an empty
+// list says "no missions yet". Printing that over a board that exists is the
+// complaint this panel was reported for.
 function paintBoard(missions) {
   if (!list) return;
+  if (!Array.isArray(missions)) return;
   list.replaceChildren();
-  const rows = Array.isArray(missions) ? missions : [];
-  if (!rows.length) {
+  if (!missions.length) {
     const empty = document.createElement("li");
     empty.textContent = "还没有任务（让模型调用 mission_start 建一个）";
     list.append(empty);
     return;
   }
-  for (const row of rows) {
+  for (const row of missions) {
     const item = document.createElement("li");
     item.textContent = "· " + (row.id || "?") + "  [" + (row.status || "?") + "]  " + (row.objective || "");
     if (row.status === "running") item.style.color = "var(--text)";
     list.append(item);
   }
 }
+// The page hands every panel the status it already holds the moment the frame
+// loads, so the list can be painted before any tool has answered. On its own that
+// would put a list of missions under a bar still reading "idle / no mission in
+// progress", which is the same complaint in another shape — so until a marker has
+// been seen the newest mission stands in for the bar. A tool answer wins over it:
+// that one is the more specific report.
+function paintStatus(event) {
+  const status = (event && event.status) || {};
+  if (!Array.isArray(status.missions)) return;
+  paintBoard(status.missions);
+  if (sawMarker || !status.missions.length) return;
+  const newest = status.missions[0] || {};
+  put("id", newest.id || "—");
+  put("status", newest.status || "?");
+  put("step", newest.objective || "（未设下一步）");
+}
+function send(text) {
+  if (!ngu || typeof ngu.call !== "function") return;
+  // The window path has no reply channel (ipc is one-way), so the promise may
+  // never settle: sending is the point, and it must not raise inside the panel.
+  const pending = ngu.call("prompt", { text: text });
+  if (pending && typeof pending.catch === "function") pending.catch(() => {});
+}
 // Every mission tool answer carries the marker, so no event needs to name the tool.
-on("tool_end", (event) => scan(event.result));
-bar.querySelector('[data-act="status"]').addEventListener("click", () => {
-  toShell({ cmd: "prompt", text: "调用 mission_status，把当前长程任务的状态原样报告给我。" });
-});
-bar.querySelector('[data-act="tick"]').addEventListener("click", () => {
-  toShell({ cmd: "prompt", text: "调用 mission_tick 推进当前长程任务一步，然后汇报这一步的结果和下一步。" });
-});
+if (ngu && typeof ngu.on === "function") {
+  ngu.on("tool_end", (event) => scan(event && event.result));
+  ngu.on("status", paintStatus);
+}
+if (bar) {
+  const refresh = bar.querySelector('[data-act="status"]');
+  if (refresh) refresh.addEventListener("click", () => send("调用 mission_status，把当前长程任务的状态原样报告给我。"));
+  const tick = bar.querySelector('[data-act="tick"]');
+  if (tick) tick.addEventListener("click", () => send("调用 mission_tick 推进当前长程任务一步，然后汇报这一步的结果和下一步。"));
+}
 "##;
 
     crate::ui::UiPanel::new("mission-bar", crate::ui::UiSlot::AboveComposer, html)
@@ -1683,6 +1731,43 @@ mod tests {
                 .collect();
             assert_eq!(files.len(), 1, "{files:?}");
             assert!(files[0].contains("scaffold"), "{files:?}");
+        });
+    }
+
+    /// The marker carries the board, not only the mission that just answered.
+    ///
+    /// The panel lists `missions` straight from the marker, and the shell's status
+    /// push reads the same directories. A marker that described only its own
+    /// mission would leave every other task on the machine invisible — which is
+    /// precisely "I cannot see the task it created". The shape and the fields are
+    /// what this asserts; what a given machine holds is not the test's business.
+    #[test]
+    fn the_marker_carries_every_mission_on_the_board() {
+        in_workspace("board", |dir| {
+            let record = json!({
+                "id": "m-20260101-000000",
+                "objective": "ship the crawler",
+                "status": "running",
+                "step": "write the test",
+                "done_when": "the tests pass",
+            });
+            let mdir = dir.join("missions").join("m-20260101-000000");
+            std::fs::create_dir_all(&mdir).unwrap();
+            std::fs::write(mdir.join("mission.json"), record.to_string()).unwrap();
+
+            let text = marker(&record, json!({}));
+            let body = text
+                .split("<!--mission-state ")
+                .nth(1)
+                .and_then(|rest| rest.split("-->").next())
+                .expect("marker present");
+            let state: Value = serde_json::from_str(body).expect("marker is JSON");
+            assert_eq!(state["id"], "m-20260101-000000");
+            let missions = state["missions"].as_array().expect("missions is an array");
+            assert_eq!(missions.len(), 1, "{state}");
+            assert_eq!(missions[0]["id"], "m-20260101-000000");
+            assert_eq!(missions[0]["objective"], "ship the crawler");
+            assert_eq!(missions[0]["status"], "running");
         });
     }
 

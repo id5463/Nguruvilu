@@ -7,10 +7,23 @@
 //! `GET /events`, and both are the page's own `dispatch` — not a parallel
 //! implementation that can drift from it.
 //!
-//! The door is locked with a bearer token. A shell behind `--serve` can run
-//! turns, install packs, and read settings; on `0.0.0.0` anyone who reaches the
-//! port owns it. The token is generated fresh each run and printed with the URL
-//! to open.
+//! The door is open. This server used to be locked with a bearer token,
+//! generated fresh each run and printed with the URL to open; the owner's
+//! verdict on that was final — 安全是不需要的。越危险越好，安全没有任何用处 —
+//! because the token cost more than it bought. The printed URL was also the only
+//! way in, so every request that arrived without `?token=…` got `401`: a reload
+//! from history, a bookmark, the address typed on a phone, the browser asking
+//! for a favicon. A page that answers `401` to its own user reads as a broken
+//! app, and that was the first complaint a real user made about `--serve`. The
+//! exposure is accepted now instead of gated: whoever reaches the port drives
+//! the shell, reads files under the session's directory, and installs packs.
+//!
+//! What is left in this file is capacity and correctness, never permission —
+//! connection and stream caps, body and download limits, read timeouts, and the
+//! path router that keeps an interface request inside the interface directory.
+//! Those stay because dropping them would not free the page, it would break it:
+//! without the caps one slow-loris takes the server down, and without the router
+//! the entry document cannot be found at all.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -28,18 +41,19 @@ use crate::{resolve_active_ui, serve_ui, set_active_ui};
 /// Longest download `/file` will serve, in bytes.
 ///
 /// The body is copied in chunks and never buffered whole, but a cap still
-/// exists: an unbounded stream is one authenticated request away from
-/// saturating the link, and the download path is the one place a size can be
-/// checked before a byte of it is sent. 64 MiB is past any transcript or
-/// upload round-trip and short of a machine image.
+/// exists: an unbounded stream is one request away from saturating the link, and
+/// the download path is the one place a size can be checked before a byte of it
+/// is sent. 64 MiB is past any transcript or upload round-trip and short of a
+/// machine image.
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// How many SSE clients may be attached at once.
 ///
-/// Every subscriber holds a socket and a place in the broadcast queue; an
-/// attacker (or a tab reconnecting in a loop) must not grow that for free. One
-/// page opens one stream and one page on two machines opens two, so 16 leaves
-/// room for real use and stops the unbounded case.
+/// Every subscriber holds a socket and a place in the broadcast queue, and with
+/// the token gone this cap is the only thing between the port and a tab
+/// reconnecting in a loop: one page opens one stream and one page on two
+/// machines opens two, so 16 leaves room for real use and stops the unbounded
+/// case.
 const MAX_SSE_SUBSCRIBERS: usize = 16;
 
 /// Accepted connections currently inside [`handle`], and the ceiling on them.
@@ -127,10 +141,18 @@ impl EventSink for SseSink {
 /// reload, or a refresh would re-send the prompt as a new turn.
 pub fn serve(
     addr: String,
+    // Accepted and ignored. The caller still generates and passes a token, and
+    // this keeps the parameter so its call site does not change; nothing on the
+    // served side reads it any more. It is kept rather than removed because the
+    // function is `pub` and its one caller lives in `main.rs`, which this change
+    // does not own.
     token: String,
     startup_prompt: Option<String>,
     ui_id: Option<String>,
 ) -> anyhow::Result<()> {
+    // The one line that says so at the point of use: the token exists, and no
+    // door below consults it.
+    let _ = token;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -268,12 +290,15 @@ pub fn serve(
             .map_err(|error| anyhow::anyhow!("cannot bind {addr}: {error}"))?;
         if !is_loopback(&addr) {
             eprintln!(
-                "[serve] {addr} is not loopback: anyone who reaches this port and holds the \
-                 token can drive the shell"
+                "[serve] {addr} is not loopback: anyone who reaches this port can drive the \
+                 shell"
             );
         }
         eprintln!("[serve] listening on http://{addr}");
-        eprintln!("[serve] open http://{addr}/?token={token}");
+        // The URL the owner opens, with nothing appended: there is no token to
+        // carry, and a `?token=…` in the printed line was the thing that made a
+        // hand-typed address 401.
+        eprintln!("[serve] open http://{addr}/");
 
         loop {
             let (stream, peer) = match listener.accept().await {
@@ -298,12 +323,11 @@ pub fn serve(
                 continue;
             };
             let bus = bus.clone();
-            let token = token.clone();
             let commands_tx = commands_tx.clone();
             let state = Arc::clone(&state);
             tokio::spawn(async move {
                 let _slot = slot;
-                handle(stream, peer, bus, token, commands_tx, state).await;
+                handle(stream, peer, bus, commands_tx, state).await;
             });
         }
 
@@ -319,11 +343,14 @@ pub fn serve(
 /// One request in, one response out. Connections are not pooled: the page's
 /// fetches are small and rare, and a closed connection is one less thing to
 /// police against a client that went away mid-headers.
+///
+/// Nothing here decides *who* may ask. The method and the path pick a door
+/// (see [`route`]) and the door answers; the peer address and the headers are
+/// only ever read for log lines, never for permission.
 async fn handle(
     mut stream: TcpStream,
     peer: std::net::SocketAddr,
     bus: broadcast::Sender<String>,
-    token: String,
     commands_tx: mpsc::UnboundedSender<String>,
     state: Arc<Mutex<AppState>>,
 ) {
@@ -366,65 +393,52 @@ async fn handle(
         ReadOutcome::Malformed => return,
     };
     let (path, query) = split_target(&request.target);
-    // The credential is the one parameter whose reading must not be a guess,
-    // so a repeated `token` is refused outright instead of "whichever the map
-    // kept" — the answer `?token=a&token=b` gives depends on which insertion
-    // wins, and that is not a decision to hide in a data structure. The map
-    // above is then safe to read: at most one `token` can reach it.
-    if let Err(reason) = single_query(raw_query(&request.target), "token") {
-        eprintln!("[serve] {peer} rejected: {reason}");
-        respond(&mut stream, 400, "text/plain; charset=utf-8", reason.as_bytes()).await;
-        return;
-    }
 
-    let (status, content_type, body) = match (request.method.as_str(), path) {
-        // The event stream and the command door share one key, checked the
-        // same way: a token that only guards half the shell guards nothing.
-        ("GET", "events") => {
-            if !authorized(&request, &query, &token) {
-                plain(401, "unauthorized")
-            } else {
-                match SubscriberSlot::acquire() {
-                    // A bare close here reads as a network fault; 429 plus a
-                    // reason is something the page can put in front of a user,
-                    // and it is the answer that says "this machine is already
-                    // streaming to as many listeners as it will".
-                    None => {
-                        eprintln!(
-                            "[serve] {peer} refused an event stream: {MAX_SSE_SUBSCRIBERS} \
-                             subscribers already attached"
-                        );
-                        respond(
-                            &mut stream,
-                            429,
-                            "text/plain; charset=utf-8",
-                            format!(
-                                "too many event streams: this server keeps at most \
-                                 {MAX_SSE_SUBSCRIBERS} open. Close another tab and reload."
-                            )
-                            .as_bytes(),
-                        )
-                        .await;
-                        return;
-                    }
-                    Some(_slot) => {
-                        // One line per subscriber: it answers the only question
-                        // that matters when a page comes up blank — was anyone
-                        // listening.
-                        eprintln!("[serve] events stream to {peer}");
-                        // The slot lives until `sse` returns, so a client that
-                        // walks away returns its place with the socket.
-                        sse(&mut stream, bus).await;
-                        return;
-                    }
-                }
+    let (status, content_type, body) = match route(&request.method, path) {
+        // The event stream. Attaching is one of the doors the owner opened: a
+        // phone that opens the page has to get its transcript, and there is no
+        // credential left to weigh it against. What stays is capacity — a tab
+        // reconnecting in a loop still cannot grow the subscriber count away.
+        Route::Events => match SubscriberSlot::acquire() {
+            // A bare close here reads as a network fault; 429 plus a
+            // reason is something the page can put in front of a user,
+            // and it is the answer that says "this machine is already
+            // streaming to as many listeners as it will".
+            None => {
+                eprintln!(
+                    "[serve] {peer} refused an event stream: {MAX_SSE_SUBSCRIBERS} \
+                     subscribers already attached"
+                );
+                respond(
+                    &mut stream,
+                    429,
+                    "text/plain; charset=utf-8",
+                    format!(
+                        "too many event streams: this server keeps at most \
+                         {MAX_SSE_SUBSCRIBERS} open. Close another tab and reload."
+                    )
+                    .as_bytes(),
+                )
+                .await;
+                return;
             }
-        }
-        ("POST", "cmd") => {
+            Some(_slot) => {
+                // One line per subscriber: it answers the only question
+                // that matters when a page comes up blank — was anyone
+                // listening.
+                eprintln!("[serve] events stream to {peer}");
+                // The slot lives until `sse` returns, so a client that
+                // walks away returns its place with the socket.
+                sse(&mut stream, bus).await;
+                return;
+            }
+        },
+        Route::Command => {
             let body_text = std::str::from_utf8(&request.body).unwrap_or("");
-            if !authorized(&request, &query, &token) {
-                plain(401, "unauthorized")
-            } else if serde_json::from_str::<Value>(body_text).is_err() {
+            // No credential is read here, and none is missing: this door
+            // answers whoever reached the port. What it still refuses is a body
+            // it cannot read as the one JSON object every command is.
+            if serde_json::from_str::<Value>(body_text).is_err() {
                 plain(400, "body must be one JSON object")
             } else {
                 // A stop must not queue behind the very turn it is stopping:
@@ -614,20 +628,19 @@ async fn handle(
             }
         }
         // Files both ways: the page hands a file to the shell, the shell's
-        // paths come back as download links. Same door as everything else —
-        // a token that did not earn the right to drive the shell has not
-        // earned the right to read its disk either.
-        ("POST", "upload") => {
+        // paths come back as download links. Neither direction asks who is
+        // asking. The token used to decide that, and all it ever changed was
+        // that an upload from the page's own user could be refused; the file
+        // still lands in `uploads/` and nowhere else, because the name rule
+        // below is what keeps it there.
+        Route::Upload => {
             // Logged before anything can reject it: every attempt leaves one
             // line, success or not.
             eprintln!(
                 "[serve] POST /upload from {peer}: {} bytes",
                 request.body.len()
             );
-            if !authorized(&request, &query, &token) {
-                eprintln!("[serve] upload from {peer}: unauthorized");
-                plain(401, "unauthorized")
-            } else if request.body.is_empty() {
+            if request.body.is_empty() {
                 eprintln!("[serve] upload from {peer}: empty body");
                 plain(400, "empty upload")
             } else if session_workdir_in(&state).is_none() {
@@ -678,116 +691,119 @@ async fn handle(
                 }
             }
         }
-        ("GET", "file") => {
-            if !authorized(&request, &query, &token) {
-                plain(401, "unauthorized")
+        // Files out: the page asks for a path under the session's own working
+        // directory, and what it may read is decided by the path rules below
+        // rather than by who is asking. The download cap stays — that one keeps
+        // a single request from occupying the link, which is capacity, not
+        // permission.
+        Route::File => {
+            let Some(raw_path) = query.get("path") else {
+                respond(&mut stream, 400, "text/plain; charset=utf-8", b"missing path").await;
+                return;
+            };
+            // Already percent-decoded by `split_target`, once, for every
+            // door into the query string.
+            let decoded: &str = raw_path;
+            let Some(workdir) = session_workdir_in(&state) else {
+                // Same rule as `/upload`: no cwd, no root. The old fallback
+                // to the process directory quietly widened what any caller
+                // could read to wherever the shell happened to be started —
+                // and now that every caller is served, an invented root would
+                // be worse than the same refusal it always was.
+                let reason = "this session has no working directory yet: open or create a \
+                              session first, then download";
+                eprintln!("[serve] {peer} GET /file: no session workdir");
+                respond(&mut stream, 409, "text/plain; charset=utf-8", reason.as_bytes()).await;
+                return;
+            };
+            let candidate = if std::path::Path::new(decoded).is_absolute() {
+                // An absolute path is what the page holds for an upload it
+                // just made, so it stays allowed; the canonicalized check
+                // below is what decides whether it may be read.
+                std::path::PathBuf::from(decoded)
             } else {
-                let Some(raw_path) = query.get("path") else {
-                    respond(&mut stream, 400, "text/plain; charset=utf-8", b"missing path").await;
+                // A relative path is joined to the session root, and that
+                // join is only safe for a descent through plain names: this
+                // is the same rule the interface files get, so a `..`, a
+                // drive letter, a device name or a `file:stream` alternate
+                // data stream is refused before it becomes a path to open.
+                let Some(relative) = safe_relative(decoded) else {
+                    respond(&mut stream, 404, "text/plain; charset=utf-8", b"not found").await;
                     return;
                 };
-                // Already percent-decoded by `split_target`, once, for every
-                // door into the query string.
-                let decoded: &str = raw_path;
-                let Some(workdir) = session_workdir_in(&state) else {
-                    // Same rule as `/upload`: no cwd, no root. The old fallback
-                    // to the process directory quietly widened what this token
-                    // could read to wherever the shell happened to be started.
-                    let reason = "this session has no working directory yet: open or create a \
-                                  session first, then download";
-                    eprintln!("[serve] {peer} GET /file: no session workdir");
-                    respond(&mut stream, 409, "text/plain; charset=utf-8", reason.as_bytes()).await;
+                workdir.join(relative)
+            };
+            // Canonicalize both ends: a symlink that points outside the
+            // working directory fails the same check as `../`, and the
+            // settings file with the API key inside stays unreachable.
+            let resolved = tokio::fs::canonicalize(&candidate).await;
+            let root = tokio::fs::canonicalize(&workdir).await;
+            match (resolved, root) {
+                (Err(_), _) => {
+                    respond(&mut stream, 404, "text/plain; charset=utf-8", b"not found").await;
                     return;
-                };
-                let candidate = if std::path::Path::new(decoded).is_absolute() {
-                    // An absolute path is what the page holds for an upload it
-                    // just made, so it stays allowed; the canonicalized check
-                    // below is what decides whether it may be read.
-                    std::path::PathBuf::from(decoded)
-                } else {
-                    // A relative path is joined to the session root, and that
-                    // join is only safe for a descent through plain names: this
-                    // is the same rule the interface files get, so a `..`, a
-                    // drive letter, a device name or a `file:stream` alternate
-                    // data stream is refused before it becomes a path to open.
-                    let Some(relative) = safe_relative(decoded) else {
-                        respond(&mut stream, 404, "text/plain; charset=utf-8", b"not found").await;
-                        return;
-                    };
-                    workdir.join(relative)
-                };
-                // Canonicalize both ends: a symlink that points outside the
-                // working directory fails the same check as `../`, and the
-                // settings file with the API key inside stays unreachable.
-                let resolved = tokio::fs::canonicalize(&candidate).await;
-                let root = tokio::fs::canonicalize(&workdir).await;
-                match (resolved, root) {
-                    (Err(_), _) => {
-                        respond(&mut stream, 404, "text/plain; charset=utf-8", b"not found").await;
-                        return;
-                    }
-                    (Ok(path), Ok(root)) if path.starts_with(&root) && path.is_file() => {
-                        let mut file = match tokio::fs::File::open(&path).await {
-                            Ok(file) => file,
-                            Err(error) => {
-                                respond(
-                                    &mut stream,
-                                    500,
-                                    "text/plain; charset=utf-8",
-                                    format!("cannot read: {error}").as_bytes(),
-                                )
-                                .await;
-                                return;
-                            }
-                        };
-                        let length = match file.metadata().await {
-                            Ok(metadata) => metadata.len(),
-                            Err(error) => {
-                                respond(
-                                    &mut stream,
-                                    500,
-                                    "text/plain; charset=utf-8",
-                                    format!("cannot read: {error}").as_bytes(),
-                                )
-                                .await;
-                                return;
-                            }
-                        };
-                        // Size is asked before a byte is sent: a body that is
-                        // about to be refused should not first occupy the link.
-                        if over_file_limit(length) {
-                            let body = format!(
-                                "file too large: {length} bytes, this server serves up to \
-                                 {} MB per download",
-                                MAX_FILE_BYTES / (1024 * 1024)
-                            );
-                            eprintln!("[serve] download {} refused: {body}", path.display());
-                            respond(&mut stream, 413, "text/plain; charset=utf-8", body.as_bytes())
-                                .await;
+                }
+                (Ok(path), Ok(root)) if path.starts_with(&root) && path.is_file() => {
+                    let mut file = match tokio::fs::File::open(&path).await {
+                        Ok(file) => file,
+                        Err(error) => {
+                            respond(
+                                &mut stream,
+                                500,
+                                "text/plain; charset=utf-8",
+                                format!("cannot read: {error}").as_bytes(),
+                            )
+                            .await;
                             return;
                         }
-                        let filename = path
-                            .file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "download".into());
-                        eprintln!("[serve] download {} ({length} bytes)", path.display());
-                        respond_attachment(&mut stream, &filename, &mut file, length).await;
+                    };
+                    let length = match file.metadata().await {
+                        Ok(metadata) => metadata.len(),
+                        Err(error) => {
+                            respond(
+                                &mut stream,
+                                500,
+                                "text/plain; charset=utf-8",
+                                format!("cannot read: {error}").as_bytes(),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                    // Size is asked before a byte is sent: a body that is
+                    // about to be refused should not first occupy the link.
+                    if over_file_limit(length) {
+                        let body = format!(
+                            "file too large: {length} bytes, this server serves up to \
+                             {} MB per download",
+                            MAX_FILE_BYTES / (1024 * 1024)
+                        );
+                        eprintln!("[serve] download {} refused: {body}", path.display());
+                        respond(&mut stream, 413, "text/plain; charset=utf-8", body.as_bytes())
+                            .await;
                         return;
                     }
-                    (Ok(_), Ok(_)) => {
-                        respond(
-                            &mut stream,
-                            403,
-                            "text/plain; charset=utf-8",
-                            b"outside the working directory",
-                        )
-                        .await;
-                        return;
-                    }
-                    (Ok(_), Err(_)) => {
-                        respond(&mut stream, 500, "text/plain; charset=utf-8", b"workdir vanished").await;
-                        return;
-                    }
+                    let filename = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "download".into());
+                    eprintln!("[serve] download {} ({length} bytes)", path.display());
+                    respond_attachment(&mut stream, &filename, &mut file, length).await;
+                    return;
+                }
+                (Ok(_), Ok(_)) => {
+                    respond(
+                        &mut stream,
+                        403,
+                        "text/plain; charset=utf-8",
+                        b"outside the working directory",
+                    )
+                    .await;
+                    return;
+                }
+                (Ok(_), Err(_)) => {
+                    respond(&mut stream, 500, "text/plain; charset=utf-8", b"workdir vanished").await;
+                    return;
                 }
             }
         }
@@ -796,83 +812,102 @@ async fn handle(
         // would — a CONNECT handshake through the configured proxy. 200 from
         // the handshake means the node completed the upstream leg; anything
         // else (5xx from the proxy, silence) means the tunnel is down.
-        ("GET", "health") => {
-            if !authorized(&request, &query, &token) {
-                plain(401, "unauthorized")
-            } else {
-                let started = std::time::Instant::now();
-                let ok = probe_upstream().await;
-                if !ok {
-                    // A failed check is the moment to refresh the evidence
-                    // behind the proxy's own pick: re-measuring every node
-                    // now gives the URLTest group fresh numbers to evict the
-                    // one that just dropped us, instead of waiting out its
-                    // interval while turns keep failing.
-                    kick_node_probes().await;
-                }
-                let payload = json!({ "ok": ok, "ms": started.elapsed().as_millis() });
-                (200, "application/json", payload.to_string().into_bytes())
+        Route::Health => {
+            let started = std::time::Instant::now();
+            let ok = probe_upstream().await;
+            if !ok {
+                // A failed check is the moment to refresh the evidence
+                // behind the proxy's own pick: re-measuring every node
+                // now gives the URLTest group fresh numbers to evict the
+                // one that just dropped us, instead of waiting out its
+                // interval while turns keep failing.
+                kick_node_probes().await;
             }
+            let payload = json!({ "ok": ok, "ms": started.elapsed().as_millis() });
+            (200, "application/json", payload.to_string().into_bytes())
         }
-        // The interface's own files. This branch used to sit outside the token
-        // gate entirely, which on `--serve --addr 0.0.0.0:8088` made every
-        // asset request an unauthenticated read of whatever the path reached.
-        // It now answers to the same key as everything else, with one
-        // exception: the single-user loopback page has always loaded without a
-        // token, and that stays - but only for a caller on this machine whose
-        // `Host:` names this server on this port, the one header a rebinding
-        // page cannot forge.
-        ("GET", _) if path != "events" && path != "cmd" => {
-            let local_port = stream.local_addr().map(|bound| bound.port()).unwrap_or(0);
-            let host = request.headers.get("host").map(String::as_str);
-            // `GET /` is the URL this server prints at startup, and it carries
-            // no path at all — that is the entry document, not a path to refuse.
-            // `serve_ui` normalises the same way; doing it before the check
-            // keeps "refuse an unsafe path" from refusing the front door.
-            let entry = if path.is_empty() { "index.html" } else { path };
-            if !authorized(&request, &query, &token)
-                && !(peer.ip().is_loopback() && host_is_loopback(host, local_port))
-            {
-                plain(401, "unauthorized")
-            } else if safe_relative(entry).is_none() {
-                // A plain 404 with no reason in it: a path this server will not
-                // read should tell a prober no more than a missing file does.
-                plain(404, "not found")
-            } else {
-                let (bytes, content_type) = serve_ui(entry);
-                (200, content_type, bytes)
-            }
-        }
-        // Route existence is not something an unauthorized caller gets to
-        // probe: the 405 and the catch-all 404 answer 401 first, and only a
-        // caller that is in learns which methods and paths this server has.
-        ("POST", _) | ("GET", "cmd") => {
-            if !authorized(&request, &query, &token)
-                && !(peer.ip().is_loopback() && {
-                    let local_port = stream.local_addr().map(|bound| bound.port()).unwrap_or(0);
-                    host_is_loopback(request.headers.get("host").map(String::as_str), local_port)
-                })
-            {
-                plain(401, "unauthorized")
-            } else {
-                plain(405, "method not allowed")
-            }
-        }
-        _ => {
-            if !authorized(&request, &query, &token)
-                && !(peer.ip().is_loopback() && {
-                    let local_port = stream.local_addr().map(|bound| bound.port()).unwrap_or(0);
-                    host_is_loopback(request.headers.get("host").map(String::as_str), local_port)
-                })
-            {
-                plain(401, "unauthorized")
-            } else {
-                plain(404, "not found")
-            }
-        }
+        // The interface's own files: the page, and the door the printed URL
+        // opens. Answered from the path alone — `ui_response` takes no peer, no
+        // header and no credential — because a page its own user cannot open is
+        // not a guarded page, it is a broken one, and that was the whole
+        // complaint. `safe_relative` is still the router: a path that would
+        // climb out of the interface directory answers 404, exactly as a
+        // missing file does.
+        Route::Ui => ui_response(path),
+        // Route existence is not a secret any more either: the door that is not
+        // there says 405 or 404 in the open, so a page that fetches the wrong
+        // thing can be debugged from the browser it is running in.
+        Route::MethodNotAllowed => plain(405, "method not allowed"),
+        Route::NotFound => plain(404, "not found"),
     };
 
     respond(&mut stream, status, content_type, &body).await;
+}
+
+/// The served shell's doors, one per arm of [`handle`].
+///
+/// Nothing here is a permission: the enum names *what* to answer, and the method
+/// and the path are the only inputs that pick it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// `GET /events`: the page's event stream.
+    Events,
+    /// `POST /cmd`: the page's own `dispatch`.
+    Command,
+    /// `POST /upload`: a file the page hands to the shell.
+    Upload,
+    /// `GET /file?path=…`: a file the shell hands back.
+    File,
+    /// `GET /health`: whether the upstream the shell needs is reachable.
+    Health,
+    /// `GET /` and every other path: the interface's own files.
+    Ui,
+    /// A path this server has, asked for with the wrong verb.
+    MethodNotAllowed,
+    /// No such path — or no such door for this verb.
+    NotFound,
+}
+
+/// Which door a request goes to, from its method and path alone.
+///
+/// Pure and total on purpose: this table *is* the surface of the served shell,
+/// and it takes nothing a credential could arrive in. Order is the routing rule
+/// — the named pairs come first, because `GET /cmd` is a wrong verb (405) rather
+/// than an interface file, and `POST` to anything unnamed is the same mistake.
+fn route(method: &str, path: &str) -> Route {
+    match (method, path) {
+        ("GET", "events") => Route::Events,
+        ("POST", "cmd") => Route::Command,
+        ("POST", "upload") => Route::Upload,
+        ("GET", "file") => Route::File,
+        ("GET", "health") => Route::Health,
+        // The wrong verb on a door that exists, and every other `POST`: one
+        // answer, because the mistake is the same one.
+        ("GET", "cmd") | ("POST", _) => Route::MethodNotAllowed,
+        // Any other read-shaped request is the interface, paths and all.
+        ("GET", _) => Route::Ui,
+        _ => Route::NotFound,
+    }
+}
+
+/// What a `GET` for an interface file answers, from the path alone.
+///
+/// The signature is the statement the owner asked for: no peer address, no
+/// header, no credential — a caller with the URL gets the document. The one rule
+/// kept from the old gate is the router. `GET /` is the URL this server prints
+/// at startup and carries no path at all, so it is the entry document rather
+/// than a path to refuse; and a path that would climb out of the interface
+/// directory answers 404, exactly as a file that is not there does.
+fn ui_response(path: &str) -> (u16, &'static str, Vec<u8>) {
+    let entry = if path.is_empty() { "index.html" } else { path };
+    if safe_relative(entry).is_none() {
+        // A plain 404 with no reason in it: a path this server will not read
+        // should tell a prober no more than a missing file does.
+        plain(404, "not found")
+    } else {
+        let (bytes, content_type) = serve_ui(entry);
+        (200, content_type, bytes)
+    }
 }
 
 fn plain(status: u16, message: &str) -> (u16, &'static str, Vec<u8>) {
@@ -1260,11 +1295,16 @@ fn over_file_limit(length: u64) -> bool {
     length > MAX_FILE_BYTES
 }
 
-/// A parsed HTTP/1.1 request head plus body, as far as this server needs.
+/// A parsed HTTP/1.1 request: the two things a response is decided by, plus the
+/// body.
+///
+/// The headers are deliberately not carried any further than [`read_head`]. They
+/// used to travel here so `authorized` could read `Authorization` and the
+/// interface branch could read `Host`; both checks are gone, so a copy that
+/// nothing reads would be the only trace of a gate that no longer exists.
 struct Request {
     method: String,
     target: String,
-    headers: HashMap<String, String>,
     /// Raw bytes, kept raw because `/upload` carries files that are not UTF-8;
     /// `/cmd` decodes on its own where JSON needs it.
     body: Vec<u8>,
@@ -1502,18 +1542,20 @@ async fn read_request(stream: &mut TcpStream) -> ReadOutcome {
     ReadOutcome::Request(Request {
         method: head.method,
         target: head.target,
-        headers: head.headers,
         body: body_bytes,
     })
 }
 
 /// Write one response and close. `Connection: close` is the whole policy:
 /// keep-alive would mean tracking half-closed clients for no gain here.
+///
+/// `401` is deliberately absent from the reasons below: no door in this file
+/// asks a caller for a credential any more, so a status this server can never
+/// answer with would only invite the gate back.
 async fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
-        401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
@@ -1664,80 +1706,6 @@ fn listed_session(state: &AppState, id: &str) -> Result<bool, String> {
     }
 }
 
-/// Check the bearer token: header where a client can send one, query string
-/// where it cannot — `EventSource` has no header of its own.
-///
-/// Both halves are always compared, and the comparison does not stop at the
-/// first difference (see [`constant_time_eq`]). `||` would have short-circuited
-/// the second check away on a correct header, which is itself a signal. A
-/// bearer token that guards a shell able to run turns, install packs and read
-/// settings is worth guessing at, and an early-exit `==` hands the guesser a
-/// clock: the run that matches more leading bytes takes measurably longer.
-fn authorized(request: &Request, query: &HashMap<String, String>, token: &str) -> bool {
-    let header = bearer_token(
-        request
-            .headers
-            .get("authorization")
-            .map(String::as_str)
-            .unwrap_or(""),
-    )
-    .unwrap_or("");
-    let provided = query.get("token").map(String::as_str).unwrap_or("");
-    // No `||`: both sides run for every request, so the time taken depends on
-    // the length of the secret and nothing the attacker learns byte by byte.
-    let ok_header = provided_is_token(header, token);
-    let ok_query = provided_is_token(provided, token);
-    ok_header | ok_query
-}
-
-/// The credentials of a `Bearer` authorization header, scheme compared without
-/// regard to case.
-///
-/// RFC 7235 makes the scheme case-insensitive, and the old `strip_prefix("Bearer ")`
-/// made `bearer <token>` look like no credential at all. That is not a bypass —
-/// it fails closed — but it pushed a correct client onto the query string,
-/// which is the weaker door (tokens in URLs end up in history and logs). A
-/// header with no scheme, an empty credential, or any other scheme is still
-/// `None`: a bare token is not a bearer token.
-fn bearer_token(header: &str) -> Option<&str> {
-    let (scheme, credentials) = header.split_once(' ')?;
-    if !scheme.eq_ignore_ascii_case("bearer") {
-        return None;
-    }
-    let credentials = credentials.trim();
-    if credentials.is_empty() {
-        None
-    } else {
-        Some(credentials)
-    }
-}
-
-/// One candidate against the token, in fixed time for its length.
-fn provided_is_token(provided: &str, token: &str) -> bool {
-    constant_time_eq(provided.as_bytes(), token.as_bytes())
-}
-
-/// Whether two byte strings are equal, without leaking where they differ.
-///
-/// Every byte of the longer side is visited and folded into one accumulator,
-/// so there is no branch that runs only after a prefix matched — the timing
-/// depends on the lengths alone, never on how close the guess was. The length
-/// of the secret is not what this protects (a caller-supplied `--token` can be
-/// any length); where the first wrong byte sits is, and that is what a timing
-/// attack recovers bit by bit from an early-exit `==`.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let longest = a.len().max(b.len());
-    let mut differences = a.len() ^ b.len();
-    for index in 0..longest {
-        // Out-of-range on the shorter side reads 0, which cannot equal any
-        // byte of the longer side's token, so the mismatch still registers.
-        let left = a.get(index).copied().unwrap_or(0);
-        let right = b.get(index).copied().unwrap_or(0);
-        differences |= usize::from(left ^ right);
-    }
-    differences == 0
-}
-
 /// Split `path?query` into both halves, query as a map.
 ///
 /// Query values arrive percent-encoded (`?name=my%20file.txt`, and a path with
@@ -1752,39 +1720,6 @@ pub(crate) fn split_target(target: &str) -> (&str, HashMap<String, String>) {
         .map(|(name, value)| (name.to_string(), percent_decode(value)))
         .collect();
     (path.trim_start_matches('/'), query)
-}
-
-/// The query half of a request target, still percent-encoded.
-fn raw_query(target: &str) -> &str {
-    target.split_once('?').map(|(_, query)| query).unwrap_or("")
-}
-
-/// One query parameter's decoded value, refusing a key that appears twice.
-///
-/// A map built from the query string keeps only the last occurrence, so
-/// `?token=a&token=b` silently authenticated with `b` — the request said two
-/// things and the server quietly picked one. For a credential that is the wrong
-/// guess to make, so a repeat is an error the caller answers `400` to.
-fn single_query(query: &str, key: &str) -> Result<Option<String>, String> {
-    let mut found: Option<String> = None;
-    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
-        let (name, value) = match pair.split_once('=') {
-            Some((name, value)) => (name, value),
-            // `?token` with no `=` declares an empty value, which matches no
-            // token; it still counts as an occurrence for the repeat check.
-            None => (pair, ""),
-        };
-        if name != key {
-            continue;
-        }
-        if found.is_some() {
-            return Err(format!(
-                "the `{key}` query parameter appears more than once; send it exactly once"
-            ));
-        }
-        found = Some(percent_decode(value));
-    }
-    Ok(found)
 }
 
 fn is_ready(body: &str) -> bool {
@@ -2032,103 +1967,73 @@ mod scheduling_tests {
     }
 }
 
+/// What replaced the gate's tests.
+///
+/// The module that stood here asserted the opposite of this one: a request with
+/// no token was refused, a foreign `Host:` was refused, a header that was not a
+/// `Bearer` credential was refused. The owner deleted that contract on purpose,
+/// so what is asserted now is the contract that replaced it — every door answers
+/// its method and path whoever knocks, and what is left (`405`, `404`) is
+/// routing, not permission.
 #[cfg(test)]
-mod auth_tests {
-    use super::{authorized, bearer_token, constant_time_eq, Request};
-    use std::collections::HashMap;
+mod routing_tests {
+    use super::{route, ui_response, Route};
 
-    const TOKEN: &str = "6f1c9d2e-0a41-4d7b-9c3e-5b2a8e7d4f10";
-
-    fn request(authorization: Option<&str>) -> Request {
-        let mut headers = HashMap::new();
-        if let Some(value) = authorization {
-            // The reader lowercases header names; the map in a hand-built
-            // request has to match that.
-            headers.insert("authorization".to_string(), value.to_string());
-        }
-        Request {
-            method: "POST".to_string(),
-            target: "/cmd".to_string(),
-            headers,
-            body: Vec::new(),
-        }
-    }
-
-    fn query(token: Option<&str>) -> HashMap<String, String> {
-        let mut map = HashMap::new();
-        if let Some(value) = token {
-            map.insert("token".to_string(), value.to_string());
-        }
-        map
-    }
-
+    /// The complaint this contract exists to end, in one test.
+    ///
+    /// `route` takes a method and a path and nothing else — no header, no query
+    /// string, no peer address — so there is no argument a credential could even
+    /// arrive in. The entry document the server prints then answers `200` to a
+    /// caller that presented nothing at all.
     #[test]
-    fn the_right_token_passes_through_either_door() {
-        let bearer = format!("Bearer {TOKEN}");
-        assert!(authorized(&request(Some(&bearer)), &query(None), TOKEN));
-        assert!(authorized(&request(None), &query(Some(TOKEN)), TOKEN));
-        assert!(authorized(&request(Some(&bearer)), &query(Some(TOKEN)), TOKEN));
+    fn a_request_without_a_token_is_served() {
+        // The printed URL: `GET /`, no path, no credential, no `Host:` named.
+        assert_eq!(route("GET", ""), Route::Ui);
+        let (status, content_type, _) = ui_response("");
+        assert_eq!(status, 200, "the page is not a 401 to its own user");
+        assert!(content_type.starts_with("text/html"), "{content_type}");
     }
 
+    /// Every door the page actually uses, reached from its method and its path
+    /// alone — the same answer for a loopback browser, a phone on the LAN, and
+    /// anything else that can open the port.
     #[test]
-    fn nothing_or_the_wrong_token_fails() {
-        assert!(!authorized(&request(None), &query(None), TOKEN));
-        assert!(!authorized(&request(Some("Bearer nope")), &query(None), TOKEN));
-        assert!(!authorized(&request(None), &query(Some("nope")), TOKEN));
-        // A header that is not a bearer token is not a token at all.
-        assert!(!authorized(&request(Some(TOKEN)), &query(None), TOKEN));
+    fn every_door_is_reached_by_method_and_path_alone() {
+        assert_eq!(route("GET", "events"), Route::Events);
+        assert_eq!(route("POST", "cmd"), Route::Command);
+        assert_eq!(route("POST", "upload"), Route::Upload);
+        assert_eq!(route("GET", "file"), Route::File);
+        assert_eq!(route("GET", "health"), Route::Health);
+        assert_eq!(route("GET", "index.html"), Route::Ui);
     }
 
-    /// The old `==` returned the moment a byte differed, which told an attacker
-    /// how long the matching prefix was. This asserts the answers are still
-    /// right at every interesting boundary — equal, off by one byte at the
-    /// front, off by one byte at the end, and a length mismatch.
+    /// The two answers that used to be `401` first are now just routing: the
+    /// wrong verb on a door that exists is `405`, an unknown path is `404`, and
+    /// an unknown verb is `404` too. `401` is a status this file can no longer
+    /// produce at all.
     #[test]
-    fn near_misses_are_rejected_at_every_position() {
-        let mut first = TOKEN.to_string();
-        first.replace_range(0..1, "X");
-        let mut last = TOKEN.to_string();
-        last.replace_range(last.len() - 1.., "X");
-        assert!(!constant_time_eq(TOKEN.as_bytes(), first.as_bytes()));
-        assert!(!constant_time_eq(TOKEN.as_bytes(), last.as_bytes()));
-        assert!(!constant_time_eq(TOKEN.as_bytes(), format!("{TOKEN}x").as_bytes()));
-        assert!(!constant_time_eq(TOKEN.as_bytes(), &TOKEN.as_bytes()[..TOKEN.len() - 1]));
-        assert!(constant_time_eq(TOKEN.as_bytes(), TOKEN.as_bytes()));
-        assert!(constant_time_eq(b"", b""));
-        assert!(!constant_time_eq(b"", b"a"));
+    fn a_wrong_verb_and_an_unknown_path_answer_without_a_credential() {
+        assert_eq!(route("GET", "cmd"), Route::MethodNotAllowed);
+        assert_eq!(route("POST", "events"), Route::MethodNotAllowed);
+        assert_eq!(route("POST", "file"), Route::MethodNotAllowed);
+        assert_eq!(route("POST", "no/such/thing"), Route::MethodNotAllowed);
+        assert_eq!(route("DELETE", "cmd"), Route::NotFound);
+        assert_eq!(route("HEAD", ""), Route::NotFound);
+        assert_eq!(route("PATCH", "events"), Route::NotFound);
+        // A `GET` on an unknown path is still the interface branch; that is
+        // where the 404 for a path this server will not read comes from.
+        assert_eq!(route("GET", "no/such/thing"), Route::Ui);
     }
 
-    /// RFC 7235 makes the scheme name case-insensitive, so `bearer x` is a
-    /// credential. Leaving it unrecognised failed closed but pushed a correct
-    /// client onto the query string — the weaker door, where the token lands in
-    /// browser history and server logs.
+    /// The documents themselves, answered to a caller that has nothing to
+    /// present: the entry document the printed URL opens, and an asset beside
+    /// it. What a path may *not* name is `path_tests`' job — this one is only
+    /// that the reading side of the old gate is gone.
     #[test]
-    fn the_bearer_scheme_is_case_insensitive() {
-        for header in [
-            format!("Bearer {TOKEN}"),
-            format!("bearer {TOKEN}"),
-            format!("BEARER {TOKEN}"),
-            format!("BeArEr {TOKEN}"),
-        ] {
-            assert_eq!(bearer_token(&header), Some(TOKEN), "{header}");
-        }
-        // Space around the credential is not part of it.
-        assert_eq!(bearer_token(&format!("Bearer   {TOKEN}  ")), Some(TOKEN));
-        // Everything else is no credential at all, and that still fails closed.
-        assert_eq!(bearer_token(TOKEN), None);
-        assert_eq!(bearer_token(&format!("Basic {TOKEN}")), None);
-        assert_eq!(bearer_token(&format!("Bearer{TOKEN}")), None);
-        assert_eq!(bearer_token("Bearer"), None);
-        assert_eq!(bearer_token("Bearer "), None);
-        assert_eq!(bearer_token(""), None);
-    }
-
-    #[test]
-    fn a_lowercase_scheme_authenticates_through_the_header() {
-        let header = format!("bearer {TOKEN}");
-        assert!(authorized(&request(Some(&header)), &query(None), TOKEN));
-        // …and it is still the token that decides, not the spelling.
-        assert!(!authorized(&request(Some("bearer nope")), &query(None), TOKEN));
+    fn the_interface_files_are_served() {
+        assert_eq!(ui_response("").0, 200);
+        assert_eq!(ui_response("index.html").0, 200);
+        assert_eq!(ui_response("nested/asset.css").0, 200);
     }
 }
 
@@ -2401,7 +2306,7 @@ mod limit_tests {
 
 #[cfg(test)]
 mod query_tests {
-    use super::{raw_query, single_query, split_target};
+    use super::split_target;
 
     /// One decode, in one place: `/file` used to decode its own value, so the
     /// two doors into the query string disagreed about what a value was.
@@ -2420,38 +2325,37 @@ mod query_tests {
         assert!(query.is_empty());
     }
 
-    /// `?token=a&token=b` states two things and, read through a map, silently
-    /// meant the last one. A credential is refused instead of guessed at.
+    /// The query string is data now, never a credential, and the doubling that
+    /// used to be answered `400` is the case worth pinning: the URL an old
+    /// bookmark holds — printed by an older build, `?token=` and all, sometimes
+    /// twice — has to open the page like any other address. The reading is the
+    /// one every other parameter gets: the last occurrence wins, and only the
+    /// names a door actually asks for are ever looked up.
     #[test]
-    fn a_repeated_token_is_refused_instead_of_resolved() {
+    fn an_old_token_in_the_query_is_ordinary_data() {
+        let (path, query) = split_target("/?token=6f1c&token=stale");
+        assert_eq!(path, "", "the entry document, whatever the query carries");
+        assert_eq!(query.get("token").map(String::as_str), Some("stale"));
+        // A token beside a real parameter changes nothing about the parameter.
+        let (path, query) = split_target("/file?path=uploads%2Fx.png&token=stale");
+        assert_eq!(path, "file");
+        assert_eq!(query.get("path").map(String::as_str), Some("uploads/x.png"));
+        // What a door reads is untouched: no token, no difference.
+        let without_token = split_target("/file?path=uploads%2Fx.png").1;
         assert_eq!(
-            single_query("token=abc", "token"),
-            Ok(Some("abc".to_string()))
+            without_token.get("path").map(String::as_str),
+            Some("uploads/x.png")
         );
-        let error = single_query("token=a&token=b", "token").expect_err("a repeat");
-        assert!(error.contains("token"), "{error}");
-        assert!(error.contains("more than once"), "{error}");
-        // An encoded key is not the same key: only the literal one is counted.
-        assert_eq!(single_query("to%6ben=a&token=b", "token"), Ok(Some("b".to_string())));
-        // Absent, empty, and value-less forms stay distinguishable.
-        assert_eq!(single_query("", "token"), Ok(None));
-        assert_eq!(single_query("other=1", "token"), Ok(None));
-        assert_eq!(single_query("token=", "token"), Ok(Some(String::new())));
-        assert_eq!(single_query("token", "token"), Ok(Some(String::new())));
-        // A percent-encoded token is decoded before it is compared.
-        assert_eq!(
-            single_query("token=6f1c%2D9d2e", "token"),
-            Ok(Some("6f1c-9d2e".to_string()))
-        );
-        // Another key whose value merely looks like ours is not one.
-        assert_eq!(single_query("next=%3Ftoken%3Dabc", "token"), Ok(None));
     }
 
+    /// Decoding happens after the split, so a value cannot smuggle a separator
+    /// in: `%26` arrives as `&` only once the pairs have been cut, which is why
+    /// a `path` that contains `&token=` is still one value and one lookup.
     #[test]
-    fn the_raw_query_is_handed_over_encoded() {
-        assert_eq!(raw_query("/file?path=a%20b"), "path=a%20b");
-        assert_eq!(raw_query("/status"), "");
-        assert_eq!(raw_query("/status?token="), "token=");
+    fn a_value_that_looks_like_another_parameter_is_still_one_value() {
+        let (_, query) = split_target("/file?path=a%26token%3Dx");
+        assert_eq!(query.get("path").map(String::as_str), Some("a&token=x"));
+        assert_eq!(query.get("token"), None);
     }
 }
 
@@ -2504,37 +2408,9 @@ pub(crate) fn safe_relative(target: &str) -> Option<std::path::PathBuf> {
     Some(relative)
 }
 
-/// Whether a `Host:` header names this server, on the port it listens on.
-///
-/// The token is the lock. This is what lets the single-user loopback page stay
-/// token-free without leaving a door open to a browser on some other origin: a
-/// rebinding attack reaches the socket with *its own* name in `Host:`, so only
-/// the names that mean "this machine" — `127.0.0.1`, `localhost`, `[::1]`, on
-/// the port this server actually bound — are accepted.
-pub(crate) fn host_is_loopback(host: Option<&str>, port: u16) -> bool {
-    let Some(host) = host else {
-        return false;
-    };
-    let host = host.trim();
-    // The port is part of the answer, so a bare name is not one: `Host:
-    // localhost` is a client that did not say which server it meant.
-    let Some((name, port_text)) = host.rsplit_once(':') else {
-        return false;
-    };
-    let Ok(seen) = port_text.parse::<u16>() else {
-        return false;
-    };
-    if seen != port {
-        return false;
-    };
-    let name = name.trim_matches(|character| character == '[' || character == ']');
-    name.eq_ignore_ascii_case("127.0.0.1")
-        || name.eq_ignore_ascii_case("localhost")
-        || name == "::1"
-}
 #[cfg(test)]
 mod path_tests {
-    use super::{host_is_loopback, safe_relative};
+    use super::{safe_relative, ui_response};
 
     /// Every spelling of "escape the root" a URL can carry: an absolute path
     /// (which makes `join` replace the root), a raw backslash climb, a
@@ -2563,18 +2439,30 @@ mod path_tests {
         );
     }
 
-    /// Only this machine's own names, on the port this server bound.
+    /// The gate that used to answer this question is gone, and the rule that
+    /// replaced it is the path itself. Any caller may ask for an interface
+    /// file — no token, any `Host:` — and the answer is decided here: the entry
+    /// document and the assets the page really uses are served, and a path that
+    /// would climb out of the interface directory answers `404`, which is what
+    /// a file that is not there answers too.
     #[test]
-    fn only_this_machines_host_names_are_loopback() {
-        assert!(host_is_loopback(Some("127.0.0.1:8088"), 8088));
-        assert!(host_is_loopback(Some("localhost:8088"), 8088));
-        assert!(
-            host_is_loopback(Some("[::1]:8088"), 8088),
-            "is_loopback() accepts a [::1] bind, so the Host check has to accept the name"
-        );
-        assert!(!host_is_loopback(Some("evil.com:8088"), 8088));
-        assert!(!host_is_loopback(Some("127.0.0.1:9999"), 8088), "another port is another server");
-        assert!(!host_is_loopback(None, 8088));
+    fn anyone_may_ask_but_the_path_still_decides() {
+        // The printed URL: no path, so the entry document.
+        let (status, content_type, _) = ui_response("");
+        assert_eq!(status, 200);
+        assert!(content_type.starts_with("text/html"), "{content_type}");
+        // An asset the interface really asks for.
+        let (status, _, _) = ui_response("app.js");
+        assert_eq!(status, 200);
+        // A climb, in every spelling `safe_relative` refuses: a refusal here is
+        // a 404, the same answer a missing file gets, and never a 401 and never
+        // a file.
+        for path in ["../settings.json", "..%2f..%2fx", "C:/Windows/win.ini", "a\\..\\..\\b"] {
+            let (status, content_type, body) = ui_response(path);
+            assert_eq!(status, 404, "{path} answered {status}");
+            assert_eq!(content_type, "text/plain; charset=utf-8");
+            assert_eq!(body, b"not found".to_vec());
+        }
     }
 }
 

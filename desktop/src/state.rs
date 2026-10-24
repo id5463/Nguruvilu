@@ -578,6 +578,17 @@ impl AppState {
 
     /// A description of the current state, for the details panel and status bar.
     pub fn describe(&self) -> Value {
+        // This session's mission board, read before any lock is taken: it is a
+        // handful of small files in a directory that usually does not exist, and
+        // the page paints it the moment a panel frame loads — a reader who starts a
+        // mission has to see it without waiting for the next tool call.
+        let missions = missions_workspace(
+            self.store.root(),
+            &self.session.id,
+            self.session.cwd.as_deref(),
+        )
+        .map(|workspace| missions_under(&workspace))
+        .unwrap_or_else(|| json!([]));
         let runtime = self.config.runtime.lock().expect("runtime lock");
         let snapshot = runtime.snapshot();
         let skills = self.config.skills.lock().expect("skills lock");
@@ -625,6 +636,10 @@ impl AppState {
             // continue while a different one is busy.
             "busy": self.running.contains(&self.session.id),
             "running_sessions": running,
+            // Every mission in this session's workspace, newest first. It is not
+            // derived from anything the page can see: the mission tools write to
+            // disk, and this is how the board reaches the page at open.
+            "missions": missions,
             "configured": self.settings.is_configured(),
             "missing": self.settings.missing(),
             "api_key_masked": self.settings.masked_key(),
@@ -1444,6 +1459,72 @@ fn adopt_workspace_for(session: &Session) -> Result<String> {
     }
     let dir = ensure_workspace(&workspaces_root()?, &session.id)?;
     Ok(dir.display().to_string())
+}
+
+/// Every mission of one session workspace, newest first.
+///
+/// The mission tools already put this board in every tool answer they return, but
+/// the page also draws it when the window opens — before any tool has answered.
+/// Otherwise the mission bar sits on "idle, no mission in progress" while the
+/// tasks exist on disk, which reads exactly like the feature is missing.
+///
+/// Missions are directories under `<workspace>/missions`, each holding a
+/// `mission.json`; their ids are time-ordered (`m-YYYYmmdd-HHMMSS`), so sorting the
+/// directory names newest-first gives the order a reader expects. Nothing here may
+/// fail: a session with no missions is the ordinary case, and this runs from
+/// `AppState::describe` under the state lock, where a half-readable board must
+/// never turn a status push into an error. A record that does not parse is skipped
+/// rather than reported as a nameless mission.
+fn missions_under(workspace: &Path) -> Value {
+    let root = workspace.join("missions");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return json!([]);
+    };
+    let mut rows: Vec<(String, Value)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = match entry.file_name().to_str() {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+        let Ok(text) = std::fs::read_to_string(path.join("mission.json")) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let row = json!({
+            "id": record
+                .get("id")
+                .cloned()
+                .unwrap_or_else(|| Value::String(name.clone())),
+            "objective": record.get("objective").cloned().unwrap_or(Value::Null),
+            "status": record.get("status").cloned().unwrap_or(Value::Null),
+        });
+        rows.push((name, row));
+    }
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    Value::Array(rows.into_iter().map(|(_, row)| row).collect())
+}
+
+/// The directory whose `missions/` this session's tools wrote into.
+///
+/// A mission lives in the session workspace, which is the recorded `cwd` while it
+/// still exists — a session can be pinned to a real project — and the per-session
+/// `<home>/workspaces/<id>` directory otherwise. That is the rule
+/// [`adopt_workspace_for`] applies, so the board is read where the tools wrote
+/// instead of where a guess says they should have. `store_root` is the sessions
+/// directory, so its parent is the state home.
+fn missions_workspace(store_root: &Path, session_id: &str, cwd: Option<&str>) -> Option<PathBuf> {
+    if let Some(cwd) = cwd.map(Path::new) {
+        if cwd.is_dir() {
+            return Some(cwd.to_path_buf());
+        }
+    }
+    nguruvilu::session::workspace_dir(store_root.parent()?, session_id).ok()
 }
 
 /// Where sessions live for the desktop shell.
@@ -3114,6 +3195,78 @@ mod tests {
         assert!(state.lock().expect("state lock").stats(Some(missing)).is_err());
         assert!(AppState::stats_outside_lock(&state, Some(missing)).is_err());
 
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The status push carries the session's mission board.
+    ///
+    /// The page paints the mission list from `status.missions` the moment a panel
+    /// frame loads, so this field is what makes a mission visible before — and
+    /// without — any tool answering. The layout asserted here is the one the
+    /// mission tools write: `<workspace>/missions/<id>/mission.json`.
+    #[test]
+    fn the_status_board_lists_the_session_missions() {
+        let home = std::env::temp_dir().join(format!("ngu-state-test-{}", uuid::Uuid::new_v4()));
+        // The sessions directory is the handle `describe` has; the state home and the
+        // workspaces under it are derived from it.
+        let sessions = home.join("sessions");
+        let workspace = missions_workspace(&sessions, "s-1", None).expect("a workspace path");
+        assert_eq!(workspace, home.join("workspaces").join("s-1"));
+
+        for id in ["m-20260101-000000", "m-20260102-000000"] {
+            let dir = workspace.join("missions").join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("mission.json"),
+                json!({
+                    "id": id,
+                    "objective": format!("objective for {id}"),
+                    "status": "running",
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        // A directory without a readable record is not a mission: the board skips it
+        // instead of reporting a nameless row.
+        std::fs::create_dir_all(workspace.join("missions").join("broken")).unwrap();
+
+        let board = missions_under(&workspace);
+        let rows = board.as_array().expect("an array");
+        assert_eq!(rows.len(), 2, "{board}");
+        // Newest first: ids are time-ordered, and the newest mission is the one a
+        // reader is looking for.
+        assert_eq!(rows[0]["id"], "m-20260102-000000");
+        assert_eq!(rows[1]["id"], "m-20260101-000000");
+        assert_eq!(rows[0]["objective"], "objective for m-20260102-000000");
+        assert_eq!(rows[0]["status"], "running");
+
+        // A recorded working directory that still exists is where the tools wrote, so
+        // it is where the board is read. A stale one falls back to the per-session
+        // workspace instead of reading a path that is gone.
+        let project = home.join("projects").join("pinned");
+        std::fs::create_dir_all(&project).unwrap();
+        assert_eq!(
+            missions_workspace(&sessions, "s-1", project.to_str()),
+            Some(project.clone())
+        );
+        assert_eq!(
+            missions_workspace(&sessions, "s-1", Some("this-project-does-not-exist")),
+            Some(home.join("workspaces").join("s-1"))
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A session with no missions reports an empty board, never an error.
+    #[test]
+    fn a_workspace_without_missions_reports_an_empty_board() {
+        let home = std::env::temp_dir().join(format!("ngu-state-test-{}", uuid::Uuid::new_v4()));
+        assert_eq!(missions_under(&home.join("nowhere")), json!([]));
+        // An empty `missions/` directory is the same fact as a missing one, and both
+        // are the ordinary case on a machine that never started a mission.
+        std::fs::create_dir_all(home.join("missions")).unwrap();
+        assert_eq!(missions_under(&home), json!([]));
         let _ = std::fs::remove_dir_all(&home);
     }
 }
