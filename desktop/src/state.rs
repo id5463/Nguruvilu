@@ -1465,6 +1465,11 @@ fn sessions_root() -> PathBuf {
 }
 
 /// Where WebView2 keeps its profile for this app.
+///
+/// The webview exists only on the window path, and `windowed` is this
+/// function's only caller: without a window there is no profile to point
+/// anywhere.
+#[cfg(windows)]
 pub fn data_directory() -> PathBuf {
     sessions_root().parent().map(|dir| dir.join("webview")).unwrap_or_else(|| PathBuf::from("."))
 }

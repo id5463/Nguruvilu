@@ -18,7 +18,12 @@ mod sink;
 mod state;
 
 use std::collections::BTreeSet;
-use std::io::{BufRead, Read, Write};
+use std::io::BufRead;
+// `Read` and `Write` are the loopback server's traits: every other reader and
+// writer here goes through `BufRead` or `std::fs`, so these ride with the
+// window path too.
+#[cfg(windows)]
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -2255,6 +2260,9 @@ impl tao::rwh_06::HasDisplayHandle for DialogParent {
     }
 }
 
+// The loopback server belongs to the window: it is there to give the webview
+// page a real origin to load from, and a page cannot exist without a window —
+// so `windowed` is its only caller and the server ships with the window path.
 /// Serve the window's interface over loopback — and its uploads too.
 ///
 /// GET serves interface files, exactly as before. `POST /upload` is the same
@@ -2264,6 +2272,7 @@ impl tao::rwh_06::HasDisplayHandle for DialogParent {
 /// parse it as JSON, so the upload button looked broken while nothing appeared
 /// in any log. Loopback only, no token: the same origin the window already
 /// trusts for its files.
+#[cfg(windows)]
 fn serve_interface_on_loopback(state: Arc<Mutex<AppState>>) -> std::io::Result<u16> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
@@ -2294,6 +2303,7 @@ fn serve_interface_on_loopback(state: Arc<Mutex<AppState>>) -> std::io::Result<u
 }
 
 /// Answer one loopback connection: an interface file, or an upload.
+#[cfg(windows)]
 fn serve_loopback_connection(
     mut stream: std::net::TcpStream,
     state: Arc<Mutex<AppState>>,
@@ -2431,6 +2441,7 @@ fn serve_loopback_connection(
 
 /// One loopback response, closed after — the style this little server always
 /// had (`Connection: close`), with the body length stated.
+#[cfg(windows)]
 fn respond_loopback(
     stream: &mut std::net::TcpStream,
     status: &str,
@@ -2555,18 +2566,29 @@ fn emit(sink: &Arc<dyn EventSink>, value: Value) {
     sink.emit(value);
 }
 
+// Everything from here to `free_upload_name` answers the window: the command
+// cap, the pick dialog guard, and the loopback server's limits and helpers. A
+// page cannot exist without a window, so outside `cfg(windows)` none of it has
+// a caller. The pieces the unit tests at the bottom of this file exercise stay
+// compiled wherever the tests are, so those tests keep running on every
+// platform — `#[cfg(any(windows, test))]` marks exactly that pair.
+#[cfg(any(windows, test))]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// The most bytes one command from the page may carry.
+#[cfg(windows)]
 const MAX_IPC_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// Set while a native pick dialog is open.
+#[cfg(any(windows, test))]
 static PICK_BUSY: AtomicBool = AtomicBool::new(false);
 
 /// Clears [`PICK_BUSY`] however the picker ends — cancelled, chosen, or a
 /// panic inside the dialog.
+#[cfg(any(windows, test))]
 struct PickGuard;
 
+#[cfg(any(windows, test))]
 impl PickGuard {
     /// Claim the picker, or `None` when one is already open.
     fn claim() -> Option<Self> {
@@ -2577,6 +2599,7 @@ impl PickGuard {
     }
 }
 
+#[cfg(any(windows, test))]
 impl Drop for PickGuard {
     fn drop(&mut self) {
         PICK_BUSY.store(false, Ordering::SeqCst);
@@ -2585,26 +2608,33 @@ impl Drop for PickGuard {
 
 /// Loopback connections allowed in flight at once. A WebView2 preconnect holds
 /// one without ever sending a byte, so the cap is generous but finite.
+#[cfg(windows)]
 const MAX_LOOPBACK_CONNECTIONS: usize = 32;
 
 /// Loopback connections currently being handled.
+#[cfg(windows)]
 static LOOPBACK_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
 /// Ten seconds to send a request head.
+#[cfg(windows)]
 const LOOPBACK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Thirty seconds to drain a response.
+#[cfg(windows)]
 const LOOPBACK_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The most an upload to the window's loopback server may weigh.
+#[cfg(windows)]
 const MAX_LOOPBACK_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 /// One connection slot, returned to `counter` when dropped — every path out of
 /// the handler gives it back, including a panic.
+#[cfg(any(windows, test))]
 struct ConnectionSlot {
     counter: &'static AtomicUsize,
 }
 
+#[cfg(any(windows, test))]
 impl Drop for ConnectionSlot {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::Relaxed);
@@ -2612,6 +2642,7 @@ impl Drop for ConnectionSlot {
 }
 
 /// Take a slot, or `None` when `cap` are already held.
+#[cfg(any(windows, test))]
 fn acquire_slot(counter: &'static AtomicUsize, cap: usize) -> Option<ConnectionSlot> {
     if counter.fetch_add(1, Ordering::Relaxed) >= cap {
         // Refused connections do not count: the increment is undone before the
@@ -2623,6 +2654,7 @@ fn acquire_slot(counter: &'static AtomicUsize, cap: usize) -> Option<ConnectionS
 }
 
 /// One header out of a request head, matched case-insensitively.
+#[cfg(windows)]
 fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     head.lines().find_map(|line| {
         let (key, value) = line.split_once(':')?;
@@ -2632,6 +2664,7 @@ fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
 
 /// Whether a `POST /upload` may proceed: no `Origin` at all is a plain
 /// same-origin client; a present one must be this server's own origin.
+#[cfg(any(windows, test))]
 fn origin_allowed(origin: Option<&str>, port: u16) -> bool {
     let Some(origin) = origin else { return true };
     let origin = origin.trim();
@@ -2639,6 +2672,7 @@ fn origin_allowed(origin: Option<&str>, port: u16) -> bool {
 }
 
 /// Uploads arrive as multipart; anything else is a mistake worth naming.
+#[cfg(any(windows, test))]
 fn content_type_is_multipart(value: Option<&str>) -> bool {
     value
         .map(|value| {
@@ -2655,6 +2689,7 @@ fn content_type_is_multipart(value: Option<&str>) -> bool {
 /// `serde_json` leaves U+2028 and U+2029 raw, and JavaScript treats both as a
 /// line terminator, so an event carrying one produced a syntax error and the
 /// page silently never saw it. Escaped, they stay inside the string literal.
+#[cfg(any(windows, test))]
 fn js_safe(value: &str) -> String {
     value
         .replace('\u{2028}', "\\u2028")
@@ -2663,6 +2698,7 @@ fn js_safe(value: &str) -> String {
 
 /// `photo.png` and 3 as `photo(3).png`, the extension kept last so both the
 /// browser and the file system still recognise the type.
+#[cfg(any(windows, test))]
 fn suffixed(name: &str, n: u32) -> String {
     match name.rsplit_once('.') {
         Some((stem, extension)) if !stem.is_empty() && !extension.is_empty() => {
@@ -2674,6 +2710,7 @@ fn suffixed(name: &str, n: u32) -> String {
 
 /// A path in `dir` no file occupies: the same rule as serve mode's
 /// `free_upload_name`, so an upload never replaces a file the session had.
+#[cfg(any(windows, test))]
 fn free_upload_name(dir: &Path, name: &str) -> PathBuf {
     let taken = |candidate: &str| dir.join(candidate).exists();
     if !taken(name) {
