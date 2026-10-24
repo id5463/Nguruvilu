@@ -751,8 +751,21 @@ const serveToken = (() => {
     params.delete("token");
     const rest = params.toString();
     history.replaceState({}, "", location.pathname + (rest ? "?" + rest : ""));
+    // 地址栏里已经不放了，但刷新（以及手机把页面丢弃后再回来）会重新请求这个地址：
+    // 没有这一份副本，一次刷新就变成 401，页面从此打不开。sessionStorage 只在
+    // 这个标签页里，关掉即失效，信任边界和地址栏里那个 token 是同一个。
+    try {
+      sessionStorage.setItem("ngu.serve-token", found);
+    } catch (error) {
+      // 无痕模式记不住：那就退回“每次打开都带 token”，不假装成功。
+    }
+    return found;
   }
-  return found;
+  try {
+    return sessionStorage.getItem("ngu.serve-token") || "";
+  } catch (error) {
+    return "";
+  }
 })();
 const toShell = onServer
   ? (payload) =>
@@ -1547,6 +1560,9 @@ function panelDocument(panel, panelId) {
 
 // panelId -> iframe。这份表就是白名单：不在表里的 panelId 说什么都不转。
 let panelFrames = new Map();
+// What the last ui_panels push held, so a panel can be re-rendered in place when
+// the user changes their mind about it (see the re-ask button in renderSlots).
+let lastPanels = [];
 
 // 装了一个带界面的包，等于让一段别人写的代码在本页里画东西、并经由宿主发命令。
 // 问一次，答一次，把答复记在 localStorage 里：每次启动都重问是噪音，从来不说
@@ -1640,6 +1656,7 @@ window.addEventListener("message", (event) => {
 /// sandboxed document (see above), so a rebuild costs one iframe load per panel
 /// and its script runs inside that document, once, with its own fragment there.
 function renderSlots(panels) {
+  lastPanels = panels || [];
   panelFrames = new Map();
   for (const slot of ["sidebar-top", "sidebar-bottom", "details-top", "details-bottom", "status-bar", "above-composer"]) {
     const container = document.getElementById("slot-" + slot);
@@ -1656,9 +1673,23 @@ function renderSlots(panels) {
 
     if (panel.html || panel.script) {
       if (!panelConsented(panel)) {
-        box.append(el("div", "empty",
+        const empty = el("div", "empty",
           "这个包的面板没有运行（拒绝过一次，记在 localStorage 的 " +
-          panelConsentKey(panel) + "）"));
+          panelConsentKey(panel) + "）");
+        // A refusal is a decision, not a verdict: without a way back, the only
+        // recovery is knowing which localStorage key to delete, so the panel
+        // stays dark forever and looks like a broken feature.
+        const again = el("button", "tiny", "重新询问并允许");
+        again.addEventListener("click", () => {
+          try {
+            localStorage.removeItem(panelConsentKey(panel));
+          } catch (error) {
+            // 无痕模式：没有可删的记录，重新渲染就会再问一次
+          }
+          renderSlots(lastPanels);
+        });
+        empty.append(again);
+        box.append(empty);
       } else {
         const frame = document.createElement("iframe");
         // 只给 allow-scripts。多给 allow-same-origin 就等于什么都没做：同源沙箱里

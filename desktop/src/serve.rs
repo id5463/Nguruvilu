@@ -1530,6 +1530,7 @@ async fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: 
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
+         Cache-Control: no-store\r\n\
          Connection: close\r\n\r\n",
         body.len()
     );

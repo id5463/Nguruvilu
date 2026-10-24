@@ -141,10 +141,12 @@ fn panel() -> crate::ui::UiPanel {
   <span style="flex:1 1 auto"></span>
   <button class="tiny" data-act="status" type="button">刷新</button>
   <button class="tiny" data-act="tick" type="button">推进一步</button>
-</div>"#;
+</div>
+<ul id="mission-list" style="list-style:none;margin:0;padding:0 10px 6px;font-size:11.5px;color:var(--dim);display:flex;flex-direction:column;gap:2px"></ul>"#;
 
     let script = r##"
 const bar = panel.querySelector("#mission-bar");
+const list = panel.querySelector("#mission-list");
 function put(field, text) {
   const node = bar.querySelector('[data-f="' + field + '"]');
   if (node) node.textContent = text;
@@ -158,12 +160,33 @@ function paint(state) {
   if (state.advances) bits.push(state.advances + " 推进");
   if (state.unread) bits.push(state.unread + " 未读信件");
   put("counts", bits.join(" · "));
+  paintBoard(state.missions);
 }
 function scan(text) {
   if (typeof text !== "string") return;
   const found = /<!--mission-state ([\s\S]*?)-->/.exec(text);
   if (!found) return;
   try { paint(JSON.parse(found[1])); } catch (error) { /* a marker we cannot read is ignored */ }
+}
+// The board: every mission on disk, not just the one this tool just touched.
+// Without it the bar can only ever say "here is the current step", and a reader
+// looking for the task they started sees nothing.
+function paintBoard(missions) {
+  if (!list) return;
+  list.replaceChildren();
+  const rows = Array.isArray(missions) ? missions : [];
+  if (!rows.length) {
+    const empty = document.createElement("li");
+    empty.textContent = "还没有任务（让模型调用 mission_start 建一个）";
+    list.append(empty);
+    return;
+  }
+  for (const row of rows) {
+    const item = document.createElement("li");
+    item.textContent = "· " + (row.id || "?") + "  [" + (row.status || "?") + "]  " + (row.objective || "");
+    if (row.status === "running") item.style.color = "var(--text)";
+    list.append(item);
+  }
 }
 // Every mission tool answer carries the marker, so no event needs to name the tool.
 on("tool_end", (event) => scan(event.result));
@@ -497,6 +520,35 @@ fn stamp(ms: u64) -> String {
     }
 }
 
+/// Every mission on the board, newest first: what the panel lists beside the bar.
+///
+/// The bar can only describe the mission a tool just talked about, so without
+/// this a reader has no way to see that other missions exist — which reads
+/// exactly like "the task I started is gone". A missing or unpinned workspace
+/// yields an empty list rather than an error: the marker decorates a tool
+/// answer, and decoration must not turn a successful call into a failure.
+fn board_json() -> Value {
+    let Ok(root) = missions_root() else {
+        return json!([]);
+    };
+    let mut rows = Vec::new();
+    for id in list_missions(&root) {
+        let path = root.join(&id).join("mission.json");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        rows.push(json!({
+            "id": record.get("id").cloned().unwrap_or(json!(id)),
+            "objective": record.get("objective").cloned().unwrap_or(Value::Null),
+            "status": record.get("status").cloned().unwrap_or(Value::Null),
+        }));
+    }
+    Value::Array(rows)
+}
+
 /// The marker every mission answer ends with.
 ///
 /// The interface reads it to paint the mission bar; it costs a line and saves
@@ -518,6 +570,9 @@ fn marker(record: &Value, extra: Value) -> String {
         for (key, value) in extra {
             map.insert(key.clone(), value.clone());
         }
+    }
+    if let Some(map) = state.as_object_mut() {
+        map.insert("missions".to_string(), board_json());
     }
     format!("\n<!--mission-state {}-->", state)
 }
