@@ -247,12 +247,73 @@ impl Injection {
     }
 }
 
-/// Rough token estimate: four characters per token.
+/// Rough token estimate for budgeting, weighted by character class.
 ///
-/// Deliberately approximate. The exact count comes from the provider; this is
-/// for budgeting, where being slightly conservative is enough.
+/// Deliberately approximate — the exact count comes from the provider — but not
+/// approximate in one direction only, and not the same for every script.
+///
+/// A flat four-characters-per-token rule is calibrated on Latin text, where it
+/// is roughly right. Chinese, Japanese, and Korean are three to four bytes and
+/// one token per character: the same rule then undercounts by three to four
+/// times, so a budget that reads as 25% of the window is really filling the
+/// window, and the injection that was supposed to fit gets rejected by the
+/// provider or silently truncates the history.
+///
+/// The weights below are per character, in quarter-tokens so the arithmetic is
+/// whole numbers:
+///
+/// * ASCII: 0.25 token per character — the four-characters rule.
+/// * CJK (Han, kana, Hangul): 1 token per character — one character is one
+///   token, sometimes a little more.
+/// * Any other non-ASCII: 0.5 token per character — accented Latin, Cyrillic,
+///   Greek, emoji, and everything else outside the two ranges above.
+///
+/// Rounded up, and never zero, so an empty fragment still costs something.
 pub fn estimate_tokens(text: &str) -> usize {
-    text.chars().count().div_ceil(4).max(1)
+    let quarters: usize = text
+        .chars()
+        .map(|character| {
+            if character.is_ascii() {
+                // Four ASCII characters per token.
+                1
+            } else if is_cjk(character) {
+                // One character per token, sometimes a bit more.
+                4
+            } else {
+                // Two characters per token for the rest of the non-ASCII world.
+                2
+            }
+        })
+        .sum();
+    quarters.div_ceil(4).max(1)
+}
+
+/// Whether a character belongs to a script that costs about one token each.
+///
+/// The ranges are the blocks a tokenizer splits per character: Han ideographs
+/// and their extensions, Japanese kana (which are also one token each even
+/// though they are three bytes), and Hangul syllables.
+fn is_cjk(character: char) -> bool {
+    matches!(character as u32,
+        // CJK Unified Ideographs Extension A.
+        0x3400..=0x4DBF
+        // CJK Unified Ideographs.
+        | 0x4E00..=0x9FFF
+        // Compatibility Ideographs.
+        | 0xF900..=0xFAFF
+        // Hiragana and Katakana.
+        | 0x3040..=0x30FF
+        // CJK Symbols and Punctuation: the full-width marks CJK text is written
+        // with, one token each.
+        | 0x3000..=0x303F
+        // Hangul Syllables.
+        | 0xAC00..=0xD7AF
+        // Half-width and full-width forms: the full-width punctuation of CJK
+        // text costs a token each as well.
+        | 0xFF00..=0xFF60
+        // CJK Unified Ideographs Extension B and beyond.
+        | 0x20000..=0x3FFFF
+    )
 }
 
 /// Which messages a trigger may match against.
@@ -337,6 +398,14 @@ impl Default for InjectionEngine {
     }
 }
 
+/// How much activated text later recursion passes may scan, in bytes.
+///
+/// Recursion feeds on what earlier passes injected. Without a ceiling, a long
+/// chain of entries grows the haystack on every pass — and the trigger surface
+/// widens the more the engine has already said — so the accumulation stops
+/// here. Real entries are small; only a pathological configuration reaches it.
+const MAX_RECURSION_SCAN_BYTES: usize = 64 * 1024;
+
 impl InjectionEngine {
     /// An engine with no entries.
     pub fn new() -> Self {
@@ -417,10 +486,17 @@ impl InjectionEngine {
     }
 
     /// The budget in tokens for a given context window.
+    ///
+    /// Both settings are clamped, because both are written by hand in a JSON
+    /// file. `budget_percent: 500` would otherwise mean a budget five times the
+    /// window — the ceiling gone, which is the opposite of what the setting is
+    /// for — and a cap of zero would refuse every entry with no diagnostic
+    /// anyone could act on.
     pub fn budget(&self, context_window: usize) -> usize {
-        let percent = (context_window as u64 * self.budget_percent as u64 / 100) as usize;
+        let percent =
+            (context_window as u64 * self.budget_percent.min(100) as u64 / 100) as usize;
         match self.budget_cap {
-            Some(cap) => percent.min(cap),
+            Some(cap) => percent.min(cap.max(1)),
             None => percent,
         }
     }
@@ -439,34 +515,54 @@ impl InjectionEngine {
         let mut result = Injection::default();
         let mut used = 0usize;
         let mut activated: BTreeSet<String> = BTreeSet::new();
+        // One member per group for the whole request — recorded only once a
+        // fragment actually landed, so a group that injected nothing keeps its
+        // members eligible for the next pass.
         let mut group_winners: BTreeMap<String, String> = BTreeMap::new();
-
-        // Triggers are matched against the scanned window, which starts as the
-        // recent history and grows with each recursion pass as activated
-        // content becomes new evidence.
-        let mut scan_text = self.scan_window(messages, None);
-        let mut overflowed = false;
+        // What earlier passes activated: the only new evidence recursion adds.
+        // Bounded, because an unbounded haystack widens the trigger surface the
+        // more the engine has already said.
+        let mut scan_text = String::new();
+        // Entries the budget refused, kept so the report at the end says
+        // whether anything was really kept out.
+        let mut refused: BTreeSet<String> = BTreeSet::new();
 
         for pass in 0..=self.max_recursion {
-            // Candidates in a deterministic order: higher order first, then id.
-            let mut candidates: Vec<&InjectionEntry> = self
+            // What this pass may consider: enabled, not yet injected, and
+            // triggered by text the entry is itself allowed to read. This set is
+            // also the only place a group winner may come from.
+            let matched: Vec<&InjectionEntry> = self
                 .entries
                 .iter()
                 .filter(|entry| entry.enabled && !activated.contains(&entry.id))
                 .filter(|entry| {
-                    if pass == 0 {
-                        entry.matches(&self.scan_window(messages, entry.scan_depth))
-                    } else {
-                        entry.matches(&scan_text)
+                    // The declared scan depth holds on every pass, not only the
+                    // first: recursion contributes activated fragments as
+                    // evidence, it does not hand an entry the whole history to
+                    // search for its trigger.
+                    let mut haystack = self.scan_window(messages, entry.scan_depth);
+                    if pass > 0 && !scan_text.is_empty() {
+                        haystack.push('\n');
+                        haystack.push_str(&scan_text);
                     }
+                    entry.matches(&haystack)
                 })
                 .collect();
-            candidates.sort_by(|a, b| b.order.cmp(&a.order).then_with(|| a.id.cmp(&b.id)));
 
-            if candidates.is_empty() {
+            if matched.is_empty() {
                 break;
             }
 
+            // Candidates in a deterministic order: higher order first, then id.
+            let matching: BTreeSet<&str> = matched.iter().map(|entry| entry.id.as_str()).collect();
+            let mut candidates: Vec<&InjectionEntry> = matched;
+            candidates.sort_by(|a, b| b.order.cmp(&a.order).then_with(|| a.id.cmp(&b.id)));
+
+            // Group decisions for this pass. A group with no qualifying member
+            // injects nothing this pass, and the decision is not remembered: a
+            // member that only activates later through recursion still gets its
+            // turn at winning.
+            let mut decided: BTreeMap<String, (Option<String>, Vec<String>)> = BTreeMap::new();
             let mut pass_activated = false;
             let mut newly_activated_text = String::new();
 
@@ -475,21 +571,28 @@ impl InjectionEngine {
                 // and the winner is chosen by weight then order then id — never
                 // at random, so the same input yields the same context.
                 if let Some(group) = &entry.group {
-                    match group_winners.get(group) {
-                        Some(winner) if winner != &entry.id => continue,
-                        Some(_) => {}
+                    // A group is closed by the member that already landed: that
+                    // member is in `activated` and cannot be a candidate again,
+                    // and every other member is out.
+                    if group_winners.contains_key(group) {
+                        continue;
+                    }
+                    let (winner, unaffordable) = match decided.get(group) {
+                        Some(decision) => decision.clone(),
                         None => {
-                            let winner = self.pick_group_winner(group, &activated);
-                            match winner {
-                                Some(id) if id != entry.id => {
-                                    group_winners.insert(group.clone(), id);
-                                    continue;
-                                }
-                                _ => {
-                                    group_winners.insert(group.clone(), entry.id.clone());
-                                }
-                            }
+                            let decision = self.pick_group_winner(group, &matching, budget, used);
+                            decided.insert(group.clone(), decision.clone());
+                            decision
                         }
+                    };
+                    // A member the budget could not pay for is a budget
+                    // outcome, not a group decision, and is reported as one.
+                    for id in unaffordable {
+                        refused.insert(id);
+                    }
+                    match winner {
+                        Some(winner) if winner == entry.id => {}
+                        _ => continue,
                     }
                 }
 
@@ -498,12 +601,13 @@ impl InjectionEngine {
                 if !entry.ignore_budget && used + cost > budget {
                     // The budget stops *new* activations; what is already
                     // injected stays.
-                    overflowed = true;
+                    refused.insert(entry.id.clone());
                     continue;
                 }
 
                 let preferred = entry.position.resolve(entry.depth);
-                let (position, relocated) = self.resolve_position(&preferred, policy);
+                let (position, relocated) =
+                    self.resolve_position(&preferred, policy, cost, budget);
 
                 match position {
                     Position::Prefix => result.prefix.push(entry.content.clone()),
@@ -519,7 +623,16 @@ impl InjectionEngine {
                     result.relocated.push(entry.id.clone());
                 }
 
-                used += cost;
+                if let Some(group) = &entry.group {
+                    group_winners.insert(group.clone(), entry.id.clone());
+                }
+
+                // An entry exempt from the budget must not spend it either:
+                // counting its cost would push every ordinary entry behind it
+                // out of an injection it was never meant to lose.
+                if !entry.ignore_budget {
+                    used += cost;
+                }
                 activated.insert(entry.id.clone());
                 pass_activated = true;
                 if entry.recursive {
@@ -531,8 +644,17 @@ impl InjectionEngine {
             if !pass_activated {
                 break;
             }
-            scan_text.push_str(&newly_activated_text);
+            if scan_text.len() < MAX_RECURSION_SCAN_BYTES {
+                scan_text.push_str(&newly_activated_text);
+            }
         }
+
+        // Overflow means "the budget kept something out". An entry refused on
+        // one pass that lands on another was not kept out, so the flag is
+        // recomputed from what is still missing instead of being latched by the
+        // first refusal — a latched flag blames the budget for what was really
+        // a trigger or group decision.
+        let overflowed = refused.iter().any(|id| !activated.contains(id));
 
         // Prefix fragments keep the deterministic order too.
         result.activated = activated.into_iter().collect();
@@ -541,13 +663,30 @@ impl InjectionEngine {
         result
     }
 
-    /// Choose the winner of a group deterministically.
-    fn pick_group_winner(&self, group: &str, activated: &BTreeSet<String>) -> Option<String> {
+    /// Choose the winner of a group, from the members that actually qualify.
+    ///
+    /// Qualifying means all three: enabled, its own trigger fired in this pass
+    /// (`matching`), and the budget can still pay for it. Choosing from the
+    /// whole group instead — what this did before — made a group whose heaviest
+    /// member was *not* triggered inject nothing at all: that member was never a
+    /// candidate, and every member that did match was skipped as "someone else
+    /// won", while the group was then recorded as decided. A group with no
+    /// qualifying member injects nothing, which is the honest outcome.
+    ///
+    /// Returns the winner and the matched members the budget ruled out, so the
+    /// report can say that the budget — not the group — kept them out.
+    fn pick_group_winner(
+        &self,
+        group: &str,
+        matching: &BTreeSet<&str>,
+        budget: usize,
+        used: usize,
+    ) -> (Option<String>, Vec<String>) {
         let mut members: Vec<&InjectionEntry> = self
             .entries
             .iter()
             .filter(|entry| entry.enabled && entry.group.as_deref() == Some(group))
-            .filter(|entry| !activated.contains(&entry.id))
+            .filter(|entry| matching.contains(entry.id.as_str()))
             .collect();
         members.sort_by(|a, b| {
             b.group_weight
@@ -555,18 +694,50 @@ impl InjectionEngine {
                 .then_with(|| b.order.cmp(&a.order))
                 .then_with(|| a.id.cmp(&b.id))
         });
-        members.first().map(|entry| entry.id.clone())
+        let mut winner = None;
+        let mut unaffordable = Vec::new();
+        for entry in members {
+            let affordable =
+                entry.ignore_budget || used + estimate_tokens(&entry.content) <= budget;
+            if !affordable {
+                unaffordable.push(entry.id.clone());
+                continue;
+            }
+            // The list is already in preference order, so the first affordable
+            // member is the winner.
+            if winner.is_none() {
+                winner = Some(entry.id.clone());
+            }
+        }
+        (winner, unaffordable)
     }
 
     /// Apply the cache policy to a preferred position.
     ///
-    /// Returns the effective position and whether it had to move.
-    fn resolve_position(&self, preferred: &Position, policy: CachePolicy) -> (Position, bool) {
+    /// Returns the effective position and whether it had to move. `cost` and
+    /// `budget` are what the middle policy needs to actually decide something.
+    fn resolve_position(
+        &self,
+        preferred: &Position,
+        policy: CachePolicy,
+        cost: usize,
+        budget: usize,
+    ) -> (Position, bool) {
         match policy {
             // Freshness accepts any position, including the prefix.
             CachePolicy::Freshness => (preferred.clone(), false),
-            // Balanced prefers history but allows the prefix.
-            CachePolicy::Balanced => (preferred.clone(), false),
+            // Balanced prefers history but allows the prefix — for a fragment
+            // small enough that invalidating the cached prefix is a rounding
+            // error: a quarter of the injection budget. Anything larger moves to
+            // the history tail, which costs the cache nothing. Without this the
+            // policy was a copy of Freshness and the three settings were really
+            // two.
+            CachePolicy::Balanced => match preferred {
+                Position::Prefix if cost.saturating_mul(4) > budget => {
+                    (Position::HistoryTail, true)
+                }
+                other => (other.clone(), false),
+            },
             // CacheFirst refuses to touch the prefix: the fragment moves into
             // the history tail instead of being dropped. Capability is never
             // gated on cache cost.
@@ -901,11 +1072,79 @@ mod tests {
     }
 
     #[test]
-    fn token_estimation_is_roughly_four_chars_per_token() {
+    fn token_estimation_is_four_ascii_characters_per_token() {
         assert_eq!(estimate_tokens("abcd"), 1);
         assert_eq!(estimate_tokens("abcdefgh"), 2);
         // Never zero, so an empty fragment still costs something.
         assert_eq!(estimate_tokens(""), 1);
+        // Rounded up rather than down: a partial character still costs a token.
+        assert_eq!(estimate_tokens("abcde"), 2);
+    }
+
+    #[test]
+    fn chinese_costs_a_token_per_character_not_per_four() {
+        // The defect this pins down: a flat characters/4 estimate reads a
+        // hundred-character Chinese fragment as 25 tokens when the provider
+        // counts about a hundred, so a Chinese session's injection budget is
+        // really three to four times the window it was set to.
+        let chinese = "这是一段用于测试中文令牌估算的说明文字";
+        let characters = chinese.chars().count();
+        assert!(characters > 10, "a fragment worth measuring: {characters}");
+        assert_eq!(
+            estimate_tokens(chinese),
+            characters,
+            "one token per CJK character"
+        );
+        // Under the old rule this was 5; anything near it is the bug.
+        assert!(estimate_tokens(chinese) >= characters);
+
+        // Full-width punctuation carries the same weight as the ideographs it
+        // sits between.
+        assert_eq!(estimate_tokens("说明：很好。"), 6);
+
+        // A mixed fragment is the sum of its parts, not the count of them.
+        // 20 ASCII characters (5 tokens) + 4 ideographs (4 tokens) = 9.
+        let mixed = "the model answered 你好世界";
+        assert_eq!(estimate_tokens(mixed), 5 + 4);
+    }
+
+    #[test]
+    fn other_scripts_fall_between_ascii_and_cjk() {
+        // Accented Latin, Cyrillic, and emoji are two characters per token:
+        // more than ASCII, less than Han.
+        assert_eq!(estimate_tokens("éééé"), 2);
+        assert_eq!(estimate_tokens("привет"), 3);
+        // Emoji are four bytes and cost more than a quarter-token character.
+        assert!(estimate_tokens("🚀🚀🚀🚀") >= 2);
+    }
+
+    #[test]
+    fn a_chinese_fragment_is_measured_against_the_same_budget() {
+        // The budget decision, not just the number: a Chinese entry that fits a
+        // window sized by the old Latin-only rule must be refused when the
+        // estimate says what Chinese actually costs.
+        let chinese = "这是一段用于测试中文令牌估算的说明文字".repeat(10);
+        let mut engine = InjectionEngine::new();
+        // The whole window, so the comparison is about the estimate alone.
+        engine.budget_percent = 100;
+        engine.add(InjectionEntry::constant("cn", chinese.clone()));
+
+        let used = estimate_tokens(&chinese);
+        let old_estimate = chinese.chars().count().div_ceil(4);
+        assert!(
+            used > old_estimate,
+            "the weighted estimate is the larger one: {used} vs {old_estimate}"
+        );
+
+        // A window sized by the old rule cannot actually hold the text.
+        let tight = engine.inject(&conversation(&["hi"]), old_estimate, CachePolicy::Balanced);
+        assert!(tight.overflowed, "the budget refuses it");
+        assert!(tight.activated.is_empty(), "and nothing was injected");
+
+        // One sized by what Chinese costs holds it.
+        let fitting = engine.inject(&conversation(&["hi"]), used, CachePolicy::Balanced);
+        assert_eq!(fitting.activated, vec!["cn".to_string()]);
+        assert_eq!(fitting.budget_used, used);
     }
 
     #[test]
@@ -915,5 +1154,228 @@ mod tests {
         assert!(injection.is_empty());
         assert_eq!(injection.budget_used, 0);
         assert!(!injection.overflowed);
+    }
+
+    #[test]
+    fn a_group_injects_the_member_whose_trigger_fired() {
+        // The heavy member of the group is not triggered. Choosing the winner
+        // from the whole group without checking that made the entire group
+        // inject nothing: the winner was never a candidate, and the member that
+        // did match was skipped as "someone else won".
+        let mut engine = InjectionEngine::new();
+        engine.add(
+            InjectionEntry::triggered("heavy", "heavy text", vec!["quantum".into()])
+                .in_group("style", 90),
+        );
+        engine.add(
+            InjectionEntry::triggered("light", "light text", vec!["pdf".into()])
+                .in_group("style", 10),
+        );
+
+        let injection = engine.inject(
+            &conversation(&["please read this pdf"]),
+            100_000,
+            CachePolicy::Balanced,
+        );
+        assert_eq!(
+            injection.activated,
+            vec!["light"],
+            "the member that matched is the one that lands"
+        );
+        assert_eq!(injection.tail, vec!["light text"]);
+        assert!(!injection.overflowed, "nothing was refused by the budget");
+    }
+
+    #[test]
+    fn a_group_injects_nothing_when_no_member_is_triggered() {
+        let mut engine = InjectionEngine::new();
+        engine.add(
+            InjectionEntry::triggered("heavy", "heavy text", vec!["quantum".into()])
+                .in_group("style", 90),
+        );
+        engine.add(
+            InjectionEntry::triggered("light", "light text", vec!["tensor".into()])
+                .in_group("style", 10),
+        );
+
+        let injection = engine.inject(
+            &conversation(&["please read this pdf"]),
+            100_000,
+            CachePolicy::Balanced,
+        );
+        assert!(injection.is_empty(), "{:?}", injection.activated);
+        assert!(!injection.overflowed);
+    }
+
+    #[test]
+    fn a_group_winner_must_also_fit_the_budget() {
+        // Both members match, the heavier one is far too big for what is left.
+        // The group still injects — the affordable member wins — and the report
+        // says the budget is what ruled the other one out.
+        let mut engine = InjectionEngine::new();
+        engine.budget_percent = 25; // 1000-token window → 250 tokens.
+        engine.add(
+            InjectionEntry::triggered("heavy", "x".repeat(4000), vec!["pdf".into()])
+                .in_group("style", 90),
+        );
+        engine.add(
+            InjectionEntry::triggered("light", "short note", vec!["pdf".into()])
+                .in_group("style", 10),
+        );
+
+        let injection = engine.inject(
+            &conversation(&["read this pdf"]),
+            1000,
+            CachePolicy::Freshness,
+        );
+        assert_eq!(
+            injection.activated,
+            vec!["light"],
+            "the member the budget can pay for wins"
+        );
+        assert!(injection.overflowed, "and the heavy one is reported as unfitted");
+    }
+
+    #[test]
+    fn a_group_loser_is_not_reported_as_a_budget_overflow() {
+        // Nothing ran out of budget here: a group decided. The flag has to name
+        // the right cause or the diagnosis goes to the wrong place.
+        let mut engine = InjectionEngine::new();
+        engine.add(InjectionEntry::constant("high", "high text").in_group("style", 90));
+        engine.add(InjectionEntry::constant("low", "low text").in_group("style", 10));
+
+        let injection = engine.inject(&conversation(&["hi"]), 100_000, CachePolicy::Balanced);
+        assert_eq!(injection.activated, vec!["high"]);
+        assert!(!injection.overflowed);
+    }
+
+    #[test]
+    fn an_exempt_entry_does_not_spend_the_budget_it_is_exempt_from() {
+        // "Ignore the budget" has to mean both halves: never refused, and never
+        // consuming. Counting it pushed every ordinary entry behind it out.
+        let mut engine = InjectionEngine::new();
+        engine.budget_percent = 25; // 1000-token window → 250 tokens.
+        engine.add(
+            InjectionEntry::constant("exempt", "x".repeat(4000))
+                .ignoring_budget()
+                .ordered(10),
+        );
+        engine.add(InjectionEntry::constant("normal", "a standing rule").ordered(5));
+
+        let injection = engine.inject(&conversation(&["hi"]), 1000, CachePolicy::Balanced);
+        assert!(
+            injection.activated.contains(&"normal".to_string()),
+            "the ordinary entry still fits: {:?}",
+            injection.activated
+        );
+        assert!(
+            injection.activated.contains(&"exempt".to_string()),
+            "and the exempt one lands too: {:?}",
+            injection.activated
+        );
+        assert!(!injection.overflowed);
+        assert_eq!(
+            injection.budget_used,
+            estimate_tokens("a standing rule"),
+            "only the ordinary entry is charged"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_budget_setting_is_clamped() {
+        let mut engine = InjectionEngine::new();
+
+        engine.budget_percent = 500;
+        assert_eq!(
+            engine.budget(1000),
+            1000,
+            "a percent above 100 must not lift the ceiling past the window"
+        );
+
+        engine.budget_percent = 25;
+        assert_eq!(engine.budget(1000), 250);
+
+        // A cap of zero would refuse every entry with nothing to diagnose.
+        engine.budget_cap = Some(0);
+        assert_eq!(engine.budget(1000), 1);
+    }
+
+    #[test]
+    fn scan_depth_is_honoured_on_recursion_passes_too() {
+        // "Only look at the last message" is a property of the entry, not of
+        // the first pass. Recursion used to rescan the *whole* history on later
+        // passes, so an entry declared with a depth of one was triggered by a
+        // word from the beginning of the conversation — and the more passes ran,
+        // the wider its trigger surface got.
+        let mut engine = InjectionEngine::new();
+        engine.add(InjectionEntry::triggered(
+            "outer",
+            "outer says go",
+            vec!["start".into()],
+        ));
+        engine.add(
+            InjectionEntry::triggered("deep", "deep detail", vec!["needle".into()]).scanning(1),
+        );
+
+        // "needle" is far outside the one-message window `deep` declared.
+        let history = conversation(&["needle", "unrelated", "start"]);
+        let injection = engine.inject(&history, 100_000, CachePolicy::Freshness);
+        assert_eq!(
+            injection.activated,
+            vec!["outer"],
+            "the depth limit holds on recursion passes"
+        );
+
+        // Recursion itself still works: `deep` fires when the activated text
+        // carries its trigger, which is the evidence recursion is for.
+        let mut chained = InjectionEngine::new();
+        chained.add(InjectionEntry::triggered(
+            "outer",
+            "the word needle appears here",
+            vec!["start".into()],
+        ));
+        chained.add(
+            InjectionEntry::triggered("deep", "deep detail", vec!["needle".into()]).scanning(1),
+        );
+        let chained_injection =
+            chained.inject(&conversation(&["start"]), 100_000, CachePolicy::Freshness);
+        let mut activated = chained_injection.activated.clone();
+        activated.sort();
+        assert_eq!(activated, vec!["deep", "outer"]);
+    }
+
+    #[test]
+    fn balanced_allows_a_cheap_prefix_and_moves_an_expensive_one() {
+        // The middle policy has to have its own behaviour, or the three
+        // settings are really two. A prefix is cheap when re-writing the cached
+        // prefix costs a rounding error of the budget; past that it moves to the
+        // history, where it costs the cache nothing.
+        let mut engine = InjectionEngine::new();
+        engine.budget_percent = 25; // 1000-token window → 250 tokens.
+        engine.add(InjectionEntry::constant("cheap", "short rule").at(PositionKind::Prefix));
+        engine.add(
+            InjectionEntry::constant("large", "x".repeat(900))
+                .at(PositionKind::Prefix)
+                .ordered(-1),
+        );
+
+        let balanced = engine.inject(&conversation(&["hi"]), 1000, CachePolicy::Balanced);
+        assert_eq!(
+            balanced.prefix,
+            vec!["short rule"],
+            "a cheap prefix keeps its place"
+        );
+        assert_eq!(balanced.tail, vec!["x".repeat(900)], "an expensive one moves");
+        assert_eq!(balanced.relocated, vec!["large"]);
+        assert_eq!(
+            balanced.activated,
+            vec!["cheap".to_string(), "large".to_string()],
+            "moving a fragment is not dropping it"
+        );
+
+        // Freshness takes either price and leaves the prefix alone.
+        let fresh = engine.inject(&conversation(&["hi"]), 1000, CachePolicy::Freshness);
+        assert_eq!(fresh.prefix.len(), 2);
+        assert!(fresh.relocated.is_empty());
     }
 }

@@ -17,6 +17,7 @@ mod serve;
 mod sink;
 mod state;
 
+use std::collections::BTreeSet;
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::path::Path;
@@ -39,6 +40,7 @@ use wry::WebViewBuilder;
 use nguruvilu::assembly::Assembly;
 use nguruvilu::ledger::default_ledger_path;
 use nguruvilu::loader::Loader;
+use nguruvilu::plugin::{Kernel, RealmMap, ReleaseOutcome};
 use nguruvilu::session::SessionStore;
 
 #[cfg(windows)]
@@ -109,15 +111,21 @@ fn options() -> Options {
 
 fn main() -> anyhow::Result<()> {
     let options = options();
-    if options.headless {
-        return headless(options.prompt);
-    }
+    // `--serve` is checked first because it never opens a window: it is the
+    // headless HTTP shell. Someone who writes both flags means "serving, with
+    // no window", and the older order answered that with a stdin loop that
+    // listened on nothing — a server that never binds looks exactly like a
+    // network problem, so the combination must not depend on which flag the
+    // code happens to test first.
     if let Some(addr) = options.serve.clone() {
         let token = options
             .token
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         return serve::serve(addr, token, options.prompt.clone(), options.ui.clone());
+    }
+    if options.headless {
+        return headless(options.prompt);
     }
     // The window exists only where the webview stack exists; everywhere else
     // the same shell is reachable through --headless or --serve.
@@ -364,6 +372,18 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
             .with_url(&format!("http://127.0.0.1:{ui_port}/"))
             .with_ipc_handler(move |request| {
                 let body = request.body().to_string();
+                // A command is a JSON object, not a payload. Past the cap the
+                // page is not talking to the shell any more, so the body is
+                // refused and only its length recorded: printing megabytes of
+                // whatever it was is its own problem.
+                if body.len() > MAX_IPC_BODY_BYTES {
+                    eprintln!(
+                        "[ipc] refused {} bytes: over the {} byte command limit",
+                        body.len(),
+                        MAX_IPC_BODY_BYTES
+                    );
+                    return;
+                }
                 let command: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
                 // Owned, not borrowed: the value crosses into the runtime task below.
                 let name: String = command
@@ -377,7 +397,24 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
                 // runtime. `None` means the user cancelled. The dialog is owned
                 // by the main window (see `DialogParent`) so it cannot hide
                 // behind it.
-                let picked: Option<PathBuf> = {
+                //
+                // The dialog is modal and blocks this thread: a second `pick_*`
+                // arriving while one is open would sit behind it until the user
+                // closed it, so it is answered at once instead of queued. The
+                // claim releases when the picker returns, whatever it returned.
+                let picked: Option<PathBuf> = if name.starts_with("pick_") {
+                    let Some(_picking) = PickGuard::claim() else {
+                        eprintln!("[ipc] {name} refused: a dialog is already open");
+                        // The handler cannot return a body, so the refusal
+                        // travels the way every other answer does: as an event.
+                        sink.emit(json!({
+                            "ev": "error",
+                            "ok": false,
+                            "error": "a dialog is already open",
+                            "message": "a dialog is already open",
+                        }));
+                        return;
+                    };
                     let parent = DialogParent::new(parent_window, parent_display);
                     match name.as_str() {
                         "pick_install" | "pick_verify" => rfd::FileDialog::new()
@@ -391,6 +428,8 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
                             .pick_folder(),
                         _ => None,
                     }
+                } else {
+                    None
                 };
 
                 let state = Arc::clone(&state);
@@ -539,7 +578,11 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
                 std::process::exit(0);
             }
             Event::UserEvent(UserEvent::ToUi(value)) => {
-                let script = format!("window.ngu && window.ngu.receive({value})");
+                // `serde_json` leaves U+2028 and U+2029 raw and JavaScript ends
+                // a line on both, so an event carrying one was a syntax error
+                // the page never saw. Escaped, it stays inside the string.
+                let payload = js_safe(&value.to_string());
+                let script = format!("window.ngu && window.ngu.receive({payload})");
                 if let Err(error) = webview.evaluate_script(&script) {
                     eprintln!("[ui] evaluate failed: {error}");
                 }
@@ -618,22 +661,61 @@ pub(crate) async fn dispatch(
                 // The turn_start event is run_turn's: it carries the session
                 // id, and it fires only once the session's running slot holds.
                 // Cascading runs any steering that arrives too late to claim.
-                state::run_turn_cascading(Arc::clone(&state), text, Arc::clone(&sink)).await?;
+                // No target: the command-line prompt belongs to the session
+                // the shell bootstrapped into.
+                state::run_turn_cascading(Arc::clone(&state), None, text, Arc::clone(&sink))
+                    .await?;
                 drain_packs(state, Arc::clone(&sink)).await;
             }
         }
 
         "prompt" => {
-            let text = command
-                .get("text")
-                .and_then(|t| t.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
+            // A malformed field is refused rather than read as absent: a page
+            // that sent `{"session": 17}` meant one particular conversation, and
+            // quietly running the turn on the one on screen is not what it
+            // asked for. The same applies to `text`.
+            let text = match command.get("text") {
+                None | Some(Value::Null) => String::new(),
+                Some(Value::String(text)) => text.trim().to_string(),
+                Some(_) => {
+                    emit(
+                        &sink,
+                        json!({ "ev": "error", "message": "`text` must be a string" }),
+                    );
+                    return Ok(());
+                }
+            };
             if text.is_empty() {
                 return Ok(());
             }
-            state::run_turn_cascading(Arc::clone(&state), text, Arc::clone(&sink)).await?;
+            // A prompt may name its conversation. Absent means "the one on
+            // screen", which is what every page sends; an explicit id lets a
+            // background client (a wake, a relay, a script) aim at a
+            // conversation the user is not looking at — that turn parks in the
+            // target's inbox instead of hijacking the view.
+            let target = match command.get("session") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(id)) => {
+                    let id = id.trim();
+                    if id.is_empty() {
+                        None
+                    } else {
+                        Some(id.to_string())
+                    }
+                }
+                Some(_) => {
+                    emit(
+                        &sink,
+                        json!({
+                            "ev": "error",
+                            "message": "`session` must be a session id string"
+                        }),
+                    );
+                    return Ok(());
+                }
+            };
+            state::run_turn_cascading(Arc::clone(&state), target, text, Arc::clone(&sink))
+                .await?;
             drain_packs(state, Arc::clone(&sink)).await;
         }
 
@@ -650,6 +732,23 @@ pub(crate) async fn dispatch(
                         let id = command.get("id").and_then(|i| i.as_str()).unwrap_or("");
                         guard.delete_session(id)?
                     }
+                }
+                // The conversation that just went away gives up its claim on the
+                // plugins it loaded: a plugin loaded by one conversation must
+                // not keep its services alive for another, and a switch is the
+                // moment the old conversation's interest ends. `keep` is read
+                // after the switch, so the session being switched *to* is the
+                // one that survives — an instance both sessions hold keeps
+                // running, which is what stops a shared pack from being torn
+                // down under the session still using it.
+                let keep = guard.session.id.clone();
+                match guard.kernel.unload_all_except(&keep) {
+                    Ok(dropped) if !dropped.is_empty() => eprintln!(
+                        "[plugin] released {} plugin instance(s) only the previous session had loaded",
+                        dropped.len()
+                    ),
+                    Ok(_) => {}
+                    Err(error) => eprintln!("[plugin] releasing the previous session's plugins: {error:#}"),
                 }
                 (guard.sessions()?, guard.transcript(), guard.describe())
             };
@@ -810,6 +909,23 @@ pub(crate) async fn dispatch(
             emit(&sink, json!({ "ev": "routes", "routes": snapshot }));
         }
 
+        // The configuration check, on demand. Read-only and answered from
+        // outside the ordered lane, because a diagnostic that queued behind a
+        // running turn would be the last thing a stuck user could reach for.
+        "doctor" => {
+            let mut report = state.lock().expect("state lock").doctor();
+            let summary = report
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("doctor: no verdict")
+                .to_string();
+            if let Value::Object(fields) = &mut report {
+                fields.insert("ev".to_string(), json!("doctor"));
+            }
+            eprintln!("[doctor] {summary}");
+            emit(&sink, report);
+        }
+
         "save_route" => {
             let name = command.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let outcome = state.lock().expect("state lock").save_route(name);
@@ -870,7 +986,24 @@ pub(crate) async fn dispatch(
             if path.is_empty() {
                 emit(&sink, json!({ "ev": "error", "message": "apply_pack needs a path" }));
             } else {
-                apply_pack(state, PathBuf::from(path), Arc::clone(&sink)).await?;
+                // The assembly is applied for the conversation on screen, so
+                // the instances it activates are claimed for that conversation.
+                // Without the claim nothing would ever release them, and the
+                // plugin this conversation asked for would keep its services
+                // alive for whichever conversation came next. The id is cloned
+                // before the state moves, because the guard must not be held
+                // across the await inside `apply_pack`.
+                let session = {
+                    let guard = state.lock().expect("state lock");
+                    guard.session.id.clone()
+                };
+                apply_pack(
+                    state,
+                    PathBuf::from(path),
+                    Arc::clone(&sink),
+                    Some(session.as_str()),
+                )
+                .await?;
             }
         }
 
@@ -880,8 +1013,9 @@ pub(crate) async fn dispatch(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let removed = {
+            let (removed, kept) = {
                 let mut guard = state.lock().expect("state lock");
+                let session = guard.session.id.clone();
                 let ids: Vec<u64> = guard
                     .kernel
                     .fibers()
@@ -889,15 +1023,49 @@ pub(crate) async fn dispatch(
                     .filter(|fiber| fiber.plugin == name)
                     .map(|fiber| fiber.id)
                     .collect();
-                let count = ids.len();
+                let mut removed = 0usize;
+                let mut kept = 0usize;
                 for id in ids {
-                    if let Err(error) = guard.kernel.unload(id) {
-                        eprintln!("[unload] {name}: {error:#}");
+                    // Who else holds this instance: the whole point of the
+                    // reference count is that this conversation drops only its
+                    // own claim, so the sessions that would lose the capability
+                    // are worth naming in the log.
+                    let others: Vec<String> = guard
+                        .kernel
+                        .users_of(id)
+                        .into_iter()
+                        .filter(|user| user != &session)
+                        .collect();
+                    // `release` gives up this session's claim and tears the
+                    // instance down only once nobody else holds it. It also
+                    // unloads an instance no session ever claimed, which is why
+                    // it replaces the outright `unload` a pack-loaded plugin
+                    // used to get.
+                    match guard.kernel.release(&session, id) {
+                        Ok(ReleaseOutcome::Unloaded) => removed += 1,
+                        Ok(ReleaseOutcome::StillUsed(remaining)) => {
+                            kept += 1;
+                            eprintln!(
+                                "[unload] {name} (fiber {id}) stays loaded: {remaining} session(s) still hold it ({})",
+                                others.join(", ")
+                            );
+                        }
+                        Ok(ReleaseOutcome::Absent) => {}
+                        Err(error) => eprintln!("[unload] {name}: {error:#}"),
                     }
                 }
-                count
+                (removed, kept)
             };
-            sink.emit(json!({ "ev": "notice", "text": format!("Unloaded {removed} instance(s) of {name}") }));
+            sink.emit(json!({
+                "ev": "notice",
+                "text": if kept == 0 {
+                    format!("Unloaded {removed} instance(s) of {name}")
+                } else {
+                    format!(
+                        "Unloaded {removed} instance(s) of {name}; {kept} still in use by another session"
+                    )
+                },
+            }));
             // The runtime keeps its own copy of the tool table; recompute puts
             // it, the route, and the status back in step with the kernel (the
             // pack set did not change, so settings and persona recompute to
@@ -1043,9 +1211,18 @@ pub(crate) async fn dispatch(
         "cancel" => {
             // The flag flips without touching the turn: the loop checks it at
             // its next safe point and keeps everything it produced so far.
+            //
+            // The optional `session` argument names the turn to stop, so a turn
+            // the page has steered away from is still reachable — without it the
+            // only stoppable turn is the one the user happens to be looking at,
+            // which is not what a stop button means.
             let stopped = {
                 let guard = state.lock().expect("state lock");
-                let session = guard.session.id.clone();
+                let session = command
+                    .get("session")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| guard.session.id.clone());
                 let sent = guard
                     .cancels
                     .get(&session)
@@ -1083,6 +1260,29 @@ pub(crate) async fn dispatch(
         "status" => {
             let status = state.lock().expect("state lock").describe();
             emit(&sink, json!({ "ev": "status", "status": status }));
+        }
+
+        // The status line asks how much this conversation has cost. The loopback
+        // door answers this itself, but the window speaks through here, and a
+        // page that can only see the totals that ride along with `status` would
+        // never learn the number while a turn is still running — which is
+        // exactly when someone looks at it. Same shape as the server's answer,
+        // so the page needs one handler.
+        "stats" => {
+            let requested = command
+                .get("session")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            // The read happens outside the state lock: one session's stats must
+            // not stop every other session's events while the disk answers.
+            let mut event = match AppState::stats_outside_lock(&state, requested.as_deref()) {
+                Ok(payload) => payload,
+                Err(error) => json!({ "error": format!("{error:#}") }),
+            };
+            if let Value::Object(fields) = &mut event {
+                fields.insert("ev".to_string(), json!("stats"));
+            }
+            emit(&sink, event);
         }
 
 
@@ -1220,9 +1420,18 @@ fn refresh_packs(state: &Arc<Mutex<AppState>>, sink: &Arc<dyn EventSink>) {
 /// restart, no pausing — the conversation continues with a new table, and a
 /// tool that was unloaded answers "no tool named …" from then on.
 async fn drain_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
+    // The queue is process-wide but a drain is not: it runs for the
+    // conversation on screen, and taking the whole queue would load a pack
+    // another conversation asked for into this tool table. The id is copied
+    // out and the guard released before anything is drained or awaited, so a
+    // long load does not pin the state lock the UI thread needs.
     let actions = {
         let guard = state.lock().expect("state lock");
-        guard.pending.drain()
+        // The on-screen conversation is the one this drain runs for: the
+        // id is copied out and the guard released at the end of this block,
+        // which is also what keeps `Unload`'s awaits from running under it.
+        let current_session = guard.session.id.clone();
+        guard.pending.drain_for(Some(current_session.as_str()))
     };
     if actions.is_empty() {
         return;
@@ -1380,6 +1589,13 @@ async fn drain_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
                         let mut guard = state.lock().expect("state lock");
                         guard.take_kernel()
                     };
+                    // Which instances existed before this load. The ones that
+                    // appear behind it are what it created, and they are the
+                    // ones the asking conversation may claim — by id, not by
+                    // pack origin, so the claim cannot land on an instance
+                    // somebody else loaded earlier.
+                    let fibers_before: BTreeSet<u64> =
+                        kernel.fibers().iter().map(|fiber| fiber.id).collect();
                     let loaded = nguruvilu::loader::load_pack(
                         &mut kernel,
                         &nguruvilu::ledger::default_ledger_path(),
@@ -1419,6 +1635,17 @@ async fn drain_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
                                         json!({ "ev": "error", "message": format!("{label} content: {error:#}") }),
                                     ),
                                 }
+                            }
+                            // The pack's plugin instances belong to the
+                            // conversation that asked for them: the claim taken
+                            // here is what lets the switch teardown release them
+                            // and what keeps one conversation's pack from
+                            // quietly becoming the next conversation's
+                            // capability. Taken after the content pass, so the
+                            // appearance plugins the pack carries are claimed
+                            // too.
+                            if let Some(current) = &session {
+                                claim_loaded_fibers(&mut kernel, &fibers_before, current);
                             }
                             if let Err(error) = guard.recompute_pack_content() {
                                 emit(
@@ -1556,6 +1783,47 @@ async fn drain_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
     }
 }
 
+/// Record `session` as a user of every plugin instance a pack load created.
+///
+/// `loader::load_pack` activates plugin fibers without a session behind them,
+/// and the kernel tears an instance down only once its last user lets go — so
+/// without a claim here nothing would ever release them, and a plugin one
+/// conversation loaded would keep its tools and services alive for the process.
+/// The claim goes through `load_for_session`, which resolves the same
+/// `(plugin, realm)` to the fiber that is already running and only adds the
+/// session to its users, so the plugin is never applied twice.
+fn claim_loaded_fibers(kernel: &mut Kernel, before: &BTreeSet<u64>, session: &str) {
+    // The details are copied out first: adding a user takes the kernel mutably,
+    // so the list cannot keep borrowing fibers out of it across the loop.
+    let created: Vec<(u64, String, RealmMap, Value)> = kernel
+        .fibers()
+        .iter()
+        .filter(|fiber| !before.contains(&fiber.id))
+        .filter(|fiber| !fiber.is_used_by(session))
+        .map(|fiber| (fiber.id, fiber.plugin.clone(), fiber.realm.clone(), fiber.config.clone()))
+        .collect();
+
+    for (id, plugin, realm, config) in created {
+        match kernel.load_for_session(session, &plugin, realm, config) {
+            // The usual case: the claim landed on the instance this load made.
+            Ok(claimed) if claimed == id => {}
+            // The name resolved to an older instance in the same realm. The
+            // new fiber keeps running unclaimed rather than the session being
+            // attached to an instance it did not load, which would let a
+            // teardown here take away somebody else's capability.
+            Ok(other) => eprintln!(
+                "[plugin] {plugin} loaded as fiber {id}, but the session claim landed on fiber \
+                 {other}; the new instance stays unclaimed"
+            ),
+            // The instance stays loaded for the process instead of the load
+            // being reported as failed: the capability is there, it simply has
+            // no owner to release it, and saying so beats a silent claim that
+            // never happened.
+            Err(error) => eprintln!("[plugin] claiming {plugin} for {session}: {error:#}"),
+        }
+    }
+}
+
 /// Load an installed pack's plugins, MCP servers, and skills into the kernel.
 /// Load every installed pack, in name order.
 ///
@@ -1607,7 +1875,9 @@ async fn load_installed_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSi
             continue;
         };
         let name = format!("{}-{}", pack.manifest.name, pack.manifest.version_id);
-        match apply_pack(Arc::clone(&state), assembly, Arc::clone(&sink)).await {
+        // No session: an installed pack is loaded for the whole app before the
+        // first paint, so its instances outlive any one conversation.
+        match apply_pack(Arc::clone(&state), assembly, Arc::clone(&sink), None).await {
             Ok(()) => eprintln!("[pack] loaded {name}"),
             Err(error) => {
                 eprintln!("[pack] {name} failed: {error:#}");
@@ -1621,10 +1891,17 @@ async fn load_installed_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSi
 }
 
 /// Apply a pack's assembly and content.
+///
+/// `session` names the conversation the pack is applied for, when there is one.
+/// Boot loads the installed packs with `None` — they belong to the process and
+/// every conversation sees them — while a load the user asked for names the
+/// conversation on screen, so the instances it activates are claimed for that
+/// conversation and a later switch can release them.
 async fn apply_pack(
     state: Arc<Mutex<AppState>>,
     assembly: PathBuf,
     sink: Arc<dyn EventSink>,
+    session: Option<&str>,
 ) -> anyhow::Result<()> {
     // Parse before taking the kernel: a malformed manifest must not be able to
     // strand it, leaving the app with no tools at all.
@@ -1637,6 +1914,11 @@ async fn apply_pack(
         let mut guard = state.lock().expect("state lock");
         guard.take_kernel()
     };
+    // Which instances existed before this load: everything that appears behind
+    // it is what the pack created, and only those may be claimed for the
+    // conversation. The loader is about to take the kernel, so the set is taken
+    // first and compared by id afterwards.
+    let fibers_before: BTreeSet<u64> = kernel.fibers().iter().map(|fiber| fiber.id).collect();
 
     let pack_name = assembly
         .parent()
@@ -1677,6 +1959,15 @@ async fn apply_pack(
             // the offline shape from before packs had manifests.
             eprintln!("[pack] no manifest beside the assembly ({error:#})");
         }
+    }
+
+    // The plugin instances this pack activated are claimed for the conversation
+    // that asked for them. A pack loaded by one conversation must not keep its
+    // services alive for another, and the claim is what makes the release on a
+    // session switch able to take them down; `None` keeps boot's process-wide
+    // packs unclaimed, so they survive every switch.
+    if let Some(session) = session {
+        claim_loaded_fibers(&mut kernel, &fibers_before, session);
     }
 
     let status = {
@@ -1930,117 +2221,161 @@ fn serve_interface_on_loopback(state: Arc<Mutex<AppState>>) -> std::io::Result<u
     eprintln!("[ui] serving http://127.0.0.1:{port}/");
     std::thread::spawn(move || {
         for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            // Headers first: a POST body may begin in this same chunk and
-            // continue past it, so the head must be located before the rest
-            // of the body is read.
-            let mut buf = vec![0u8; 8192];
-            let mut read = stream.read(&mut buf).unwrap_or(0);
-            let header_end = loop {
-                if let Some(pos) = buf[..read].windows(4).position(|w| w == b"\r\n\r\n") {
-                    break Some(pos + 4);
-                }
-                if read >= buf.len() {
-                    break None;
-                }
-                match stream.read(&mut buf[read..]) {
-                    Ok(0) => break None,
-                    Ok(n) => read += n,
-                    Err(_) => break None,
-                }
-            };
-            let Some(header_end) = header_end else {
-                // Unparseable: the entry page, the old behaviour.
-                let (body, mime) = serve_ui("");
-                respond_loopback(&mut stream, "200 OK", mime, &body);
+            let Ok(stream) = stream else { continue };
+            // One thread per connection. WebView2 opens sockets it never sends
+            // on, and while connections were served one after another a single
+            // silent one held every asset and `/upload` behind it forever.
+            let Some(slot) = acquire_slot(&LOOPBACK_CONNECTIONS, MAX_LOOPBACK_CONNECTIONS) else {
+                // At the cap the socket is dropped rather than queued: the page
+                // retries, and nothing waits on a peer that may never speak.
+                drop(stream);
                 continue;
             };
-            let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
-            let (method, target) = {
-                let mut parts = head.split_whitespace();
-                (
-                    parts.next().unwrap_or("").to_string(),
-                    parts.next().unwrap_or("/").to_string(),
-                )
-            };
-            let (path, query) = crate::serve::split_target(&target);
-
-            if method == "POST" && path == "upload" {
-                let content_length: usize = head
-                    .lines()
-                    .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
-                    .and_then(|line| line.split(':').nth(1))
-                    .and_then(|value| value.trim().parse().ok())
-                    .unwrap_or(0);
-                let cap = crate::serve::max_body_bytes() as usize;
-                if content_length == 0 {
-                    respond_loopback(&mut stream, "400 Bad Request", "text/plain; charset=utf-8", b"empty upload");
-                    continue;
-                }
-                if content_length > cap {
-                    let message = format!(
-                        "payload too large: {content_length} bytes declared, this server \
-                         accepts up to {} MB. Set NGU_MAX_UPLOAD_MB to raise the limit.",
-                        cap / (1024 * 1024)
-                    );
-                    eprintln!("[ui] upload rejected: {content_length} bytes exceeds the cap");
-                    respond_loopback(&mut stream, "413 Payload Too Large", "text/plain; charset=utf-8", message.as_bytes());
-                    continue;
-                }
-                let mut body = buf[header_end..read].to_vec();
-                while body.len() < content_length {
-                    let mut chunk = vec![0u8; 64 * 1024];
-                    let want = (content_length - body.len()).min(chunk.len());
-                    match stream.read(&mut chunk[..want]) {
-                        Ok(0) => break,
-                        Ok(n) => body.extend_from_slice(&chunk[..n]),
-                        Err(_) => break,
-                    }
-                }
-                if body.len() != content_length {
-                    respond_loopback(&mut stream, "400 Bad Request", "text/plain; charset=utf-8", b"truncated upload body");
-                    continue;
-                }
-                let name = crate::serve::sanitize_name(
-                    query.get("name").map(String::as_str).unwrap_or(""),
-                );
-                let workdir = crate::serve::session_workdir(&state);
-                let directory = workdir.join("uploads");
-                let outcome = std::fs::create_dir_all(&directory).and_then(|()| {
-                    let file_path = directory.join(&name);
-                    std::fs::write(&file_path, &body).map(|()| file_path)
-                });
-                match outcome {
-                    Ok(file_path) => {
-                        eprintln!(
-                            "[ui] uploaded {} bytes → {}",
-                            body.len(),
-                            file_path.display()
-                        );
-                        let payload = serde_json::json!({
-                            "ok": true,
-                            "path": file_path.display().to_string(),
-                            "name": name,
-                            "size": body.len(),
-                        })
-                        .to_string();
-                        respond_loopback(&mut stream, "200 OK", "application/json", payload.as_bytes());
-                    }
-                    Err(error) => {
-                        eprintln!("[ui] upload failed: {error}");
-                        let message = format!("cannot write upload: {error}");
-                        respond_loopback(&mut stream, "500 Internal Server Error", "text/plain; charset=utf-8", message.as_bytes());
-                    }
-                }
-                continue;
-            }
-
-            // GET (and anything else): the interface file, as always.
-            let (body, mime) = serve_ui(&path);
-            respond_loopback(&mut stream, "200 OK", mime, &body);
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                // The slot goes back however this handler ends.
+                let _slot = slot;
+                serve_loopback_connection(stream, state, port);
+            });
         }
     });
     Ok(port)
+}
+
+/// Answer one loopback connection: an interface file, or an upload.
+fn serve_loopback_connection(
+    mut stream: std::net::TcpStream,
+    state: Arc<Mutex<AppState>>,
+    port: u16,
+) {
+    // A peer that connects and then stops sending — or stops reading — must not
+    // hold this thread: both directions time out.
+    let _ = stream.set_read_timeout(Some(LOOPBACK_READ_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(LOOPBACK_WRITE_TIMEOUT));
+    // Headers first: a POST body may begin in this same chunk and
+    // continue past it, so the head must be located before the rest
+    // of the body is read.
+    let mut buf = vec![0u8; 8192];
+    let mut read = stream.read(&mut buf).unwrap_or(0);
+    let header_end = loop {
+        if let Some(pos) = buf[..read].windows(4).position(|w| w == b"\r\n\r\n") {
+            break Some(pos + 4);
+        }
+        if read >= buf.len() {
+            break None;
+        }
+        match stream.read(&mut buf[read..]) {
+            Ok(0) => break None,
+            Ok(n) => read += n,
+            Err(_) => break None,
+        }
+    };
+    let Some(header_end) = header_end else {
+        // Unparseable: the entry page, the old behaviour.
+        let (body, mime) = serve_ui("");
+        respond_loopback(&mut stream, "200 OK", mime, &body);
+        return;
+    };
+    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let (method, target) = {
+        let mut parts = head.split_whitespace();
+        (
+            parts.next().unwrap_or("").to_string(),
+            parts.next().unwrap_or("/").to_string(),
+        )
+    };
+    let (path, query) = crate::serve::split_target(&target);
+
+    if method == "POST" && path == "upload" {
+        // Only the window's own origin. Loopback is not a permission to write
+        // files: a page on any other origin that can reach this port is not
+        // the interface, and an absent `Origin` is a plain same-origin client.
+        if !origin_allowed(header_value(&head, "origin"), port) {
+            eprintln!("[ui] upload refused: origin is not this window");
+            respond_loopback(&mut stream, "403 Forbidden", "text/plain; charset=utf-8", b"origin not allowed");
+            return;
+        }
+        if !content_type_is_multipart(header_value(&head, "content-type")) {
+            eprintln!("[ui] upload refused: content type is not multipart");
+            respond_loopback(&mut stream, "415 Unsupported Media Type", "text/plain; charset=utf-8", b"uploads must be multipart/form-data");
+            return;
+        }
+        let content_length: usize = header_value(&head, "content-length")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        if content_length == 0 {
+            respond_loopback(&mut stream, "400 Bad Request", "text/plain; charset=utf-8", b"empty upload");
+            return;
+        }
+        if content_length > MAX_LOOPBACK_UPLOAD_BYTES {
+            let message = format!(
+                "payload too large: {content_length} bytes declared, this window accepts \
+                 up to {} MB.",
+                MAX_LOOPBACK_UPLOAD_BYTES / (1024 * 1024)
+            );
+            eprintln!("[ui] upload rejected: {content_length} bytes exceeds the cap");
+            respond_loopback(&mut stream, "413 Payload Too Large", "text/plain; charset=utf-8", message.as_bytes());
+            return;
+        }
+        let mut body = buf[header_end..read].to_vec();
+        while body.len() < content_length {
+            let mut chunk = vec![0u8; 64 * 1024];
+            let want = (content_length - body.len()).min(chunk.len());
+            match stream.read(&mut chunk[..want]) {
+                Ok(0) => break,
+                Ok(n) => body.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        if body.len() != content_length {
+            respond_loopback(&mut stream, "400 Bad Request", "text/plain; charset=utf-8", b"truncated upload body");
+            return;
+        }
+        let name = crate::serve::sanitize_name(
+            query.get("name").map(String::as_str).unwrap_or(""),
+        );
+        // No cwd, no upload: falling back to the process directory would write
+        // the file into whatever directory the window happened to start from.
+        let Some(workdir) = crate::serve::session_workdir_in(&state) else {
+            eprintln!("[ui] upload refused: the session has no cwd");
+            respond_loopback(&mut stream, "409 Conflict", "text/plain; charset=utf-8", b"the session has no working directory");
+            return;
+        };
+        let directory = workdir.join("uploads");
+        let outcome = std::fs::create_dir_all(&directory).and_then(|()| {
+            // Never over an existing file: a second `photo.png` becomes
+            // `photo(1).png`, the same rule serve mode uses.
+            let file_path = free_upload_name(&directory, &name);
+            std::fs::write(&file_path, &body).map(|()| file_path)
+        });
+        match outcome {
+            Ok(file_path) => {
+                eprintln!(
+                    "[ui] uploaded {} bytes → {}",
+                    body.len(),
+                    file_path.display()
+                );
+                let payload = serde_json::json!({
+                    "ok": true,
+                    "path": file_path.display().to_string(),
+                    "name": name,
+                    "size": body.len(),
+                })
+                .to_string();
+                respond_loopback(&mut stream, "200 OK", "application/json", payload.as_bytes());
+            }
+            Err(error) => {
+                eprintln!("[ui] upload failed: {error}");
+                let message = format!("cannot write upload: {error}");
+                respond_loopback(&mut stream, "500 Internal Server Error", "text/plain; charset=utf-8", message.as_bytes());
+            }
+        }
+        return;
+    }
+
+    // GET (and anything else): the interface file, as always.
+    let (body, mime) = serve_ui(&path);
+    respond_loopback(&mut stream, "200 OK", mime, &body);
 }
 
 /// One loopback response, closed after — the style this little server always
@@ -2071,14 +2406,22 @@ pub(crate) fn serve_ui(path: &str) -> (Vec<u8>, &'static str) {
     // A path from a URL is untrusted input that becomes a filesystem path.
     // Refusing anything but a plain relative descent is what keeps `..` from
     // reaching outside the interface directory.
-    let requested = if path.is_empty() { "index.html" } else { path };
-    let candidate = if requested
-        .split('/')
-        .all(|part| !part.is_empty() && part != "." && part != "..")
-    {
-        root.join(requested)
-    } else {
-        root.join("index.html")
+    let requested = if path.is_empty() || path == "/" { "index.html" } else { path };
+    // `safe_relative` is the only thing allowed to decide what a URL path may
+    // name: decoded, backslash-unified, and refusing any segment that is `.`,
+    // `..`, a drive letter or stream, or a Windows device. `canonicalize`
+    // settles symlinks, and `starts_with` is the last word - the resolved file
+    // has to still be inside the interface directory, whatever the join
+    // produced. Anything that fails falls back to the index, which is inside.
+    let Ok(root) = root.canonicalize() else {
+        return builtin();
+    };
+    let candidate = match crate::serve::safe_relative(requested) {
+        Some(relative) => match root.join(relative).canonicalize() {
+            Ok(resolved) if resolved.starts_with(&root) => resolved,
+            _ => root.join("index.html"),
+        },
+        None => root.join("index.html"),
     };
 
     let file = if candidate.is_file() {
@@ -2159,4 +2502,211 @@ fn emit_panels(state: &Arc<Mutex<AppState>>, sink: &Arc<dyn EventSink>) {
 /// Send one event to the page.
 fn emit(sink: &Arc<dyn EventSink>, value: Value) {
     sink.emit(value);
+}
+
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+/// The most bytes one command from the page may carry.
+const MAX_IPC_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Set while a native pick dialog is open.
+static PICK_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Clears [`PICK_BUSY`] however the picker ends — cancelled, chosen, or a
+/// panic inside the dialog.
+struct PickGuard;
+
+impl PickGuard {
+    /// Claim the picker, or `None` when one is already open.
+    fn claim() -> Option<Self> {
+        PICK_BUSY
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for PickGuard {
+    fn drop(&mut self) {
+        PICK_BUSY.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Loopback connections allowed in flight at once. A WebView2 preconnect holds
+/// one without ever sending a byte, so the cap is generous but finite.
+const MAX_LOOPBACK_CONNECTIONS: usize = 32;
+
+/// Loopback connections currently being handled.
+static LOOPBACK_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Ten seconds to send a request head.
+const LOOPBACK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Thirty seconds to drain a response.
+const LOOPBACK_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The most an upload to the window's loopback server may weigh.
+const MAX_LOOPBACK_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
+
+/// One connection slot, returned to `counter` when dropped — every path out of
+/// the handler gives it back, including a panic.
+struct ConnectionSlot {
+    counter: &'static AtomicUsize,
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Take a slot, or `None` when `cap` are already held.
+fn acquire_slot(counter: &'static AtomicUsize, cap: usize) -> Option<ConnectionSlot> {
+    if counter.fetch_add(1, Ordering::Relaxed) >= cap {
+        // Refused connections do not count: the increment is undone before the
+        // socket is dropped.
+        counter.fetch_sub(1, Ordering::Relaxed);
+        return None;
+    }
+    Some(ConnectionSlot { counter })
+}
+
+/// One header out of a request head, matched case-insensitively.
+fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
+/// Whether a `POST /upload` may proceed: no `Origin` at all is a plain
+/// same-origin client; a present one must be this server's own origin.
+fn origin_allowed(origin: Option<&str>, port: u16) -> bool {
+    let Some(origin) = origin else { return true };
+    let origin = origin.trim();
+    origin == format!("http://127.0.0.1:{port}") || origin == format!("http://localhost:{port}")
+}
+
+/// Uploads arrive as multipart; anything else is a mistake worth naming.
+fn content_type_is_multipart(value: Option<&str>) -> bool {
+    value
+        .map(|value| {
+            value
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("multipart/form-data")
+        })
+        .unwrap_or(false)
+}
+
+/// Text that is safe to place inside a script.
+///
+/// `serde_json` leaves U+2028 and U+2029 raw, and JavaScript treats both as a
+/// line terminator, so an event carrying one produced a syntax error and the
+/// page silently never saw it. Escaped, they stay inside the string literal.
+fn js_safe(value: &str) -> String {
+    value
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+/// `photo.png` and 3 as `photo(3).png`, the extension kept last so both the
+/// browser and the file system still recognise the type.
+fn suffixed(name: &str, n: u32) -> String {
+    match name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() && !extension.is_empty() => {
+            format!("{stem}({n}).{extension}")
+        }
+        _ => format!("{name}({n})"),
+    }
+}
+
+/// A path in `dir` no file occupies: the same rule as serve mode's
+/// `free_upload_name`, so an upload never replaces a file the session had.
+fn free_upload_name(dir: &Path, name: &str) -> PathBuf {
+    let taken = |candidate: &str| dir.join(candidate).exists();
+    if !taken(name) {
+        return dir.join(name);
+    }
+    for n in 1..=999 {
+        let candidate = suffixed(name, n);
+        if !taken(&candidate) {
+            return dir.join(candidate);
+        }
+    }
+    // A thousand uploads under one name is not a naming problem anymore; the
+    // last candidate is better than failing an upload the user asked for.
+    dir.join(suffixed(name, 1000))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn js_safe_escapes_the_line_separators_js_ends_a_line_on() {
+        assert_eq!(js_safe("a\u{2028}b"), "a\\u2028b");
+        assert_eq!(js_safe("a\u{2029}b"), "a\\u2029b");
+        // Ordinate JSON is untouched.
+        assert_eq!(js_safe(r#"{"ev":"ready","text":"ok"}"#), r#"{"ev":"ready","text":"ok"}"#);
+    }
+
+    #[test]
+    fn connection_slots_are_capped_and_given_back() {
+        let counter: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+        let first = acquire_slot(counter, 2).expect("first slot");
+        let second = acquire_slot(counter, 2).expect("second slot");
+        assert!(acquire_slot(counter, 2).is_none(), "the third must be refused");
+        assert_eq!(counter.load(Ordering::Relaxed), 2, "a refusal must not count");
+        drop(first);
+        assert_eq!(counter.load(Ordering::Relaxed), 1, "dropping returns the slot");
+        let third = acquire_slot(counter, 2).expect("the freed slot is usable");
+        drop(second);
+        drop(third);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn upload_names_never_replace_an_existing_file() {
+        let dir = std::env::temp_dir().join(format!("ngu-upload-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        assert_eq!(free_upload_name(&dir, "note.txt"), dir.join("note.txt"));
+        std::fs::write(dir.join("note.txt"), b"first").expect("write");
+        assert_eq!(free_upload_name(&dir, "note.txt"), dir.join("note(1).txt"));
+        std::fs::write(dir.join("note(1).txt"), b"second").expect("write");
+        assert_eq!(free_upload_name(&dir, "note.txt"), dir.join("note(2).txt"));
+        // A name with no extension gains the suffix at the end.
+        std::fs::write(dir.join("README"), b"x").expect("write");
+        assert_eq!(free_upload_name(&dir, "README"), dir.join("README(1)"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upload_origin_must_be_this_window() {
+        assert!(origin_allowed(None, 40000), "no Origin is a plain client");
+        assert!(origin_allowed(Some("http://127.0.0.1:40000"), 40000));
+        assert!(origin_allowed(Some("http://localhost:40000"), 40000));
+        assert!(!origin_allowed(Some("http://127.0.0.1:40001"), 40000), "other port");
+        assert!(!origin_allowed(Some("https://example.com"), 40000), "other host");
+        assert!(!origin_allowed(Some("null"), 40000), "opaque origin");
+    }
+
+    #[test]
+    fn only_one_pick_dialog_opens_at_a_time() {
+        let first = PickGuard::claim().expect("the first dialog opens");
+        assert!(PickGuard::claim().is_none(), "a second must be refused");
+        drop(first);
+        let again = PickGuard::claim().expect("the guard releases on drop");
+        drop(again);
+        assert!(!PICK_BUSY.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn upload_requests_must_be_multipart() {
+        assert!(content_type_is_multipart(Some(
+            "multipart/form-data; boundary=x"
+        )));
+        assert!(!content_type_is_multipart(Some("application/json")));
+        assert!(!content_type_is_multipart(None));
+    }
 }

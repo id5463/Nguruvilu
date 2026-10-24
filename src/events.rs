@@ -233,15 +233,15 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
 
         let a = Arc::clone(&order);
-        bus.subscribe("tool.end", move |name, payload| {
+        let _dispose_a = bus.subscribe("tool.end", move |name, payload| {
             a.lock().unwrap().push(format!("a:{name}:{}", payload["ok"]));
         });
         let b = Arc::clone(&order);
-        bus.subscribe("tool.end", move |name, _| {
+        let _dispose_b = bus.subscribe("tool.end", move |name, _| {
             b.lock().unwrap().push(format!("b:{name}"));
         });
         let s = Arc::clone(&seen);
-        bus.subscribe_all(move |name, _| s.lock().unwrap().push(name.to_string()));
+        let _dispose_s = bus.subscribe_all(move |name, _| s.lock().unwrap().push(name.to_string()));
 
         bus.emit("tool.end", &json!({ "ok": true }));
         assert_eq!(
@@ -274,8 +274,8 @@ mod tests {
         let bus = EventBus::default();
         let after = Arc::new(AtomicUsize::new(0));
         let inner = Arc::clone(&after);
-        bus.subscribe("x", |_, _| panic!("broken listener"));
-        bus.subscribe("x", move |_, _| {
+        let _broken = bus.subscribe("x", |_, _| panic!("broken listener"));
+        let _alive = bus.subscribe("x", move |_, _| {
             inner.fetch_add(1, Ordering::Relaxed);
         });
 

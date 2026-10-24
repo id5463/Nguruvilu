@@ -92,6 +92,16 @@ fn next_nonce() -> u64 {
     NONCE.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Take the registry, recovering the data if a previous holder panicked.
+///
+/// A reader runs inside a pack's factory, so any panic on that thread poisons
+/// the lock. `.expect()` there would turn one bad reader into a process where
+/// *every* later read panics; the registry's `Vec<Reader>` is still perfectly
+/// usable, so the poison is stepped over.
+fn registry_lock() -> std::sync::MutexGuard<'static, Vec<Reader>> {
+    registry().lock().unwrap_or_else(|error| error.into_inner())
+}
+
 /// Register one reader; the disposer removes **exactly this registration**
 /// (id + nonce), so an old fiber's disposal cannot unseat the replacement its
 /// own reload registered a moment earlier.
@@ -99,7 +109,7 @@ pub fn register(spec: ReaderSpec, owner: impl Into<String>) -> impl FnOnce() + S
     let id = spec.id.clone();
     let nonce = next_nonce();
     {
-        let mut guard = registry().lock().expect("reader registry");
+        let mut guard = registry_lock();
         // Replace, don't stack: two readers under one id would leave the
         // first one's verdict winning forever (conversion stops at the first
         // text produced).
@@ -113,19 +123,14 @@ pub fn register(spec: ReaderSpec, owner: impl Into<String>) -> impl FnOnce() + S
         });
     }
     move || {
-        registry()
-            .lock()
-            .expect("reader registry")
-            .retain(|r| !(r.id == id && r.nonce == nonce));
+        registry_lock().retain(|r| !(r.id == id && r.nonce == nonce));
     }
 }
 
 /// Every installed reader (`id`, `owner`): named in `read`'s failure message
 /// so "can't read it" is diagnosable at a glance.
 pub fn installed() -> Vec<(String, String)> {
-    registry()
-        .lock()
-        .expect("reader registry")
+    registry_lock()
         .iter()
         .map(|r| (r.id.clone(), r.owner.clone()))
         .collect()
@@ -138,7 +143,7 @@ pub fn installed() -> Vec<(String, String)> {
 /// arrive while a read is in flight.
 pub fn convert(bytes: &[u8], path: &Path) -> ReadAnswer {
     let snapshot: Vec<Convert> = {
-        let guard = registry().lock().expect("reader registry");
+        let guard = registry_lock();
         guard
             .iter()
             .filter(|r| (r.claims)(bytes, path))

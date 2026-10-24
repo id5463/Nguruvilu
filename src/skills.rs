@@ -65,9 +65,50 @@ pub struct ScanReport {
     /// Skills now registered.
     pub loaded: usize,
     /// Roots that did not exist.
+    ///
+    /// Separate from [`Self::skipped`] because an absent root is ordinary — a
+    /// checkout simply has no `.nguruvilu/skills` — and a caller that only
+    /// wants to know which roots are absent should not have to filter a list of
+    /// failures. Nothing lands in both.
     pub missing_roots: Vec<PathBuf>,
-    /// Directories that looked like skills but had no usable `SKILL.md`.
-    pub skipped: Vec<PathBuf>,
+    /// Paths that *were* there and contributed no skill, each with the reason: a
+    /// directory without `SKILL.md`, an entry or root that could not be read, a
+    /// file that would not parse.
+    ///
+    /// The reason is carried rather than just the path because the failure a
+    /// user actually reports is "my skills disappeared", and a bare path in a
+    /// log gives them nothing to act on: permission denied, not a directory,
+    /// unreadable file are three different fixes.
+    pub skipped: Vec<(PathBuf, String)>,
+    /// Ids that were already taken: `(id offered, id used)`.
+    ///
+    /// The later root does **not** replace the earlier one. Both stay in the
+    /// catalog under different ids, because a skill body is read into the model
+    /// as instructions: letting a workspace directory silently displace a skill
+    /// the user installed themselves would hand the model an instruction set
+    /// nobody asked for.
+    pub collisions: Vec<(String, String)>,
+}
+
+impl ScanReport {
+    /// The scan as user-facing text, one fact per line.
+    ///
+    /// This is the only place the reasons are rendered, so every caller that
+    /// wants to tell a user what happened to their skills prints this instead of
+    /// reformatting the fields itself — otherwise a reason added here would go
+    /// unread by half the front ends.
+    pub fn summary(&self) -> String {
+        let mut out = format!("{} skill(s) loaded", self.loaded);
+        for (path, reason) in &self.skipped {
+            out.push_str(&format!("\nskipped {}: {reason}", path.display()));
+        }
+        for (offered, used) in &self.collisions {
+            out.push_str(&format!(
+                "\nskill '{offered}' was already taken; the later copy is catalogued as '{used}'"
+            ));
+        }
+        out
+    }
 }
 
 /// Every skill visible to the kernel, across all configured roots.
@@ -93,6 +134,13 @@ impl SkillRegistry {
     }
 
     /// The default roots: `$NGU_HOME/skills`, then `<cwd>/.nguruvilu/skills`.
+    ///
+    /// Priority follows this order — the first root to offer an id keeps it. The
+    /// user's own skills are therefore listed first, so a `.nguruvilu/skills`
+    /// directory inside a checkout cannot take over a skill the user installed
+    /// (a skill body becomes model instructions, and a workspace is content
+    /// nobody vetted). A workspace copy of an existing id is still catalogued,
+    /// under a suffixed id.
     pub fn default_roots() -> Vec<PathBuf> {
         let mut roots = Vec::new();
         if let Ok(home) = std::env::var("NGU_HOME") {
@@ -132,36 +180,84 @@ impl SkillRegistry {
     ///
     /// A rescan is the reload path for skills: it is idempotent, so calling it
     /// after files change is enough to pick the change up.
+    ///
+    /// It is deliberately hard to fail. One unreadable root or one broken entry
+    /// loses that path and nothing else: returning `Err` there used to throw
+    /// away every skill the scan had already found, so a single permission
+    /// problem anywhere turned the whole catalog into "no skills". Failures are
+    /// recorded in [`ScanReport::skipped`] with the reason instead, and the
+    /// `Result` remains only so a future whole-scan failure has a shape to use.
     pub fn scan(&mut self) -> Result<ScanReport> {
         let mut report = ScanReport::default();
         let mut found: BTreeMap<String, Skill> = BTreeMap::new();
 
         for root in self.roots.clone() {
             if !root.exists() {
+                // A root that is simply not there is not a failure: `default_roots`
+                // offers paths the user may never have created, and reporting
+                // that at every boot trains people to ignore the report that
+                // also carries real failures. `missing_roots` is the quiet list
+                // for exactly this case; `skipped` means "present and broken".
                 report.missing_roots.push(root);
                 continue;
             }
-            let entries = std::fs::read_dir(&root)
-                .with_context(|| format!("reading skills root {}", root.display()))?;
+            let entries = match std::fs::read_dir(&root) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    // A root that cannot even be listed is recorded and passed
+                    // over: the other roots still hold skills worth cataloguing.
+                    report.skipped.push((
+                        root,
+                        format!("skills root could not be read: {error}"),
+                    ));
+                    continue;
+                }
+            };
 
             for entry in entries {
-                let entry = entry?;
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        // The iterator itself can fail per entry; attributing it
+                        // to the root is the most precise thing available,
+                        // because the failing entry has no path to name.
+                        report.skipped.push((
+                            root.clone(),
+                            format!("an entry in this root could not be read: {error}"),
+                        ));
+                        continue;
+                    }
+                };
                 let dir = entry.path();
                 if !dir.is_dir() {
                     continue;
                 }
                 let manifest = dir.join("SKILL.md");
                 if !manifest.is_file() {
-                    report.skipped.push(dir);
+                    report.skipped.push((dir, "no SKILL.md in this directory".to_string()));
                     continue;
                 }
                 match parse_skill(&manifest, &dir, &root) {
-                    Ok(skill) => {
-                        // A later root shadows an earlier one with the same id,
-                        // so a user root can override a shipped skill.
+                    Ok(mut skill) => {
+                        // Roots are scanned in priority order and the first one
+                        // to offer an id keeps it: `default_roots` lists
+                        // `$NGU_HOME/skills` first so the user's own skill
+                        // outranks a copy checked into a workspace. The later
+                        // copy is neither dropped nor allowed to overwrite — it
+                        // lands under a suffixed id and the collision is
+                        // reported, so a repository cannot displace a skill the
+                        // user installed.
+                        let id = unique_id(&skill.id, &found);
+                        if id != skill.id {
+                            report.collisions.push((skill.id.clone(), id.clone()));
+                            skill.id = id;
+                        }
                         found.insert(skill.id.clone(), skill);
                     }
-                    Err(_) => report.skipped.push(dir),
+                    // Unreadable or unusable `SKILL.md`: one lost skill, not a
+                    // lost scan. The context chain names the file and the OS
+                    // error, which is exactly what the reason has to say.
+                    Err(error) => report.skipped.push((dir, format!("{error:#}"))),
                 }
             }
         }
@@ -249,32 +345,51 @@ fn parse_skill(manifest: &Path, dir: &Path, root: &Path) -> Result<Skill> {
 /// parser and pulling one in would be more machinery than the format deserves.
 /// The two shapes real skills use beyond flat pairs — block scalars and
 /// quoted values — are handled explicitly (see inside).
+///
+/// The walk runs over the **original** text and advances by the bytes it really
+/// consumed. `str::lines()` is deliberately not used for offsets: it strips the
+/// `\r` of a CRLF file while a caller has to guess the newline width, so every
+/// frontmatter line in a Windows `SKILL.md` (CRLF is the default there) shifted
+/// the body one byte early. The body then began inside the closing `---`, and
+/// when the drift landed mid-character `str::get` returned `None` — which the
+/// old `.unwrap_or("")` turned into a **silently empty body**. A skill that
+/// loads with no instructions is the worst of the three outcomes.
 fn split_frontmatter(raw: &str) -> (BTreeMap<String, String>, String) {
     let mut fields = BTreeMap::new();
     let trimmed = raw.strip_prefix('\u{feff}').unwrap_or(raw);
 
-    let mut lines = trimmed.lines();
-    let Some(first) = lines.next() else {
-        return (fields, String::new());
+    // The opening delimiter has to be the first line, exactly `---`.
+    let Some(first_newline) = trimmed.find('\n') else {
+        // No newline at all: nothing can be frontmatter, so all of it is body.
+        return (fields, trimmed.to_string());
     };
-    if first.trim() != "---" {
+    if trimmed[..first_newline].trim() != "---" {
         return (fields, trimmed.to_string());
     }
 
-    let mut body_start = None;
-    let mut offset = first.len() + 1;
     // A YAML block scalar (`>` folded or `|` literal, optionally chomped with
     // -/+) keeps its value on the following indented lines. Treating those as
     // pairs would silently drop a long description and smuggle its sentences
     // in as fake keys — Claude Code skills use this shape routinely, so
     // reading their frontmatter needs it.
     let mut block: Option<(String, bool)> = None; // (key, folded?)
-    for line in lines {
-        offset += line.len() + 1;
+    let mut cursor = first_newline + 1;
+    while cursor < trimmed.len() {
+        let rest = &trimmed[cursor..];
+        // Byte-exact: the line, plus whatever newline actually ended it.
+        let (line, next) = match rest.find('\n') {
+            Some(newline) => (&rest[..newline], cursor + newline + 1),
+            None => (rest, trimmed.len()),
+        };
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        cursor = next;
+
         if line.trim() == "---" {
-            body_start = Some(offset);
-            break;
+            // A slice of the original text: it cannot drift, and it cannot be
+            // cut mid-character.
+            return (fields, trimmed[cursor..].to_string());
         }
+
         if let Some((key, folded)) = block.clone() {
             let indented = line.starts_with([' ', '\t']) || line.trim().is_empty();
             if indented {
@@ -295,27 +410,44 @@ fn split_frontmatter(raw: &str) -> (BTreeMap<String, String>, String) {
             // Not indented any more: the block ended.
             block = None;
         }
-        if let Some((key, value)) = line.split_once(':') {
-            let key = key.trim().to_ascii_lowercase();
-            let value = value.trim();
-            // `>`, `|-`, `|+` … — an indicator, never a value.
-            let scalar_shape = !value.is_empty()
-                && matches!(value.as_bytes()[0], b'>' | b'|')
-                && value.bytes().all(|b| matches!(b, b'>' | b'|' | b'-' | b'+'));
-            if scalar_shape {
-                fields.entry(key.clone()).or_default();
-                block = Some((key, value.as_bytes()[0] == b'>'));
-                continue;
-            }
-            fields.insert(key, unquote(value).to_string());
+
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim();
+        // `>`, `|-`, `|+` … — an indicator, never a value.
+        let scalar_shape = !value.is_empty()
+            && matches!(value.as_bytes()[0], b'>' | b'|')
+            && value.bytes().all(|b| matches!(b, b'>' | b'|' | b'-' | b'+'));
+        if scalar_shape {
+            fields.entry(key.clone()).or_default();
+            block = Some((key, value.as_bytes()[0] == b'>'));
+            continue;
         }
+        fields.insert(key, unquote(value).to_string());
     }
 
-    match body_start {
-        Some(start) => (fields, trimmed.get(start..).unwrap_or("").to_string()),
-        // Unterminated frontmatter: treat the whole file as body.
-        None => (BTreeMap::new(), trimmed.to_string()),
+    // Unterminated frontmatter: treat the whole file as body.
+    (BTreeMap::new(), trimmed.to_string())
+}
+
+/// A key that is not taken yet: `id`, else `id-2`, `id-3`, …
+///
+/// Used when two roots offer the same skill id. Neither copy is discarded: a
+/// workspace that happens to check in `.nguruvilu/skills/pdf` must not be able
+/// to make the user's own `pdf` skill disappear from the catalog.
+fn unique_id(wanted: &str, taken: &BTreeMap<String, Skill>) -> String {
+    if !taken.contains_key(wanted) {
+        return wanted.to_string();
     }
+    for suffix in 2.. {
+        let candidate = format!("{wanted}-{suffix}");
+        if !taken.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("a free suffix always exists")
 }
 
 /// Strip one matching pair of surrounding quotes.
@@ -333,11 +465,30 @@ fn unquote(value: &str) -> &str {
     value
 }
 
+/// Owner recorded on the `skill` tool.
+///
+/// Not `"kernel"`. The tool is a *view* of the catalog: `loader::merge_skills`
+/// unregisters and re-registers it whenever the roots change, and any future
+/// unload path needs to tell it apart from the tools the kernel itself owns. The
+/// old hard-coded owner claimed kernel ownership for a tool that is rebuilt from
+/// pack content.
+pub const SKILL_TOOL_OWNER: &str = "skills";
+
 /// Register the `skill` tool against a registry.
 ///
 /// The tool exposes two actions instead of two tools: listing and loading are
 /// the same concern, and one schema costs fewer prompt tokens.
 pub fn register_skill_tool(tools: &mut ToolRegistry, skills: Arc<SkillRegistry>) -> Result<()> {
+    register_skill_tool_owned(tools, skills, SKILL_TOOL_OWNER)
+}
+
+/// [`register_skill_tool`] with an explicit owner, for a caller that reloads the
+/// catalog and needs to recognise its own registration (see [`SKILL_TOOL_OWNER`]).
+pub fn register_skill_tool_owned(
+    tools: &mut ToolRegistry,
+    skills: Arc<SkillRegistry>,
+    owner: &'static str,
+) -> Result<()> {
     tools.register(
         ToolDef::new(
             "skill",
@@ -358,7 +509,7 @@ pub fn register_skill_tool(tools: &mut ToolRegistry, skills: Arc<SkillRegistry>)
                 },
                 "required": ["action"]
             }),
-            "kernel",
+            owner,
             move |args| {
                 let skills = Arc::clone(&skills);
                 Box::pin(async move { skill_tool(skills, args).await.map(Into::into) }) as ToolFuture
@@ -519,7 +670,11 @@ mod tests {
 
         assert_eq!(report.loaded, 2);
         assert_eq!(report.missing_roots.len(), 1);
-        assert_eq!(report.skipped.len(), 1);
+        // Only the present-but-empty directory is a skip: an absent root is
+        // ordinary and lives in `missing_roots`, so a boot on a checkout
+        // without `.nguruvilu/skills` stays quiet.
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+        assert_eq!(report.skipped[0].0, root.join("not-a-skill"));
         assert_eq!(registry.len(), 2);
 
         let pdf = registry.get("pdf-tools").expect("skill found");
@@ -534,16 +689,181 @@ mod tests {
     }
 
     #[test]
-    fn later_roots_shadow_earlier_ones() {
-        let base = temp_root("shadow-base");
-        let user = temp_root("shadow-user");
-        write_skill(&base, "search", "search", "Base search", "base body");
-        write_skill(&user, "search", "search", "User search", "user body");
+    fn a_missing_root_is_reported_with_a_reason_and_keeps_the_other_roots() {
+        // One absent root must cost that root and nothing else: the skills the
+        // other roots offered are still catalogued.
+        let good = temp_root("missing-root-good");
+        write_skill(&good, "pdf-tools", "pdf-tools", "Read PDFs", "Use pdftotext.");
+        let absent = good.join("nowhere");
 
-        let mut registry = SkillRegistry::with_roots([base, user]);
-        registry.scan().unwrap();
+        let mut registry = SkillRegistry::with_roots([good.clone()]);
+        registry.add_root(absent.clone());
+        // A root that exists but is a file cannot be listed. That is the case
+        // that has to be loud, and it must not cost the readable root either.
+        let not_a_directory = good.join("root-is-a-file");
+        std::fs::write(&not_a_directory, b"not a directory").unwrap();
+        registry.add_root(not_a_directory.clone());
+        let report = registry.scan().unwrap();
+
+        assert_eq!(report.loaded, 1, "the readable root still loads: {report:?}");
+        assert!(registry.get("pdf-tools").is_some());
+        assert_eq!(report.missing_roots, vec![absent.clone()]);
+
+        // The absent root is quiet: it is in `missing_roots` and nowhere else,
+        // because every checkout is missing roots the user never created.
+        assert!(
+            !report.skipped.iter().any(|(path, _)| path == &absent),
+            "an absent root is not a failure: {report:?}"
+        );
+        assert!(
+            !report.summary().contains(&absent.display().to_string()),
+            "the summary stays quiet about a root that is simply not there: {}",
+            report.summary()
+        );
+
+        // The unlistable root is the opposite: named, with the OS reason.
+        let reason = report
+            .skipped
+            .iter()
+            .find_map(|(path, reason)| (path == &not_a_directory).then(|| reason.clone()))
+            .expect("the broken root is reported, not dropped");
+        assert!(!reason.is_empty(), "a skip without a reason explains nothing");
+        assert!(
+            report.summary().contains(&not_a_directory.display().to_string()),
+            "the summary names the path: {}",
+            report.summary()
+        );
+        assert!(
+            report.summary().contains(&reason),
+            "the summary prints the reason: {}",
+            report.summary()
+        );
+    }
+
+    #[test]
+    fn an_unreadable_entry_is_skipped_with_a_reason_while_its_siblings_load() {
+        // A `SKILL.md` that is not valid UTF-8 fails `read_to_string`. The old
+        // scan propagated that as an error and discarded every skill it had
+        // already found, so one bad file meant an empty catalog.
+        let root = temp_root("unreadable-entry");
+        write_skill(&root, "good", "good", "Still loads", "body");
+        let broken = root.join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("SKILL.md"), [b'-', b'-', b'-', b'\n', 0xff, 0xfe, b'\n'])
+            .unwrap();
+
+        let mut registry = SkillRegistry::with_roots([root]);
+        let report = registry.scan().unwrap();
+
+        assert_eq!(report.loaded, 1, "the sibling survives: {report:?}");
+        assert!(registry.get("good").is_some());
         assert_eq!(registry.len(), 1);
-        assert_eq!(registry.get("search").unwrap().description, "User search");
+
+        let (path, reason) = report
+            .skipped
+            .iter()
+            .find_map(|(path, reason)| {
+                let named = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy() == "broken")
+                    .unwrap_or(false);
+                named.then(|| (path.clone(), reason.clone()))
+            })
+            .expect("the broken entry is reported");
+        assert_eq!(path, broken);
+        assert!(!reason.is_empty(), "a skip without a reason explains nothing");
+        assert!(
+            report.summary().contains(&broken.display().to_string()),
+            "the summary names the directory: {}",
+            report.summary()
+        );
+    }
+
+    #[test]
+    fn a_duplicate_id_from_a_later_root_keeps_the_first_and_adds_the_second() {
+        // The first root is the user's own, the second is a checkout. A skill
+        // body becomes model instructions, so the workspace copy must not be
+        // able to displace the user's — but it is not dropped either.
+        let user = temp_root("collide-user");
+        let workspace = temp_root("collide-workspace");
+        write_skill(&user, "search", "search", "User search", "user body");
+        write_skill(&workspace, "search", "search", "Workspace search", "workspace body");
+
+        let mut registry = SkillRegistry::with_roots([user, workspace]);
+        let report = registry.scan().unwrap();
+
+        assert_eq!(registry.len(), 2, "both copies stay in the catalog");
+        assert_eq!(
+            registry.get("search").unwrap().description,
+            "User search",
+            "the first root keeps the plain id"
+        );
+        let second = registry.get("search-2").expect("the later copy under a free id");
+        assert_eq!(second.description, "Workspace search");
+        assert_eq!(
+            report.collisions,
+            vec![("search".to_string(), "search-2".to_string())],
+            "the collision is reported, not silent"
+        );
+    }
+
+    #[test]
+    fn a_crlf_skill_keeps_its_body() {
+        // Windows writes `SKILL.md` with CRLF. The old offset arithmetic counted
+        // one byte per line after `lines()` had already eaten the `\r`, so the
+        // body slice started inside the closing delimiter — and once the drift
+        // grew past it the cut landed mid-character, `str::get` returned `None`,
+        // and `.unwrap_or("")` turned the whole body into an empty string.
+        let raw = concat!(
+            "---\r\n",
+            "name: 中文技能\r\n",
+            "description: 中文描述\r\n",
+            "allowed-tools: Read\r\n",
+            "license: MIT\r\n",
+            "version: 1.0.0\r\n",
+            "author: someone\r\n",
+            "tags: a, b\r\n",
+            "notes: 更多中文内容\r\n",
+            "---\r\n",
+            "\r\n",
+            "步骤一：先读文件。\r\n",
+            "步骤二：再改代码。\r\n"
+        );
+        let (fields, body) = split_frontmatter(raw);
+        assert_eq!(fields.get("name").unwrap(), "中文技能");
+        assert_eq!(fields.get("description").unwrap(), "中文描述");
+        assert!(!body.trim().is_empty(), "the body must not be empty: {body:?}");
+        assert!(
+            body.trim_start().starts_with("步骤一"),
+            "the body must start at the body, not inside the delimiter: {body:?}"
+        );
+        assert!(body.contains("步骤二"));
+        assert!(!body.contains("---"), "no frontmatter residue: {body:?}");
+    }
+
+    #[test]
+    fn a_crlf_skill_loads_through_a_scan() {
+        let root = temp_root("crlf-scan");
+        let dir = root.join("cn");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\r\nname: cn\r\ndescription: 中文\r\nallowed-tools: Read\r\nlicense: MIT\r\n\
+             owner: me\r\nversion: 2\r\n---\r\n\r\n第一行指令。\r\n第二行指令。\r\n",
+        )
+        .unwrap();
+
+        let mut registry = SkillRegistry::with_roots([root]);
+        let report = registry.scan().unwrap();
+        assert_eq!(report.loaded, 1, "the skill is not skipped: {report:?}");
+
+        let skill = registry.get("cn").expect("loaded");
+        assert!(
+            skill.body.starts_with("第一行指令"),
+            "the body survived the CRLF frontmatter: {:?}",
+            skill.body
+        );
+        assert!(skill.body.contains("第二行指令"));
     }
 
     #[test]

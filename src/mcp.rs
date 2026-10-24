@@ -15,8 +15,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -109,14 +109,306 @@ pub struct McpClient {
     server: String,
     /// The child's stdin. `None` for an HTTP server, which has no child.
     stdin: Option<Arc<Mutex<ChildStdin>>>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
-    next_id: AtomicU64,
+    pending: Arc<Mutex<Pending>>,
+    /// The request ids of this connection: monotonic within it, and drawn from a
+    /// slice of the id space no other connection ever uses.
+    ids: IdSpace,
+    /// The child's process id, captured at spawn, or 0 once it is no longer
+    /// safely ours to signal. Kept because the last-resort kill must not depend
+    /// on getting a turn with the child handle.
+    pid: AtomicU32,
     /// The child itself. `None` for an HTTP server.
     child: Option<Mutex<Child>>,
     /// The HTTP wiring, present exactly when [`McpSpec::url`] was.
     http: Option<HttpSession>,
     tools: Vec<McpTool>,
     timeout: Duration,
+}
+
+/// The requests one connection is waiting on, and the answers that belonged to
+/// no request at all.
+#[derive(Default)]
+struct Pending {
+    waiters: HashMap<u64, oneshot::Sender<Value>>,
+    /// Answers whose id no request of this connection was waiting for: a repeat
+    /// of one already delivered, or a number this connection never spoke. Kept
+    /// as a count rather than discarded silently, because a server that does it
+    /// is the thing a "wrong answer" report has to be able to name.
+    stray: u64,
+}
+
+impl Pending {
+    /// The most requests one connection may have in flight at once.
+    ///
+    /// A server that stops answering would otherwise grow this table for as long
+    /// as the conversation lasted. Refusing a request is visible; an unbounded
+    /// table is not.
+    const LIMIT: usize = 1_024;
+
+    /// Register a waiter. `false` when the table is full.
+    ///
+    /// The ones whose caller has gone are dropped first: a cancelled turn or a
+    /// closed window leaves a sender nobody will take, and those would otherwise
+    /// count against the limit forever.
+    fn register(&mut self, id: u64, sender: oneshot::Sender<Value>) -> bool {
+        self.waiters.retain(|_, waiting| !waiting.is_closed());
+        if self.waiters.len() >= Self::LIMIT {
+            return false;
+        }
+        self.waiters.insert(id, sender);
+        true
+    }
+
+    /// Stop waiting for one request. `false` means the answer got out first.
+    fn forget(&mut self, id: u64) -> bool {
+        self.waiters.remove(&id).is_some()
+    }
+
+    /// Hand one answer to the request that asked for it.
+    ///
+    /// `false` means nobody was waiting for that id — an answer delivered twice,
+    /// or one to a request this table never held. It is counted, not accepted.
+    fn deliver(&mut self, id: u64, message: Value) -> bool {
+        match self.waiters.remove(&id) {
+            Some(sender) => sender.send(message).is_ok(),
+            None => {
+                self.stray += 1;
+                false
+            }
+        }
+    }
+
+    /// Fail every waiter with the same message: the pipe closed.
+    fn fail_all(&mut self, reason: Value) {
+        for (_, sender) in self.waiters.drain() {
+            let _ = sender.send(reason.clone());
+        }
+    }
+}
+
+/// The request ids one connection speaks.
+///
+/// A plain counter starting at 1 would hand out the same numbers again every
+/// time a pack is reloaded, so an answer still travelling from the connection
+/// being replaced is indistinguishable from an answer to the connection that
+/// replaced it — the request that "answered" with someone else's result. Each
+/// connection therefore numbers its requests inside its own slice of the id
+/// space: the connection's `tag` in the high half, a counter climbing from 1 in
+/// the low half. Ids stay monotonic within a connection and are never reused by
+/// another one for as long as this process lives, and [`IdSpace::owns`] is the
+/// check the reader makes before delivering anything.
+struct IdSpace {
+    /// This connection's number, in the high half of every id it speaks.
+    tag: u64,
+    /// The low half: climbs by one per request.
+    next: AtomicU64,
+}
+
+/// Connection numbers, handed out one per [`IdSpace`].
+static CONNECTIONS: AtomicU64 = AtomicU64::new(1);
+
+impl IdSpace {
+    fn new() -> Self {
+        // Masked into the high half: a process cannot make 2^32 connections, and
+        // wrapping is preferable to failing the 2^32nd connect outright.
+        let tag = CONNECTIONS.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff;
+        Self {
+            tag,
+            next: AtomicU64::new(1),
+        }
+    }
+
+    /// The next request id of this connection.
+    fn next(&self) -> u64 {
+        let count = self.next.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff;
+        (self.tag << 32) | count
+    }
+
+    /// Whether `id` is one this connection could have spoken.
+    ///
+    /// The reader task does the same check on the hot path (it only holds the
+    /// tag, not the space); this is the form the tests assert against.
+    #[cfg(test)]
+    fn owns(&self, id: u64) -> bool {
+        spoken_by(self.tag, id)
+    }
+}
+
+/// Whether `id` carries `tag` in its high half, the way every id of that
+/// connection does.
+fn spoken_by(tag: u64, id: u64) -> bool {
+    (id >> 32) == tag
+}
+
+/// What a best-effort kill managed to do.
+///
+/// [`McpClient::force_kill`] runs where nothing can await anything — an unload,
+/// a drop at exit — so it has to say what it achieved. Returning `()` here (as
+/// this did) is how a child process went on running with nobody noticing: the
+/// handle was busy, nothing was signalled, and the caller had no way to tell
+/// that apart from success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KillReport {
+    /// An HTTP server owns no child process; its session ends server-side.
+    NoProcess,
+    /// The child was signalled through its handle.
+    Signalled,
+    /// The handle stayed locked for the whole retry budget — a request being
+    /// written, or a close already inside its own wait — so the process was
+    /// stopped by the pid captured when it was spawned.
+    SignalledByPid(u32),
+    /// Neither route reached the process. The reason is reported, never
+    /// swallowed.
+    Blocked(String),
+}
+
+impl KillReport {
+    /// Whether the server is on its way out (or had no process to stop).
+    pub fn stopped(&self) -> bool {
+        !matches!(self, KillReport::Blocked(_))
+    }
+}
+
+impl std::fmt::Display for KillReport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KillReport::NoProcess => write!(formatter, "no child process"),
+            KillReport::Signalled => write!(formatter, "signalled"),
+            KillReport::SignalledByPid(pid) => write!(formatter, "signalled by pid {pid}"),
+            KillReport::Blocked(reason) => write!(formatter, "not stopped: {reason}"),
+        }
+    }
+}
+
+/// How many times a kill waits for a busy child handle before going around it.
+const KILL_RETRIES: usize = 4;
+
+/// The pause between those attempts. Bounded and short on purpose: this runs on
+/// the way out of an unload, where waiting forever is worse than a pid kill.
+const KILL_RETRY_PAUSE: Duration = Duration::from_millis(50);
+
+/// Live clients by server id.
+///
+/// An unload reads the ledger and the kernel; it does not hold the handles that
+/// started the servers — `load_pack` handed those to the caller, and every
+/// registered tool holds one of its own. Without this table the only thing that
+/// could stop a server on unload would be the last `Arc` going away, which is an
+/// assumption about code elsewhere, and one that leaked a child process per
+/// load/unload cycle.
+fn live() -> &'static StdMutex<HashMap<String, Vec<Weak<McpClient>>>> {
+    static LIVE: OnceLock<StdMutex<HashMap<String, Vec<Weak<McpClient>>>>> = OnceLock::new();
+    LIVE.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn live_lock() -> std::sync::MutexGuard<'static, HashMap<String, Vec<Weak<McpClient>>>> {
+    live().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Remember a live client under its server id, so [`close_server`] can reach its
+/// process without being handed the handle.
+pub fn track(client: &Arc<McpClient>) {
+    let mut live = live_lock();
+    let entry = live.entry(client.server().to_string()).or_default();
+    entry.retain(|known| known.strong_count() > 0);
+    entry.push(Arc::downgrade(client));
+}
+
+/// What closing one server id by name produced.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CloseReport {
+    /// Clients reached — stopped, already gone, or with no process at all.
+    pub stopped: usize,
+    /// Clients whose process could not be reached, each with the reason.
+    pub failed: Vec<String>,
+}
+
+impl CloseReport {
+    /// Whether the close had nothing to complain about.
+    pub fn clean(&self) -> bool {
+        self.failed.is_empty()
+    }
+}
+
+/// Stop every live client of one server id, without awaiting.
+///
+/// This is what an unload calls. The id's entries are dropped either way, so a
+/// second unload of the same pack finds nothing here and returns at once; a
+/// server this could not reach is put back and reported, and keeps the `Drop`
+/// path as a second chance like any other handle.
+pub fn close_server(id: &str) -> CloseReport {
+    let mut report = CloseReport::default();
+    let targets: Vec<Arc<McpClient>> = live_lock()
+        .remove(id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|known| known.upgrade())
+        .collect();
+
+    for client in targets {
+        match client.force_kill() {
+            KillReport::Blocked(reason) => {
+                report.failed.push(format!("{}: {reason}", client.server()));
+                // Put the handle back: a process this did not reach is worth
+                // another try later, not something to forget it existed.
+                live_lock()
+                    .entry(client.server().to_string())
+                    .or_default()
+                    .push(Arc::downgrade(&client));
+            }
+            _ => report.stopped += 1,
+        }
+    }
+    report
+}
+
+/// Stop a process by its id. The last resort when the child handle is locked.
+///
+/// Signal, not reap: whoever holds the [`Child`] still owns the wait.
+#[cfg(windows)]
+fn kill_by_pid(pid: u32) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    // No console window flashes up for a kill nobody asked to see.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let status = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("taskkill exited with {status}"),
+        ))
+    }
+}
+
+/// Stop a process by its id. The last resort when the child handle is locked.
+#[cfg(unix)]
+fn kill_by_pid(pid: u32) -> std::io::Result<()> {
+    // SAFETY: signalling a process needs no memory access. `ESRCH` means the
+    // process went on its own, which is the outcome being asked for.
+    if unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+/// Stop a process by its id, where this platform offers no way to do that.
+#[cfg(not(any(windows, unix)))]
+fn kill_by_pid(pid: u32) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        format!("no way to signal process {pid} on this platform"),
+    ))
 }
 
 /// One Streamable HTTP connection.
@@ -218,8 +510,9 @@ pub(crate) fn resolve_program(command: &str) -> std::path::PathBuf {
             .take()
             .ok_or_else(|| anyhow!("MCP server '{}' has no stdout", spec.id))?;
 
-        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: Arc<Mutex<Pending>> = Arc::new(Mutex::new(Pending::default()));
+        let ids = IdSpace::new();
+        let tag = ids.tag;
 
         // One reader owns stdout for the connection's lifetime.
         {
@@ -239,16 +532,21 @@ pub(crate) fn resolve_program(command: &str) -> std::path::PathBuf {
                         // A notification or a server-initiated request: not used here.
                         continue;
                     };
-                    let sender = pending.lock().await.remove(&id);
-                    if let Some(sender) = sender {
-                        let _ = sender.send(message);
+                    let mut waiting = pending.lock().await;
+                    if !spoken_by(tag, id) {
+                        // An id this connection never spoke — an answer to the
+                        // request of a connection this one replaced, or one the
+                        // server made up. It goes to no waiter, and the count of
+                        // such answers is what a report can point at.
+                        waiting.stray += 1;
+                        continue;
                     }
+                    waiting.deliver(id, message);
                 }
                 // The pipe closed: fail every waiter rather than hang them.
-                let mut waiting = pending.lock().await;
-                for (_, sender) in waiting.drain() {
-                    let _ = sender.send(json!({ "error": { "message": format!("MCP server '{server}' closed the connection") } }));
-                }
+                pending.lock().await.fail_all(json!({
+                    "error": { "message": format!("MCP server '{server}' closed the connection") }
+                }));
             });
         }
 
@@ -256,7 +554,10 @@ pub(crate) fn resolve_program(command: &str) -> std::path::PathBuf {
             server: spec.id.clone(),
             stdin: Some(Arc::new(Mutex::new(stdin))),
             pending,
-            next_id: AtomicU64::new(1),
+            ids,
+            // Captured before the child goes behind a lock: killing by pid is
+            // the one route that does not need a turn with that lock.
+            pid: AtomicU32::new(child.id().unwrap_or(0)),
             child: Some(Mutex::new(child)),
             http: None,
             tools: Vec::new(),
@@ -288,8 +589,10 @@ pub(crate) fn resolve_program(command: &str) -> std::path::PathBuf {
         let mut client = Self {
             server: spec.id.clone(),
             stdin: None,
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            next_id: AtomicU64::new(1),
+            pending: Arc::new(Mutex::new(Pending::default())),
+            ids: IdSpace::new(),
+            // No child, so no pid: there is nothing here to signal.
+            pid: AtomicU32::new(0),
             child: None,
             http: Some(http),
             tools: Vec::new(),
@@ -419,7 +722,11 @@ pub(crate) fn resolve_program(command: &str) -> std::path::PathBuf {
         };
         let mut child = child.lock().await;
         let _ = child.kill().await;
-        let _ = child.wait().await;
+        if child.wait().await.is_ok() {
+            // Waited on: the pid belongs to the operating system again, so the
+            // pid fallback in `force_kill` must never signal it.
+            self.pid.store(0, Ordering::Relaxed);
+        }
     }
 
     /// A bounded close: returns whether the shutdown finished inside `deadline`.
@@ -436,18 +743,63 @@ pub(crate) fn resolve_program(command: &str) -> std::path::PathBuf {
         false
     }
 
-    /// Best-effort synchronous kill: no await, never panics.
+    /// How many answers this connection received that matched no request.
     ///
-    /// The close path calls this *first* so the servers are already on their
-    /// way out before any waiting starts; the `Drop` path is the same call for
-    /// handles nobody shut down explicitly.
-    pub fn force_kill(&self) {
+    /// Zero for a well-behaved server. Anything else means it replayed an id, or
+    /// invented one — useful to know before blaming a slow answer.
+    pub fn stray_answers(&self) -> u64 {
+        match self.pending.try_lock() {
+            Ok(pending) => pending.stray,
+            // A request is in flight this instant; the count is a diagnostic,
+            // not something to wait behind.
+            Err(_) => 0,
+        }
+    }
+
+    /// Best-effort synchronous kill: no await, never panics, and says what it
+    /// managed.
+    ///
+    /// The close path calls this *first* so the servers are already on their way
+    /// out before any waiting starts; the `Drop` path is the same call for
+    /// handles nobody shut down explicitly, and an unload calls it for the
+    /// servers its ledger entry named.
+    ///
+    /// The lock on the child is retried a bounded number of times, then stepped
+    /// around: a call in flight or a close already inside its own wait holds it,
+    /// and a teardown that quietly did nothing because the lock was busy is
+    /// exactly the leak this path exists to prevent. The pid captured at spawn is
+    /// the way in that needs no lock at all.
+    pub fn force_kill(&self) -> KillReport {
         // An HTTP server has no process to kill; its session ends server-side
         // (see `shutdown`) or times out there. Nothing is leaked here.
-        if let Some(child) = &self.child {
+        let Some(child) = &self.child else {
+            return KillReport::NoProcess;
+        };
+
+        for attempt in 0..=KILL_RETRIES {
+            if attempt > 0 {
+                std::thread::sleep(KILL_RETRY_PAUSE);
+            }
             if let Ok(mut child) = child.try_lock() {
                 let _ = child.start_kill();
+                return KillReport::Signalled;
             }
+        }
+
+        // Still locked. The handle cannot be reached, but the process can: the
+        // pid captured at spawn is still this child's — a process nobody has
+        // waited on keeps its number, and a held lock means exactly that.
+        match self.pid.load(Ordering::Relaxed) {
+            0 => KillReport::Blocked(
+                "the child handle stayed locked and the process id was already released"
+                    .to_string(),
+            ),
+            pid => match kill_by_pid(pid) {
+                Ok(()) => KillReport::SignalledByPid(pid),
+                Err(error) => KillReport::Blocked(format!(
+                    "the child handle stayed locked and stopping pid {pid} failed: {error}"
+                )),
+            },
         }
     }
 
@@ -461,8 +813,9 @@ pub(crate) fn resolve_program(command: &str) -> std::path::PathBuf {
         Self {
             server: server.to_string(),
             stdin: Some(Arc::new(Mutex::new(stdin))),
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            next_id: AtomicU64::new(1),
+            pending: Arc::new(Mutex::new(Pending::default())),
+            ids: IdSpace::new(),
+            pid: AtomicU32::new(child.id().unwrap_or(0)),
             child: Some(Mutex::new(child)),
             http: None,
             tools: Vec::new(),
@@ -471,24 +824,46 @@ pub(crate) fn resolve_program(command: &str) -> std::path::PathBuf {
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = self.ids.next();
         let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         if let Some(http) = &self.http {
             return self.http_post(http, Some(id), method, &message).await;
         }
 
         let (sender, receiver) = oneshot::channel();
-        self.pending.lock().await.insert(id, sender);
+        if !self.pending.lock().await.register(id, sender) {
+            return Err(anyhow!(
+                "MCP server '{}' has {} requests already waiting and takes no more",
+                self.server,
+                Pending::LIMIT
+            ));
+        }
 
-        self.write_line(&message).await?;
+        if let Err(error) = self.write_line(&message).await {
+            // Nothing was sent, so nothing is coming: the waiter goes with the
+            // request rather than sitting in the table until the timeout.
+            self.pending.lock().await.forget(id);
+            return Err(error);
+        }
 
         match tokio::time::timeout(self.timeout, receiver).await {
             Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => Err(anyhow!("MCP server '{}' dropped request {id}", self.server)),
+            Ok(Err(_)) => {
+                self.pending.lock().await.forget(id);
+                Err(anyhow!("MCP server '{}' dropped request {id}", self.server))
+            }
             Err(_) => {
-                self.pending.lock().await.remove(&id);
+                // If the entry is already gone, the answer arrived just as the
+                // deadline did and went with the dropped receiver — worth
+                // saying, because it is not the same as a silent server.
+                let waiting = self.pending.lock().await.forget(id);
+                let late = if waiting {
+                    ""
+                } else {
+                    "; its answer arrived too late to be taken"
+                };
                 Err(anyhow!(
-                    "MCP server '{}' timed out after {:?} on {method}",
+                    "MCP server '{}' timed out after {:?} on {method}{late}",
                     self.server,
                     self.timeout
                 ))
@@ -1030,5 +1405,148 @@ mod tests {
             "already dead: {:?}",
             started.elapsed()
         );
+    }
+
+    /// The synchronous kill says what it did instead of returning nothing, so a
+    /// teardown that did not reach a process can report it rather than assume.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_synchronous_kill_reports_what_it_reached() {
+        let client = McpClient::from_child_for_tests(stubborn_child().await, "stub");
+        assert_eq!(
+            client.force_kill(),
+            KillReport::Signalled,
+            "the first kill reaches the child"
+        );
+        assert!(
+            client.force_kill().stopped(),
+            "a second one still reports the server as stopped, not as a leak"
+        );
+    }
+
+    /// A kill that cannot get the handle must still end the process, and must
+    /// say which route it took: this is LOADER-05's silent failure. The handle is
+    /// held here exactly as a close in progress holds it.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn force_kill_goes_around_a_locked_child_and_stops_it_anyway() {
+        let client = McpClient::from_child_for_tests(stubborn_child().await, "stub");
+        let pid = client.pid.load(Ordering::Relaxed);
+        assert_ne!(pid, 0, "a spawned child has a pid to fall back on");
+
+        let held = client
+            .child
+            .as_ref()
+            .expect("the stub is a child process")
+            .lock()
+            .await;
+        let report = client.force_kill();
+        assert_eq!(report, KillReport::SignalledByPid(pid), "{report:?}");
+        drop(held);
+
+        // The child really is gone: the next close is instant rather than a wait
+        // for a process nobody stopped.
+        let started = std::time::Instant::now();
+        assert!(
+            client
+                .shutdown_within(std::time::Duration::from_secs(10))
+                .await
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "already dead: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Ids climb within a connection and every connection draws from its own
+    /// slice, so a rebuilt connection speaks numbers the one it replaced never
+    /// used — and would refuse to answer for them anyway.
+    #[test]
+    fn a_rebuilt_connection_never_speaks_the_old_ones_ids() {
+        let before = IdSpace::new();
+        let old: Vec<u64> = (0..3).map(|_| before.next()).collect();
+        assert!(
+            old.windows(2).all(|pair| pair[0] < pair[1]),
+            "monotonic inside one connection: {old:?}"
+        );
+        assert!(old.iter().all(|id| before.owns(*id)));
+
+        let rebuilt = IdSpace::new();
+        let fresh: Vec<u64> = (0..3).map(|_| rebuilt.next()).collect();
+        assert!(fresh.iter().all(|id| rebuilt.owns(*id)), "{fresh:?}");
+        assert!(
+            fresh.iter().all(|id| !old.contains(id)),
+            "a rebuilt connection must not reuse an id: {old:?} vs {fresh:?}"
+        );
+        assert!(
+            old.iter().all(|id| !rebuilt.owns(*id)),
+            "and would not accept an answer addressed to the old one"
+        );
+    }
+
+    /// An answer is delivered to the request that asked for it, or to nobody.
+    #[test]
+    fn an_answer_reaches_only_the_request_that_asked_for_it() {
+        let mut pending = Pending::default();
+        let (sender, receiver) = oneshot::channel();
+        assert!(pending.register(1, sender));
+
+        assert!(
+            pending.deliver(1, json!({ "result": 1 })),
+            "the waiter for this id takes the answer"
+        );
+        assert_eq!(receiver.blocking_recv().unwrap()["result"], 1);
+
+        // The same id a second time is a replay: it reaches nobody, and the
+        // count of such answers is what a report can point at.
+        assert!(!pending.deliver(1, json!({ "result": 2 })));
+        assert_eq!(pending.stray, 1);
+    }
+
+    /// A request whose caller went away — a cancelled turn, a closed window —
+    /// leaves no waiter behind to fill the table.
+    #[test]
+    fn a_cancelled_request_leaves_no_waiter_behind() {
+        let mut pending = Pending::default();
+        let mut live = Vec::new();
+        for id in 1..=4u64 {
+            let (sender, receiver) = oneshot::channel();
+            assert!(pending.register(id, sender));
+            if id <= 3 {
+                // Its caller went away before any answer arrived.
+                drop(receiver);
+            } else {
+                live.push(receiver);
+            }
+        }
+
+        let (sender, _receiver) = oneshot::channel();
+        assert!(pending.register(5, sender));
+        assert_eq!(
+            pending.waiters.len(),
+            2,
+            "the abandoned waiters are dropped on the way in, the live ones stay"
+        );
+        assert!(pending.waiters.contains_key(&4), "a live caller keeps its waiter");
+        assert!(pending.waiters.contains_key(&5), "and the new request is registered");
+    }
+
+    #[test]
+    fn the_waiter_table_refuses_to_grow_past_its_limit() {
+        // A server that stops answering must not turn the table into a leak.
+        let mut pending = Pending::default();
+        let mut receivers = Vec::new();
+        for id in 1..=Pending::LIMIT as u64 {
+            let (sender, receiver) = oneshot::channel();
+            receivers.push(receiver);
+            assert!(pending.register(id, sender));
+        }
+        let (sender, _receiver) = oneshot::channel();
+        assert!(
+            !pending.register(Pending::LIMIT as u64 + 1, sender),
+            "live waiters are not pruned, so the limit holds"
+        );
+        assert_eq!(pending.waiters.len(), Pending::LIMIT);
     }
 }

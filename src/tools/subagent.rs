@@ -108,6 +108,41 @@ fn tool(access: Arc<dyn ModelAccess>) -> ToolDef {
 }
 
 async fn run(access: Arc<dyn ModelAccess>, args: Value) -> Result<ToolOutput> {
+    // A native async recursion guard: a subtask that could itself delegate
+    // would let one instruction spawn an unbounded tree, and nothing in the
+    // transcript would show where the budget went. The scope is entered around
+    // the body (below), so an error return ends it as surely as success.
+    let current = delegation_depth();
+    if current >= MAX_DEPTH {
+        return Err(anyhow!(
+            "subagents are already {MAX_DEPTH} deep; this one may not delegate further. \
+             Do the work here instead."
+        ));
+    }
+    // The scope *is* the guard: the value lives inside the future and ends
+    // with it, however the delegation ends. The old thread-local + Drop guard
+    // could be incremented on one worker and dropped on another — tokio polls
+    // one task on whichever worker is free — and the count then leaked, after
+    // which a legitimate delegation was refused as "already deepest" forever.
+    enter_delegation(delegate(access, args)).await.1
+}
+
+/// Run `body` one delegation level deeper, and report the depth it ran at.
+///
+/// The depth travels with the future, so it ends where the body ends — on
+/// whichever worker that happens to be. Handing the depth back as well is what
+/// lets a test assert what a real delegation saw, instead of reading another
+/// task's locals from the outside (which a task-local deliberately refuses).
+async fn enter_delegation<F>(body: F) -> (usize, F::Output)
+where
+    F: std::future::Future,
+{
+    let depth = delegation_depth() + 1;
+    DEPTH.scope(depth, async move { (depth, body.await) }).await
+}
+
+/// The body of one delegation, run inside the depth scope.
+async fn delegate(access: Arc<dyn ModelAccess>, args: Value) -> Result<ToolOutput> {
     let task = args
         .get("task")
         .and_then(|t| t.as_str())
@@ -119,25 +154,6 @@ async fn run(access: Arc<dyn ModelAccess>, args: Value) -> Result<ToolOutput> {
                  conversation, so it must be written out in full."
             )
         })?;
-
-    // A native async recursion guard: a subtask that could itself delegate
-    // would let one instruction spawn an unbounded tree, and nothing in the
-    // transcript would show where the budget went.
-    if !DEPTH.with(|depth| {
-        let current = depth.get();
-        if current >= MAX_DEPTH {
-            false
-        } else {
-            depth.set(current + 1);
-            true
-        }
-    }) {
-        return Err(anyhow!(
-            "subagents are already {MAX_DEPTH} deep; this one may not delegate further. \
-             Do the work here instead."
-        ));
-    }
-    let _guard = DepthGuard;
 
     let client = match args.get("model").and_then(|m| m.as_str()) {
         Some(model) => access.client_for(model)?,
@@ -190,22 +206,26 @@ async fn run(access: Arc<dyn ModelAccess>, args: Value) -> Result<ToolOutput> {
 /// How deep delegation may nest.
 const MAX_DEPTH: usize = 2;
 
-thread_local! {
-    /// Depth of delegation on this thread.
+tokio::task_local! {
+    /// Depth of delegation on this task.
     ///
-    /// A thread-local rather than a parameter because the tool handler signature
+    /// A task-local rather than a parameter because the tool handler signature
     /// carries only the arguments, and threading depth through it would change
-    /// every tool for the sake of one.
-    static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// every tool for the sake of one. Explicitly *not* a thread-local: tokio
+    /// polls one task on whichever worker thread is free, so an increment on
+    /// one thread and its restore on another leak the count — silently, until
+    /// a legitimate delegation is refused as "already deepest" forever. A
+    /// task-local travels with the future, so the scope's value ends when the
+    /// delegation does, on any thread.
+    static DEPTH: usize;
 }
 
-/// Puts the depth back however the subtask ends.
-struct DepthGuard;
-
-impl Drop for DepthGuard {
-    fn drop(&mut self) {
-        DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
-    }
+/// How deep the current delegation is; zero outside one.
+///
+/// Read-only, for tests and diagnostics: outside a delegation there is no
+/// scope at all, which is the honest answer to "how deep".
+pub(crate) fn delegation_depth() -> usize {
+    DEPTH.try_with(|depth| *depth).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -370,24 +390,89 @@ mod tests {
     #[tokio::test]
     async fn delegating_past_the_depth_limit_is_refused_by_name() {
         // Depth is entered before the call, so pretend we are already there.
-        DEPTH.with(|depth| depth.set(MAX_DEPTH));
-        let error = run(access(), json!({ "task": "x" }))
+        let error = DEPTH
+            .scope(MAX_DEPTH, run(access(), json!({ "task": "x" })))
             .await
             .expect_err("must refuse");
         let text = format!("{error:#}");
         assert!(text.contains("deep"), "{text}");
-        DEPTH.with(|depth| depth.set(0));
+        // The refusal is the scope check, not a counter somebody has to reset.
+        assert_eq!(delegation_depth(), 0);
     }
 
-    #[test]
-    fn the_depth_guard_restores_the_count() {
-        DEPTH.with(|depth| depth.set(0));
-        DEPTH.with(|depth| depth.set(1));
-        {
-            let _guard = DepthGuard;
-            DEPTH.with(|depth| depth.set(depth.get() + 1));
+    #[tokio::test]
+    async fn the_depth_scope_ends_when_the_delegation_does() {
+        DEPTH.scope(1, async {
+            assert_eq!(delegation_depth(), 1);
+            DEPTH.scope(2, async {
+                assert_eq!(delegation_depth(), 2);
+            })
+            .await;
+            // The inner scope ended: back to the outer value, with nothing
+            // leaked upward — the property a thread-local could not promise.
+            assert_eq!(delegation_depth(), 1);
+        })
+        .await;
+        assert_eq!(delegation_depth(), 0);
+    }
+
+    /// Delegations running at the same time on two workers: each must see
+    /// *itself* at depth 1, and none may leave a count behind.
+    ///
+    /// With the old thread-local guard the increment and its restore could land
+    /// on different threads — tokio polls one task on whichever worker is free
+    /// — so the count leaked and a later legitimate delegation was refused as
+    /// "already deepest" forever. Each body parks across an await so the
+    /// workers really do swap tasks under it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_delegations_see_depth_one_and_leave_nothing_behind() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let seen = Arc::clone(&seen);
+            handles.push(tokio::spawn(async move {
+                // The same entry point the tool itself uses, so this is the
+                // real scope rather than a copy of its arithmetic.
+                let (entered, observed) = enter_delegation(async {
+                    tokio::task::yield_now().await;
+                    delegation_depth()
+                })
+                .await;
+                seen.lock().expect("seen").push((entered, observed));
+            }));
         }
-        assert_eq!(DEPTH.with(|depth| depth.get()), 1, "restored to what it was");
-        DEPTH.with(|depth| depth.set(0));
+        for handle in handles {
+            handle.await.expect("the task ran");
+        }
+        let seen = seen.lock().expect("seen").clone();
+        assert_eq!(seen.len(), 4);
+        assert!(
+            seen.iter().all(|(entered, observed)| *entered == 1 && *observed == 1),
+            "each concurrent delegation runs at depth 1, not at a shared count: {seen:?}"
+        );
+        assert_eq!(
+            delegation_depth(),
+            0,
+            "a finished delegation must leave no count behind"
+        );
+
+        // And the entry point ends the scope on its failure path too: this is
+        // the same wrapper `run` uses, driven with a body that returns an error
+        // instead of calling a provider. Testing the real error path needs a
+        // live transport and a connection timeout — an integration test's job,
+        // not something that should stall the unit suite behind a hang.
+        let (depth, (result, seen)) = enter_delegation(async {
+            tokio::task::yield_now().await;
+            (Err::<(), &'static str>("the transport refused"), delegation_depth())
+        })
+        .await;
+        assert_eq!(depth, 1);
+        assert!(result.is_err(), "the body's error is handed back untouched");
+        assert_eq!(seen, 1, "the body still saw its own depth");
+        assert_eq!(
+            delegation_depth(),
+            0,
+            "a failed delegation left a count behind"
+        );
     }
 }

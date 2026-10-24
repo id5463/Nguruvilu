@@ -61,8 +61,46 @@ impl PendingQueue {
     }
 
     /// Take every request recorded so far, leaving the queue empty.
+    ///
+    /// This is the process-wide sweep, and it is what a host running a single
+    /// conversation wants: the CLI serves one session per process, so every
+    /// entry in its queue belongs to the turn that just ended. A host serving
+    /// several conversations has to use [`PendingQueue::drain_for`] instead,
+    /// because a turn that takes the whole queue loads a pack another
+    /// conversation asked for into its own tool table.
     pub fn drain(&self) -> Vec<Pending> {
         std::mem::take(&mut *self.items.lock().expect("pending queue lock"))
+    }
+
+    /// Take the requests recorded for `session`, leaving the rest queued.
+    ///
+    /// An entry that names no conversation is addressed to all of them — an
+    /// install changes a pack list every conversation reads — so it goes to
+    /// whoever asks first. An entry some conversation queued goes only to that
+    /// conversation, which is why asking with `None` takes the session-free
+    /// entries and nothing else: an identity-less caller has no claim on work
+    /// another conversation is waiting for.
+    pub fn drain_for(&self, session: Option<&str>) -> Vec<Pending> {
+        let mut items = self.items.lock().expect("pending queue lock");
+        let (taken, kept): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut *items)
+            .into_iter()
+            .partition(|item| match (session, queued_for(item)) {
+                (_, None) => true,
+                (Some(asking), Some(queued)) => asking == queued,
+                (None, Some(_)) => false,
+            });
+        *items = kept;
+        taken
+    }
+}
+
+/// The conversation an entry was queued for, or `None` when it is for everyone.
+fn queued_for(item: &Pending) -> Option<&str> {
+    match item {
+        Pending::Load { session, .. } | Pending::Unload { session, .. } => session.as_deref(),
+        // An install is news about the installed set, which every conversation
+        // reads, so it does not belong to one of them.
+        Pending::Installed { .. } => None,
     }
 }
 
@@ -156,9 +194,28 @@ async fn run_with(args: Value, pending: Option<Arc<PendingQueue>>) -> Result<Too
     }
 }
 
+/// The path a `pack` action was given, resolved the way every other tool
+/// resolves one: against the session's workspace, not the process directory.
+///
+/// Every other file-facing tool starts from `tools::current_workspace()` (see
+/// `base::default_base_dir`). This tool used to hand `PathBuf::from` straight to
+/// the installer, so a relative archive path meant "wherever the server happened
+/// to be started" — the one tool that ignored the identity the rest of them
+/// obey, which is exactly how a served session ends up reading a pack file out
+/// of the host's own directory.
+fn resolve(raw: &str) -> PathBuf {
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        return path;
+    }
+    super::current_workspace()
+        .map(|workspace| workspace.join(&path))
+        .unwrap_or(path)
+}
+
 fn build(dir: Option<&str>, out: Option<&str>) -> Result<ToolOutput> {
     let dir = dir.ok_or_else(|| anyhow!("build needs a path: the pack directory"))?;
-    let dir = PathBuf::from(dir);
+    let dir = resolve(dir);
 
     // Report a missing manifest as what it is, with the fix, rather than as a
     // bare filesystem error: this is the mistake a first attempt makes.
@@ -202,7 +259,7 @@ fn build(dir: Option<&str>, out: Option<&str>) -> Result<ToolOutput> {
 
 fn verify(path: Option<&str>) -> Result<ToolOutput> {
     let path = path.ok_or_else(|| anyhow!("verify needs a path: the .dshpack archive"))?;
-    let report = crate::pack::verify(&PathBuf::from(path))?;
+    let report = crate::pack::verify(&resolve(path))?;
 
     let mut text = format!(
         "{} {} — license {}, {} files, assembly {}",
@@ -351,7 +408,7 @@ fn set_loaded(
 
 fn apply(path: Option<&str>, pending: Option<&Arc<PendingQueue>>) -> Result<ToolOutput> {
     let path = path.ok_or_else(|| anyhow!("apply needs a path: the installed assembly.yaml"))?;
-    let assembly = PathBuf::from(path);
+    let assembly = resolve(path);
 
     if !assembly.is_file() {
         return Err(anyhow!(
@@ -400,7 +457,7 @@ fn apply(path: Option<&str>, pending: Option<&Arc<PendingQueue>>) -> Result<Tool
 
 async fn install(path: Option<&str>, pending: Option<&Arc<PendingQueue>>) -> Result<ToolOutput> {
     let path = path.ok_or_else(|| anyhow!("install needs a path: the .dshpack archive"))?;
-    let archive = PathBuf::from(path);
+    let archive = resolve(path);
 
     // Verify before unpacking, so a corrupt archive is reported rather than
     // scattered across the packs directory.
@@ -519,7 +576,9 @@ mod tests {
         std::env::remove_var("NGU_HOME");
 
         assert!(installed.text.contains("Installed tool-ping"), "{}", installed.text);
-        let pending = queue.drain();
+        // The install entry names no conversation, so it is addressed to every
+        // one of them and an identity-less drain is the one that takes it.
+        let pending = queue.drain_for(None);
         assert!(
             pending.iter().any(|item| matches!(
                 item,
@@ -530,6 +589,106 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn draining_for_one_conversation_leaves_anothers_pack_queued() {
+        // One process serves several conversations, so a turn may take only the
+        // work its own conversation asked for: draining everything is how a
+        // pack queued in one conversation loads into another one's tool table.
+        let queue = PendingQueue::new();
+        queue.push(Pending::Load {
+            name: "pack-a".into(),
+            session: Some("session-a".into()),
+        });
+        queue.push(Pending::Load {
+            name: "pack-b".into(),
+            session: Some("session-b".into()),
+        });
+
+        let mine = queue.drain_for(Some("session-a"));
+        assert_eq!(
+            mine,
+            vec![Pending::Load {
+                name: "pack-a".into(),
+                session: Some("session-a".into()),
+            }],
+            "only the pack session A queued comes out"
+        );
+        // B's request names a conversation, so an identity-less ask has no
+        // claim on it and takes nothing.
+        assert!(
+            queue.drain_for(None).is_empty(),
+            "A's request is gone and B's is not free to take"
+        );
+
+        // B's pack is still queued for B's own turn, and only that turn.
+        let theirs = queue.drain_for(Some("session-b"));
+        assert!(
+            matches!(&theirs[..], [Pending::Load { name, .. }] if name == "pack-b"),
+            "{theirs:?}"
+        );
+        assert!(
+            queue.drain_for(Some("session-b")).is_empty(),
+            "the queue is empty once each conversation took its own"
+        );
+    }
+
+    #[test]
+    fn an_install_is_addressed_to_every_conversation() {
+        // Installing changes the installed set, which every conversation reads,
+        // so an entry that names no session must stay available to whichever
+        // conversation drains next rather than be held to one of them.
+        let queue = PendingQueue::new();
+        queue.push(Pending::Installed {
+            name: "shared".into(),
+            version: "2.0.0".into(),
+        });
+        queue.push(Pending::Unload {
+            name: "only-here".into(),
+            session: Some("session-a".into()),
+        });
+
+        let mine = queue.drain_for(Some("session-b"));
+        assert!(
+            matches!(&mine[..], [Pending::Installed { name, version }]
+                if name == "shared" && version == "2.0.0"),
+            "{mine:?}"
+        );
+        assert!(
+            queue.drain_for(Some("session-b")).is_empty(),
+            "the notice is taken once, not on every drain"
+        );
+
+        // The unload was queued by A, so it is still waiting for A.
+        let theirs = queue.drain_for(Some("session-a"));
+        assert!(
+            matches!(&theirs[..], [Pending::Unload { name, .. }] if name == "only-here"),
+            "{theirs:?}"
+        );
+    }
+
+    #[test]
+    fn a_process_wide_drain_still_takes_every_conversations_pack() {
+        // The single-conversation hosts keep the behaviour they have: the CLI
+        // runs one session per process, and a host that owns the queue outright
+        // has no other conversation's work in it to protect.
+        let queue = PendingQueue::new();
+        queue.push(Pending::Load {
+            name: "a".into(),
+            session: Some("session-a".into()),
+        });
+        queue.push(Pending::Load {
+            name: "b".into(),
+            session: Some("session-b".into()),
+        });
+        queue.push(Pending::Installed {
+            name: "c".into(),
+            version: "1.0.0".into(),
+        });
+
+        assert_eq!(queue.drain().len(), 3);
+        assert!(queue.drain().is_empty(), "the sweep leaves nothing behind");
     }
 
     #[tokio::test]

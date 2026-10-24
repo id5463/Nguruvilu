@@ -62,6 +62,64 @@ pub extern "C" fn ngu_describe() -> *const c_char {
         .as_ptr()
 }
 
+/// The ABI revision this plugin was built against.
+///
+/// Optional, but the host checks it before it calls anything else: answering
+/// with a number instead of letting the descriptor JSON carry it means a
+/// mismatched build is refused before any of this plugin's code runs.
+#[no_mangle]
+pub extern "C" fn ngu_abi_version() -> u32 {
+    ABI_VERSION
+}
+
+/// A fingerprint of the `HostApi` layout as *this* crate sees it.
+///
+/// The ABI number alone cannot catch a mirror that agrees on "version 1" and
+/// disagrees about padding, field order, or pointer width. Two builds of the
+/// same revision would then hand each other a table neither of them can read,
+/// and the failure would surface as a crash inside a callback rather than as a
+/// refusal. The host computes the same fingerprint from its own definition and
+/// compares; equal numbers mean the two structs have the same size and the same
+/// offsets.
+///
+/// Optional too: a plugin that does not export it is loaded anyway, with the
+/// ABI number as its only proof.
+#[no_mangle]
+pub extern "C" fn ngu_abi_layout() -> u32 {
+    // Measured from a table built the way the host builds its own, so this
+    // describes the struct above rather than a number somebody typed.
+    let probe = HostApi {
+        abi_version: ABI_VERSION,
+        user_data: std::ptr::null_mut(),
+        log: probe_log,
+        register_tool: probe_register_tool,
+        call_tool: probe_call_tool,
+        free_string: probe_free_string,
+    };
+    let base = &probe as *const HostApi as usize;
+    let probes: [usize; 7] = [
+        std::mem::size_of::<HostApi>(),
+        (&probe.abi_version as *const u32 as usize).wrapping_sub(base),
+        (&probe.user_data as *const *mut c_void as usize).wrapping_sub(base),
+        (&probe.log as *const _ as usize).wrapping_sub(base),
+        (&probe.register_tool as *const _ as usize).wrapping_sub(base),
+        (&probe.call_tool as *const _ as usize).wrapping_sub(base),
+        (&probe.free_string as *const _ as usize).wrapping_sub(base),
+    ];
+
+    // FNV-1a, 32 bit: short, dependency-free, and stable across runs. The
+    // constants and the byte order have to match the host's, or two compatible
+    // tables would disagree.
+    let mut hash: u32 = 0x811c_9dc5;
+    for value in probes {
+        for byte in (value as u64).to_le_bytes() {
+            hash ^= u32::from(byte);
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+    }
+    hash
+}
+
 /// Receive the host table and register this plugin's tools.
 ///
 /// Returns 0 on success; any other value makes the host refuse the plugin.
@@ -188,3 +246,23 @@ fn log(level: u32, message: &str) {
         (api.log)(api.user_data, level, text.as_ptr());
     }
 }
+
+// Placeholders whose *signatures and addresses* are what `ngu_abi_layout`
+// measures. They are never called: if the host's table had different offsets,
+// calling through it would be the crash the fingerprint exists to prevent.
+
+extern "C" fn probe_log(_: *mut c_void, _: u32, _: *const c_char) {}
+
+extern "C" fn probe_register_tool(_: *mut c_void, _: *const c_char) -> u64 {
+    0
+}
+
+extern "C" fn probe_call_tool(
+    _: *mut c_void,
+    _: *const c_char,
+    _: *const c_char,
+) -> *const c_char {
+    std::ptr::null()
+}
+
+extern "C" fn probe_free_string(_: *mut c_char) {}

@@ -274,8 +274,50 @@ async fn run(settings: &JudgeSettings, args: Value) -> Result<ToolOutput> {
         .with_context(|| format!("reaching the judge at {}", settings.endpoint))?;
 
     let status = response.status();
-    let text = response.text().await.unwrap_or_default();
+    let text = body_text(response, "the judge").await?;
     Ok(ToolOutput::text(interpret(status, &text)?))
+}
+
+/// The most response body one of these tool calls reads into memory.
+///
+/// A judge or search answer is kilobytes; the cap exists for a misbehaving or
+/// hostile endpoint, and it is enforced while streaming, so an oversized body
+/// fails at the cap instead of after being buffered in full.
+pub(crate) const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Read a response body as text, bounded, with read errors kept honest.
+///
+/// `response.text().await.unwrap_or_default()` — the shape this replaces — did
+/// neither: it buffered whatever the endpoint sent, and it turned a read error
+/// into an empty body, which then surfaced as "non-JSON body: " with the real
+/// cause gone. This streams up to [`MAX_BODY_BYTES`], and a broken read is an
+/// error that names what broke. (`search.rs` shares this helper: both are
+/// plain HTTP tool calls with the same two failure modes.)
+pub(crate) async fn body_text(response: reqwest::Response, what: &str) -> Result<String> {
+    use futures_util::StreamExt;
+
+    let declared = response.content_length();
+    if declared.unwrap_or(0) > MAX_BODY_BYTES as u64 {
+        return Err(anyhow!(
+            "{what} announced more than {} MiB of body; refusing to read it",
+            MAX_BODY_BYTES / (1024 * 1024)
+        ));
+    }
+    // Reserve what the response claims, but never on the strength of a number
+    // that would itself be an allocation worth avoiding.
+    let mut bytes = Vec::with_capacity(declared.unwrap_or(0).min(64 * 1024) as usize);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.with_context(|| format!("{what} response could not be read"))?;
+        if bytes.len() + chunk.len() > MAX_BODY_BYTES {
+            return Err(anyhow!(
+                "{what} sent more than {} MiB of body; refusing to read it",
+                MAX_BODY_BYTES / (1024 * 1024)
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Turn a response (or a failure) into the transcript.
@@ -323,7 +365,20 @@ fn interpret(status: reqwest::StatusCode, text: &str) -> Result<String> {
             usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0)
         ));
     }
-    out.push_str(&format!("raw: {}", compact(&value)));
+    // The echo is a convenience, not the answer. Review endpoints commonly
+    // repeat the material they were sent, so an unclipped `raw:` line can
+    // duplicate the whole input on every call: the full reply is not worth its
+    // size in the transcript. Everything the model acts on is already in the
+    // structured fields above, so only the echo is bounded.
+    let echoed = compact(&value);
+    let echoed_chars = echoed.chars().count();
+    out.push_str(&format!("raw: {}", clip(&echoed, RAW_ECHO_CAP)));
+    if echoed_chars > RAW_ECHO_CAP {
+        out.push_str(&format!(
+            "\n(raw cut after {RAW_ECHO_CAP} of {echoed_chars} characters; the \
+             structured fields above are complete)"
+        ));
+    }
     Ok(out)
 }
 
@@ -372,6 +427,27 @@ fn flatten_answer(answer: &Value) -> String {
 
 fn compact(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+}
+
+/// How much of a judge reply is echoed into the transcript as `raw`.
+///
+/// The structured fields carry the answer; the echo exists so an unexpected
+/// shape can be checked by eye. A review endpoint that echoes its own input
+/// makes that echo as large as the material, and the transcript pays for every
+/// character of it on every turn the reply stays in context.
+const RAW_ECHO_CAP: usize = 2000;
+
+/// Shorten text to `max` characters without cutting one in half.
+///
+/// The marker is a real ellipsis, so a clipped reply is visibly clipped rather
+/// than looking like a shorter one.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max).collect();
+    out.push('…');
+    out
 }
 
 fn snippet_of(text: &str) -> String {
@@ -489,6 +565,49 @@ mod tests {
         assert!(text.contains("is_bug: true"), "{text}");
         assert!(text.contains("confidence 0.970"), "{text}");
         assert!(text.contains("416 in / 42 out"), "{text}");
+    }
+
+    #[test]
+    fn a_reply_far_larger_than_the_cap_keeps_a_bounded_raw_excerpt() {
+        // A review endpoint that echoes the state it was given turns `raw:`
+        // into a second copy of the whole input. The excerpt must stay bounded
+        // and must say it was cut, while the answer itself stays complete.
+        let filler = "x".repeat(60_000);
+        let body = json!({
+            "model": "jev-1.13.0",
+            "answers": {
+                "is_bug": { "type": "noul", "value": true, "confidence": 0.97 }
+            },
+            "usage": { "input_tokens": 20_000, "output_tokens": 2 },
+            "review": { "echoed_state": filler }
+        });
+        let text = interpret(
+            reqwest::StatusCode::OK,
+            &serde_json::to_string(&body).unwrap(),
+        )
+        .unwrap();
+
+        assert!(text.contains("is_bug: true"), "the answer survives: {text}");
+        assert!(text.contains("confidence 0.970"), "{text}");
+        assert!(text.contains("raw cut after"), "the cut is reported: {text}");
+
+        let raw_line = text
+            .lines()
+            .find(|line| line.starts_with("raw: "))
+            .expect("a raw excerpt line");
+        assert!(
+            raw_line.chars().count() <= RAW_ECHO_CAP + 6,
+            "raw excerpt is bounded: {} chars",
+            raw_line.chars().count()
+        );
+        assert!(
+            raw_line.ends_with('…'),
+            "the excerpt is visibly cut: {raw_line}"
+        );
+        assert!(
+            text.chars().count() < 60_000,
+            "the transcript does not carry the whole echo"
+        );
     }
 
     #[test]

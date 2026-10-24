@@ -211,6 +211,35 @@ const MAX_CONTINUATIONS: usize = 3;
 /// What a stopped turn reports as its error.
 const STOPPED: &str = "stopped by the user";
 
+/// How much of a tool's failure is sent back to the model.
+///
+/// `{error:#}` is the whole anyhow cause chain, written for a developer sitting
+/// at the terminal: nested absolute paths, internal hostnames, a token pasted
+/// into a failed URL, a stack of "while doing X" contexts. All of it would go
+/// out to the provider and stay in the history for the rest of the session —
+/// and a model that can read the plumbing tends to imitate it. The model needs
+/// to know *which call failed and for what reason*; that fits in a line.
+const MAX_TOOL_ERROR_BYTES: usize = 500;
+
+/// A bounded, single-line summary of a tool failure, for the transcript.
+///
+/// The top-level message is kept (it names the failure), the cause chain is
+/// dropped, newlines are collapsed so one error cannot impersonate several
+/// turns of text, and the tail is cut at a character boundary with the cut
+/// marked. A synthetic "tool panicked" line is short and passes through here
+/// unchanged.
+fn summarize_tool_error(error: &anyhow::Error) -> String {
+    let one_line = error.to_string().trim().replace(['\n', '\r'], " ");
+    if one_line.len() <= MAX_TOOL_ERROR_BYTES {
+        return one_line;
+    }
+    let mut end = MAX_TOOL_ERROR_BYTES;
+    while end > 0 && !one_line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [truncated]", &one_line[..end])
+}
+
 /// Waits until a stop is requested for the turn this receiver belongs to.
 ///
 /// `false` means the requester went away without asking — nobody will ever
@@ -282,6 +311,13 @@ pub struct Agent {
     /// is built — so the model reads it on its next step. `None` for hosts
     /// without steering (CLI, subagents).
     inbox: Option<Arc<std::sync::Mutex<VecDeque<String>>>>,
+    /// The session this turn belongs to, when the host knows it.
+    ///
+    /// Resolved once at the start of [`Agent::run`] and handed to every tool
+    /// call, so a host that re-homes its "current session" mid-turn (the
+    /// desktop does, on every switch) cannot move a running turn's workspace
+    /// or its job attribution. `None` means "ask the registry at turn start".
+    identity: Option<crate::tools::ToolIdentity>,
 }
 
 impl Agent {
@@ -297,7 +333,19 @@ impl Agent {
             injection_override: None,
             cancel: None,
             inbox: None,
+            identity: None,
         }
+    }
+
+    /// Bind this turn to one session and its workspace.
+    ///
+    /// Hosts that serve more than one conversation (the desktop, an embedded
+    /// server) pass the session they are running for. Without it the turn
+    /// falls back to whatever the registry has pinned when the turn starts —
+    /// still a snapshot, never a per-call read.
+    pub fn with_identity(mut self, identity: crate::tools::ToolIdentity) -> Self {
+        self.identity = Some(identity);
+        self
     }
 
     /// Build an agent over a fixed configuration.
@@ -388,6 +436,26 @@ impl Agent {
         // Frozen for the whole turn: a reload landing now is next turn's news.
         let settings = self.config.settings();
 
+        // The tool table is frozen with them, for a reason of its own: the
+        // desktop releases a conversation's plugins when that conversation is
+        // left, and a background turn can still be running. Reading the live
+        // table per step would let a tool the model has already seen vanish
+        // between two steps, and the turn would end on "no tool named …"
+        // halfway through its work. Copying the table is cheap — every handler
+        // is an `Arc` — and the copy is what keeps the code it names alive
+        // until this turn returns.
+        let tools = Arc::new((*settings.tools).clone());
+
+        // The session identity is frozen the same way, and for a sharper
+        // reason: the desktop pins "the current session" onto one shared tool
+        // table, so reading it per call would let a switch mid-turn re-home
+        // this turn's `bash` cwd, relative paths and job ownership. One read,
+        // at turn start, then every tool call in this turn carries it.
+        let identity = self
+            .identity
+            .clone()
+            .unwrap_or_else(|| tools.default_identity());
+
         let mut outcome = AgentOutcome {
             text: String::new(),
             steps: 0,
@@ -402,7 +470,7 @@ impl Agent {
             retries: 0,
         };
 
-        let schemas = settings.tools.schemas();
+        let schemas = tools.schemas();
 
         // What the provider last reported for the prompt. This is the only
         // accurate size signal available: estimating from characters drifts
@@ -432,7 +500,17 @@ impl Agent {
             // committed like any other — they are model-visible from here on.
             let inbox = self.inbox.clone();
             if let Some(inbox) = inbox {
-                let texts: Vec<String> = inbox.lock().expect("inbox").drain(..).collect();
+                // A panic in another thread while the inbox was locked poisons
+                // the mutex. The queue itself is intact — it is a plain
+                // `VecDeque` with no invariant a torn write could break, and
+                // `drain` leaves it empty either way — so the step continues
+                // with what is there. Panicking here instead would fail every
+                // remaining step of the turn for a lock that has nothing left
+                // to corrupt.
+                let texts: Vec<String> = match inbox.lock() {
+                    Ok(mut queue) => queue.drain(..).collect(),
+                    Err(poisoned) => poisoned.into_inner().drain(..).collect(),
+                };
                 for text in texts {
                     let message = Message::user(text);
                     self.messages.push(message.clone());
@@ -505,6 +583,13 @@ impl Agent {
 
                 match &produced.error {
                     Some(error) => {
+                        // A provider that refuses an oversized prompt names the
+                        // window it enforces, and that is a fact about this
+                        // route rather than about the model id. It is recorded
+                        // here, before the retry decision, so the next
+                        // compaction check measures against it — the failure
+                        // itself still travels exactly as far as it did before.
+                        record_reported_window(error, &settings.model);
                         let retry = llm::retryable(error);
                         if retry && attempt < max_attempts {
                             let message = format!("{error:#}");
@@ -531,6 +616,12 @@ impl Agent {
             outcome.usage.input += out.usage.input;
             outcome.usage.output += out.usage.output;
             outcome.usage.cached += out.usage.cached;
+            // Cache *writes* are billed at a premium and reasoning tokens are
+            // billed as output, so dropping either under-reports what the turn
+            // cost. Both are summed here for the same reason as the other
+            // counters: the ledger is the only place a user sees the bill.
+            outcome.usage.cache_created += out.usage.cache_created;
+            outcome.usage.reasoning += out.usage.reasoning;
 
             // Remember the prompt size the provider just reported, so the next
             // step can decide whether history needs reducing.
@@ -627,21 +718,31 @@ impl Agent {
             // Dispatch every call concurrently, then restore call order.
             let tools_started = Instant::now();
             let mut set: JoinSet<(usize, ToolCall, Result<crate::tools::ToolOutput>)> = JoinSet::new();
-            for (position, call) in tool_calls.iter().enumerate() {
-                let registry = Arc::clone(&settings.tools);
-                let call = call.clone();
-                self.observer.on_tool_start(&call.name, &call.arguments);
-                set.spawn(async move {
-                    let result = registry.execute(&call.name, &call.arguments).await;
-                    (position, call, result)
-                });
+            // A stop that landed while the answer was being committed is seen
+            // *before* the batch starts. The user has already walked away, and
+            // starting a whole set of tools anyway spends side effects nobody
+            // will read. The calls are answered below regardless, so the
+            // history stays complete either way.
+            let mut stopped = self.stop_requested();
+            if !stopped {
+                for (position, call) in tool_calls.iter().enumerate() {
+                    let registry = Arc::clone(&tools);
+                    let call = call.clone();
+                    let identity = identity.clone();
+                    self.observer.on_tool_start(&call.name, &call.arguments);
+                    set.spawn(async move {
+                        let result = registry
+                            .execute_as(identity, &call.name, &call.arguments)
+                            .await;
+                        (position, call, result)
+                    });
+                }
             }
 
             let mut results: Vec<Option<(ToolCall, Result<crate::tools::ToolOutput>)>> =
                 (0..tool_calls.len()).map(|_| None).collect();
             // Collecting is cancellable: a bash call that runs for minutes
             // must not outlive the user's decision to stop watching it.
-            let mut stopped = false;
             let mut stop = self.cancel.clone();
             let mut stop_closed = false;
             'collect: loop {
@@ -667,7 +768,20 @@ impl Agent {
                 };
                 match joined {
                     Some(Ok((position, call, result))) => results[position] = Some((call, result)),
-                    Some(Err(error)) => return Err(error.into()),
+                    Some(Err(failed)) => {
+                        // The tool task died: a panic inside the handler, or an
+                        // abort from the runtime. Its slot stays empty and the
+                        // loop below answers that call explicitly.
+                        //
+                        // Escaping the turn with `failed` here (what this arm
+                        // used to do) skipped that fill-in with the assistant
+                        // message already committed: a `tool_call` with no
+                        // result. Every later request built from that history
+                        // is refused by the provider with a 400, so one
+                        // panicking tool cost the whole conversation instead of
+                        // one call.
+                        eprintln!("[tools] task failed: {failed}");
+                    }
                     // Every task finished: nothing left to wait for.
                     None => break 'collect,
                 }
@@ -694,8 +808,12 @@ impl Agent {
                     None if stopped => Err(anyhow::anyhow!(
                         "stopped by the user before this tool call finished"
                     )),
-                    // Unreachable without a stop: every task joined above.
-                    None => continue,
+                    // A task that died without a stop request: it panicked or
+                    // was aborted, so nothing was written into its slot. The
+                    // call is answered explicitly anyway — the same rule as
+                    // above, and this arm *is* reachable: a panicking tool is
+                    // exactly what lands here.
+                    None => Err(anyhow::anyhow!("tool panicked: {}", call.name)),
                 };
                 outcome.tool_calls += 1;
                 let (ok, body) = match result {
@@ -705,7 +823,7 @@ impl Agent {
                         }
                         (true, output.text)
                     }
-                    Err(error) => (false, format!("error: {error:#}")),
+                    Err(error) => (false, format!("error: {}", summarize_tool_error(&error))),
                 };
                 self.observer.on_tool_end(&call.name, ok, &body);
                 let message = Message::tool_result(call.id.clone(), call.name.clone(), body);
@@ -960,6 +1078,28 @@ impl Agent {
         }
 
         (request, injection)
+    }
+}
+
+/// Learn this route's real context window from a provider error.
+///
+/// The built-in table is a guess about a model id, and it is wrong on exactly
+/// the routes that matter — a gateway serving an id whose window is smaller than
+/// the family name implies. The rejection message is the provider's own
+/// statement about the route in front of us, so the number is recorded in the
+/// store the context policy consults, and the next `should_compact` measures
+/// against the real limit instead of the table's estimate.
+///
+/// Nothing about the failure changes here: the error is neither consumed nor
+/// reworded, the retry classification is untouched, and the turn still ends the
+/// way it did before. Only a number is taken from it.
+fn record_reported_window(error: &anyhow::Error, model: &str) {
+    // The whole chain is flattened because the number usually sits one or more
+    // layers down: the streaming open labels the failure with the URL it posted
+    // to, above the request error whose message carries the provider's words.
+    let message = format!("{error:#}");
+    if let Some(tokens) = llm::reported_window(&message) {
+        window::reported_windows().record(model, tokens);
     }
 }
 
@@ -1333,6 +1473,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rejected_prompt_teaches_the_route_its_real_window() {
+        // A gateway whose model accepts far less than the family table assumes
+        // answers an oversized prompt with a 400 that names the limit. The turn
+        // must still fail exactly as it did before, and the next compaction
+        // decision must measure against the number the provider stated instead
+        // of against the table's estimate for the model id.
+        //
+        // The id is unique because the report is stored process-wide: recording
+        // one for a name another test resolves would make these tests depend on
+        // the order they ran in.
+        let model = format!("window-probe-{}", uuid::Uuid::new_v4().simple());
+        let body = serde_json::json!({
+            "error": { "message": "This model's maximum context length is 8192 tokens" }
+        })
+        .to_string();
+        let (base, hits) = provider(vec![format!(
+            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}"
+        )])
+        .await;
+
+        let tools = Arc::new(ToolRegistry::with_base_tools().unwrap());
+        let config: Arc<dyn TurnConfig> = Arc::new(StaticConfig::new("SYS", tools, model.clone()));
+        let client = LlmClient::new(crate::llm::LlmConfig::new(base, "k", model.clone())).unwrap();
+        let mut agent = Agent::new(client, config, Vec::new());
+
+        let outcome = agent.run("go").await.expect("the loop still answers");
+
+        assert!(outcome.error.is_some(), "a rejected request still fails the turn");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "and it is still not retried"
+        );
+        assert_eq!(
+            window::reported_windows().get(&model),
+            Some(8192),
+            "the provider's own number is learned from its refusal"
+        );
+        let resolved = window::DefaultContextPolicy::default().window(&model);
+        assert_eq!(resolved.tokens, 8192);
+        assert_eq!(resolved.source, window::WindowSource::Provider);
+    }
+
+    #[tokio::test]
     async fn an_empty_response_is_retried_and_then_reported() {
         let (base, hits) = provider(vec!["HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: [DONE]\n\n".to_string()])
             .await;
@@ -1345,5 +1529,207 @@ mod tests {
         // Default budget: one attempt plus three retries.
         assert_eq!(outcome.retries, 3);
         assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 4);
+    }
+
+    #[tokio::test]
+    async fn a_poisoned_inbox_does_not_end_the_turn() {
+        // A panic in another thread while the inbox was locked leaves the mutex
+        // poisoned. `expect("inbox")` then panics on *every* remaining step of
+        // the turn, so one unrelated panic silently breaks the whole loop. The
+        // queue is a plain `VecDeque` and is still intact, so the step goes on
+        // with what is there.
+        //
+        // The panic printed while this test sets that up is the point: poisoning
+        // can only happen by panicking, so it cannot be arranged quietly.
+        let inbox: Arc<std::sync::Mutex<VecDeque<String>>> =
+            Arc::new(std::sync::Mutex::new(VecDeque::new()));
+        let doomed = Arc::clone(&inbox);
+        let _ = std::thread::spawn(move || {
+            let mut queue = doomed.lock().expect("a fresh lock");
+            queue.push_back("said while the thread was dying".to_string());
+            panic!("this panic is what poisons the inbox");
+        })
+        .join();
+        assert!(inbox.lock().is_err(), "the mutex is poisoned");
+
+        let (base, hits) = provider(vec![sse_answer("answered", "stop")]).await;
+        let mut agent = agent_against(base).with_inbox(Arc::clone(&inbox));
+
+        let outcome = agent.run("go").await.expect("the turn must not panic");
+
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(outcome.text, "answered");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        // What was queued before the poison still reached the model, and the
+        // queue was drained rather than left to be re-read on every step.
+        let texts: Vec<String> = agent
+            .messages()
+            .iter()
+            .map(|message| message.text().to_string())
+            .collect();
+        assert!(
+            texts.iter().any(|text| text == "said while the thread was dying"),
+            "the steering text survived: {texts:?}"
+        );
+        let drained = match inbox.lock() {
+            Ok(queue) => queue.is_empty(),
+            Err(poisoned) => poisoned.into_inner().is_empty(),
+        };
+        assert!(drained, "claimed once, not on every step");
+    }
+
+    /// A registry holding exactly one tool, built from a handler.
+    fn registry_with(
+        name: &str,
+        handler: impl Fn(serde_json::Value) -> crate::tools::ToolFuture + Send + Sync + 'static,
+    ) -> Arc<ToolRegistry> {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(
+                crate::tools::ToolDef::new(
+                    name,
+                    "a tool that does exactly what this test needs",
+                    serde_json::json!({ "type": "object", "properties": {} }),
+                    "test",
+                    handler,
+                ),
+                crate::tools::ConflictPolicy::Error,
+            )
+            .expect("the tool registers");
+        Arc::new(registry)
+    }
+
+    /// One SSE response asking for a single tool call.
+    fn sse_tool_call(id: &str, name: &str, arguments: &str) -> String {
+        let frame = serde_json::json!({
+            "choices": [{
+                "delta": { "tool_calls": [{
+                    "index": 0,
+                    "id": id,
+                    "function": { "name": name, "arguments": arguments }
+                }]},
+                "finish_reason": "tool_calls"
+            }]
+        });
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {frame}\n\ndata: [DONE]\n\n"
+        )
+    }
+
+    /// An agent against `base`, with `tools` and a single step per turn.
+    fn agent_with_tools(base: String, tools: Arc<ToolRegistry>) -> Agent {
+        let config: Arc<dyn TurnConfig> = Arc::new(StaticConfig::new("SYS", tools, "test-model"));
+        let client = LlmClient::new(crate::llm::LlmConfig::new(base, "k", "test-model"))
+            .expect("client builds");
+        Agent::new(client, config, Vec::new()).with_max_steps(1)
+    }
+
+    /// The tool message answering call `id`, if the history holds one.
+    fn answer_to(agent: &Agent, id: &str) -> Option<String> {
+        agent.messages().iter().find_map(|message| {
+            (message.role == crate::message::Role::Tool
+                && message.tool_call_id.as_deref() == Some(id))
+            .then(|| message.text().to_string())
+        })
+    }
+
+    #[tokio::test]
+    async fn a_panicking_tool_is_answered_instead_of_ending_the_turn() {
+        // A panic inside a tool makes its task return a `JoinError`. The
+        // assistant message that asked for the call is already in the history,
+        // so letting that error escape leaves a call with no result — a history
+        // no provider accepts, refused with a 400 on every later request, which
+        // ends the conversation rather than the call. The call is answered
+        // instead, and the turn goes on.
+        let tools = registry_with("boom", |_arguments| -> crate::tools::ToolFuture {
+            Box::pin(async move {
+                panic!("the tool went down");
+            })
+        });
+        let (base, hits) = provider(vec![sse_tool_call("call_1", "boom", "{}")]).await;
+        let mut agent = agent_with_tools(base, tools);
+
+        let outcome = agent
+            .run("go")
+            .await
+            .expect("a panicking tool must not end the turn");
+
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(outcome.tool_calls, 1);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        // The pairing, asserted where a request builder looks for it: the call
+        // is immediately followed by its result, and the result names the call.
+        let messages = agent.messages();
+        let call_at = messages
+            .iter()
+            .position(|message| !message.tool_calls.is_empty())
+            .expect("the call was committed");
+        assert_eq!(messages[call_at].tool_calls[0].id, "call_1");
+        assert_eq!(messages[call_at + 1].role, crate::message::Role::Tool);
+        assert_eq!(
+            messages[call_at + 1].tool_call_id.as_deref(),
+            Some("call_1")
+        );
+
+        // The model reads a failure it can act on, not a missing answer.
+        let answer = answer_to(&agent, "call_1").expect("the call has an answer");
+        assert!(answer.starts_with("error:"), "{answer}");
+        assert!(answer.contains("tool panicked: boom"), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn a_tool_failure_reaches_the_model_as_a_bounded_summary() {
+        // The whole cause chain is a developer artifact — nested contexts,
+        // absolute paths, internal hostnames, a token pasted into a failed URL —
+        // and it enters the history and travels to the provider on every request
+        // after it. The model gets the top-level reason, bounded and on one line;
+        // the chain underneath stays in the log.
+        let tools = registry_with("explode", |_arguments| -> crate::tools::ToolFuture {
+            Box::pin(async move {
+                let long = "C:\\Users\\someone\\project\\".to_string() + &"nested\\".repeat(200);
+                let failed: Result<crate::tools::ToolOutput> = Err(anyhow::anyhow!(
+                    "no such device (os error 6)"
+                )
+                .context(format!("copy failed for {long}artifact.bin")));
+                failed
+            })
+        });
+        let (base, _) = provider(vec![sse_tool_call("call_2", "explode", "{}")]).await;
+        let mut agent = agent_with_tools(base, tools);
+
+        let outcome = agent.run("go").await.expect("the turn finishes");
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        let answer = answer_to(&agent, "call_2").expect("the call has an answer");
+        assert!(answer.starts_with("error: copy failed"), "{answer}");
+        assert!(
+            answer.len() <= "error: ".len() + MAX_TOOL_ERROR_BYTES + "… [truncated]".len(),
+            "the failure is bounded; it was {} bytes",
+            answer.len()
+        );
+        assert!(answer.ends_with("[truncated]"), "{answer}");
+        assert!(
+            !answer.contains("no such device"),
+            "the cause chain stays out of the transcript: {answer}"
+        );
+        assert!(!answer.contains('\n'), "one line, not several: {answer}");
+    }
+
+    #[test]
+    fn a_long_tool_error_is_cut_at_a_character_boundary() {
+        // Cutting by byte would split a multi-byte character and put U+FFFD in
+        // the transcript. Chinese text is the easy way to reach the limit.
+        let error = anyhow::anyhow!("读取失败：{}", "路径".repeat(400));
+        let summary = summarize_tool_error(&error);
+        assert!(summary.ends_with("[truncated]"), "{summary}");
+        assert!(summary.len() <= MAX_TOOL_ERROR_BYTES + "… [truncated]".len());
+        assert!(!summary.contains('\u{FFFD}'), "no torn characters: {summary}");
+        assert!(summary.starts_with("读取失败："), "the reason survives");
+
+        // A short failure passes through untouched, newlines collapsed.
+        let short = summarize_tool_error(&anyhow::anyhow!("line one\nline two"));
+        assert_eq!(short, "line one line two");
     }
 }

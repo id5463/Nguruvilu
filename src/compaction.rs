@@ -21,16 +21,37 @@
 //! rewriting the file. The store is append-only precisely so a crash cannot
 //! corrupt it, and rewriting would give that up. On load, a compaction record
 //! replaces the run it covers, so a reloaded session matches what the model saw.
+//!
+//! # How the record finds its run again
+//!
+//! A count alone — "the first N messages" — says where the run *started*, not
+//! which messages it held. N is exactly what a missing line changes, and a
+//! session file can lose a line for reasons this program never sees: an
+//! interrupted write, a hand edit, a merge between machines, an unparsable line
+//! skipped by the reader. So a record also stores [`anchors_of`] the run it
+//! replaced, and the store finds the span by those ids. When they are gone, the
+//! store says so instead of folding at the old offset. The count stays as well:
+//! it is the fallback for records written before anchors existed, and it is the
+//! check the anchors are measured against.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::llm::LlmClient;
 use crate::message::Message;
 
 /// The kernel's record of one compaction.
+///
+/// The count and the summary are all this in-memory record carries. The ids of
+/// the run it replaced — the anchors a replay needs — are added when the record
+/// is written down, because only a session store can see which messages a
+/// loader will reduce; see [`crate::session`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Compaction {
     /// How many leading messages the summary stands in for.
+    ///
+    /// Kept as the fallback for records written before anchors existed, and as
+    /// the length the anchors are measured against.
     pub replaced: usize,
     /// The summary text.
     pub summary: String,
@@ -50,6 +71,138 @@ impl Compaction {
     pub fn is_summary(message: &Message) -> bool {
         message.text().starts_with(Self::MARKER)
     }
+}
+
+/// How many hex characters of an anchor's digest are kept.
+///
+/// Sixteen hex characters is 64 bits, which no session will ever collide on by
+/// accident, and the identifier still fits in a log line that a person reads.
+pub const ANCHOR_HEX: usize = 16;
+
+/// A stable identifier for one message.
+///
+/// A message carries no generated id — the wire format has none, and inventing
+/// one would have to be threaded through every producer and every file already
+/// on disk — so the identifier is derived from what the message *is*: its role,
+/// its text, the calls it makes or answers, and where its images point. A
+/// message's anchor therefore survives being reloaded, copied between machines,
+/// or written by a different build.
+///
+/// This digest is deliberately independent of the run fingerprint in
+/// [`crate::session`]. That one guards a whole stored run against a count that
+/// no longer describes it; this one names a single message. They cover the same
+/// fields, but deriving one from the other would mean a change to either
+/// invalidates records the other has already written.
+pub fn anchor_of(message: &Message) -> String {
+    let mut hasher = Sha256::new();
+    // A version tag, so a later change to this digest cannot be mistaken for a
+    // match against an anchor written by an older build.
+    hasher.update(b"nguruvilu/anchor/1");
+    anchor_field(&mut hasher, message.role.as_wire().as_bytes());
+    anchor_field(&mut hasher, message.text().as_bytes());
+    hasher.update((message.tool_calls.len() as u64).to_le_bytes());
+    for call in &message.tool_calls {
+        anchor_field(&mut hasher, call.id.as_bytes());
+        anchor_field(&mut hasher, call.name.as_bytes());
+        anchor_field(&mut hasher, call.arguments.as_bytes());
+    }
+    anchor_field(
+        &mut hasher,
+        message.tool_call_id.as_deref().unwrap_or("").as_bytes(),
+    );
+    hasher.update((message.images.len() as u64).to_le_bytes());
+    for image in &message.images {
+        anchor_field(&mut hasher, image.url.as_bytes());
+    }
+    let hex = format!("{:x}", hasher.finalize());
+    hex[..ANCHOR_HEX.min(hex.len())].to_string()
+}
+
+/// Feed one length-prefixed field into an anchor digest.
+///
+/// Length-prefixed rather than delimited: two different messages must not hash
+/// the same because one of them happened to contain the separator.
+fn anchor_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+/// The anchors naming both ends of a run, when there is a run to name.
+///
+/// Both ends are stored because one id cannot tell a run that lost its last
+/// message from a run that is intact: the record has to bracket the span it
+/// replaced, not merely point into it.
+pub fn anchors_of(run: &[Message]) -> Option<(String, String)> {
+    let first = run.first()?;
+    let last = run.last()?;
+    Some((anchor_of(first), anchor_of(last)))
+}
+
+/// The refusal for a record whose anchor is not in the transcript.
+///
+/// One wording for either end, because which end went missing is a detail of
+/// the damage, not of the conclusion: the run cannot be identified, so the
+/// summary must not be applied to whatever happens to sit at the recorded
+/// offset.
+fn anchor_missing(which: &str, count: usize) -> String {
+    format!(
+        "the {which} message it replaced is no longer in the file; \
+         not applied, kept all {count} messages"
+    )
+}
+
+/// Locate the span a compaction record replaced, by the anchors it stored.
+///
+/// Returns the inclusive index range into `messages`, or the reason the span
+/// cannot be trusted. The reason is a lowercase clause written to be read after
+/// the record's number ("compaction #2: ..."): the session loader prefixes it
+/// and reports it as drift.
+///
+/// A count says "the first N", and a count is exactly what a missing line
+/// changes. So when a record carries anchors, the count is only used to
+/// sanity-check the span the anchors found: the anchors say *which* messages,
+/// the count says *how many* must be between them. A record whose anchors
+/// cannot both be found, or whose found span is not the length it recorded, is
+/// refused rather than guessed at — folding the wrong run deletes messages no
+/// summary ever stood in for, and nothing else in the system would notice.
+pub fn locate_span(
+    messages: &[Message],
+    replaced: usize,
+    first: &str,
+    last: &str,
+) -> Result<(usize, usize), String> {
+    let start = messages
+        .iter()
+        .position(|message| anchor_of(message) == first)
+        .ok_or_else(|| anchor_missing("first", messages.len()))?;
+
+    // The count is checked first, because on an intact transcript it is exact:
+    // the last replaced message sits precisely `replaced` slots after the first
+    // one, and an identical message repeating elsewhere cannot fool that check.
+    // Only when it is not there is the anchor itself searched for, and then the
+    // span is measured against the count instead of being trusted.
+    let end = match start.checked_add(replaced.saturating_sub(1)) {
+        Some(candidate) if messages.get(candidate).map(anchor_of).as_deref() == Some(last) => {
+            candidate
+        }
+        _ => messages
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find(|(_, message)| anchor_of(*message) == last)
+            .map(|(index, _)| index)
+            .ok_or_else(|| anchor_missing("last", messages.len()))?,
+    };
+
+    let span = end - start + 1;
+    if span != replaced {
+        return Err(format!(
+            "the run it replaced is now {span} messages long, not the {replaced} it recorded; \
+             not applied, kept all {} messages",
+            messages.len()
+        ));
+    }
+    Ok((start, end))
 }
 
 /// Which leading messages to summarize.
@@ -246,6 +399,10 @@ pub async fn summarize(
 /// Replace a leading run of messages with a summary.
 ///
 /// Returns the new history. Callers pass the result straight back to the agent.
+///
+/// The record built on the way carries the count and the summary, and nothing
+/// else: the anchors that identify the run are taken when the record is stored,
+/// because only the store can see the messages the loader will reduce.
 pub fn apply(messages: &[Message], plan: Plan, summary: &str) -> Vec<Message> {
     let compaction = Compaction {
         replaced: plan.summarize,
@@ -263,6 +420,13 @@ pub fn apply(messages: &[Message], plan: Plan, summary: &str) -> Vec<Message> {
 /// Used when loading: the file holds the original messages *and* the records
 /// that replaced them, and this reduces the two into the history the model
 /// actually saw.
+///
+/// This is the count-only form. A [`Compaction`] carries the offset, not the
+/// anchors, so it cannot check itself against the transcript — which is why a
+/// session file's records also store [`anchors_of`] the run they replaced, and
+/// [`crate::session`] replays those through [`locate_span`] rather than here.
+/// A caller that has anchors should use them; this function exists for the
+/// records that do not.
 pub fn replay(messages: Vec<Message>, compactions: &[Compaction]) -> Vec<Message> {
     let mut history = messages;
     for compaction in compactions {
@@ -502,5 +666,73 @@ mod tests {
         let four = vec![user("one"), user("two"), user("three"), user("four")];
         // keep_recent = 3 would summarize exactly one; below the floor.
         assert_eq!(plan(&four, 3), None);
+    }
+
+    // ------------------------------------------------------- anchors
+
+    #[test]
+    fn an_anchor_names_a_message_by_what_it_is_not_by_where_it_is() {
+        let one = user("one");
+        // The same message read back from a file is the same message, so the
+        // anchor has to be equal: that is the whole point of it.
+        let same = user("one");
+        assert_eq!(anchor_of(&one), anchor_of(&same));
+        assert_ne!(anchor_of(&one), anchor_of(&user("two")));
+        assert_ne!(anchor_of(&one), anchor_of(&assistant_calling("read", "c1")));
+        assert_ne!(
+            anchor_of(&assistant_calling("read", "c1")),
+            anchor_of(&assistant_calling("write", "c1")),
+            "the tool a call names is part of what the message is"
+        );
+        assert_eq!(anchor_of(&one).len(), ANCHOR_HEX);
+    }
+
+    #[test]
+    fn the_anchors_of_a_run_name_its_two_ends() {
+        let run = vec![user("one"), user("two"), user("three")];
+        let (first, last) = anchors_of(&run).expect("a run has two ends");
+        assert_eq!(first, anchor_of(&run[0]));
+        assert_eq!(last, anchor_of(&run[2]));
+
+        assert!(anchors_of(&[]).is_none(), "an empty run names nothing");
+    }
+
+    #[test]
+    fn an_intact_run_is_located_by_its_anchors() {
+        let messages = vec![user("one"), user("two"), user("three"), user("four")];
+        let (first, last) = anchors_of(&messages[..2]).expect("anchors");
+        assert_eq!(
+            locate_span(&messages, 2, &first, &last),
+            Ok::<(usize, usize), String>((0, 1))
+        );
+
+        // A run that does not begin at the head is found where it actually
+        // sits; a count cannot express that at all, which is the case anchors
+        // exist for.
+        let (first, last) = anchors_of(&messages[2..]).expect("anchors");
+        assert_eq!(
+            locate_span(&messages, 2, &first, &last),
+            Ok::<(usize, usize), String>((2, 3))
+        );
+    }
+
+    #[test]
+    fn a_run_that_lost_its_last_message_is_refused_rather_than_guessed() {
+        let (first, last) = anchors_of(&[user("one"), user("two")]).expect("anchors");
+        let now = vec![user("one")];
+        let refused = locate_span(&now, 2, &first, &last).expect_err("must refuse");
+        assert!(refused.contains("no longer in the file"), "{refused}");
+        assert!(refused.contains("not applied"), "{refused}");
+    }
+
+    #[test]
+    fn a_run_that_grew_is_refused_rather_than_mis_applied() {
+        // Both anchors are still present, so the span can be found — but a
+        // message was inserted inside it, and folding this span would delete a
+        // message the summary was never written for.
+        let (first, last) = anchors_of(&[user("one"), user("two")]).expect("anchors");
+        let now = vec![user("one"), user("inserted"), user("two"), user("three")];
+        let refused = locate_span(&now, 2, &first, &last).expect_err("must refuse");
+        assert!(refused.contains("not the 2 it recorded"), "{refused}");
     }
 }

@@ -147,6 +147,12 @@ impl Loader {
     /// Rescan the skill roots.
     pub fn rescan_skills(&mut self) -> Result<usize> {
         let report = self.skills.scan()?;
+        // A rescan is usually triggered because a skill appeared or vanished,
+        // so the paths it could not use are exactly what the user needs to see;
+        // the return value alone would report "0 loaded" with no reason.
+        if !report.skipped.is_empty() || !report.collisions.is_empty() {
+            eprintln!("[skills] {}", report.summary());
+        }
         Ok(report.loaded)
     }
 
@@ -382,6 +388,10 @@ impl Loader {
         }
 
         let tool_count = registered.len();
+        // Keep a way back to this process that does not depend on the tools: an
+        // unload has the ledger, not the handles, and this is what lets it stop
+        // a server the ledger named instead of trusting the last drop to do it.
+        crate::mcp::track(&client);
         self.mcp_clients.push(client);
 
         self.ledger.record(LedgerEntry {
@@ -549,8 +559,10 @@ impl Loader {
 pub struct UnloadReport {
     /// Plugin instances unloaded, by plugin name.
     pub plugins: Vec<String>,
-    /// MCP servers whose tools were removed; the child stops with its last
-    /// handle.
+    /// MCP servers taken out of the conversation: their tools are gone, and
+    /// their processes were stopped here rather than left to whatever drops
+    /// last. A server that could not be reached is in [`Self::notes`], with the
+    /// reason for it.
     pub mcp: Vec<String>,
     /// Skill roots removed from the catalog.
     pub skills: Vec<String>,
@@ -602,6 +614,12 @@ pub fn unload_pack(
                         .push(format!("plugin '{plugin}' was not loaded here"));
                 }
                 for id in ids {
+                    // Pack-plane unload is deliberately global and
+                    // ledger-driven: a pack's resources are not per-session
+                    // references, so this tears the fiber down for every session
+                    // at once. `Kernel::release` is the other shape — a teardown
+                    // counted against the sessions still holding a reference —
+                    // and it is not what a ledger row means.
                     kernel.unload(id)?;
                     report.plugins.push(plugin.clone());
                 }
@@ -609,9 +627,12 @@ pub fn unload_pack(
             }
             "mcp" => {
                 // An MCP server has no fiber: its tools are registered
-                // directly, so they are removed directly. With the loader's own
-                // handle already dropped, removing the last tool drops the last
-                // handle and the child process stops.
+                // directly, so they are removed directly. Removing them drops
+                // *a* handle on the client — not the last one, whatever the
+                // old comment here assumed: whoever started the server keeps
+                // one, and a call in flight keeps another. So the process is
+                // stopped here, explicitly, through the bounded kill path, and
+                // what it could not reach is reported rather than hoped about.
                 let owner = format!("mcp:{}", entry.id);
                 let tools: Vec<String> = kernel
                     .tools()
@@ -621,6 +642,15 @@ pub fn unload_pack(
                     .collect();
                 for tool in tools {
                     kernel.tools_mut().unregister(&tool);
+                }
+                let closed = crate::mcp::close_server(&entry.id);
+                for failure in &closed.failed {
+                    // A process this could not stop is said out loud, where the
+                    // user sees the unload report, rather than left to be found
+                    // later in a process list.
+                    report
+                        .notes
+                        .push(format!("an MCP server was not stopped — {failure}"));
                 }
                 report.mcp.push(entry.id.clone());
                 ledger.remove("mcp", &entry.id);
@@ -648,6 +678,11 @@ pub fn unload_pack(
         .map(|fiber| fiber.id)
         .collect();
     for id in ids {
+        // Same rule as the ledger rows above, for the appearance fiber: pack
+        // unload is global and ledger-driven, not reference-counted per session,
+        // so this one teardown takes the look away from every session at once.
+        // (`Kernel::release` is the per-session form, and a ledger row is not a
+        // session's claim.)
         kernel.unload(id)?;
         report.plugins.push(appearance.clone());
     }
@@ -1316,6 +1351,123 @@ stages:
             "{:?}",
             report.notes
         );
+    }
+
+    /// A server process that sits there for thirty seconds, the shape of the
+    /// one that used to outlive every unload.
+    #[cfg(windows)]
+    fn stub_server() -> (tokio::process::Child, u32) {
+        let child = tokio::process::Command::new("cmd")
+            .args(["/c", "ping -n 30 127.0.0.1"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawning the stub server");
+        let pid = child.id().expect("a running child has a process id");
+        (child, pid)
+    }
+
+    /// Whether the operating system lists this process right now.
+    #[cfg(windows)]
+    fn listed(pid: u32) -> bool {
+        let output = std::process::Command::new("tasklist")
+            .args(["/NH", "/FI", &format!("PID eq {pid}")])
+            .output()
+            .expect("running tasklist");
+        String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+    }
+
+    /// Wait for the process list to agree with what was asked of it: a spawn is
+    /// not instant, and neither is a kill.
+    #[cfg(windows)]
+    fn wait_for(pid: u32, want_running: bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if listed(pid) == want_running {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn unloading_a_pack_stops_the_server_it_named_rather_than_the_last_handle() {
+        // The old unload removed the tools and called that enough, on the
+        // assumption that the tools were the only handles. They are not: the
+        // caller that started the server keeps one, so the process kept running
+        // and every load/unload cycle added another. This is that leak, pinned.
+        let dir = temp_dir("unload-mcp");
+        let ledger_path = dir.join("installed.json");
+        let mut kernel = Kernel::new();
+        let mut skills = SkillRegistry::new();
+
+        let (child, pid) = stub_server();
+        let client = Arc::new(McpClient::from_child_for_tests(child, "demo-server"));
+
+        // One tool, holding one handle, registered exactly the way the loader
+        // registers a server's tools.
+        let tool_client = Arc::clone(&client);
+        kernel
+            .tools_mut()
+            .register(
+                ToolDef::new(
+                    "mcp__demo_server__ping",
+                    "a tool from the stub server",
+                    serde_json::json!({ "type": "object", "properties": {} }),
+                    "mcp:demo-server",
+                    move |_| {
+                        let client = Arc::clone(&tool_client);
+                        Box::pin(async move { client.call("ping", serde_json::json!({})).await })
+                            as ToolFuture
+                    },
+                ),
+                ConflictPolicy::Error,
+            )
+            .unwrap();
+        crate::mcp::track(&client);
+
+        let mut ledger = Ledger::new();
+        ledger.record(ledger_entry("mcp", "demo-server", "stdio:x", None));
+        ledger.save(&ledger_path).unwrap();
+
+        assert!(wait_for(pid, true), "the stub server is up before the unload");
+
+        // The handle the caller keeps. With this alive, no drop of the tool can
+        // be what ends the process — so the unload has to end it by name.
+        let held = Arc::clone(&client);
+
+        let report =
+            unload_pack(&mut kernel, &mut skills, &ledger_path, "demo-1.0.0", "demo").unwrap();
+
+        assert_eq!(report.mcp, vec!["demo-server".to_string()]);
+        assert!(kernel.tools().get("mcp__demo_server__ping").is_none(), "its tool");
+        assert!(report.notes.is_empty(), "{:?}", report.notes);
+        assert!(
+            wait_for(pid, false),
+            "the server stopped with the unload, not after it"
+        );
+        assert_eq!(Arc::strong_count(&held), 2, "and it stopped while a handle was still held");
+
+        // The second unload is the idempotent case: the entry is out of the
+        // ledger and the client is out of the registry, so there is nothing to
+        // wait on and it must say so at once.
+        let started = std::time::Instant::now();
+        let again =
+            unload_pack(&mut kernel, &mut skills, &ledger_path, "demo-1.0.0", "demo").unwrap();
+        assert!(again.mcp.is_empty(), "{:?}", again.mcp);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "a repeat unload waited {:?}",
+            started.elapsed()
+        );
+
+        drop(held);
+        drop(client);
     }
 
     #[test]

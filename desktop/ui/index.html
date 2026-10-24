@@ -670,6 +670,9 @@
     </div>
 
     <h2 id="sec-runtime">Runtime</h2>
+    <!-- 会话累计用量：整段对话的账（本回合那一行在状态栏的 timing 里）。数字来自
+         内核 —— status.totals 或 stats 命令 —— 这里只做文本化，一律 textContent。 -->
+    <div class="hint tight" id="usage-line">Tokens: —</div>
     <div id="runtime-info"></div>
     <h2 id="sec-skills">Skills</h2>
     <div id="skill-info"></div>
@@ -736,7 +739,21 @@ const turnEvents = new Set([
   "step", "step_retry", "continuation", "turn_end", "error",
   "compaction_start", "compaction", "injection", "steer",
 ]);
-const serveToken = new URLSearchParams(location.search).get("token") || "";
+// The token arrives in the URL once, in the address `ngu serve` printed. Read it
+// there and then take it back out of the address bar and out of history: a token
+// left in `location.search` is a token in the back button, in a screenshot, and
+// in whatever that page hands to the next one. From here on it lives only in
+// this closure — never in a DOM attribute, never in the title, never in a log.
+const serveToken = (() => {
+  const params = new URLSearchParams(location.search);
+  const found = params.get("token") || "";
+  if (found) {
+    params.delete("token");
+    const rest = params.toString();
+    history.replaceState({}, "", location.pathname + (rest ? "?" + rest : ""));
+  }
+  return found;
+})();
 const toShell = onServer
   ? (payload) =>
       fetch("/cmd", {
@@ -761,6 +778,9 @@ if (onServer) {
   events.onopen = () => {
     console.log("[serve] stream open; re-sending ready");
     toShell({ cmd: "ready" });
+    // 再按会话拉一次用量账。窗口模式的 status 本来就带着 totals，没有这一问；
+    // 服务端模式的首推送可能早于这条流的订阅，所以流一开补问一次。
+    toShell({ cmd: "stats" });
     if (streamDown) {
       streamDown = false;
       notice("事件流已恢复");
@@ -779,6 +799,14 @@ if (onServer) {
       console.error("事件解析失败", error, message.data);
     }
   };
+  // 服务端在订阅者落后（广播队列 Lagged）时会插一条 `resync`：那一瞬间已经有
+  // 事件丢掉了，页面手里画的就不是当前状态。重发一次 ready 让服务端把整份状态
+  // 推回来，页面随之重画 —— 这比让用户自己刷新页面诚实。
+  events.addEventListener("resync", () => {
+    console.log("[serve] stream lagged; re-sending ready");
+    toShell({ cmd: "ready" });
+    toShell({ cmd: "stats" });
+  });
   // A backgrounded tab can lose its stream and miss pushes while hidden. On
   // return, re-send `ready` so the server pushes the current state again
   // instead of leaving the page on whatever it last drew.
@@ -933,11 +961,23 @@ stream.addEventListener("scroll", () => {
   loadingOlder = true;
   toShell({ cmd: "load_older", before: olderFirst });
 });
+// `/file` 链接点一下就走下载：地址里只有路径，凭据由请求头带上。
+stream.addEventListener("click", (event) => {
+  if (!onServer) return;
+  const target = event.target;
+  const link = target && target.closest ? target.closest("a.file-link") : null;
+  if (!link) return;
+  event.preventDefault();
+  const match = /[?&]path=([^&]*)/.exec(link.getAttribute("href") || "");
+  if (!match) return;
+  downloadServedPath(decodeURIComponent(match[1]));
+});
 const sessionList = document.getElementById("session-list");
 const logInfo = document.getElementById("log-info");
 const runtimeInfo = document.getElementById("runtime-info");
 const skillInfo = document.getElementById("skill-info");
 const toolInfo = document.getElementById("tool-info");
+const usageLine = document.getElementById("usage-line");
 const input = document.getElementById("input");
 const send = document.getElementById("send");
 /// Placeholder restored when no turn is running (packs may replace it later).
@@ -1027,6 +1067,13 @@ function scrollToEndForced() {
 // A path the shell can serve as a download link: the agent says where it
 // wrote the file, the human clicks it, the bytes arrive. Served pages only:
 // the window has no `/file` door, and a dead link beats plain text.
+//
+// The credential does not go in the link. `href` is a DOM attribute, and the
+// token in it would be readable by anything that can read the page, would ride
+// into the browser history, and would be captured by any screenshot; the click
+// is intercepted instead and the fetch carries the token in its header. The
+// href the markup contains is only the path, percent-encoded, so no attribute
+// can be escaped from it either.
 function linkifyServerPaths(text) {
   if (typeof onServer === "undefined" || !onServer) return text;
   return text.replace(
@@ -1036,9 +1083,32 @@ function linkifyServerPaths(text) {
     // required — a bare directory is not a file anyone can download.
     /(^|[\s('"（(“])((?:\/|~\/|\.[/]|[A-Za-z]:[\\/])(?:[\w\-.]+[\\/])*[\w\-.]+\.[A-Za-z0-9]{1,10})/g,
     (_, lead, path) => lead + '<a class="file-link" href="/file?path=' +
-      encodeURIComponent(path) + "&token=" + encodeURIComponent(serveToken) +
-      '" download>' + path + "</a>"
+      encodeURIComponent(path) + '" download>' + path + "</a>"
   );
+}
+
+/// 下载一个服务端文件：字节走一次带头授权的请求，再作为 blob 交出去。
+///
+/// 这是 `/file` 链接的点击处理，不是链接本身的地址 —— 见 linkifyServerPaths
+/// 上面的说明：凭据不进 DOM 属性。
+async function downloadServedPath(path) {
+  try {
+    const response = await fetch("/file?path=" + encodeURIComponent(path), {
+      headers: { Authorization: "Bearer " + serveToken },
+    });
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = path.split(/[\\/]/).pop() || "download";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 20000);
+  } catch (error) {
+    notice("下载失败 — " + path + ": " + error.message, true);
+  }
 }
 
 function escapeHtml(text) {
@@ -1046,7 +1116,10 @@ function escapeHtml(text) {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    // 单引号也转义：今天拼属性都用双引号，所以这里还不构成逃逸；但属性一旦被
+    // 写成单引号，少这一条就是立刻可用的注入点。转义它没有代价。
+    .replace(/'/g, "&#39;");
 }
 
 /// Inline spans on already-escaped text.
@@ -1312,12 +1385,6 @@ function errorBlock(text) {
   return box;
 }
 
-/// Render the panels plugins contributed.
-///
-/// Rebuilt wholesale on every update rather than diffed: a panel is a small
-/// fragment, the update happens when something changed anyway, and a diff would
-/// be a second rendering path to keep correct. Scripts run once per panel after
-/// its fragment is in the document, so they can find the elements they added.
 /// Apply the token set plugins contributed.
 ///
 /// Every token the interface knows is set explicitly, so removing a theme
@@ -1383,7 +1450,197 @@ function applyStrings(strings) {
   }
 }
 
+// ---- pack 面板的沙箱 ------------------------------------------------
+//
+// 面板是包里带来的 HTML 加脚本，而包常常是远端下载物。这段代码过去直接进主文档、
+// 用 new Function 运行 —— 与本页同源、与本页同一个 token，于是「画个界面」就
+// 等于「拿到这台机器的 shell」。现在它被关进一个 srcdoc iframe：sandbox 只给
+// allow-scripts，不给 allow-same-origin，那是个不透明来源的孤岛 —— 拿不到主
+// 文档、cookie、localStorage，也读不到本页的 token。
+//
+// 它能做的只剩一件事：发命令。而那条路要经过宿主 —— 面板 postMessage 到父窗口，
+// 父窗口核对「消息来自哪一帧」与「panelId 在白名单里」，才转成 toShell。
+const PANEL_CSP = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'";
+
+// iframe 是独立文档，继承不到本页的样式变量：给一套跟随系统深浅色的最小样式，
+// 免得面板渲染成白底 Times。
+const PANEL_BASE_CSS = [
+  ":root { color-scheme: light dark; }",
+  "body { margin: 0; padding: 6px; background: transparent; color: CanvasText;",
+  "  font: 13px/1.45 system-ui, -apple-system, 'Segoe UI', sans-serif; }",
+  "button, input, select, textarea { font: inherit; color: inherit; }",
+  "a { color: inherit; }",
+].join("\n");
+
+/// 面板侧的最小 SDK：`window.ngu.call(cmd, args)` 返回 Promise。
+///
+/// 它自己只做一件事 —— 把请求交给父窗口，再等一条带 requestId 的回复；超时自己
+/// 收尾，免得面板永久挂着。不是 `panel-reply` 的消息一律不看。
+function panelSdk(panelId) {
+  return [
+    "(function () {",
+    '  "use strict";',
+    "  var panelId = " + JSON.stringify(String(panelId)).replace(/</g, "\\u003c") + ";",
+    "  var waiting = Object.create(null);",
+    "  var seq = 0;",
+    '  window.addEventListener("message", function (event) {',
+    "    var data = event.data;",
+    '    if (!data || data.ngu !== "panel-reply" || typeof data.requestId !== "string") return;',
+    "    var waiter = waiting[data.requestId];",
+    "    if (!waiter) return;",
+    "    delete waiting[data.requestId];",
+    "    clearTimeout(waiter.timer);",
+    "    if (data.ok) waiter.resolve(data.data === undefined ? null : data.data);",
+    '    else waiter.reject(new Error(data.error || "panel command failed"));',
+    "  });",
+    "  function call(cmd, args) {",
+    "    return new Promise(function (resolve, reject) {",
+    "      seq += 1;",
+    '      var requestId = "p" + seq + "-" + Date.now().toString(36);',
+    "      var timer = setTimeout(function () {",
+    "        delete waiting[requestId];",
+    '        reject(new Error("panel command timed out: " + cmd));',
+    "      }, 30000);",
+    "      waiting[requestId] = { resolve: resolve, reject: reject, timer: timer };",
+    "      parent.postMessage({",
+    '        ngu: "panel", panelId: panelId, requestId: requestId,',
+    "        cmd: String(cmd),",
+    '        args: args && typeof args === "object" ? args : {},',
+    '      }, "*");',
+    "    });",
+    "  }",
+    "  window.ngu = { call: call };",
+    "  var reported = 0;",
+    "  function reportHeight() {",
+    "    if (!document.body) return;",
+    "    var height = Math.ceil(document.body.getBoundingClientRect().height);",
+    "    if (!height || Math.abs(height - reported) < 8) return;",
+    "    reported = height;",
+    "    parent.postMessage({",
+    '      ngu: "panel", panelId: panelId, requestId: null,',
+    '      cmd: "panel:resize", args: { height: height },',
+    '    }, "*");',
+    "  }",
+    '  window.addEventListener("load", reportHeight);',
+    '  if (typeof ResizeObserver === "function") {',
+    "    new ResizeObserver(reportHeight).observe(document.body);",
+    "  }",
+    "})();",
+  ].join("\n");
+}
+
+/// 一个面板的完整小页面：`srcdoc` 的正文。
+///
+/// 面板的 HTML 与脚本都到这块文档为止，进不了主文档。收尾的脚本标签不能以字面量
+/// 写在外层脚本里（外层那块 script 会就此闭合），所以标签是拼出来的。
+function panelDocument(panel, panelId) {
+  const open = "<scr" + "ipt>";
+  const close = "</scr" + "ipt>";
+  const head =
+    '<!doctype html><html><head><meta charset="utf-8">' +
+    '<meta http-equiv="Content-Security-Policy" content="' + PANEL_CSP + '">' +
+    "<style>" + PANEL_BASE_CSS + "</style></head><body>";
+  const sdk = open + "\n" + panelSdk(panelId) + "\n" + close;
+  const script = panel.script ? "\n" + open + "\n" + panel.script + "\n" + close : "";
+  return head + (panel.html || "") + sdk + script + "</body></html>";
+}
+
+// panelId -> iframe。这份表就是白名单：不在表里的 panelId 说什么都不转。
+let panelFrames = new Map();
+
+// 装了一个带界面的包，等于让一段别人写的代码在本页里画东西、并经由宿主发命令。
+// 问一次，答一次，把答复记在 localStorage 里：每次启动都重问是噪音，从来不说
+// 是另一种隐瞒。
+const PANEL_CONSENT_TEXT =
+  "此包会在沙箱面板里运行代码，可用于显示界面；它不能读写你的文件，除非你批准它发起的命令。";
+
+function panelPackKey(panel) {
+  const id = String(panel.id || "");
+  const sep = id.indexOf(":");
+  return sep > 0 ? id.slice(0, sep) : id || "unknown";
+}
+
+function panelConsentKey(panel) {
+  return "ngu.panel-consent." + panelPackKey(panel);
+}
+
+function panelConsented(panel) {
+  const key = panelConsentKey(panel);
+  let answer = null;
+  try {
+    answer = localStorage.getItem(key);
+  } catch (error) {
+    answer = null;   // 无痕窗口里 localStorage 会抛，那就每次都问
+  }
+  if (answer === "allow") return true;
+  if (answer === "deny") return false;
+  const allowed = window.confirm(
+    PANEL_CONSENT_TEXT + "\n\n包: " + panelPackKey(panel) + "\n\n允许它的面板运行吗？"
+  );
+  try {
+    localStorage.setItem(key, allowed ? "allow" : "deny");
+  } catch (error) {
+    // 记不住就下次再问 —— 这比不问安全。
+  }
+  return allowed;
+}
+
+// 面板 -> shell 的唯一通道。三条都成立才转：消息来自我们注册过的那一帧、panelId
+// 在白名单里、cmd 是个字符串。别的窗口、别的形状、别的消息体一律丢弃。
+window.addEventListener("message", (event) => {
+  const data = event.data;
+  if (!data || typeof data !== "object" || data.ngu !== "panel") return;
+  const entry = panelFrames.get(data.panelId);
+  if (!entry || entry.frame.contentWindow !== event.source) return;
+  const cmd = typeof data.cmd === "string" ? data.cmd : "";
+  if (!cmd) return;
+  const frame = entry.frame;
+  const requestId = typeof data.requestId === "string" ? data.requestId : null;
+  const reply = (ok, payload, error) => {
+    if (!frame.contentWindow) return;
+    frame.contentWindow.postMessage({
+      ngu: "panel-reply",
+      requestId: requestId,
+      ok: ok,
+      data: payload === undefined ? null : payload,
+      error: error || null,
+    }, "*");
+  };
+  const args = data.args && typeof data.args === "object" ? data.args : {};
+  // 面板自己的那条内部命令（量高度）不转给 shell：它只碰这一帧的样式。
+  if (cmd === "panel:resize") {
+    const height = Number(args.height);
+    if (Number.isFinite(height)) {
+      frame.style.height = Math.min(Math.max(Math.round(height), 40), 480) + "px";
+    }
+    return;
+  }
+  // `{cmd, args}` 平铺成内置界面同形的命令体：args 先铺，cmd 最后落，面板改不了
+  // 命令的名字。
+  const payload = Object.assign({}, args, { cmd: cmd });
+  Promise.resolve(toShell(payload)).then(
+    (response) => {
+      // 窗口模式没有应答通道（ipc 是单向的），发出即算成功。
+      if (!response) return reply(true, null);
+      if (!response.ok) return reply(false, null, "HTTP " + response.status);
+      return response.json().then(
+        (ack) => reply(true, ack),
+        () => reply(true, null)
+      );
+    },
+    (error) => reply(false, null, String((error && error.message) || error))
+  );
+});
+
+/// Render the panels plugins contributed.
+///
+/// Rebuilt wholesale on every update rather than diffed: a panel is a small
+/// fragment, the update happens when something changed anyway, and a diff would
+/// be a second rendering path to keep correct. Each panel is now its own
+/// sandboxed document (see above), so a rebuild costs one iframe load per panel
+/// and its script runs inside that document, once, with its own fragment there.
 function renderSlots(panels) {
+  panelFrames = new Map();
   for (const slot of ["sidebar-top", "sidebar-bottom", "details-top", "details-bottom", "status-bar", "above-composer"]) {
     const container = document.getElementById("slot-" + slot);
     if (container) container.replaceChildren();
@@ -1396,20 +1653,30 @@ function renderSlots(panels) {
     const box = el("div", "panel-fragment");
     box.dataset.panelId = panel.id;
     if (panel.title) box.append(el("h2", null, panel.title));
-    const body = el("div", "fragment-body");
-    // A plugin's HTML is trusted to the degree the plugin is: one that can
-    // register a tool can already run code in this process.
-    body.innerHTML = panel.html;
-    box.append(body);
-    container.append(box);
 
-    if (panel.script) {
-      try {
-        new Function("panel", "toShell", panel.script)(box, toShell);
-      } catch (error) {
-        box.append(el("div", "notice bad", "panel script failed: " + error.message));
+    if (panel.html || panel.script) {
+      if (!panelConsented(panel)) {
+        box.append(el("div", "empty",
+          "这个包的面板没有运行（拒绝过一次，记在 localStorage 的 " +
+          panelConsentKey(panel) + "）"));
+      } else {
+        const frame = document.createElement("iframe");
+        // 只给 allow-scripts。多给 allow-same-origin 就等于什么都没做：同源沙箱里
+        // 的脚本可以把自己的 sandbox 属性摘掉。
+        frame.setAttribute("sandbox", "allow-scripts");
+        frame.setAttribute("title", panel.title || ("panel " + panel.id));
+        frame.style.width = "100%";
+        frame.style.height = "120px";
+        frame.style.border = "0";
+        frame.style.background = "transparent";
+        frame.style.display = "block";
+        // srcdoc 用属性赋值，不拼 innerHTML：面板的 HTML 到这块文档为止。
+        frame.setAttribute("srcdoc", panelDocument(panel, panel.id));
+        box.append(frame);
+        panelFrames.set(panel.id, { frame: frame });
       }
     }
+    container.append(box);
   }
 }
 
@@ -2082,6 +2349,44 @@ function formatWindow(tokens) {
   return String(tokens);
 }
 
+/// 一个 token 数的短写法：上万之后按 k 显示，免得一行统计撑成一堵墙。
+function formatTokens(value) {
+  const n = Number(value) || 0;
+  if (n >= 1000000) return (n / 1000000).toFixed(2) + "M";
+  if (n >= 10000) return (n / 1000).toFixed(1) + "k";
+  return String(n);
+}
+
+/// 会话累计用量那一行：`Tokens: in/out/cached · 命中率 xx% · turns N`。
+///
+/// 数字是内核给的（`ready` 推的 status.totals，或 `stats` 命令），这里只做
+/// 文本化。整行走 `textContent`：它是服务端算出来的数字，没有理由让它有机会
+/// 变成 HTML。
+function renderUsageTotals(totals) {
+  // 没有数字就不动这一行：清空它比留旧数字更像是坏了。
+  if (!totals) return;
+  const turns = Number(totals.turns) || 0;
+  const input = Number(totals.input) || 0;
+  if (turns === 0 && input === 0) {
+    usageLine.textContent = "Tokens: \u2014 (no turns recorded yet)";
+    return;
+  }
+  // 命中率内核也算了一份；这里仍然兜一次底，旧壳的 status 可能没有这一项。
+  const hit = typeof totals.cache_hit_ratio === "number"
+    ? totals.cache_hit_ratio
+    : (input > 0 ? (Number(totals.cached) || 0) / input : 0);
+  // 写进缓存的那部分只在有时才显示：它是钱（写入常按加价计），但 0 写进
+  // 每一行只是噪音。
+  const written = Number(totals.cache_created) || 0;
+  usageLine.textContent =
+    "Tokens: " + formatTokens(input) + " in / " + formatTokens(totals.output) + " out / " +
+    formatTokens(totals.cached) + " cached \u00b7 \u547d\u4e2d\u7387 " +
+    (hit * 100).toFixed(1) + "%" +
+    (written ? " \u00b7 \u5199\u5165 " + formatTokens(written) : "") +
+    " \u00b7 turns " + turns +
+    (Number(totals.tool_calls) ? " \u00b7 tools " + Number(totals.tool_calls) : "");
+}
+
 function renderStatus(status) {
   if (!status) return;
 
@@ -2092,6 +2397,9 @@ function renderStatus(status) {
   document.getElementById("stats").textContent =
     (status.messages === undefined ? 0 : status.messages) + " messages \u00b7 " +
     (status.tools || []).length + " tools";
+  // 会话累计用量：状态推送本来就带着它，省一次往返。缺这一项（旧壳）时保持原样，
+  // 不清掉 `stats` 已经画出来的数字。
+  if (status.totals) renderUsageTotals(status.totals);
 
   renderSettings(status);
 
@@ -2334,6 +2642,18 @@ onAny((name, event) => {
       case "status":
         renderStatus(event.status);
         break;
+      case "stats":
+        // `stats` 命令的回复（serve 模式主动问的那一次）。属于别的会话的账不画
+        // 在这里 —— 一条 SSE 流服务所有标签页，筛选和回合事件同一套规矩。页面
+        // 还不知道自己在哪个会话时（首推送尚未到手）先收下，别把它丢掉。
+        if (!event.session || !currentSessionId || event.session === currentSessionId) {
+          if (event.error) {
+            usageLine.textContent = "Tokens: \u2014 (" + event.error + ")";
+          } else {
+            renderUsageTotals(event.totals);
+          }
+        }
+        break;
       case "settings_saved":
         settingsDirty = false;
         settingsSaved.hidden = false;
@@ -2397,7 +2717,9 @@ onAny((name, event) => {
           event.steps + " steps \u00b7 " + event.tool_calls + " tools" +
           (event.retries ? " \u00b7 " + event.retries + " retries" : "") +
           " \u00b7 " + event.usage.input + "/" + event.usage.output + " tok (" +
-          event.usage.cached + " cached) \u00b7 model " + event.timing.model_ms +
+          event.usage.cached + " cached" +
+          (event.usage.cache_created ? ", " + event.usage.cache_created + " written" : "") +
+          ") \u00b7 model " + event.timing.model_ms +
           " ms, tools " + event.timing.tools_ms + " ms";
         toShell({ cmd: "status" });
         break;
@@ -2538,7 +2860,13 @@ document.getElementById("save-settings").addEventListener("click", saveSettings)
     details.classList.toggle("open", open);
     toggle.setAttribute("aria-expanded", String(open));
   };
-  toggle.addEventListener("click", () => setOpen(!details.classList.contains("open")));
+  toggle.addEventListener("click", () => {
+    const open = !details.classList.contains("open");
+    setOpen(open);
+    // 抽屉一打开就按会话要一次用量账（只有服务端模式需要问：窗口模式的
+    // status 推送已经带着 totals）。只读命令，内核不会为它排队。
+    if (open && onServer) toShell({ cmd: "stats" });
+  });
   document.getElementById("close-settings").addEventListener("click", () => setOpen(false));
 })();
 

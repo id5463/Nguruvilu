@@ -1314,8 +1314,67 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Extract an archive into a directory.
+/// The most entries one archive may hold.
+///
+/// A pack is a manifest and a handful of content files; thousands of members is
+/// a different animal, and the cheap thing to refuse before reading a byte.
+pub const MAX_ARCHIVE_ENTRIES: usize = 4_096;
+
+/// The most bytes one entry may expand to.
+pub const MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The most bytes one archive may expand to in total.
+///
+/// These three numbers bound `unpack`, which both `install` and `verify` run —
+/// `verify` on an archive nobody has agreed to install yet. Without them a few
+/// hundred kilobytes of deflated zeros was enough to fill a directory and the
+/// memory of whoever looked at it: an archive is input from a stranger, and
+/// reading a member whole into a buffer is how the kernel dies instead of
+/// refusing.
+pub const MAX_UNPACKED_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The permission bits a pack may keep: owner/group/other rwx, nothing else.
+///
+/// `setuid` and `setgid` are not in it. A pack's file lands owned by the person
+/// unpacking it, and a bit that makes it run as somebody *else* is not something
+/// an archive gets to decide — the same reasoning that drops world-writeable.
+/// (This is `0o755` rather than `mode & 0o7777`: the high three bits go away.)
+#[cfg(unix)]
+const PACK_PERMISSION_BITS: u32 = 0o755;
+
+/// The three limits an extraction runs under.
+///
+/// A struct rather than three arguments so a test can hold them all to something
+/// it can afford to build: the accounting is what needs proving, not the size of
+/// a real archive.
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    entries: usize,
+    entry_bytes: u64,
+    total_bytes: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            entries: MAX_ARCHIVE_ENTRIES,
+            entry_bytes: MAX_ENTRY_BYTES,
+            total_bytes: MAX_UNPACKED_BYTES,
+        }
+    }
+}
+
+/// Extract an archive into a directory, under the limits above.
+///
+/// Fails — rather than half-extracting silently — on an archive that expands
+/// past any of them, on one that names the same path twice, and on a symlink
+/// entry. Callers own the destination and are expected to discard it on failure
+/// (`install` and `verify` both remove their scratch directory).
 pub fn unpack(pack_path: &Path, dest: &Path) -> Result<PackManifest> {
+    unpack_under(pack_path, dest, Limits::default())
+}
+
+fn unpack_under(pack_path: &Path, dest: &Path, limits: Limits) -> Result<PackManifest> {
     std::fs::create_dir_all(dest)
         .with_context(|| format!("creating {}", dest.display()))?;
 
@@ -1324,16 +1383,63 @@ pub fn unpack(pack_path: &Path, dest: &Path) -> Result<PackManifest> {
     let mut archive = zip::ZipArchive::new(file)
         .with_context(|| format!("{} is not a zip archive", pack_path.display()))?;
 
+    let entries = archive.len() as usize;
+    if entries > limits.entries {
+        return Err(anyhow!(
+            "{} holds {entries} entries; a pack may hold at most {}",
+            pack_path.display(),
+            limits.entries
+        ));
+    }
+
+    // Bytes that actually landed on disk, not the bytes the headers promise:
+    // a member's declared size is the archive's claim, and a claim is free.
+    let mut expanded = 0u64;
+    // Paths already written, so a repeat name is caught instead of the second
+    // entry quietly winning over the first.
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
+        let name = entry.name().to_string();
         let Some(relative) = entry.enclosed_name() else {
             return Err(anyhow!(
-                "{} contains an entry that escapes the archive: {}",
-                pack_path.display(),
-                entry.name()
+                "{} contains an entry that escapes the archive: {name}",
+                pack_path.display()
             ));
         };
-        let target = dest.join(relative);
+
+        // A symlink is a second path the archive does not name, and this format
+        // has no use for one: whatever it points at is written outside the
+        // control of `enclosed_name`.
+        if entry.is_symlink() {
+            return Err(anyhow!(
+                "{} carries {name} as a symbolic link; a pack holds plain files only",
+                pack_path.display()
+            ));
+        }
+
+        // The comparison is on what the name *means*, not on how it is spelled:
+        // `a.md` and `./a.md` land on one file, and on Windows so do `A.md` and
+        // `a.md`. An archive carrying both would install one and lose the other
+        // with nothing said. A repeat of the *same* spelling never reaches here
+        // — the reader collapses a repeated central-directory name into a single
+        // entry — so the collision above is the one an archive can hand over.
+        let key: PathBuf = relative
+            .components()
+            .filter(|component| !matches!(component, std::path::Component::CurDir))
+            .collect();
+        #[cfg(windows)]
+        let key = PathBuf::from(key.to_string_lossy().to_lowercase());
+        if !seen.insert(key) {
+            return Err(anyhow!(
+                "{} names {name} twice; which copy would install is not a choice \
+                 this program should be making",
+                pack_path.display()
+            ));
+        }
+
+        let target = dest.join(&relative);
         if entry.is_dir() {
             std::fs::create_dir_all(&target)?;
             continue;
@@ -1341,19 +1447,111 @@ pub fn unpack(pack_path: &Path, dest: &Path) -> Result<PackManifest> {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut buffer = Vec::new();
-        entry.read_to_end(&mut buffer)?;
-        std::fs::write(&target, buffer)
-            .with_context(|| format!("writing {}", target.display()))?;
+
+        // The declared size is checked before anything is written, so an
+        // obviously enormous member costs nothing; the bytes that arrive are
+        // checked again as they stream out, so an understated header cannot
+        // get around the limit either.
+        let declared = entry.size();
+        let room = limits.total_bytes.saturating_sub(expanded);
+        if declared > limits.entry_bytes {
+            return Err(expansion_error(
+                pack_path,
+                &name,
+                "one entry's",
+                limits.entry_bytes,
+                declared,
+                expanded,
+            ));
+        }
+        if declared > room {
+            return Err(expansion_error(
+                pack_path,
+                &name,
+                "the whole archive's",
+                limits.total_bytes,
+                expanded + declared,
+                expanded,
+            ));
+        }
+        // Which limit is the one this member could cross: both are in play, and
+        // the smaller of the two is what stops it.
+        let per_entry = limits.entry_bytes <= room;
+        let limit = if per_entry { limits.entry_bytes } else { room };
+        let which = if per_entry { "one entry's" } else { "the whole archive's" };
+
+        let mut written = std::fs::File::create(&target)
+            .with_context(|| format!("creating {}", target.display()))?;
+        // One byte past the limit: enough to tell "exactly at it" from "past
+        // it", without ever holding the member in memory. The copy streams, so
+        // a header that understated the size still stops at the limit instead of
+        // filling the disk first.
+        let copied = std::io::copy(&mut (&mut entry).take(limit + 1), &mut written)
+            .with_context(|| format!("reading {name} out of {}", pack_path.display()))?;
+        if copied > limit {
+            // Windows will not delete a file that is still open.
+            drop(written);
+            let _ = std::fs::remove_file(&target);
+            let reached = if per_entry { copied } else { expanded + copied };
+            let limit = if per_entry { limits.entry_bytes } else { limits.total_bytes };
+            return Err(expansion_error(pack_path, &name, which, limit, reached, expanded));
+        }
+        expanded += copied;
 
         #[cfg(unix)]
         if let Some(mode) = entry.unix_mode() {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode));
+            let _ = std::fs::set_permissions(
+                &target,
+                std::fs::Permissions::from_mode(mode & PACK_PERMISSION_BITS),
+            );
         }
     }
 
     read_manifest(dest)
+}
+
+/// The complaint about a member that expands too much: which limit it crosses,
+/// how far the archive reaches, and how much had already landed — the three
+/// things needed to tell a bomb from an honest pack that grew too big.
+fn expansion_error(
+    pack: &Path,
+    name: &str,
+    which: &str,
+    limit: u64,
+    reached: u64,
+    already: u64,
+) -> anyhow::Error {
+    if already == 0 {
+        anyhow!(
+            "{} is refused: {name} crosses {which} limit of {} — this archive \
+             would expand to {}",
+            pack.display(),
+            human_bytes(limit),
+            human_bytes(reached),
+        )
+    } else {
+        anyhow!(
+            "{} is refused: {name} crosses {which} limit of {} — this archive \
+             would expand to {}, with {} already unpacked",
+            pack.display(),
+            human_bytes(limit),
+            human_bytes(reached),
+            human_bytes(already),
+        )
+    }
+}
+
+/// A byte count in the largest unit that still reads as a whole number.
+fn human_bytes(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= MIB && bytes % MIB == 0 {
+        format!("{} MiB", bytes / MIB)
+    } else if bytes >= 1024 && bytes % 1024 == 0 {
+        format!("{} KiB", bytes / 1024)
+    } else {
+        format!("{bytes} bytes")
+    }
 }
 
 /// Check an archive without installing it.
@@ -2442,6 +2640,201 @@ mod tests {
             "{:?}",
             report.warnings
         );
+    }
+
+    /// An archive written by hand, so a test can put in it what `pack()` never
+    /// would: a member that expands enormous, a name given twice, a symlink.
+    /// These are the shapes `unpack` has to survive, and they only arrive from
+    /// somebody else's hands.
+    fn by_hand(
+        dir: &Path,
+        name: &str,
+        build: impl FnOnce(&mut zip::ZipWriter<std::fs::File>),
+    ) -> PathBuf {
+        let archive = dir.join(name);
+        let file = std::fs::File::create(&archive).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        build(&mut writer);
+        writer.finish().unwrap();
+        archive
+    }
+
+    fn deflated() -> zip::write::SimpleFileOptions {
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
+    }
+
+    #[test]
+    fn a_small_archive_that_expands_past_a_limit_is_refused() {
+        // The decompression bomb, at a size a test can build: each member is a
+        // few kilobytes on disk and megabytes when expanded, and the limits here
+        // are lowered so the accounting is what is under test rather than 256 MiB
+        // of zeros.
+        let dir = scratch("bomb");
+        let archive = by_hand(&dir, "bomb.dshpack", |writer| {
+            writer.start_file("dsh.index.json", deflated()).unwrap();
+            writer.write_all(b"{\"formatVersion\":1}").unwrap();
+            // Two members of 4 KiB each; the second crosses the 6 KiB total.
+            for id in ["one", "two"] {
+                writer.start_file(id, deflated()).unwrap();
+                writer.write_all(&vec![0u8; 4096]).unwrap();
+            }
+        });
+
+        let limits = Limits { entries: 16, entry_bytes: 8192, total_bytes: 6144 };
+        let out = dir.join("out");
+        let error = unpack_under(&archive, &out, limits).expect_err("refused, not extracted");
+        let text = format!("{error:#}");
+
+        // The complaint names the member and the limit it crossed — "too big" on
+        // its own says nothing about which rule to change.
+        assert!(text.contains("two"), "{text}");
+        assert!(text.contains("the whole archive"), "{text}");
+        assert!(text.contains("6 KiB"), "{text}");
+        assert!(
+            !out.join("two").exists(),
+            "the member that crossed the limit is not left half-written"
+        );
+    }
+
+    #[test]
+    fn a_pack_of_kilobytes_that_unpacks_to_gigabytes_is_refused() {
+        // The real limits, the real shape of the attack: zeros deflate to
+        // almost nothing, so a few kilobytes of archive claim tens of megabytes
+        // — and, continued, gigabytes.
+        let dir = scratch("bomb-real");
+        let archive = by_hand(&dir, "bomb.dshpack", |writer| {
+            writer.start_file("dsh.index.json", deflated()).unwrap();
+            writer.write_all(b"{\"formatVersion\":1}").unwrap();
+            writer.start_file("payload", deflated()).unwrap();
+            let zeros = vec![0u8; 1024 * 1024];
+            // One megabyte past the per-entry limit.
+            for _ in 0..=(MAX_ENTRY_BYTES / (1024 * 1024)) {
+                writer.write_all(&zeros).unwrap();
+            }
+        });
+
+        let compressed = std::fs::metadata(&archive).unwrap().len();
+        assert!(
+            compressed < 1024 * 1024,
+            "the archive itself is small: {compressed} bytes"
+        );
+
+        let out = dir.join("out");
+        let error = unpack(&archive, &out).expect_err("refused, not extracted");
+        let text = format!("{error:#}");
+        assert!(text.contains("payload"), "{text}");
+        assert!(text.contains("64 MiB"), "{text}");
+        assert!(!out.join("payload").exists(), "nothing was written for it");
+    }
+
+    #[test]
+    fn one_enormous_member_is_refused_by_the_per_entry_limit() {
+        let dir = scratch("bomb-entry");
+        let archive = by_hand(&dir, "bomb.dshpack", |writer| {
+            writer.start_file("dsh.index.json", deflated()).unwrap();
+            writer.write_all(b"{\"formatVersion\":1}").unwrap();
+            writer.start_file("payload", deflated()).unwrap();
+            writer.write_all(&vec![0u8; 8192]).unwrap();
+        });
+
+        let limits = Limits { entries: 16, entry_bytes: 4096, total_bytes: 1024 * 1024 };
+        let error = unpack_under(&archive, &dir.join("out"), limits).expect_err("refused");
+        let text = format!("{error:#}");
+        assert!(text.contains("payload"), "{text}");
+        assert!(text.contains("one entry"), "{text}");
+        assert!(text.contains("4 KiB"), "{text}");
+    }
+
+    #[test]
+    fn an_archive_with_too_many_entries_is_refused_before_anything_is_written() {
+        let dir = scratch("bomb-count");
+        let archive = by_hand(&dir, "bomb.dshpack", |writer| {
+            for index in 0..5 {
+                writer.start_file(format!("f{index}"), deflated()).unwrap();
+                writer.write_all(b"x").unwrap();
+            }
+        });
+
+        let limits = Limits { entries: 3, entry_bytes: MAX_ENTRY_BYTES, total_bytes: MAX_UNPACKED_BYTES };
+        let out = dir.join("out");
+        let error = unpack_under(&archive, &out, limits).expect_err("refused");
+        let text = format!("{error:#}");
+        assert!(text.contains("5 entries"), "{text}");
+        assert!(text.contains("at most 3"), "{text}");
+        assert!(!out.join("f0").exists(), "nothing was extracted: {text}");
+    }
+
+    #[test]
+    fn an_archive_that_names_the_same_file_twice_is_refused() {
+        // Which copy wins would decide what `verify` reports and what installs,
+        // and that is not a choice to make silently on the archive's behalf.
+        //
+        // The two members are named `a.md` and `./a.md`: different bytes in the
+        // archive, one file on disk. That is the shape that reaches this check —
+        // an archiver that writes the *same* name twice is collapsed by the
+        // reader before anything here sees it (verified: a hand-built archive
+        // with two identical central entries reads back as one member), so the
+        // guard is proved against the collision it can be handed.
+        let dir = scratch("repeated");
+        let archive = by_hand(&dir, "members.dshpack", |writer| {
+            writer.start_file("dsh.index.json", deflated()).unwrap();
+            writer.write_all(b"{\"formatVersion\":1}").unwrap();
+            writer.start_file("a.md", deflated()).unwrap();
+            writer.write_all(b"first").unwrap();
+            writer.start_file("./a.md", deflated()).unwrap();
+            writer.write_all(b"second").unwrap();
+        });
+
+        let error = unpack(&archive, &dir.join("out")).expect_err("refused, not extracted");
+        let text = format!("{error:#}");
+        let asked = text.to_lowercase();
+        assert!(
+            asked.contains("twice") || asked.contains("a.md") || asked.contains("duplicate"),
+            "the refusal has to name what is wrong with the archive: {text}"
+        );
+        // A pack whose manifest went missing fails with a different message
+        // entirely, and that is not this check firing.
+        assert!(
+            !asked.contains("dsh.index.json") && !asked.contains("a pack needs one"),
+            "the repeated name was missed and the manifest was blamed instead: {text}"
+        );
+
+        // On Windows the same reasoning covers names that differ only in case:
+        // `A.md` and `a.md` are one file there, so installing both would drop
+        // one of them. Only Windows folds case, so the case is part of the test.
+        #[cfg(windows)]
+        {
+            let dir = scratch("repeated-case");
+            let archive = by_hand(&dir, "members.dshpack", |writer| {
+                writer.start_file("dsh.index.json", deflated()).unwrap();
+                writer.write_all(b"{\"formatVersion\":1}").unwrap();
+                writer.start_file("A.md", deflated()).unwrap();
+                writer.write_all(b"upper").unwrap();
+                writer.start_file("a.md", deflated()).unwrap();
+                writer.write_all(b"lower").unwrap();
+            });
+            let error = unpack(&archive, &dir.join("out"))
+                .expect_err("two names that one file system folds together");
+            let text = format!("{error:#}");
+            assert!(text.to_lowercase().contains("twice"), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_archive_holding_a_symlink_is_refused() {
+        // Written out as a plain file, a symlink entry is a path the archive
+        // does not name — and the format has no use for one.
+        let dir = scratch("symlink");
+        let archive = by_hand(&dir, "link.dshpack", |writer| {
+            writer
+                .add_symlink("escape", "../../outside", zip::write::SimpleFileOptions::default())
+                .unwrap();
+        });
+
+        let error = unpack(&archive, &dir.join("out")).expect_err("refused");
+        let text = format!("{error:#}");
+        assert!(text.contains("escape"), "{text}");
+        assert!(text.contains("symbolic link"), "{text}");
     }
 
     #[test]

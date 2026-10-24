@@ -167,16 +167,146 @@ for i, page in enumerate(doc):
     print(page.get_text())
 "#;
 
-/// Spawn, collect stdout with a 30-second bound, kill on timeout.
+// ------------------------------------------------------------ bounded engine run
+
+/// Bytes one engine run may accumulate before its reader stops growing the
+/// buffer. The reader keeps draining the pipe past the cap — a child that
+/// cannot write is a child that never exits — but the text is then known to
+/// be a prefix, not the whole conversion.
+const ENGINE_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+
+/// How long one engine attempt gets, end to end: spawn, run, and close its
+/// output pipe.
+const ENGINE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How much of the budget a reader may still use after its process is gone.
+/// A killed tree owes an EOF at once; this is slack, never a second timeout.
+const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What one engine's reader thread has collected so far.
+///
+/// Shared with the waiting thread on purpose. The drain can be abandoned at
+/// the deadline — and the bytes that did arrive are still the answer the user
+/// asked for, minus whatever the wedged writer never sent.
+struct Collected {
+    bytes: std::sync::Mutex<Vec<u8>>,
+    /// Set once the cap was hit: the text above is a prefix.
+    overflowed: std::sync::atomic::AtomicBool,
+    /// Set when the reader reached EOF (or its pipe broke trying).
+    done: std::sync::atomic::AtomicBool,
+}
+
+impl Collected {
+    fn new() -> Self {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Mutex;
+        Self {
+            bytes: Mutex::new(Vec::new()),
+            overflowed: AtomicBool::new(false),
+            done: AtomicBool::new(false),
+        }
+    }
+
+    /// Append what just arrived, keeping at most [`ENGINE_OUTPUT_LIMIT`].
+    fn push(&self, chunk: &[u8]) {
+        use std::sync::atomic::Ordering;
+        // A poisoned mutex still holds a perfectly good `Vec<u8>`: recovering
+        // the inner data beats panicking every later read of this file.
+        let mut buf = self
+            .bytes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let room = ENGINE_OUTPUT_LIMIT.saturating_sub(buf.len());
+        if chunk.len() > room {
+            buf.extend_from_slice(&chunk[..room]);
+            self.overflowed.store(true, Ordering::Relaxed);
+        } else {
+            buf.extend_from_slice(chunk);
+        }
+    }
+
+    /// Everything read so far, taken out of the shared buffer.
+    fn take(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.bytes.lock().unwrap_or_else(|error| error.into_inner()))
+    }
+
+    fn finished(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.done.load(Ordering::Acquire)
+    }
+}
+
+/// Read a pipe into `sink` until EOF, on its own thread.
+///
+/// The thread is deliberately never joined: see [`await_drain`].
+fn drain_pipe<R>(mut pipe: R, sink: Arc<Collected>)
+where
+    R: std::io::Read + Send + 'static,
+{
+    use std::sync::atomic::Ordering;
+    // Detached on purpose: the handle is never joined, so there is nothing to
+    // do with it (`await_drain` is how a caller gives up on this thread).
+    let _ = std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match std::io::Read::read(&mut pipe, &mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => sink.push(&chunk[..read]),
+            }
+        }
+        sink.done.store(true, Ordering::Release);
+    });
+}
+
+/// Wait up to `budget` for the reader to reach EOF; `false` means "still
+/// open", and what was collected is as good as it gets.
+fn await_drain(sink: &Collected, budget: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    while !sink.finished() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    true
+}
+
+/// `30s`, `1200ms` — the budget as the message states it.
+fn budget_label(budget: std::time::Duration) -> String {
+    if budget.as_millis() % 1000 == 0 {
+        format!("{}s", budget.as_secs())
+    } else {
+        format!("{}ms", budget.as_millis())
+    }
+}
+
+/// Spawn, collect stdout with a bound, kill on timeout.
 ///
 /// A parser wedged on a corrupt file must not wedge the turn that tried to
-/// read it. `PYTHONIOENCODING=utf-8` fixes the one encoding bug that would
-/// sink this path: a piped stdout otherwise follows the console code page,
-/// and a GBK console dies on exactly the CJK text this exists for.
+/// read it — and neither may a *pipe* the process left open. The old code
+/// bounded only the wait for the process, then joined the reader unbounded:
+/// a grandchild that inherited stdout (the exact thing the comment here
+/// claimed to defend against) kept `read_to_end` from ever returning, leaking
+/// the thread and hanging the whole read. Both waits now run to one deadline,
+/// and the timeout path returns the partial text with a note instead of
+/// hanging or discarding it.
+/// `PYTHONIOENCODING=utf-8` fixes the one encoding bug that would sink this
+/// path: a piped stdout otherwise follows the console code page, and a GBK
+/// console dies on exactly the CJK text this exists for.
 fn run_blocking(program: &str, args: &[String]) -> Result<String, String> {
-    use std::process::Stdio;
+    run_blocking_within(program, args, ENGINE_BUDGET)
+}
 
-    const LIMIT: usize = 4 * 1024 * 1024;
+/// [`run_blocking`] with the budget in hand, so a test can prove the bound
+/// without waiting thirty seconds for the production one.
+fn run_blocking_within(
+    program: &str,
+    args: &[String],
+    budget: std::time::Duration,
+) -> Result<String, String> {
+    use std::process::Stdio;
+    use std::sync::atomic::Ordering;
+
     let mut child = std::process::Command::new(program)
         .args(args)
         .env("PYTHONIOENCODING", "utf-8")
@@ -186,39 +316,80 @@ fn run_blocking(program: &str, args: &[String]) -> Result<String, String> {
         .spawn()
         .map_err(|error| format!("spawning {program}: {error}"))?;
 
-    let mut stdout = child.stdout.take().expect("piped");
-    let drain = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
-        buf
-    });
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{program}: stdout was not piped"))?;
+    let sink = Arc::new(Collected::new());
+    drain_pipe(stdout, Arc::clone(&sink));
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + budget;
+    let mut timed_out = false;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
+                    timed_out = true;
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!("conversion timed out after 30s"));
+                    break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
-            Err(error) => return Err(format!("waiting for {program}: {error}")),
+            Err(error) => {
+                // Never leave an un-reaped child behind on the error path.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("waiting for {program}: {error}"));
+            }
         }
     }
 
-    let bytes = drain.join().unwrap_or_default();
-    if bytes.is_empty() {
-        return Ok(String::new());
-    }
-    let text = if bytes.len() > LIMIT {
-        format!("{}…", String::from_utf8_lossy(&bytes[..LIMIT]))
+    // The process is gone, but the pipe only owes an EOF once every writer is
+    // gone with it — a descendant can hold it open forever. Same deadline;
+    // after a kill, a short grace is enough for the EOF a killed tree owes.
+    let drain_budget = if timed_out {
+        DRAIN_GRACE
     } else {
-        String::from_utf8_lossy(&bytes).into_owned()
+        deadline.saturating_duration_since(std::time::Instant::now())
     };
-    Ok(text)
+    let complete = await_drain(&sink, drain_budget);
+    let truncated = sink.overflowed.load(Ordering::Relaxed);
+    let bytes = sink.take();
+
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        text.push('…');
+    }
+    let mut notes: Vec<String> = Vec::new();
+    if timed_out {
+        notes.push(format!(
+            "conversion timed out after {} and was killed",
+            budget_label(budget)
+        ));
+    }
+    if !complete {
+        notes.push(format!(
+            "a process other than the engine still holds its output pipe, so the \
+             text above stops at {} and may be incomplete",
+            budget_label(budget)
+        ));
+    }
+
+    if text.trim().is_empty() {
+        // Nothing readable came out. Without a note that is the honest
+        // "engine produced no text"; with one, the reason is the whole answer.
+        return if notes.is_empty() {
+            Ok(String::new())
+        } else {
+            Err(format!("{}: {}", program, notes.join("; ")))
+        };
+    }
+    if notes.is_empty() {
+        return Ok(text);
+    }
+    Ok(format!("{text}\n\n[{}]", notes.join("; ")))
 }
 
 // ---------------------------------------------------------------- built-in
@@ -456,6 +627,154 @@ mod tests {
         assert!(PYTHON_MISSING.contains("brew install python"));
         assert!(ENGINES_MISSING.contains("pip install --user pymupdf markitdown"));
         assert!(NO_TEXT_FOUND.contains("OCR"));
+    }
+
+    /// The wedged pipe, in-process: a `Read` that hands over some bytes and
+    /// then never reaches EOF is exactly what a grandchild holding the
+    /// engine's stdout looks like. Joining that reader is the unbounded wait
+    /// the 30s deadline used to miss — so the drain gets a bounded grace, and
+    /// the bytes that did arrive survive it.
+    #[test]
+    fn a_wedged_drain_is_abandoned_without_losing_what_it_read() {
+        use std::io::Read;
+        use std::time::{Duration, Instant};
+
+        /// Some text, then a writer that will not close: two seconds of
+        /// blocking stands in for "forever" at test speed.
+        struct Wedged {
+            served: bool,
+        }
+
+        impl Read for Wedged {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.served {
+                    self.served = true;
+                    let text = b"partial-conversion";
+                    buf[..text.len()].copy_from_slice(text);
+                    return Ok(text.len());
+                }
+                // The writer nobody is waiting for: eventually it does close,
+                // but an unbounded join would wait exactly that long.
+                for _ in 0..100 {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(0)
+            }
+        }
+
+        let sink = Arc::new(Collected::new());
+        let reading = Arc::clone(&sink);
+        let _ = std::thread::spawn(move || drain_pipe(Wedged { served: false }, reading));
+
+        let started = Instant::now();
+        let complete = await_drain(&sink, Duration::from_millis(200));
+        let elapsed = started.elapsed();
+
+        assert!(!complete, "a pipe that never closes must be abandoned");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the wait ends at its own budget, not at the writer's pleasure: {elapsed:?}"
+        );
+        let bytes = sink.take();
+        assert_eq!(
+            String::from_utf8_lossy(&bytes).as_ref(),
+            "partial-conversion",
+            "what was read before the deadline is the answer, not garbage"
+        );
+    }
+
+    /// The same cap the reader shares: past it the text is a prefix and the
+    /// flag says so, while the pipe keeps draining (a child that cannot write
+    /// never exits, and the deadline would then only hide the hang).
+    #[test]
+    fn the_drain_stops_growing_but_keeps_reading() {
+        use std::io::Read as _;
+
+        /// An endless pipe: always ready, never EOF.
+        struct Endless;
+        impl std::io::Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let filled = buf.len().min(64);
+                for byte in &mut buf[..filled] {
+                    *byte = b'x';
+                }
+                Ok(filled)
+            }
+        }
+
+        let sink = Arc::new(Collected::new());
+        // Pushed directly rather than through a thread: what is under test is
+        // the cap, and a thread would only make the assertion racy.
+        let mut source = Endless;
+        let mut chunk = [0u8; 64];
+        let mut pushed = 0usize;
+        while pushed <= ENGINE_OUTPUT_LIMIT + 4096 {
+            let read = source.read(&mut chunk).expect("endless source");
+            sink.push(&chunk[..read]);
+            pushed += read;
+        }
+
+        assert_eq!(
+            sink.take().len(),
+            ENGINE_OUTPUT_LIMIT,
+            "the buffer is capped, not unbounded"
+        );
+        assert!(
+            sink.overflowed.load(std::sync::atomic::Ordering::Relaxed),
+            "the truncation is recorded, so the caller can say so"
+        );
+    }
+
+    /// End to end, with a real process: the engine exits at once, a background
+    /// descendant inherits its stdout and keeps the pipe open. The old code
+    /// joined that reader with no bound and hung for as long as the descendant
+    /// lived; now the call returns at its deadline with the text it did get.
+    ///
+    /// The Windows command carries no double quotes on purpose. Rust passes an
+    /// argument to `cmd` in MSVCRT escaping (`"` inside an argument becomes
+    /// `\"`), and cmd.exe has no backslash escape — a nested `cmd /C "…"` gets
+    /// mangled, its `echo` never runs, and the test fails for a reason that has
+    /// nothing to do with the drain. Bare words only; `start /b` hands the
+    /// grandchild our stdout, and `ping` holds it for ~15 s.
+    #[test]
+    fn a_grandchild_holding_stdout_returns_partial_output_at_the_deadline() {
+        use std::time::{Duration, Instant};
+
+        let budget = Duration::from_millis(1200);
+        // Long enough that an unbounded join would blow through the assertion
+        // below, short enough not to leave a stray process for long.
+        let (program, args) = if cfg!(windows) {
+            (
+                "cmd".to_string(),
+                vec![
+                    "/C".to_string(),
+                    "start /b ping -n 16 127.0.0.1 & echo engine-done".to_string(),
+                ],
+            )
+        } else {
+            (
+                "sh".to_string(),
+                vec!["-c".to_string(), "sleep 15 & echo engine-done".to_string()],
+            )
+        };
+
+        let started = Instant::now();
+        let outcome = run_blocking_within(&program, &args, budget);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "the call must end at its deadline, not when the orphan closes the pipe: {elapsed:?}"
+        );
+
+        let text = match outcome {
+            Ok(text) => text,
+            Err(reason) => reason,
+        };
+        assert!(text.contains("engine-done"), "partial output is kept: {text}");
+        assert!(
+            text.contains("output pipe") || text.contains("timed out"),
+            "the reason the text may be short is named: {text}"
+        );
     }
 
     /// The whole chain, end to end: kernel loads the plugin, `read` consults

@@ -32,7 +32,7 @@ use nguruvilu::llm::LlmClient;
 use nguruvilu::loader::Loader;
 use nguruvilu::source::PackSource;
 use nguruvilu::plugin::{Kernel, Plugin as PluginTrait};
-use nguruvilu::session::{JsonlStore, Session, SessionStore};
+use nguruvilu::session::{totals_of, JsonlStore, Session, SessionStore, SessionTotals, TurnStats};
 use nguruvilu::settings::Settings;
 use nguruvilu::window::ContextPolicy;
 use nguruvilu::skills::{register_skill_tool, SkillRegistry};
@@ -94,8 +94,14 @@ struct Cli {
     #[arg(long, global = true)]
     cwd: Option<PathBuf>,
 
-    /// Session storage root.
-    #[arg(long, env = "NGU_HOME", global = true)]
+    /// Session storage root, overriding `$NGU_HOME/sessions`.
+    ///
+    /// Deliberately not bound to `NGU_HOME`: that variable names the state
+    /// *home*, and both frontends have to read it the same way. Binding this
+    /// flag to it meant `NGU_HOME=/x` put the command line's sessions in `/x`
+    /// while the desktop put them in `/x/sessions` — one variable, two
+    /// directories, and a history that looked split for no visible reason.
+    #[arg(long, global = true)]
     home: Option<PathBuf>,
 
     /// Extra skill search root (repeatable).
@@ -145,8 +151,49 @@ enum Command {
         /// Session id.
         id: String,
     },
+    /// Show the token and time usage recorded by stored sessions.
+    Stats {
+        /// Session id. Defaults to the most recently updated session.
+        id: Option<String>,
+        /// Report every session, plus a grand total.
+        #[arg(long)]
+        all: bool,
+        /// Also report money, using the rates in the price file.
+        #[arg(long)]
+        cost: bool,
+        /// Price file to read instead of the default one.
+        #[arg(long)]
+        prices: Option<PathBuf>,
+    },
+    /// Export a stored session as a file meant to be shared.
+    ///
+    /// The format is Markdown unless `--format json` asks for JSON. The global
+    /// `--json` flag also selects JSON, and it wins over `--format`: a script
+    /// that already passes `--json` to every subcommand must not have to know
+    /// which of two flags this one happens to read first.
+    Export {
+        /// Session id.
+        id: String,
+        /// Write to this file instead of stdout. Parent directories are created.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Output format: `md` (or `markdown`) or `json`.
+        #[arg(long)]
+        format: Option<String>,
+    },
     /// List models available on the configured route.
-    Models,
+    Models {
+        /// Also print the context window each model reports.
+        ///
+        /// A provider that reports one is the reason the compaction policy can
+        /// stop guessing, so the number is recorded here as well: a turn in this
+        /// process then measures its history against what the provider actually
+        /// enforces instead of against a built-in table.
+        #[arg(long)]
+        windows: bool,
+    },
+    /// Check this machine's configuration without changing anything.
+    Doctor,
     /// List skills found under the configured roots.
     Skills {
         /// Also print each skill's full instructions.
@@ -614,7 +661,19 @@ async fn run() -> Result<()> {
     for dir in &cli.skill_dirs {
         skills.add_root(dir.clone());
     }
-    skills.scan().ok();
+    match skills.scan() {
+        Ok(report) => {
+            // A scan that skipped something is the only trace of a skill the
+            // user expects to exist, so it is printed; a clean scan says
+            // nothing, because a silent start is the normal start.
+            if !report.skipped.is_empty() || !report.collisions.is_empty() {
+                eprintln!("[skills] {}", report.summary());
+            }
+        }
+        // The scan is hard to fail by design, but swallowing an Err here would
+        // leave the user with no catalog and no reason for it.
+        Err(error) => eprintln!("[skills] scan failed: {error:#}"),
+    }
 
     match &cli.command {
         Some(Command::Sessions) => return list_sessions(&store, cli.json),
@@ -624,18 +683,85 @@ async fn run() -> Result<()> {
             println!("deleted session {id}");
             return Ok(());
         }
-        Some(Command::Models) => {
+        Some(Command::Stats { id, all, cost, prices }) => {
+            return stats_command(
+                &store,
+                id.as_deref(),
+                *all,
+                *cost,
+                prices.as_deref(),
+                cli.json,
+            )
+        }
+        Some(Command::Export { id, out, format }) => {
+            return export_command(&store, id, out.as_ref(), format.as_deref(), cli.json)
+        }
+        Some(Command::Doctor) => {
+            // The command decides its own exit code, because a report with
+            // warnings is a successful run and a report with a failure is not.
+            let options = nguruvilu::doctor::Options {
+                sessions: store.root().to_path_buf(),
+                skill_dirs: cli.skill_dirs.clone(),
+                ..nguruvilu::doctor::Options::default()
+            };
+            let code = nguruvilu::doctor::print_report(&options, cli.json)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            return Ok(());
+        }
+        Some(Command::Models { windows }) => {
             require_key(&api_key)?;
             let client = model_route(&cli, &settings, None).client()?;
-            let mut ids = client.list_models().await?;
-            ids.sort();
+            // The plain list keeps its own tolerant reader: it is what scripts
+            // and the picker use, and it must not start failing because a
+            // gateway's catalog gained a field. Only `--windows` reads the wider
+            // shape.
+            let mut models: Vec<(String, Option<usize>)> = if *windows {
+                client.list_models_with_windows().await?
+            } else {
+                client
+                    .list_models()
+                    .await?
+                    .into_iter()
+                    .map(|id| (id, None))
+                    .collect()
+            };
+            models.sort_by(|a, b| a.0.cmp(&b.0));
+            for (id, window) in &models {
+                if let Some(tokens) = window {
+                    nguruvilu::window::reported_windows().record(id, *tokens);
+                }
+            }
             if cli.json {
+                let entries: Vec<serde_json::Value> = models
+                    .iter()
+                    .map(|(id, window)| {
+                        serde_json::json!({ "id": id, "context_length": window })
+                    })
+                    .collect();
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({ "models": ids }))?
+                    serde_json::to_string_pretty(&serde_json::json!({ "models": entries }))?
                 );
+            } else if *windows {
+                // The id column is wide enough for a gateway's long names, and a
+                // model the provider did not price in tokens says so instead of
+                // showing a zero that looks like a window of nothing.
+                let width = models
+                    .iter()
+                    .map(|(id, _)| id.chars().count())
+                    .max()
+                    .unwrap_or(8)
+                    .clamp(8, 48);
+                for (id, window) in &models {
+                    match window {
+                        Some(tokens) => println!("{id:<width$}  {tokens:>9}"),
+                        None => println!("{id:<width$}  {:>9}", "-"),
+                    }
+                }
             } else {
-                for id in ids {
+                for (id, _) in &models {
                     println!("{id}");
                 }
             }
@@ -956,10 +1082,17 @@ async fn run() -> Result<()> {
     if kernel.tools().get(nguruvilu::tools::subagent::TOOL).is_some() {
         eprintln!("[subagent] delegate loaded by the subagent pack");
     }
-    runtime
+    // A refusal is not an error for this run: the session keeps the table it
+    // already had and nothing downstream changes. It is still worth a line,
+    // because the only other symptom of a denied swap is that a pack's tools
+    // never appeared, and the reason the policy wrote would be read by nobody.
+    if let nguruvilu::hotreload::ApplyOutcome::Denied(reason) = runtime
         .lock()
         .expect("runtime lock")
-        .adopt_kernel_tools(&kernel);
+        .adopt_kernel_tools(&kernel)
+    {
+        eprintln!("[pack] the adopted tool table was refused: {reason}");
+    }
 
     // `runtime` describes the session that would run, so it is answered from
     // the assembled kernel: the tools a turn would actually see, the services
@@ -1087,7 +1220,14 @@ async fn run() -> Result<()> {
             let original_len = session.messages.len();
             let mut agent = Agent::new(client, Arc::clone(&config), session.messages.clone())
                 .with_max_steps(cli.max_steps)
-                .with_observer(observer);
+                .with_observer(observer)
+                // This CLI turn's session, fixed for the turn: a plugin that
+                // re-pins the registry mid-turn (or a second process) cannot
+                // move this turn's workspace or job attribution.
+                .with_identity(nguruvilu::tools::ToolIdentity::for_session(
+                    session.id.clone(),
+                    session.cwd.as_deref().map(std::path::PathBuf::from),
+                ));
             let outcome = agent.run(&text).await;
             let turn_ms = turn_started.elapsed().as_millis() as u64;
             match &outcome {
@@ -1133,9 +1273,24 @@ async fn run() -> Result<()> {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     ensure_session(&session)?;
-                    let salvaged = agent.messages()[original_len..].to_vec();
+                    // A compaction mid-turn rewrites the history, so it can be
+                    // *shorter* than it was when the turn started. Indexing at
+                    // `original_len` then panics — and a panic here swallows the
+                    // real error, reporting a crash where the honest answer is
+                    // the provider failure. A saturated slice keeps the failure
+                    // a failure: when the history was compacted there is no
+                    // new-message run to salvage, and the earlier turns are
+                    // already recorded.
+                    let salvaged = agent
+                        .messages()
+                        .get(original_len..)
+                        .unwrap_or(&[])
+                        .to_vec();
                     session.messages.extend(salvaged.clone());
                     store.append(&session.id, &salvaged)?;
+                    // The turn happened even though nothing about its cost was
+                    // reported: one row keeps the turn count honest.
+                    record_turn_stats(&store, &session.id, &TurnStats::unreported());
                     return Err(error);
                 }
             };
@@ -1174,6 +1329,11 @@ async fn run() -> Result<()> {
             if !outcome.compactions.is_empty() {
                 session.messages = agent.messages().to_vec();
             }
+
+            // What the turn cost, recorded before the failure return below: a
+            // turn that stopped on an error still spent its tokens, and a
+            // ledger that only counts happy turns is a ledger that lies.
+            record_turn_stats(&store, &session.id, &TurnStats::from_outcome(&outcome));
 
             // The turn stopped on a failure — everything it produced is on
             // disk by now, so leave with a non-zero status instead of letting
@@ -1219,6 +1379,8 @@ async fn run() -> Result<()> {
                         "input": outcome.usage.input,
                         "output": outcome.usage.output,
                         "cached": outcome.usage.cached,
+                        "cache_created": outcome.usage.cache_created,
+                        "reasoning": outcome.usage.reasoning,
                     },
                     "timing": {
                         "model_ms": outcome.timing.model_ms,
@@ -1237,13 +1399,14 @@ async fn run() -> Result<()> {
                 }
                 if !cli.quiet {
                     eprintln!(
-                        "\n[session {} | {} steps | {} tool calls | {} in / {} out ({} cached) | model {} ms, tools {} ms]",
+                        "\n[session {} | {} steps | {} tool calls | {} in / {} out ({} cached, {} written to cache) | model {} ms, tools {} ms]",
                         session.id,
                         outcome.steps,
                         outcome.tool_calls,
                         outcome.usage.input,
                         outcome.usage.output,
                         outcome.usage.cached,
+                        outcome.usage.cache_created,
                         outcome.timing.model_ms,
                         outcome.timing.tools_ms
                     );
@@ -1300,6 +1463,18 @@ async fn stop_mcp(clients: &[Arc<nguruvilu::mcp::McpClient>]) {
     }
 }
 
+/// Record one turn's usage in its session file.
+///
+/// One helper for every recording site, so the three callers cannot drift
+/// apart. A failure is reported rather than fatal: the turn itself is already
+/// on disk, and losing the accounting must not turn a finished turn into a
+/// failed one in the caller's eyes.
+fn record_turn_stats(store: &JsonlStore, id: &str, stats: &TurnStats) {
+    if let Err(error) = store.append_stats(id, stats) {
+        eprintln!("[stats] {error:#}");
+    }
+}
+
 async fn interactive(
     client: LlmClient,
     config: Arc<dyn TurnConfig>,
@@ -1327,7 +1502,13 @@ async fn interactive(
 
     let mut agent = Agent::new(client, Arc::clone(&config), session.messages.clone())
         .with_max_steps(max_steps)
-        .with_observer(Arc::new(PrettyObserver { quiet: false }));
+        .with_observer(Arc::new(PrettyObserver { quiet: false }))
+        // The interactive session this loop serves, fixed for every turn it
+        // runs (the id and workspace do not change while the loop is alive).
+        .with_identity(nguruvilu::tools::ToolIdentity::for_session(
+            session.id.clone(),
+            session.cwd.as_deref().map(std::path::PathBuf::from),
+        ));
 
     loop {
         print!("› ");
@@ -1424,24 +1605,51 @@ async fn interactive(
         }
         match turn {
             Ok(outcome) => {
+                // Read before the messages are moved out of the outcome: the
+                // stats are a snapshot of the turn, taken here.
+                let stats = TurnStats::from_outcome(&outcome);
                 // Recorded even when the turn failed: the agent kept what it
                 // produced, and a REPL that forgets half a turn is a REPL that
                 // lies about the conversation on the next input.
                 store.append(&session.id, &outcome.new_messages)?;
                 session.messages.extend(outcome.new_messages);
+
+                // Record what was injected and what was compacted, the same way
+                // the one-shot path does. Without the compaction line a reload
+                // would replay messages the model never saw again, and the REPL
+                // would diverge from the file as it accumulates turns.
+                for record in &outcome.injections {
+                    store.append_injection(&session.id, record)?;
+                }
+                for compaction in &outcome.compactions {
+                    store.append_compaction(&session.id, compaction)?;
+                    eprintln!(
+                        "[compacted {} messages into a summary of {} chars]",
+                        compaction.replaced,
+                        compaction.summary.chars().count()
+                    );
+                }
+                // The live history must match what was recorded; a compaction
+                // shrinks it, and the next turn's split point is read from here.
+                if !outcome.compactions.is_empty() {
+                    session.messages = agent.messages().to_vec();
+                }
+                record_turn_stats(&store, &session.id, &stats);
+
                 let retries = if outcome.retries > 0 {
                     format!(" | {} retries", outcome.retries)
                 } else {
                     String::new()
                 };
                 println!(
-                    "\n[{} steps | {} tool calls{} | {} in / {} out ({} cached) | model {} ms, tools {} ms]\n",
+                    "\n[{} steps | {} tool calls{} | {} in / {} out ({} cached, {} written to cache) | model {} ms, tools {} ms]\n",
                     outcome.steps,
                     outcome.tool_calls,
                     retries,
                     outcome.usage.input,
                     outcome.usage.output,
                     outcome.usage.cached,
+                    outcome.usage.cache_created,
                     outcome.timing.model_ms,
                     outcome.timing.tools_ms
                 );
@@ -1461,11 +1669,21 @@ async fn interactive(
                 // The agent still holds everything it committed before dying;
                 // record it so the failure costs the error message, not the
                 // progress that was already made.
-                let salvaged = agent.messages()[original_len..].to_vec();
+                //
+                // A mid-turn compaction can leave the history shorter than it
+                // was when the turn started, which is why this is a `get`: the
+                // slice index would panic there and hide the real error behind
+                // a crash.
+                let salvaged = agent
+                    .messages()
+                    .get(original_len..)
+                    .unwrap_or(&[])
+                    .to_vec();
                 if !salvaged.is_empty() {
                     store.append(&session.id, &salvaged)?;
                     session.messages.extend(salvaged);
                 }
+                record_turn_stats(&store, &session.id, &TurnStats::unreported());
                 eprintln!("error: {error:#}\n");
             }
         }
@@ -1497,6 +1715,317 @@ fn list_sessions(store: &JsonlStore, as_json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// One session's totals as the JSON payload's `totals` object.
+///
+/// The field names are the contract: the desktop builds the same object from
+/// the same struct, so a script reading either frontend reads the same shape.
+/// `cache_hit_ratio` is a fraction (0..=1), so no consumer repeats the division.
+fn stats_totals_json(totals: &SessionTotals) -> serde_json::Value {
+    serde_json::json!({
+        "turns": totals.turns,
+        "steps": totals.steps,
+        "tool_calls": totals.tool_calls,
+        "input": totals.input,
+        "output": totals.output,
+        "cached": totals.cached,
+        "cache_created": totals.cache_created,
+        "reasoning": totals.reasoning,
+        "model_ms": totals.model_ms,
+        "tools_ms": totals.tools_ms,
+        "cache_hit_ratio": totals.cache_hit_ratio(),
+    })
+}
+
+/// One recorded turn, as the JSON payload's per-turn entries.
+fn stats_turn_json(stats: &TurnStats) -> serde_json::Value {
+    serde_json::json!({
+        "ts": stats.ts,
+        "steps": stats.steps,
+        "tool_calls": stats.tool_calls,
+        "retries": stats.retries,
+        "input": stats.input,
+        "output": stats.output,
+        "cached": stats.cached,
+        "cache_created": stats.cache_created,
+        "reasoning": stats.reasoning,
+        "model_ms": stats.model_ms,
+        "tools_ms": stats.tools_ms,
+    })
+}
+
+/// How many turns `ngu stats` shows per session.
+///
+/// A screenful for tracing where a spike came from, not a ledger: the totals
+/// cover the whole session.
+const STATS_TAIL: usize = 20;
+
+fn print_stats_block(id: &str, totals: &SessionTotals, cost: Option<&nguruvilu::pricing::Cost>, found: bool) {
+    println!("session {id}{}", if found { "" } else { " (not found)" });
+    if totals.turns == 0 {
+        println!("  no turns recorded");
+        return;
+    }
+    println!(
+        "  turns {}  steps {}  tool calls {}",
+        totals.turns, totals.steps, totals.tool_calls
+    );
+    println!(
+        "  tokens  in {}  out {}  cached {}  written {}  hit {:.1}%  reasoning {}",
+        totals.input,
+        totals.output,
+        totals.cached,
+        totals.cache_created,
+        totals.cache_hit_ratio() * 100.0,
+        totals.reasoning
+    );
+    println!(
+        "  time    model {} ms  tools {} ms",
+        totals.model_ms, totals.tools_ms
+    );
+    // Money is printed as a fact or as a refusal, never as a zero: "unpriced"
+    // and "cost nothing" read the same on a receipt, and only one is true.
+    if let Some(cost) = cost {
+        match (&cost.reason, cost.priced) {
+            (_, true) => println!("  cost    {:.4} ({})", cost.amount, cost.model),
+            (Some(reason), false) => println!("  cost    unpriced: {reason}"),
+            (None, false) => println!("  cost    unpriced"),
+        }
+    }
+}
+
+/// `ngu stats` — what stored sessions cost, read from their recorded turns.
+///
+/// A session with no usage rows — every session written before the ledger
+/// existed — totals to zeros rather than erroring, and so does an id whose file
+/// is gone: "nothing recorded" is a fact about the file, not a failed read.
+#[allow(clippy::too_many_arguments)]
+fn stats_command(
+    store: &JsonlStore,
+    id: Option<&str>,
+    all: bool,
+    priced: bool,
+    prices: Option<&std::path::Path>,
+    as_json: bool,
+) -> Result<()> {
+    // The table is only read when money was asked for: a report without `--cost`
+    // must not fail because a price file somewhere has a typo in it.
+    let table = if priced {
+        match prices {
+            Some(path) => nguruvilu::pricing::PriceTable::from_path(path)?,
+            None => {
+                nguruvilu::pricing::PriceTable::from_path(&nguruvilu::pricing::PriceTable::default_path())?
+            }
+        }
+    } else {
+        None
+    };
+    let cost_of = |model: Option<&str>, totals: &SessionTotals| -> Option<nguruvilu::pricing::Cost> {
+        if !priced {
+            return None;
+        }
+        // A session that records no model has nothing to price against. Saying
+        // so is better than pricing it at the wildcard rate as if it were known.
+        let model = model.unwrap_or("");
+        Some(if model.is_empty() {
+            nguruvilu::pricing::Cost {
+                amount: 0.0,
+                model: String::new(),
+                priced: false,
+                reason: Some("the session records no model".to_string()),
+                fresh_input: 0,
+                cached: 0,
+                cache_created: 0,
+                output: 0,
+            }
+        } else {
+            nguruvilu::pricing::cost(
+                table.as_ref(),
+                model,
+                nguruvilu::pricing::Tokens::of_totals(totals),
+            )
+        })
+    };
+
+    // Which sessions to report, in the listing's recency order.
+    let ids: Vec<String> = if all {
+        store.list()?.into_iter().map(|summary| summary.id).collect()
+    } else if let Some(id) = id {
+        vec![id.to_string()]
+    } else {
+        store.latest()?.map(|summary| summary.id).into_iter().collect()
+    };
+
+    if ids.is_empty() {
+        if as_json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "sessions": [],
+                    "total": stats_totals_json(&SessionTotals::default()),
+                }))?
+            );
+        } else {
+            println!("no sessions in {}", store.root().display());
+        }
+        return Ok(());
+    }
+
+    // Every session is loaded up front so the report can borrow them: the
+    // per-turn tail reads the same in-memory rows the totals were summed from.
+    // A missing file is a zero row, not an error — a typo and a deleted session
+    // should both answer "nothing recorded".
+    let mut loaded: Vec<(String, Option<Session>)> = Vec::with_capacity(ids.len());
+    for id in ids {
+        let session = store.load(&id)?;
+        loaded.push((id, session));
+    }
+
+    let total: SessionTotals = loaded
+        .iter()
+        .map(|(_, session)| session.as_ref().map(totals_of).unwrap_or_default())
+        .sum();
+    // The grand total's money is the sum of the sessions' money, not the money
+    // of the summed tokens: sessions can run on different models at different
+    // rates, and one rate applied to a mixed total would invent a number.
+    let total_cost = if priced {
+        Some(nguruvilu::pricing::total(loaded.iter().filter_map(
+            |(_, session)| {
+                let totals = session.as_ref().map(totals_of).unwrap_or_default();
+                cost_of(session.as_ref().and_then(|s| s.model.as_deref()), &totals)
+            },
+        )))
+    } else {
+        None
+    };
+
+    if as_json {
+        let entries: Vec<serde_json::Value> = loaded
+            .iter()
+            .map(|(id, session)| {
+                let totals = session.as_ref().map(totals_of).unwrap_or_default();
+                let mut entry = serde_json::json!({
+                    "session": id,
+                    "found": session.is_some(),
+                    "totals": stats_totals_json(&totals),
+                });
+                if let Some(cost) = cost_of(session.as_ref().and_then(|s| s.model.as_deref()), &totals) {
+                    entry["cost"] = cost.json();
+                }
+                // The per-turn tail is for tracing one session; an `--all`
+                // listing would only bury the totals in a wall of rows.
+                if !all {
+                    if let Some(session) = session {
+                        let tail: Vec<serde_json::Value> = session
+                            .stats
+                            .iter()
+                            .rev()
+                            .take(STATS_TAIL)
+                            .rev()
+                            .map(stats_turn_json)
+                            .collect();
+                        entry["turns"] = serde_json::Value::Array(tail);
+                    }
+                }
+                entry
+            })
+            .collect();
+        let mut payload = serde_json::json!({
+            "sessions": entries,
+            "total": stats_totals_json(&total),
+        });
+        if let Some(cost) = &total_cost {
+            payload["total_cost"] = cost.json();
+        }
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
+    // A grand total is what `--all` asked for, so it is printed even when one
+    // session is all there is: a report whose last line appears sometimes is a
+    // report a script cannot read.
+    let show_total = all || loaded.len() > 1;
+    for (id, session) in &loaded {
+        let totals = session.as_ref().map(totals_of).unwrap_or_default();
+        let cost = cost_of(session.as_ref().and_then(|s| s.model.as_deref()), &totals);
+        print_stats_block(id, &totals, cost.as_ref(), session.is_some());
+        if show_total {
+            println!();
+        }
+    }
+    if show_total {
+        print_stats_block("total", &total, total_cost.as_ref(), true);
+    }
+    Ok(())
+}
+
+/// `ngu export` — write a stored session out in a shape that can be shared.
+///
+/// A missing session is an error here, unlike `ngu stats`, which reports zeros
+/// for an id with no file: a report about nothing is still a report, while an
+/// export of a session that does not exist would be an empty file that looks
+/// exactly like a real one.
+fn export_command(
+    store: &JsonlStore,
+    id: &str,
+    out: Option<&PathBuf>,
+    requested: Option<&str>,
+    as_json: bool,
+) -> Result<()> {
+    let session = store
+        .load(id)?
+        .ok_or_else(|| anyhow!("session not found: {id}"))?;
+    let options = nguruvilu::export::ExportOptions {
+        tool_output_cap: nguruvilu::export::DEFAULT_TOOL_OUTPUT_CAP,
+        format: export_format(requested, as_json)?,
+    };
+    let rendered = nguruvilu::export::render(&session, &totals_of(&session), &options);
+
+    match out {
+        // `--out` turns the export into a file. Missing directories are created
+        // rather than demanded, because `--out exports/session.md` failing
+        // because `exports/` did not exist yet is a worse answer than making it.
+        Some(path) => {
+            if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            std::fs::write(path, rendered.as_bytes())
+                .with_context(|| format!("writing {}", path.display()))?;
+            // One line on stdout, saying where the file went and how large it
+            // is: the size is the only feedback that distinguishes a complete
+            // export from one of a session that turned out to be nearly empty.
+            println!("wrote {} ({} bytes)", path.display(), rendered.len());
+        }
+        // `print!` rather than `println!`: the rendered text already ends with
+        // exactly one newline, so the bytes reaching a pipe here are the same
+        // bytes `--out` writes to a file.
+        None => print!("{rendered}"),
+    }
+    Ok(())
+}
+
+/// Which format an export should use, from `--format` and the global `--json`.
+///
+/// `--json` is answered first, before `--format` is even read: a script driving
+/// this program passes `--json` to every subcommand, and one that quietly
+/// ignored it because the subcommand's own flag defaulted to Markdown would hand
+/// that script prose to parse as JSON.
+fn export_format(requested: Option<&str>, as_json: bool) -> Result<nguruvilu::export::Format> {
+    if as_json {
+        return Ok(nguruvilu::export::Format::Json);
+    }
+    match requested.map(str::trim) {
+        None => Ok(nguruvilu::export::Format::Markdown),
+        Some(raw) => match raw.to_ascii_lowercase().as_str() {
+            "md" | "markdown" => Ok(nguruvilu::export::Format::Markdown),
+            "json" => Ok(nguruvilu::export::Format::Json),
+            other => Err(anyhow!(
+                "unknown export format '{other}'; expected md, markdown, or json"
+            )),
+        },
+    }
 }
 
 fn show_session(store: &JsonlStore, id: &str) -> Result<()> {
@@ -2700,6 +3229,15 @@ fn plugin_load(path: &PathBuf, as_json: bool) -> Result<()> {
     let contributions = PluginTrait::apply(&plugin, &ctx)?;
     let tools: Vec<String> = contributions.tools.iter().map(|t| t.name.clone()).collect();
     let logs = plugin.log_lines();
+    // The library stays mapped for the life of the process on purpose, and a
+    // second load of the *same path* returns the module already in memory —
+    // `DllMain` does not run again, so the plugin's statics carry over. Both
+    // facts used to be invisible from outside; they are the reason a reload can
+    // behave differently from a fresh start.
+    let lib_ref = plugin.lib_ref();
+    let leaked = nguruvilu::dylib::leaked_libraries();
+    let mine = leaked.iter().find(|entry| entry.path == *path);
+    let loads = mine.map(|entry| entry.loads).unwrap_or(0);
 
     if as_json {
         println!(
@@ -2714,6 +3252,11 @@ fn plugin_load(path: &PathBuf, as_json: bool) -> Result<()> {
                 "inject": plugin.inject(),
                 "provide": plugin.provide(),
                 "tools": tools,
+                "library": {
+                    "lib_ref": lib_ref,
+                    "loads": loads,
+                    "leaked_total": leaked.len(),
+                },
                 "log": logs.iter().map(|(level, text)| serde_json::json!({"level": level, "text": text})).collect::<Vec<_>>(),
             }))?
         );
@@ -2739,6 +3282,16 @@ fn plugin_load(path: &PathBuf, as_json: bool) -> Result<()> {
     println!("tools ({}):", tools.len());
     for tool in &tools {
         println!("  {tool}");
+    }
+    println!("library:     ref {lib_ref}, {loads} load(s) of this path here");
+    if loads > 1 {
+        println!(
+            "note:        this module was already mapped, so it was not loaded again — its \
+             statics carry over from the previous load"
+        );
+    }
+    if leaked.len() > 1 {
+        println!("leaked:      {} librar(y|ies) kept for the life of this process", leaked.len());
     }
     for (level, text) in logs {
         let name = match level {
@@ -3385,6 +3938,10 @@ impl PackHost<'_> {
         use nguruvilu::tools::pack::Pending;
 
         let mut changed = false;
+        // Kept because the tool-table adoption happens once, after the loop,
+        // and by then no per-pack label is in scope — yet a refusal has to be
+        // able to say which packs the table it would not take belonged to.
+        let mut touched: Vec<String> = Vec::new();
         for action in self.queue.drain() {
             let packs = nguruvilu::pack::installed(&nguruvilu::pack::default_packs_dir())?;
             match action {
@@ -3409,6 +3966,7 @@ impl PackHost<'_> {
                         };
                         found = true;
                         changed = true;
+                        touched.push(label.clone());
                         eprintln!(
                             "[pack] unloaded {label}: {} plugin instance(s), {} mcp server(s), {} skill root(s)",
                             report.plugins.len(),
@@ -3485,6 +4043,7 @@ impl PackHost<'_> {
                                 eprintln!("[pack] skipped {}: {}", entry.id, entry.reason);
                             }
                             changed = true;
+                            touched.push(label.clone());
                         }
                         match nguruvilu::pack::read_manifest(&pack.path) {
                             Ok(manifest) => {
@@ -3563,8 +4122,23 @@ impl PackHost<'_> {
                     ChangePayload::Persona(persona.clone()),
                 ))?;
             }
-            guard.adopt_kernel_tools(self.kernel);
-            eprintln!("[pack] the next turn sees the new tool table");
+            // A denial leaves the previous table in place, so the pack reads as
+            // loaded while its tools are not callable. That is the whole trace
+            // a refused swap leaves, so it says which packs it was for and
+            // repeats the policy's own words. It is not an error: this returns
+            // `Ok` and the turn loop carries on with the table it already had.
+            // `changed` is only ever set beside a push, so `touched` is not
+            // empty here.
+            if let nguruvilu::hotreload::ApplyOutcome::Denied(reason) =
+                guard.adopt_kernel_tools(self.kernel)
+            {
+                eprintln!(
+                    "[pack] the tool table was not swapped for {}: {reason}",
+                    touched.join(", ")
+                );
+            } else {
+                eprintln!("[pack] the next turn sees the new tool table");
+            }
         }
         Ok(())
     }

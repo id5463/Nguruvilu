@@ -53,6 +53,23 @@ pub const INBOX: &str = "agent_inbox";
 /// Most steps one tick's worker may take.
 const TICK_STEPS: usize = 12;
 
+/// How long one tick's worker may run before it is abandoned.
+///
+/// Step count bounds *how many* things the worker may do, never how long it
+/// spends doing them: a single `bash` call can hold a step for minutes and a
+/// retry loop for hours. Thirty minutes is generous for one mission step and
+/// short enough that a wedged worker does not hang a whole turn.
+const TICK_WALL_CLOCK_MS: u64 = 30 * 60 * 1000;
+
+/// Floor for a caller-supplied `timeout_ms`: below this the worker could not
+/// even report what it found, and any timeout would be indistinguishable from
+/// a failure of the step itself.
+const TICK_MIN_WALL_CLOCK_MS: u64 = 10 * 1000;
+
+/// Ceiling for `timeout_ms` — six hours, the same order as a mission's own
+/// useful lifetime.
+const TICK_MAX_WALL_CLOCK_MS: u64 = 6 * 60 * 60 * 1000;
+
 /// Most lines `recall` returns in one call.
 const RECALL_LIMIT: usize = 40;
 
@@ -274,7 +291,8 @@ fn tick_tool(access: Arc<dyn crate::model::ModelAccess>) -> ToolDef {
             "properties": {
                 "step": { "type": "string", "description": "Step to run. Defaults to the mission's current step." },
                 "model": { "type": "string", "description": "Optional model for the worker. A cheaper model is usually right for mechanical steps." },
-                "max_steps": { "type": "integer", "description": "Steps the worker may take before giving up (default 12, max 40)." }
+                "max_steps": { "type": "integer", "description": "Steps the worker may take before giving up (default 12, max 40)." },
+                "timeout_ms": { "type": "integer", "description": "Wall-clock budget for the worker in milliseconds (default 1800000 = 30 minutes; max 6 hours). The worker is abandoned when it runs out." }
             }
         }),
         PLUGIN,
@@ -288,10 +306,14 @@ fn tick_tool(access: Arc<dyn crate::model::ModelAccess>) -> ToolDef {
 fn post_tool() -> ToolDef {
     ToolDef::new(
         POST,
-        "Send a letter to another agent working on the active mission. Mail is written \
-         to that agent's mailbox on disk, so it is delivered whether or not the \
-         recipient is running — it is read at the start of the recipient's next turn. \
-         Use it to hand over findings, ask for something, or warn about a dead end.",
+        format!(
+            "Send a letter to another agent working on the active mission. Mail is written \
+             to that agent's mailbox on disk, so it is delivered whether or not the \
+             recipient is running — it is read at the start of the recipient's next turn. \
+             Use it to hand over findings, ask for something, or warn about a dead end. \
+             A body longer than {LETTER_BODY_CAP} characters is cut, and this tool's reply \
+             says so: write anything longer to a file and name the path in the letter."
+        ),
         json!({
             "type": "object",
             "properties": {
@@ -309,9 +331,14 @@ fn post_tool() -> ToolDef {
 fn inbox_tool() -> ToolDef {
     ToolDef::new(
         INBOX,
-        "Read your mailbox for the active mission. Unread letters are returned and \
-         marked read, so the same letter is not delivered twice; pass mark_read=false \
-         to peek. Recipients that are not running still receive mail — it waits here.",
+        format!(
+            "Read your mailbox for the active mission. Unread letters are returned and \
+             marked read, so the same letter is not delivered twice; pass mark_read=false \
+             to peek. Recipients that are not running still receive mail — it waits here. \
+             One read renders at most {INBOX_LETTER_CAP} letters or about \
+             {INBOX_RENDER_CAP} characters and reports how many are still unread; call it \
+             again to render the rest, which stay unread until they are shown."
+        ),
         json!({
             "type": "object",
             "properties": {
@@ -795,7 +822,12 @@ fn total_unread(dir: &Path) -> usize {
                 .to_string_lossy()
                 .trim_end_matches(".jsonl")
                 .to_string();
-            mailbox_unread(&maildir, &name)
+            // `mailbox_unread` takes the *mission* directory: it resolves the
+            // mailbox itself (`<dir>/mailbox/<who>.jsonl`) and the watermark
+            // beside it. Handing it the mailbox directory made both paths one
+            // level too deep, so every mailbox read as empty and `status`
+            // reported no unread mail at all.
+            mailbox_unread(dir, &name)
         })
         .sum()
 }
@@ -1105,6 +1137,18 @@ fn worker_prompt(record: &Value, state: &str, step: &str) -> String {
     )
 }
 
+/// `30 minutes`, `2 hours` — a budget as the error message states it.
+fn format_wall_clock(budget: std::time::Duration) -> String {
+    let secs = budget.as_secs();
+    if secs >= 3600 && secs % 3600 == 0 {
+        format!("{} hours", secs / 3600)
+    } else if secs >= 60 {
+        format!("{} minutes", secs / 60)
+    } else {
+        format!("{secs} seconds")
+    }
+}
+
 async fn tick(access: Arc<dyn crate::model::ModelAccess>, args: Value) -> Result<String> {
     let (dir, mut record) = active_mission()?;
     let id = record
@@ -1144,6 +1188,15 @@ async fn tick(access: Arc<dyn crate::model::ModelAccess>, args: Value) -> Result
         .map(|v| v as usize)
         .unwrap_or(TICK_STEPS)
         .clamp(1, 40);
+    // A step count is not a time bound: one step can sit inside a single `bash`
+    // call for an hour (the default bash timeout alone is two minutes). The
+    // wall clock is the bound that actually protects the turn.
+    let wall_clock = std::time::Duration::from_millis(
+        args.get("timeout_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(TICK_WALL_CLOCK_MS)
+            .clamp(TICK_MIN_WALL_CLOCK_MS, TICK_MAX_WALL_CLOCK_MS),
+    );
 
     let config: Arc<dyn crate::agent::TurnConfig> = Arc::new(
         crate::agent::StaticConfig::new(access.system_prompt(), access.tools(), client.model())
@@ -1151,7 +1204,21 @@ async fn tick(access: Arc<dyn crate::model::ModelAccess>, args: Value) -> Result
     );
     let mut agent = crate::agent::Agent::new(client, config, Vec::new())
         .with_max_steps(max_steps);
-    let outcome = agent.run(&worker_prompt(&record, &state, &step)).await;
+    let prompt = worker_prompt(&record, &state, &step);
+    let outcome = match tokio::time::timeout(wall_clock, agent.run(&prompt)).await {
+        Ok(outcome) => outcome,
+        // The worker future is dropped here, which cancels it: a mission that
+        // hangs must not hold the turn open indefinitely. Saying exactly that
+        // is better than an empty reply, and the log records it as the tick's
+        // error so the next tick sees what happened.
+        Err(_) => Err(anyhow!(
+            "the worker ran past its wall-clock budget of {} and was abandoned. Nothing \
+             it may have done is known to be undone — check the working tree before \
+             retrying, or raise timeout_ms (max {} s) for a genuinely long step.",
+            format_wall_clock(wall_clock),
+            TICK_MAX_WALL_CLOCK_MS / 1000
+        )),
+    };
 
     let (text, failed) = match outcome {
         Ok(outcome) => (outcome.text.clone(), outcome.error.clone()),
@@ -1212,27 +1279,121 @@ async fn tick(access: Arc<dyn crate::model::ModelAccess>, args: Value) -> Result
 
 // ------------------------------------------------------------------- mailbox
 
+/// Most characters one letter may store.
+///
+/// A letter is rendered at the start of the recipient's next turn, so an
+/// oversized one is charged to that turn's context, and to every later read
+/// that renders it again. A sender with more to say writes a file instead and
+/// puts the path in the letter.
+const LETTER_BODY_CAP: usize = 16_000;
+
+/// Most characters one `inbox` read renders into the transcript.
+///
+/// A mailbox is an append-only file that can hold thousands of letters, so
+/// "read the unread ones" is unbounded unless a read bounds itself.
+const INBOX_RENDER_CAP: usize = 64 * 1024;
+
+/// Most letters one `inbox` read renders, so a mailbox of many tiny letters is
+/// bounded as well rather than only by the character cap.
+const INBOX_LETTER_CAP: usize = 200;
+
 /// One mailbox file per recipient.
 fn mailbox_file(dir: &Path, who: &str) -> PathBuf {
     dir.join("mailbox").join(format!("{}.jsonl", safe_segment(who)))
 }
 
 /// How many letters a mailbox holds, and how many were already read.
+///
+/// The "read" half goes through the same check [`read_watermark`] applies to a
+/// read: a bare count clamped to a *rewritten* file would report "nothing
+/// unread" for letters that are still on disk and are about to be delivered
+/// again, so `status` and `inbox` would disagree about the same mailbox.
 fn mailbox_counts(dir: &Path, who: &str) -> (usize, usize) {
     let file = mailbox_file(dir, who);
-    let total = std::fs::read_to_string(&file)
-        .map(|text| text.lines().filter(|l| !l.trim().is_empty()).count())
-        .unwrap_or(0);
-    let read = std::fs::read_to_string(offset_path(dir, who))
-        .ok()
-        .and_then(|text| text.trim().parse::<usize>().ok())
-        .unwrap_or(0)
-        .min(total);
-    (total, read)
+    let text = std::fs::read_to_string(&file).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let (read, _rotated) = read_watermark(&lines, dir, who);
+    (lines.len(), read)
 }
 
 fn offset_path(dir: &Path, who: &str) -> PathBuf {
     dir.join("mailbox").join(format!("{}.read", safe_segment(who)))
+}
+
+/// The watermark as it is stored on disk: how many letters were consumed, and
+/// — in the new format — a fingerprint of the prefix that was consumed,
+/// `12@0f3a…`. A bare number (the old format) is still accepted, but it cannot
+/// be verified, so it reads as "rotated" once: the letters come back, and the
+/// next mark rewrites it in the verifiable format.
+fn read_mark(dir: &Path, who: &str) -> Option<(usize, Option<String>)> {
+    let raw = std::fs::read_to_string(offset_path(dir, who)).ok()?;
+    let raw = raw.trim();
+    let (count, fingerprint) = match raw.split_once('@') {
+        Some((count, fingerprint)) => (count.parse::<usize>().ok()?, Some(fingerprint.to_string())),
+        None => (raw.parse::<usize>().ok()?, None),
+    };
+    Some((count, fingerprint))
+}
+
+/// Where "already read" sits in this mailbox, and whether the mailbox no
+/// longer matches what was read.
+///
+/// A watermark that is only a count cannot survive a rewrite: when the file is
+/// truncated or rotated, the stale count either points past the end — or,
+/// clamped to the new length, silently marks letters that are **still on disk**
+/// as already read, and they become unreachable forever, with no error and no
+/// hint. The fingerprint is the tripwire: if the prefix the count covered is
+/// not the prefix on disk any more, the mailbox was rewritten.
+fn read_watermark(lines: &[&str], dir: &Path, who: &str) -> (usize, bool) {
+    let (read, fingerprint) = match read_mark(dir, who) {
+        Some(mark) => mark,
+        None => return (0, false),
+    };
+    if read == 0 {
+        return (0, false);
+    }
+    // The file shrank under the watermark: those letters are gone.
+    if read > lines.len() {
+        return (0, true);
+    }
+    match fingerprint {
+        // The prefix that was read is still the prefix on disk.
+        Some(fingerprint) if fingerprint == prefix_fingerprint(&lines[..read]) => (read, false),
+        // Everything else — a prefix that changed, and a watermark written
+        // before fingerprints existed, which nothing can verify — reads again
+        // from the top: a duplicate delivery costs a re-read; a lost letter
+        // costs the work it carried. The first mark rewrites the watermark in
+        // the verifiable format, so the re-read happens once, not forever.
+        _ => (0, true),
+    }
+}
+
+/// Persist the watermark after a read consumed `lines` in full.
+fn write_watermark(dir: &Path, who: &str, lines: &[&str]) -> Result<()> {
+    let mark = format!("{}@{}", lines.len(), prefix_fingerprint(lines));
+    write_atomic(&offset_path(dir, who), mark.as_bytes())
+}
+
+/// A short, stable fingerprint of the letters a watermark covered.
+///
+/// FNV-1a, by hand: a persisted watermark must compare equal across processes,
+/// so the digest has to be stable forever, which a dependency's hash (or the
+/// std one, whose algorithm is unspecified) does not promise. The newline each
+/// line lost to `lines()` goes back in, so a line that splits in two never
+/// reads as the same prefix.
+fn prefix_fingerprint(lines: &[&str]) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for line in lines {
+        for byte in line.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash ^= u64::from(b'\n');
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
 }
 
 fn mailbox_unread(dir: &Path, who: &str) -> usize {
@@ -1253,8 +1414,12 @@ fn post(args: Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .ok_or_else(|| anyhow!("missing required argument: body"))?
-        .to_string();
+        .ok_or_else(|| anyhow!("missing required argument: body"))?;
+    // The letter is capped at the door, not at the reader: whoever opens the
+    // mailbox pays for whatever is in it. The cut is reported to the sender,
+    // so a truncated letter is never mistaken for a whole one.
+    let body_chars = body.chars().count();
+    let body = clip(body, LETTER_BODY_CAP);
     let from = args
         .get("from")
         .and_then(|v| v.as_str())
@@ -1281,12 +1446,20 @@ fn post(args: Value) -> Result<String> {
     log_entry(&dir, "mail", &from, &format!("→ {to}: {}", clip(&body, 400)), None)?;
 
     let (total, read) = mailbox_counts(&dir, &to);
-    Ok(format!(
+    let mut out = format!(
         "Letter from {from} to {to} written to {}\n  {to} has {} unread letter(s) \
          (it sees them with {INBOX} at the start of its next turn).\n",
         file.display(),
         total.saturating_sub(read)
-    ) + &marker(&record, json!({ "unread": total_unread(&dir), "id": id })))
+    );
+    if body_chars > LETTER_BODY_CAP {
+        out.push_str(&format!(
+            "  the body was cut to {LETTER_BODY_CAP} characters (sent {body_chars}); \
+             {to} will not see the rest. Write the whole text to a file and put its \
+             path in the letter when it matters.\n"
+        ));
+    }
+    Ok(out + &marker(&record, json!({ "unread": total_unread(&dir), "id": id })))
 }
 
 fn inbox(args: Value) -> Result<String> {
@@ -1311,27 +1484,56 @@ fn inbox(args: Value) -> Result<String> {
     let file = mailbox_file(&dir, &who);
     let text = std::fs::read_to_string(&file).unwrap_or_default();
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    let (total, read) = mailbox_counts(&dir, &who);
+    let total = lines.len();
+    // The watermark may no longer match the file: a truncated or rotated
+    // mailbox reads again from the top instead of silently skipping letters
+    // that are still on disk.
+    let (read, rotated) = read_watermark(&lines, &dir, &who);
     let fresh: Vec<&str> = lines.iter().skip(read).copied().collect();
 
     let mut out = format!("{who}@…{}: {} letter(s), {} unread\n", id, total, fresh.len());
+    if rotated {
+        out.push_str("  (mailbox rotated, re-read from the top)\n");
+    }
     if fresh.is_empty() {
         out.push_str("(no new mail)\n");
     }
+    // Rendering is what this turn pays for, so the read bounds itself instead
+    // of trusting the mailbox to stay small. A letter that is not rendered is
+    // not consumed either: the watermark covers only the prefix this read
+    // actually showed, so the rest is delivered on the next call.
+    let mut shown = 0usize;
+    let mut rendered_chars = 0usize;
     for line in &fresh {
-        match serde_json::from_str::<Value>(line) {
-            Ok(entry) => out.push_str(&format!(
+        if shown >= INBOX_LETTER_CAP || rendered_chars >= INBOX_RENDER_CAP {
+            break;
+        }
+        let entry = match serde_json::from_str::<Value>(line) {
+            Ok(entry) => format!(
                 "  [{} · {}]\n    {}\n",
                 entry.get("from").and_then(|v| v.as_str()).unwrap_or("?"),
                 entry.get("when").and_then(|v| v.as_str()).unwrap_or(""),
                 entry.get("body").and_then(|v| v.as_str()).unwrap_or("")
-            )),
-            Err(_) => out.push_str(&format!("  (unreadable letter) {}\n", clip(line, 160))),
-        }
+            ),
+            Err(_) => format!("  (unreadable letter) {}\n", clip(line, 160)),
+        };
+        rendered_chars += entry.chars().count();
+        out.push_str(&entry);
+        shown += 1;
     }
-    if mark && !fresh.is_empty() {
-        write_atomic(&offset_path(&dir, &who), total.to_string().as_bytes())?;
-        out.push_str(&format!("  (marked read; {} total)\n", total));
+    let withheld = fresh.len().saturating_sub(shown);
+    if withheld > 0 {
+        out.push_str(&format!(
+            "  ({withheld} more unread letter(s) not shown by this read — they stay \
+             unread; run {INBOX} again to render the next batch)\n"
+        ));
+    }
+    if mark && shown > 0 {
+        write_watermark(&dir, &who, &lines[..read + shown])?;
+        out.push_str(&format!(
+            "  (marked read; {} of {total} letters)\n",
+            read + shown
+        ));
     }
     Ok(out + &marker(&record, json!({ "unread": total_unread(&dir) })))
 }
@@ -1515,6 +1717,248 @@ mod tests {
             post(json!({ "to": "../escape", "body": "nope" })).expect("post");
             let escaped = dir.join("missions").join("escape.jsonl");
             assert!(!escaped.exists(), "mail stayed inside the mission");
+        });
+    }
+
+    /// A mailbox that is truncated or rotated keeps delivering the letters that
+    /// are still on disk.
+    ///
+    /// The watermark used to be a bare line count. After a rewrite the stale
+    /// count either pointed past the new end or — clamped to it — marked
+    /// letters that were *still there* as already read: they became unreachable
+    /// forever, with no error and no hint. The read now notices that the prefix
+    /// it remembers is not the prefix on disk, and starts again from the top.
+    #[test]
+    fn a_truncated_mailbox_still_shows_the_letters_that_are_left() {
+        in_workspace("mail-truncate", |dir| {
+            start_mission(dir, "rotate");
+            for body in ["letter one", "letter two", "letter three"] {
+                post(json!({ "to": "worker-a", "body": body })).expect("post");
+            }
+            let first = inbox(json!({ "path": "worker-a" })).expect("inbox");
+            assert!(first.contains("letter three"), "{first}");
+            assert!(!first.contains("rotated"), "a first read is not a rotation: {first}");
+
+            // The mailbox is rewritten, as a cleanup or a rotation would: the
+            // one letter left is a letter that was already read.
+            let missions = dir.join("missions");
+            let id = active_id(&missions).unwrap().expect("an active mission");
+            let mailbox = mailbox_file(&missions.join(&id), "worker-a");
+            let kept = std::fs::read_to_string(&mailbox).unwrap();
+            let last = kept.lines().last().unwrap().to_string() + "\n";
+            std::fs::write(&mailbox, last).unwrap();
+
+            // `status` and `inbox` must agree about the same mailbox: one
+            // letter on disk and an unverifiable mark is one unread letter,
+            // not "0" from a stale count clamped to the new length.
+            let status_text = status(json!({})).expect("status");
+            assert!(status_text.contains("unread mail: 1"), "{status_text}");
+
+            let second = inbox(json!({ "path": "worker-a" })).expect("inbox");
+            assert!(
+                second.contains("mailbox rotated, re-read from the top"),
+                "the rewrite is reported, not swallowed: {second}"
+            );
+            assert!(
+                second.contains("letter three"),
+                "a letter still on disk is delivered again instead of vanishing: {second}"
+            );
+            assert!(
+                !second.contains("letter one"),
+                "a letter no longer on disk is not invented: {second}"
+            );
+
+            // The watermark caught up with the rewritten file, so the next
+            // letter is an ordinary increment.
+            post(json!({ "to": "worker-a", "body": "letter four" })).expect("post");
+            let third = inbox(json!({ "path": "worker-a" })).expect("inbox");
+            assert!(third.contains("letter four"), "{third}");
+            assert!(!third.contains("rotated"), "it matches again: {third}");
+            assert!(!third.contains("letter three"), "already read: {third}");
+        });
+    }
+
+    /// Reading twice returns the increment only — the property the fingerprint
+    /// must preserve rather than trade away for rotation detection.
+    #[test]
+    fn an_appended_mailbox_returns_only_the_increment() {
+        in_workspace("mail-append", |dir| {
+            start_mission(dir, "append");
+            post(json!({ "to": "worker-a", "body": "first" })).expect("post");
+            post(json!({ "to": "worker-a", "body": "second" })).expect("post");
+            let first = inbox(json!({ "path": "worker-a" })).expect("inbox");
+            assert!(first.contains("first") && first.contains("second"), "{first}");
+
+            let again = inbox(json!({ "path": "worker-a" })).expect("inbox");
+            assert!(again.contains("no new mail"), "{again}");
+            assert!(
+                !again.contains("rotated"),
+                "an unchanged mailbox is not a rotation: {again}"
+            );
+
+            post(json!({ "to": "worker-a", "body": "third" })).expect("post");
+            let increment = inbox(json!({ "path": "worker-a" })).expect("inbox");
+            assert!(increment.contains("third"), "{increment}");
+            assert!(!increment.contains("first"), "only the increment: {increment}");
+            assert!(!increment.contains("second"), "only the increment: {increment}");
+            assert!(increment.contains("1 unread"), "{increment}");
+        });
+    }
+
+    /// A letter that arrives oversized is stored cut, and the sender is told so:
+    /// a letter is charged to the recipient's context, so the door is where the
+    /// bound has to be enforced.
+    #[test]
+    fn a_letter_longer_than_the_cap_is_stored_cut_and_says_so() {
+        in_workspace("mail-cap", |dir| {
+            start_mission(dir, "coordinate");
+            let sent = LETTER_BODY_CAP * 3;
+            let reply = post(json!({ "to": "worker-a", "body": "y".repeat(sent) }))
+                .expect("post");
+            assert!(
+                reply.contains("the body was cut to"),
+                "the sender learns about the cut: {reply}"
+            );
+            assert!(reply.contains(&sent.to_string()), "with the size sent: {reply}");
+
+            let missions = dir.join("missions");
+            let id = active_id(&missions).unwrap().expect("an active mission");
+            let mailbox = mailbox_file(&missions.join(&id), "worker-a");
+            let text = std::fs::read_to_string(&mailbox).unwrap();
+            let letter: Value =
+                serde_json::from_str(text.lines().next().expect("one letter")).unwrap();
+            let stored = letter.get("body").and_then(|v| v.as_str()).expect("a body");
+            assert!(
+                stored.chars().count() <= LETTER_BODY_CAP + 1,
+                "the stored body is bounded: {} chars",
+                stored.chars().count()
+            );
+            assert!(stored.ends_with('…'), "the cut is visible in the letter");
+
+            // A letter under the cap keeps its exact text and no warning.
+            let short = post(json!({ "to": "worker-a", "body": "short one" })).expect("post");
+            assert!(!short.contains("cut to"), "no warning when nothing was cut: {short}");
+        });
+    }
+
+    /// One read renders a bounded batch, names what is left, and leaves exactly
+    /// that remainder unread — a letter that was not shown must not be consumed.
+    #[test]
+    fn a_full_mailbox_renders_a_bounded_reply_and_leaves_the_rest_unread() {
+        in_workspace("mail-full", |dir| {
+            start_mission(dir, "many letters");
+            let total = INBOX_LETTER_CAP + 50;
+            for index in 0..total {
+                post(json!({ "to": "worker-a", "body": format!("letter {index}") })).expect("post");
+            }
+
+            let first = inbox(json!({ "path": "worker-a" })).expect("inbox");
+            assert_eq!(
+                first.matches('·').count(),
+                INBOX_LETTER_CAP,
+                "the batch is bounded by the letter cap"
+            );
+            assert!(first.contains("letter 0"), "the oldest letter leads the batch");
+            assert!(
+                first.contains("more unread letter(s) not shown"),
+                "the remainder is named: {first}"
+            );
+            assert!(
+                !first.contains(&format!("letter {}", total - 1)),
+                "the last letter is withheld, not rendered"
+            );
+
+            // The unread count matches what this read did not show.
+            let status_text = status(json!({})).expect("status");
+            assert!(
+                status_text.contains("unread mail: 50"),
+                "only the withheld letters stay unread: {status_text}"
+            );
+
+            let second = inbox(json!({ "path": "worker-a" })).expect("inbox");
+            assert!(
+                second.contains(&format!("letter {}", total - 1)),
+                "the withheld letters arrive on the next read: {second}"
+            );
+            assert!(
+                !second.contains("letter 0"),
+                "a rendered letter is not delivered twice: {second}"
+            );
+            assert!(
+                !second.contains("more unread letter(s)"),
+                "the tail fits in one read: {second}"
+            );
+            let third = inbox(json!({ "path": "worker-a" })).expect("inbox");
+            assert!(third.contains("no new mail"), "{third}");
+        });
+    }
+
+    /// The character cap bounds a read even when few letters carry a lot of
+    /// text: eight full-sized letters would otherwise render in one reply.
+    #[test]
+    fn a_few_huge_letters_are_rendered_only_up_to_the_character_cap() {
+        in_workspace("mail-huge", |dir| {
+            start_mission(dir, "big letters");
+            for _ in 0..8 {
+                post(json!({ "to": "worker-a", "body": "z".repeat(LETTER_BODY_CAP) }))
+                    .expect("post");
+            }
+            let reply = inbox(json!({ "path": "worker-a" })).expect("inbox");
+            assert!(
+                reply.contains("more unread letter(s)"),
+                "the read stops at the cap and says so"
+            );
+            assert!(
+                reply.chars().count() < INBOX_RENDER_CAP + LETTER_BODY_CAP,
+                "the reply is bounded by the cap plus the one letter that crossed it: \
+                 {} chars",
+                reply.chars().count()
+            );
+        });
+    }
+
+    /// A watermark written by an older build is a bare line count, which
+    /// nothing can verify. It is not trusted: the letters come back once, and
+    /// the mark is rewritten in the verifiable format.
+    #[test]
+    fn an_old_bare_count_watermark_migrates_instead_of_hiding_letters() {
+        in_workspace("mail-legacy-mark", |dir| {
+            start_mission(dir, "legacy mark");
+            post(json!({ "to": "worker-a", "body": "first" })).expect("post");
+            post(json!({ "to": "worker-a", "body": "second" })).expect("post");
+            let first = inbox(json!({ "path": "worker-a" })).expect("inbox");
+            assert!(first.contains("first") && first.contains("second"), "{first}");
+
+            let missions = dir.join("missions");
+            let id = active_id(&missions).unwrap().expect("an active mission");
+            let mdir = missions.join(&id);
+            let mark_file = offset_path(&mdir, "worker-a");
+            let fresh = std::fs::read_to_string(&mark_file).expect("the new-format mark");
+            assert!(fresh.contains('@'), "count@fingerprint is the new format: {fresh}");
+
+            // What an older build left behind: the count, and nothing to check
+            // it against.
+            std::fs::write(&mark_file, "2").expect("downgrade the watermark");
+
+            // Unverifiable, so it reads as a rewrite: the letters that are
+            // still on disk are delivered again rather than hidden behind a
+            // mark nothing can check.
+            let again = inbox(json!({ "path": "worker-a" })).expect("inbox");
+            assert!(again.contains("first") && again.contains("second"), "{again}");
+            let upgraded = std::fs::read_to_string(&mark_file).expect("the rewritten mark");
+            assert!(
+                upgraded.contains('@'),
+                "the old mark is migrated, not kept as a bare number: {upgraded}"
+            );
+
+            // From here it is an ordinary watermark again: only the increment.
+            post(json!({ "to": "worker-a", "body": "third" })).expect("post");
+            let third = inbox(json!({ "path": "worker-a" })).expect("inbox");
+            assert!(third.contains("third"), "{third}");
+            assert!(
+                !third.contains("first") && !third.contains("second"),
+                "only the increment: {third}"
+            );
         });
     }
 

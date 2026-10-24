@@ -54,6 +54,73 @@ pub trait ModelAccess: Send + Sync {
     fn context_policy(&self) -> Arc<dyn ContextPolicy>;
 }
 
+/// Take a lock without panicking on poisoning.
+///
+/// A `std::sync::Mutex` is poisoned when a thread panicked while holding it, and
+/// `.expect("…lock")` turns that one panic into a second panic on *every* later
+/// read — for the route, tools, prompt and policy locks that means every
+/// subsequent turn fails, not the one step that panicked. None of those locks
+/// guards an invariant a panic could have broken (they hold plain snapshots), so
+/// recovering the guard is the right answer. Use this at every host call site
+/// instead of `.lock().expect(…)`.
+pub fn lock_recovering<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Reject a base URL that would put the credentials on the wire in clear text.
+///
+/// The route reaches the provider through [`crate::llm::LlmConfig`], which sends
+/// the key as a `bearer_auth` header. Nothing between the settings file and that
+/// header looks at the scheme, so `http://api.example/v1` — a typo, or a URL
+/// copied from a gateway's docs — ships the key in clear text to every hop on the
+/// path. Loopback is exempt: a gateway on the same machine (`127.0.0.1`,
+/// `localhost`, `[::1]`) never leaves it. An empty URL is not an error, because
+/// "not configured" is reported by [`crate::settings::Settings::missing`].
+pub fn check_base_url(base_url: &str) -> Result<()> {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return Err(anyhow::anyhow!(
+            "base URL '{trimmed}' has no scheme; expected https://host/path"
+        ));
+    };
+    let scheme = scheme.trim().to_ascii_lowercase();
+    if scheme == "https" {
+        return Ok(());
+    }
+    if scheme != "http" {
+        return Err(anyhow::anyhow!(
+            "base URL scheme '{scheme}' is not supported; use https://"
+        ));
+    }
+
+    // `http://user:pass@host/` — strip any userinfo *before* looking at the host,
+    // or a password could make a remote endpoint look like `localhost`.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let host = match authority.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let loopback = host == "localhost"
+        || host == "::1"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .map(|address| address.is_loopback())
+            .unwrap_or(false);
+    if loopback {
+        return Ok(());
+    }
+
+    Err(anyhow::anyhow!(
+        "base URL '{trimmed}' is http:// but not loopback, so the API key would travel in \
+         clear text. Use https://, or a gateway on localhost"
+    ))
+}
+
 /// The name a plugin looks the service up under.
 pub const SERVICE: &str = "llm";
 
@@ -207,6 +274,53 @@ mod tests {
 
         let default = access.client().unwrap();
         assert_eq!(default.model(), "m");
+    }
+
+    #[test]
+    fn a_clear_text_base_url_is_refused_unless_it_stays_on_the_machine() {
+        assert!(check_base_url("").is_ok(), "not configured is not an error");
+        assert!(check_base_url("https://api.example.test/v1").is_ok());
+        assert!(check_base_url("https://api.example.test:8443/v1").is_ok());
+        assert!(check_base_url("http://127.0.0.1:11434/v1").is_ok());
+        assert!(check_base_url("http://localhost:8080/v1").is_ok());
+        assert!(check_base_url("http://[::1]:8080/v1").is_ok());
+        assert!(check_base_url("http://127.0.0.5/v1").is_ok());
+
+        for refused in [
+            "http://api.example.test/v1",
+            "http://192.168.1.5:8080/v1",
+            "http://api.example.test:80/v1",
+            // Userinfo must not be able to disguise a remote host as loopback.
+            "http://user:pass@api.example.test/v1",
+            "ftp://api.example.test/v1",
+            "api.example.test/v1",
+        ] {
+            let error = check_base_url(refused)
+                .expect_err(&format!("{refused} must be refused"));
+            assert!(
+                !format!("{error:#}").is_empty(),
+                "the refusal explains itself: {error:#}"
+            );
+        }
+        let error = check_base_url("http://api.example.test/v1").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("clear text"),
+            "the reason names the risk: {error:#}"
+        );
+    }
+
+    #[test]
+    fn a_poisoned_lock_is_recovered_instead_of_panicking_again() {
+        let mutex = std::sync::Mutex::new(7_usize);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mutex.lock().unwrap();
+            panic!("a holder panicked");
+        }));
+        assert!(poisoned.is_err(), "the lock is poisoned now");
+        assert!(mutex.lock().is_err(), "which .expect() would turn into a panic");
+
+        let value = *lock_recovering(&mutex);
+        assert_eq!(value, 7, "the guard is still usable");
     }
 
     #[test]

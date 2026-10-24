@@ -143,14 +143,86 @@ pub struct OverrideRecord {
     pub new_owner: String,
 }
 
+/// Whose tool call is running: the session it belongs to and that session's
+/// working directory.
+///
+/// This is the *per-call* identity. It travels with the call — the agent that
+/// dispatches a turn builds one from the session the turn belongs to and hands
+/// it to [`ToolRegistry::execute_as`], which pins it over every poll of the
+/// handler.
+///
+/// It exists because one registry serves several conversations: the desktop's
+/// single `AppState` shares one tool table across sessions, and two sessions
+/// can run turns at the same time. A process-level "current session" that the
+/// shell rewrites on every switch is read at whatever moment a handler polls,
+/// so switching to B in the gap between two polls of A's handler silently
+/// re-homes A's `bash` cwd, relative paths, and job attribution. Carrying the
+/// identity in the call makes that impossible by construction.
+///
+/// `None` in either field keeps the old meaning: no session (jobs and packs
+/// see no owner) and the process directory for relative paths.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolIdentity {
+    /// The session the call belongs to.
+    pub session: Option<String>,
+    /// Working directory of that session; `None` is the process directory.
+    pub workspace: Option<std::path::PathBuf>,
+}
+
+impl ToolIdentity {
+    /// An identity from its parts.
+    pub fn new(session: Option<String>, workspace: Option<std::path::PathBuf>) -> Self {
+        Self { session, workspace }
+    }
+
+    /// The identity of one named session in its workspace.
+    pub fn for_session(
+        session: impl Into<String>,
+        workspace: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            session: Some(session.into()),
+            workspace,
+        }
+    }
+
+    /// Whether this identity names nothing at all.
+    pub fn is_empty(&self) -> bool {
+        self.session.is_none() && self.workspace.is_none()
+    }
+
+    /// The identity pinned around the call running on this thread, if any.
+    ///
+    /// A tool that runs another agent (a subagent, a long-horizon mission)
+    /// inherits the host turn's identity through this: the nested agent runs
+    /// inside the parent's handler, which runs inside the parent's pin.
+    pub fn ambient() -> Self {
+        Self {
+            session: current_session(),
+            workspace: current_workspace(),
+        }
+    }
+
+    /// [`ToolIdentity::ambient`], or `None` when nothing is pinned.
+    pub fn ambient_if_set() -> Option<Self> {
+        let ambient = Self::ambient();
+        if ambient.is_empty() {
+            None
+        } else {
+            Some(ambient)
+        }
+    }
+}
+
 // The session the current tool call belongs to, for the duration of one
-// `execute`.
+// `execute_as`.
 //
-// A thread-local rather than a parameter because the tool handler signature
-// carries only the arguments — threading a session id through it would change
-// every tool for the sake of jobs and packs, which need it to tell one
-// conversation's work from another's. Set by `execute` around each handler
-// call; handlers read it via `current_session`.
+// A thread-local rather than a handler parameter because the tool handler
+// signature carries only the arguments — threading a session id through it
+// would change every tool for the sake of jobs and packs, which need it to tell
+// one conversation's work from another's. Set by `execute_as` around each
+// handler call, *from that call's own identity*, and restored after every poll;
+// handlers read it via `current_session`.
 //
 // The working directory of the same session travels alongside it in
 // `CURRENT_WORKSPACE`, so path resolution in handlers can default to it.
@@ -185,11 +257,24 @@ pub fn current_workspace() -> Option<std::path::PathBuf> {
 /// A thread-local set around `handler(args)` alone is empty by the time an
 /// `async` body runs, because the body executes when it is first polled.
 /// Wrapping the future keeps the scope in force for each poll and restores
-/// the previous values after each one, so nested tool calls never leak.
+/// the previous values after each one, so nested tool calls never leak — and,
+/// because the values are copied into the wrapper before the first poll, a
+/// registry default that changes mid-flight cannot reach the handler.
 pub(crate) struct ScopedSession<F> {
     pub(crate) session: Option<String>,
     pub(crate) workspace: Option<std::path::PathBuf>,
     pub(crate) inner: F,
+}
+
+impl<F> ScopedSession<F> {
+    /// Scope one call's identity over its handler.
+    pub(crate) fn for_identity(identity: &ToolIdentity, inner: F) -> Self {
+        Self {
+            session: identity.session.clone(),
+            workspace: identity.workspace.clone(),
+            inner,
+        }
+    }
 }
 
 impl<F: Future + Unpin> Future for ScopedSession<F> {
@@ -215,14 +300,22 @@ pub struct ToolRegistry {
     /// execution happens, so it is where the bus lives, and the kernel hands
     /// out clones of it (`kernel.events()`).
     events: crate::events::EventBus,
-    /// The session whose turn calls into this table.
+    /// The **fallback** identity, used only by [`ToolRegistry::execute`] — the
+    /// legacy entry point with no identity argument.
     ///
-    /// The desktop swaps sessions in place (one `AppState`, one registry), so
-    /// the id moves here rather than living in the session struct; `execute`
-    /// reads it and pins the thread-local for the duration of each handler.
+    /// This was the whole mechanism before per-call identities: the desktop
+    /// rewrote it on every session switch, and `execute` read it as each poll
+    /// came in, so a switch landing between two polls of one handler moved that
+    /// handler's cwd and job ownership to the other conversation. Nothing on
+    /// the per-call path ([`ToolRegistry::execute_as`]) reads these any more;
+    /// they survive so a caller that cannot supply an identity yet keeps
+    /// working, and so [`ToolIdentity::ambient`] has a last resort.
+    ///
+    /// Do not build new behaviour on them: two conversations running at the
+    /// same time cannot both be "the" caller.
     caller: std::sync::Arc<std::sync::RwLock<Option<String>>>,
-    /// Working directory of the pinned session; `None` means the process
-    /// directory. Set together with `caller` by [`ToolRegistry::set_session`].
+    /// Working directory of the fallback identity; `None` means the process
+    /// directory. Set together with `caller`.
     workspace: std::sync::Arc<std::sync::RwLock<Option<std::path::PathBuf>>>,
 }
 
@@ -239,26 +332,46 @@ impl Default for ToolRegistry {
 }
 
 impl ToolRegistry {
-    /// Pin the session whose turn will call into this table, with its
-    /// working directory.
+    /// Set the **default** identity: the session and working directory that
+    /// [`ToolRegistry::execute`] uses when a caller supplies none.
     ///
-    /// Called when the desktop switches conversations: from then on every
-    /// `execute` through this registry is attributed to `session`, and
-    /// path-taking tools without an explicit directory resolve under
-    /// `workspace`.
+    /// Deprecated as a mechanism for naming the live conversation. It is a
+    /// process-level value on a registry that every conversation shares, so
+    /// rewriting it mid-turn is exactly the race that
+    /// [`ToolRegistry::execute_as`] exists to close: it must not decide which
+    /// session a caller's tool call belongs to. Prefer building a
+    /// [`ToolIdentity`] from the turn's own session and passing it per call.
+    ///
+    /// Kept for shells that have not been converted yet, and for the paths that
+    /// legitimately have one caller for the whole process (a one-shot CLI
+    /// turn).
     pub fn set_session(&self, session: Option<String>, workspace: Option<std::path::PathBuf>) {
         *self.caller.write().expect("registry caller") = session;
         *self.workspace.write().expect("registry workspace") = workspace;
     }
 
-    /// The session currently pinned to this table, if any.
+    /// The fallback session, if any.
+    ///
+    /// Deprecated in the same sense as [`ToolRegistry::set_session`]: this is
+    /// the default, not "the current session" — with two turns in flight there
+    /// is no single answer.
     pub fn session(&self) -> Option<String> {
         self.caller.read().expect("registry caller").clone()
     }
 
-    /// The working directory currently pinned to this table, if any.
+    /// The fallback working directory, if any.
+    ///
+    /// Deprecated in the same sense as [`ToolRegistry::set_session`].
     pub fn workspace(&self) -> Option<std::path::PathBuf> {
         self.workspace.read().expect("registry workspace").clone()
+    }
+
+    /// The fallback identity, read in one go.
+    pub fn default_identity(&self) -> ToolIdentity {
+        ToolIdentity {
+            session: self.caller.read().expect("registry caller").clone(),
+            workspace: self.workspace.read().expect("registry workspace").clone(),
+        }
     }
 }
 
@@ -361,13 +474,25 @@ impl ToolRegistry {
         entries.into_iter().map(|(_, def)| def.schema()).collect()
     }
 
-    /// Execute a tool by name with raw JSON arguments.
+    /// Execute a tool by name with raw JSON arguments, under a **caller-named**
+    /// identity.
     ///
-    /// The single funnel every caller goes through (the agent loop, the pack
-    /// tool, delegates), which makes it where `tool.start` / `tool.end` are
-    /// emitted: the payload carries truncated arguments and results, because
-    /// an event must not become a copy of a 2 MB file read.
-    pub async fn execute(&self, name: &str, arguments: &str) -> Result<ToolOutput> {
+    /// The one funnel the per-call path goes through: the identity is copied
+    /// into the scope before the handler is first polled, so every later poll
+    /// of this handler sees this call's session and workspace no matter what
+    /// the process-level defaults do in the meantime. Two sessions' turns can
+    /// run concurrently through one registry without touching each other's cwd,
+    /// relative paths, job ownership, or pack-scoped state.
+    ///
+    /// Also where `tool.start` / `tool.end` are emitted: the payload carries
+    /// truncated arguments and results, because an event must not become a copy
+    /// of a 2 MB file read.
+    pub async fn execute_as(
+        &self,
+        identity: ToolIdentity,
+        name: &str,
+        arguments: &str,
+    ) -> Result<ToolOutput> {
         let def = self
             .tools
             .get(name)
@@ -385,17 +510,11 @@ impl ToolRegistry {
             &json!({
                 "tool": name,
                 "arguments": crate::events::truncate(arguments, 4000),
+                "session": identity.session.as_deref(),
             }),
         );
         let started = std::time::Instant::now();
-        let caller = self.caller.read().expect("registry caller").clone();
-        let workspace = self.workspace.read().expect("registry workspace").clone();
-        let result = ScopedSession {
-            session: caller,
-            workspace,
-            inner: (def.handler)(args),
-        }
-        .await;
+        let result = ScopedSession::for_identity(&identity, (def.handler)(args)).await;
         let duration_ms = started.elapsed().as_millis() as u64;
         match &result {
             Ok(output) => self.events.emit(
@@ -405,6 +524,7 @@ impl ToolRegistry {
                     "ok": true,
                     "duration_ms": duration_ms,
                     "text": crate::events::truncate(&output.text, 4000),
+                    "session": identity.session.as_deref(),
                 }),
             ),
             Err(error) => self.events.emit(
@@ -414,9 +534,95 @@ impl ToolRegistry {
                     "ok": false,
                     "duration_ms": duration_ms,
                     "error": crate::events::truncate(&format!("{error:#}"), 1000),
+                    "session": identity.session.as_deref(),
                 }),
             ),
         }
         result
+    }
+
+    /// Execute a tool by name with raw JSON arguments under the registry's
+    /// **default** identity.
+    ///
+    /// Legacy entry point: it reads the process-level default (see
+    /// [`ToolRegistry::set_session`]) instead of taking one from the caller, so
+    /// it inherits that mechanism's race and is only correct when a process
+    /// really has one conversation. Hosts that run turns for several sessions
+    /// call [`ToolRegistry::execute_as`] with the turn's own identity;
+    /// everything else — tests, embedding, and tools that execute tools — can
+    /// stay here.
+    pub async fn execute(&self, name: &str, arguments: &str) -> Result<ToolOutput> {
+        let identity = self.default_identity();
+        self.execute_as(identity, name, arguments).await
+    }
+}
+
+#[cfg(test)]
+mod freeze_tests {
+    use super::*;
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    /// The table a turn copies at its start keeps a tool the live table drops.
+    ///
+    /// This is what stands between a background turn and a plugin released
+    /// while it runs: the desktop lets go of a conversation's plugins when that
+    /// conversation is left, and the turn still going has to finish with the
+    /// tools it started with rather than fail on "unknown tool" halfway
+    /// through its work.
+    #[tokio::test]
+    async fn a_copy_of_the_table_keeps_a_tool_the_live_table_drops() {
+        let mut live = ToolRegistry::with_base_tools().unwrap();
+        live.register(
+            ToolDef::new(
+                "frozen_probe",
+                "a tool that only exists to be taken away",
+                json!({ "type": "object", "properties": {} }),
+                "test",
+                |_| Box::pin(async { Ok(ToolOutput::text("still here")) }) as ToolFuture,
+            ),
+            ConflictPolicy::Error,
+        )
+        .unwrap();
+
+        // The copy `Agent::run` takes at the start of a turn.
+        let frozen = live.clone();
+        assert!(
+            live.unregister("frozen_probe"),
+            "the live table has something to drop"
+        );
+        assert!(live.get("frozen_probe").is_none(), "the live table dropped it");
+        assert!(
+            frozen.get("frozen_probe").is_some(),
+            "the turn's copy has to keep the tool it started with"
+        );
+
+        let output = frozen
+            .execute_as(
+                ToolIdentity::for_session("s1", Some(PathBuf::from("."))),
+                "frozen_probe",
+                "{}",
+            )
+            .await
+            .expect("the frozen copy still runs it");
+        assert_eq!(output.text, "still here");
+
+        // And it is a copy, not a second view of one table: a tool registered
+        // after the turn began must not become callable inside that turn.
+        live.register(
+            ToolDef::new(
+                "late_probe",
+                "registered after the turn began",
+                json!({ "type": "object", "properties": {} }),
+                "test",
+                |_| Box::pin(async { Ok(ToolOutput::text("too late")) }) as ToolFuture,
+            ),
+            ConflictPolicy::Error,
+        )
+        .unwrap();
+        assert!(
+            frozen.get("late_probe").is_none(),
+            "the turn's table is fixed"
+        );
     }
 }

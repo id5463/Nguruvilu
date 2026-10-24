@@ -29,8 +29,34 @@ const DEFAULT_READ_WINDOW: usize = 200;
 /// Hard ceiling on lines one `read` call may return.
 const MAX_READ_WINDOW: usize = 2000;
 
+/// Bytes one `read` call may return, whatever the line window says.
+///
+/// The window counts lines, and a line has no ceiling of its own: a minified
+/// bundle, a base64 blob, or a log with everything on one line would each let
+/// "2000 lines" carry megabytes into the next prompt. This bound is what keeps
+/// the answer to a size the model can actually work with, and the reply says
+/// which line to continue from when it cuts.
+const MAX_READ_BYTES: usize = 192 * 1024;
+
+/// Characters one line may contribute before it is cut.
+///
+/// Beyond this a single line is not something a model reads anyway; keeping the
+/// head is enough to recognise what the line is, and the reply says it was cut
+/// so nobody mistakes it for the whole line.
+const MAX_READ_LINE_CHARS: usize = 4_000;
+
 /// Output ceiling for `bash` before head/tail truncation kicks in.
 const MAX_BASH_OUTPUT: usize = 30_000;
+
+/// Bytes one `bash` call may accumulate per pipe while the command runs.
+///
+/// [`MAX_BASH_OUTPUT`] bounds what the *model* sees, but truncation used to
+/// happen only after everything had been read into memory: a command printing
+/// gigabytes became gigabytes of `Vec<u8>` first. The cap is generous enough
+/// that the head/tail view still shows real content on both ends, and the
+/// reader keeps draining past it (a child whose pipe is never read blocks
+/// forever) while recording that the output was cut.
+const MAX_BASH_BUFFER: usize = 8 * 1024 * 1024;
 
 /// Default `bash` timeout.
 const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
@@ -368,11 +394,47 @@ async fn read_any(args: Value) -> Result<crate::tools::ToolOutput> {
     let width = end.to_string().len();
     let mut out = String::with_capacity((end - start + 1) * 80 + 128);
     out.push_str(&format!("{} ({} lines total)\n", path.display(), total));
+    // The window counts lines; bytes are what the next prompt pays. Both are
+    // checked as the answer is built: a line is cut when it is enormous on its
+    // own, and the whole reply stops when it has reached [`MAX_READ_BYTES`].
+    let mut shown_upto = start - 1;
+    let mut cut_lines = 0usize;
     for (i, line) in lines[start - 1..end].iter().enumerate() {
         let number = start + i;
-        out.push_str(&format!("{:>width$}| {}\n", number, line, width = width));
+        let rendered;
+        if line.chars().count() > MAX_READ_LINE_CHARS {
+            cut_lines += 1;
+            rendered = line
+                .chars()
+                .take(MAX_READ_LINE_CHARS)
+                .collect::<String>()
+                + " …(line continues)";
+        } else {
+            rendered = (*line).to_string();
+        }
+        let piece = format!("{:>width$}| {}\n", number, rendered, width = width);
+        if out.len() + piece.len() > MAX_READ_BYTES {
+            break;
+        }
+        out.push_str(&piece);
+        shown_upto = number;
     }
-    if end < total {
+    if cut_lines > 0 {
+        out.push_str(&format!(
+            "… {cut_lines} line(s) cut at {MAX_READ_LINE_CHARS} characters; a line that long \
+             is not readable through this tool.\n"
+        ));
+    }
+    if shown_upto < end {
+        // The reply stopped early, so the honest hint is the first line that
+        // was *not* shown — not `end`, which may never have been reached.
+        out.push_str(&format!(
+            "… stopped after {} line(s) to keep this reply bounded. \
+             Continue with start_line={}.\n",
+            shown_upto + 1 - start,
+            shown_upto + 1
+        ));
+    } else if end < total {
         out.push_str(&format!(
             "… {} more lines. Continue with start_line={}.\n",
             total - end,
@@ -474,23 +536,55 @@ fn render_bash_output(stdout: &[u8], stderr: &[u8], empty_placeholder: bool) -> 
 /// Chunks land in the buffer as they arrive, so a wait that runs out of time
 /// can still return what the command printed instead of losing it with the
 /// reader. Generic because `ChildStdout` and `ChildStderr` are distinct types.
-fn pump<R>(pipe: Option<R>, buf: Arc<Mutex<Vec<u8>>>) -> tokio::task::JoinHandle<()>
+///
+/// The buffer stops growing at [`MAX_BASH_BUFFER`] and `capped` is set; the
+/// pipe keeps being drained, because a child blocked on a full pipe never
+/// exits and the deadline would then hide the hang instead of the memory.
+fn pump<R>(
+    pipe: Option<R>,
+    buf: Arc<Mutex<Vec<u8>>>,
+    capped: Arc<std::sync::atomic::AtomicBool>,
+) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Send + Unpin + 'static,
 {
+    use std::sync::atomic::Ordering;
+
     tokio::spawn(async move {
         let Some(mut pipe) = pipe else { return };
         let mut chunk = [0u8; 8192];
         loop {
             match pipe.read(&mut chunk).await {
                 Ok(0) | Err(_) => break,
-                Ok(read) => buf
-                    .lock()
-                    .expect("pipe buffer")
-                    .extend_from_slice(&chunk[..read]),
+                Ok(read) => {
+                    // Recovering the data from a poisoned mutex beats turning
+                    // one panic into a permanently panicking `bash`.
+                    let mut guard = buf.lock().unwrap_or_else(|error| error.into_inner());
+                    let room = MAX_BASH_BUFFER.saturating_sub(guard.len());
+                    if read > room {
+                        guard.extend_from_slice(&chunk[..room]);
+                        drop(guard);
+                        capped.store(true, Ordering::Relaxed);
+                    } else {
+                        guard.extend_from_slice(&chunk[..read]);
+                    }
+                }
             }
         }
     })
+}
+
+/// Wait for one pump task to finish, but no later than `deadline`.
+///
+/// Returns `true` when the task is done, and `false` when the deadline came
+/// first. The distinction matters: a `JoinHandle` that already returned `Ready`
+/// panics when polled again ("JoinHandle polled after completion"), so a handle
+/// whose wait timed out is the only one that may be waited on a second time.
+async fn pump_finished(
+    task: &mut tokio::task::JoinHandle<()>,
+    deadline: tokio::time::Instant,
+) -> bool {
+    tokio::time::timeout_at(deadline, &mut *task).await.is_ok()
 }
 
 async fn bash_tool(args: Value) -> Result<String> {
@@ -540,15 +634,29 @@ async fn bash_tool(args: Value) -> Result<String> {
     }
 
     // Same process-group rule as jobs: a timeout must stop what the command
-    // forked, not just the shell. Deliberate background work (`nohup ... &`
-    // outliving the command) is unaffected -- the group is only signalled on
-    // the timeout path below.
+    // forked, not just the shell. What that means for a command that started
+    // something on purpose: work that *redirects its own stdio*
+    // (`nohup my-server > /dev/null 2>&1 &`) never holds this call's pipes, so
+    // it is never signalled and outlives the call as intended. Work that
+    // inherits the pipes and keeps them after the shell is gone is
+    // indistinguishable from the leak that stalled a turn for 105 minutes, so
+    // it is stopped with a note saying so. Anything that should genuinely
+    // outlive the step belongs in `bash { background: true }`, which is a job
+    // the caller owns and `job_kill` can stop.
     #[cfg(unix)]
     cmd.process_group(0);
 
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawning {program} (shell: {})", shell.label))?;
+
+    // The whole tree as one unit, adopted before anything is read: descendants
+    // inherit the job as they are created (see `jobs::ProcessTree`). This is
+    // what makes the two exits below able to *close the write ends* of the
+    // output pipes, which is the only thing that lets a pump's in-flight read
+    // finish. On Unix this is `None` — the process group from the spawn is the
+    // same mechanism, and the signal path already stops it.
+    let tree = super::jobs::ProcessTree::adopt(child.id());
 
     // One deadline for the whole call: waiting for the shell, then waiting
     // for its pipes to close. The old code bounded only the wait on the
@@ -559,21 +667,49 @@ async fn bash_tool(args: Value) -> Result<String> {
 
     let stdout_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let mut stdout_task = pump(child.stdout.take(), Arc::clone(&stdout_buf));
-    let mut stderr_task = pump(child.stderr.take(), Arc::clone(&stderr_buf));
+    let stdout_capped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stderr_capped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut stdout_task = pump(
+        child.stdout.take(),
+        Arc::clone(&stdout_buf),
+        Arc::clone(&stdout_capped),
+    );
+    let mut stderr_task = pump(
+        child.stderr.take(),
+        Arc::clone(&stderr_buf),
+        Arc::clone(&stderr_capped),
+    );
 
     let status = match tokio::time::timeout_at(deadline, child.wait()).await {
         Ok(result) => result.context("waiting for command")?,
         Err(_) => {
-            super::jobs::kill_tree(&mut child);
+            // Stop the tree as one unit when the platform can name it as one:
+            // one call, every descendant gone at the same instant. Otherwise
+            // fall back to the signal sweep, which is what Unix has always used.
+            let stopped_as_tree = tree.as_ref().map(|tree| tree.terminate()).unwrap_or(false);
+            if stopped_as_tree {
+                let _ = child.start_kill();
+            } else {
+                super::jobs::kill_tree(&mut child);
+            }
             // kill_tree only sends the signal. A descendant (a `ping` under
             // `cmd`) outlives the shell on Windows, so this reap must have its
             // own bound too: an unbounded wait here is the 60-second stall.
             let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
+            // Now that the writers are gone, the readers owe an EOF. Give them
+            // the moment it takes to arrive, *then* cut them loose: aborting a
+            // task whose overlapped read the OS already accepted parks the
+            // handle until that read completes on its own — the tail this
+            // whole arrangement exists to remove.
+            let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                let _ = (&mut stdout_task).await;
+                let _ = (&mut stderr_task).await;
+            })
+            .await;
             stdout_task.abort();
             stderr_task.abort();
-            let stdout = std::mem::take(&mut *stdout_buf.lock().expect("stdout buffer"));
-            let stderr = std::mem::take(&mut *stderr_buf.lock().expect("stderr buffer"));
+            let stdout = std::mem::take(&mut *stdout_buf.lock().unwrap_or_else(|e| e.into_inner()));
+            let stderr = std::mem::take(&mut *stderr_buf.lock().unwrap_or_else(|e| e.into_inner()));
             let mut message = format!(
                 "command timed out after {} ms and was killed: {command}",
                 timeout.as_millis()
@@ -585,6 +721,13 @@ async fn bash_tool(args: Value) -> Result<String> {
                 message.push('\n');
                 message.push_str(&render_bash_output(&stdout, &stderr, false));
             }
+            note_capped_output(
+                &mut message,
+                stdout_capped.load(std::sync::atomic::Ordering::Relaxed)
+                    || stderr_capped.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            // `tree` is dropped here with kill-on-close still set: a last,
+            // free guarantee that nothing of this command outlives its timeout.
             return Ok(message);
         }
     };
@@ -594,16 +737,34 @@ async fn bash_tool(args: Value) -> Result<String> {
     // This wait runs to the same deadline: close enough is good enough, and
     // what was already read is returned with a note instead of the turn
     // hanging on a writer that is never going away.
-    let pipes_closed = tokio::time::timeout_at(deadline, async {
-        let _ = (&mut stdout_task).await;
-        let _ = (&mut stderr_task).await;
-    })
-    .await
-    .is_ok();
+    //
+    // Each handle is awaited at most once and its completion is remembered: a
+    // `JoinHandle` that already returned `Ready` panics if it is polled again
+    // ("JoinHandle polled after completion"), and the second bounded wait below
+    // exists precisely for the handle that did *not* finish the first time.
+    let mut stdout_finished = pump_finished(&mut stdout_task, deadline).await;
+    let mut stderr_finished = pump_finished(&mut stderr_task, deadline).await;
+    let mut pipes_closed = stdout_finished && stderr_finished;
+    // Still open: something the shell forked is holding the pipes. On Windows
+    // the job can close those write ends as a group — the difference between a
+    // pump that ends here and one whose read stays pending for as long as the
+    // descendant feels like living.
+    let mut stopped_holder = false;
+    if !pipes_closed && tree.as_ref().map(|tree| tree.terminate()).unwrap_or(false) {
+        stopped_holder = true;
+        let grace = tokio::time::Instant::now() + Duration::from_millis(500);
+        if !stdout_finished {
+            stdout_finished = pump_finished(&mut stdout_task, grace).await;
+        }
+        if !stderr_finished {
+            stderr_finished = pump_finished(&mut stderr_task, grace).await;
+        }
+        pipes_closed = stdout_finished && stderr_finished;
+    }
     stdout_task.abort();
     stderr_task.abort();
-    let stdout = std::mem::take(&mut *stdout_buf.lock().expect("stdout buffer"));
-    let stderr = std::mem::take(&mut *stderr_buf.lock().expect("stderr buffer"));
+    let stdout = std::mem::take(&mut *stdout_buf.lock().unwrap_or_else(|e| e.into_inner()));
+    let stderr = std::mem::take(&mut *stderr_buf.lock().unwrap_or_else(|e| e.into_inner()));
 
     let mut out = render_bash_output(&stdout, &stderr, true);
     if !pipes_closed {
@@ -613,6 +774,28 @@ async fn bash_tool(args: Value) -> Result<String> {
              pipes open past {} ms; output ends here ---",
             timeout.as_millis()
         ));
+    } else if stopped_holder {
+        out.push('\n');
+        out.push_str(&format!(
+            "--- the command exited, but a background process was still holding \
+             its output pipes past {} ms; that process was stopped so the output \
+             above could end ---",
+            timeout.as_millis()
+        ));
+    }
+    note_capped_output(
+        &mut out,
+        stdout_capped.load(std::sync::atomic::Ordering::Relaxed)
+            || stderr_capped.load(std::sync::atomic::Ordering::Relaxed),
+    );
+
+    // Hand the tree back. Two cases, and the same call does both: if nothing
+    // had to be stopped, clearing kill-on-close is what lets a stdio-redirected
+    // `nohup`/server outlive the command (members are only killed when this
+    // handle closes *with* the flag set); if the pipe-holder above was
+    // terminated, it is already gone and this is a formality.
+    if let Some(tree) = tree {
+        tree.release();
     }
 
     let code = status.code();
@@ -770,6 +953,23 @@ fn which(program: &str) -> Option<String> {
     None
 }
 
+/// Say so when the *buffer* was cut, not just the view.
+///
+/// [`truncate_output`] trims the two ends of whatever was collected; this note
+/// distinguishes "that is all it printed" from "that is all we kept", which
+/// otherwise look identical in a head/tail rendering.
+fn note_capped_output(out: &mut String, capped: bool) {
+    if !capped {
+        return;
+    }
+    out.push('\n');
+    out.push_str(&format!(
+        "--- buffering stopped at {} MB, so the tail above is not the end of what \
+         the command printed ---",
+        MAX_BASH_BUFFER / (1024 * 1024)
+    ));
+}
+
 /// Keep the head and tail of an oversized output.
 fn truncate_output(text: &str, max: usize) -> String {
     if text.len() <= max {
@@ -838,6 +1038,59 @@ mod bash_tests {
         assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
         assert!(output.contains("timed out"), "{output}");
         assert!(output.contains("before-timeout"), "{output}");
+    }
+
+    /// The cap is applied while reading, not after: the old path read the whole
+    /// pipe into memory and only then cut the view, so a runaway printer was a
+    /// memory limit away from taking the process down with it.
+    #[tokio::test]
+    async fn a_runaway_printer_is_capped_while_it_is_read() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// A pipe that never ends: `left` bytes of `y`, then EOF.
+        struct Endless {
+            left: usize,
+        }
+
+        impl tokio::io::AsyncRead for Endless {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if self.left == 0 {
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                let filled = buf.remaining().min(self.left);
+                for byte in buf.initialize_unfilled_to(filled) {
+                    *byte = b'y';
+                }
+                buf.advance(filled);
+                self.left -= filled;
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let collected: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let capped = Arc::new(AtomicBool::new(false));
+        let reading = pump(
+            Some(Endless {
+                left: MAX_BASH_BUFFER + 1024 * 1024,
+            }),
+            Arc::clone(&collected),
+            Arc::clone(&capped),
+        );
+        reading.await.expect("the pump ends");
+
+        assert_eq!(
+            collected.lock().unwrap().len(),
+            MAX_BASH_BUFFER,
+            "the buffer stops at the cap instead of holding everything"
+        );
+        assert!(
+            capped.load(Ordering::Relaxed),
+            "the caller is told the output was cut"
+        );
     }
 }
 
@@ -1000,4 +1253,65 @@ mod path_tests {
     }
 }
 
+/// What one `read` answer is allowed to cost.
+///
+/// Its own module because the ceiling is about neither paths nor images: it is
+/// about the size of the reply, which is what these two tests are about.
+#[cfg(test)]
+mod read_window_tests {
+    use super::*;
 
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ngu-read-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    /// A line with no end is cut, and the reply says it was cut.
+    ///
+    /// The window counts lines, so one minified bundle or one base64 blob used
+    /// to arrive whole: "2000 lines" said nothing about how many megabytes the
+    /// next prompt would carry.
+    #[tokio::test]
+    async fn one_enormous_line_is_cut_and_says_so() {
+        let path = scratch("one-line.json");
+        std::fs::write(&path, "x".repeat(200_000)).unwrap();
+
+        let output = read_any(json!({ "path": path })).await.expect("read succeeds");
+        assert!(
+            output.text.len() < MAX_READ_BYTES + 1024,
+            "the answer stays inside the ceiling: {} bytes",
+            output.text.len()
+        );
+        assert!(output.text.contains("…(line continues)"), "{}", &output.text[..200.min(output.text.len())]);
+        assert!(output.text.contains("cut at"), "the cut is stated");
+        // The line is still identifiable, which is the point of keeping its head.
+        assert!(output.text.contains("1| x"), "line 1 is still labelled");
+    }
+
+    /// A window that would exceed the ceiling stops early and says where to
+    /// resume, rather than answering with whatever it managed to collect.
+    #[tokio::test]
+    async fn an_oversized_window_stops_early_and_says_where_to_continue() {
+        let path = scratch("wide.log");
+        let line = format!("{}\n", "y".repeat(500));
+        std::fs::write(&path, line.repeat(1_000)).unwrap();
+
+        let output = read_any(json!({ "path": path, "end_line": 1_000 }))
+            .await
+            .expect("read succeeds");
+        assert!(
+            output.text.len() <= MAX_READ_BYTES + 1024,
+            "the answer stays inside the ceiling: {} bytes",
+            output.text.len()
+        );
+        assert!(output.text.contains("stopped after"), "the stop is stated");
+        assert!(
+            output.text.contains("Continue with start_line="),
+            "the reply says where to resume"
+        );
+        // It stopped before the window ended, so it must not also claim the
+        // window was complete.
+        assert!(!output.text.contains("more lines. Continue"));
+    }
+}

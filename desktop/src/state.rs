@@ -36,6 +36,76 @@ give its absolute path — a bare or relative name is not something they can ope
 /// Older history is fetched on demand as the page scrolls up.
 const TRANSCRIPT_PAGE: usize = 40;
 
+/// How many per-turn usage rows the `stats` command returns.
+///
+/// The totals cover the whole session; the tail exists so a spike can be
+/// traced to the turn that caused it. Twenty is a screenful, not a ledger.
+const STATS_TAIL: usize = 20;
+
+/// The wire shape of a session's cumulative usage.
+///
+/// Built field by field rather than serialising the Rust struct: the page's
+/// names are part of the IPC contract, and `cache_hit_ratio` is computed here
+/// (as a fraction, 0..=1) so no client has to repeat the division.
+fn totals_json(totals: &nguruvilu::session::SessionTotals) -> Value {
+    json!({
+        "turns": totals.turns,
+        "steps": totals.steps,
+        "tool_calls": totals.tool_calls,
+        "input": totals.input,
+        "output": totals.output,
+        "cached": totals.cached,
+        "cache_created": totals.cache_created,
+        "reasoning": totals.reasoning,
+        "model_ms": totals.model_ms,
+        "tools_ms": totals.tools_ms,
+        "cache_hit_ratio": totals.cache_hit_ratio(),
+    })
+}
+
+/// One stored turn's usage, in the same field names as the totals.
+fn turn_stats_json(stats: &nguruvilu::session::TurnStats) -> Value {
+    json!({
+        "ts": stats.ts,
+        "steps": stats.steps,
+        "tool_calls": stats.tool_calls,
+        "retries": stats.retries,
+        "input": stats.input,
+        "output": stats.output,
+        "cached": stats.cached,
+        "cache_created": stats.cache_created,
+        "reasoning": stats.reasoning,
+        "model_ms": stats.model_ms,
+        "tools_ms": stats.tools_ms,
+    })
+}
+
+/// One session's ledger as the page reads it: what the conversation cost, and
+/// the turns that made up the cost.
+///
+/// One definition for both entry points — [`AppState::stats`], which answers
+/// while the state lock is held, and [`AppState::stats_outside_lock`], which
+/// reads the rows first and formats after the lock is gone — so the two cannot
+/// answer different JSON for the same session. `totals` arrives already built
+/// because the totals are summed from a whole session record, which the caller
+/// has and this function does not need.
+fn stats_json(id: &str, totals: Value, stats: &[nguruvilu::session::TurnStats]) -> Value {
+    // Newest first for the tail, then back to chronological order: a log reads
+    // forward, and the page lists it as it happened.
+    let turns: Vec<Value> = stats
+        .iter()
+        .rev()
+        .take(STATS_TAIL)
+        .rev()
+        .map(turn_stats_json)
+        .collect();
+    json!({
+        "session": id,
+        "totals": totals,
+        "turns": turns,
+    })
+}
+
 /// The `[first, end)` range of the page that ends just before `before`, for a
 /// transcript of `total` entries. `before` is clamped to `total`, so a stale
 /// request cannot index past the log.
@@ -70,6 +140,72 @@ mod page_tests {
     fn a_full_page_is_always_the_page_size() {
         let (first, end) = page_before(500, 400);
         assert_eq!(end - first, TRANSCRIPT_PAGE);
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::{turn_stats_json, totals_json};
+    use nguruvilu::session::{SessionTotals, TurnStats};
+
+    /// The page reads these names; renaming one here without renaming it in
+    /// the script blanks the usage line, so the keys themselves are the test.
+    #[test]
+    fn the_totals_wire_shape_carries_every_field_the_page_draws() {
+        let totals = SessionTotals {
+            turns: 3,
+            steps: 7,
+            tool_calls: 4,
+            input: 1000,
+            output: 200,
+            cached: 250,
+            cache_created: 120,
+            reasoning: 60,
+            model_ms: 1500,
+            tools_ms: 400,
+        };
+        let json = totals_json(&totals);
+        assert_eq!(json["turns"], 3);
+        assert_eq!(json["input"], 1000);
+        assert_eq!(json["output"], 200);
+        assert_eq!(json["cached"], 250);
+        assert_eq!(json["cache_created"], 120);
+        assert_eq!(json["reasoning"], 60);
+        assert_eq!(json["model_ms"], 1500);
+        assert_eq!(json["tools_ms"], 400);
+        // A fraction, not a percentage: the page multiplies.
+        assert!((json["cache_hit_ratio"].as_f64().unwrap() - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_session_with_nothing_recorded_reports_zero_rather_than_dividing_by_zero() {
+        let json = totals_json(&SessionTotals::default());
+        assert_eq!(json["turns"], 0);
+        assert_eq!(json["cache_hit_ratio"], 0.0);
+    }
+
+    #[test]
+    fn one_turn_keeps_its_own_counts_when_it_is_sent_as_a_row() {
+        let stats = TurnStats {
+            ts: "2026-10-24T00:00:00.000Z".to_string(),
+            steps: 2,
+            tool_calls: 1,
+            retries: 1,
+            input: 500,
+            output: 90,
+            cached: 100,
+            cache_created: 40,
+            reasoning: 30,
+            model_ms: 700,
+            tools_ms: 50,
+        };
+        let json = turn_stats_json(&stats);
+        assert_eq!(json["ts"], "2026-10-24T00:00:00.000Z");
+        assert_eq!(json["steps"], 2);
+        assert_eq!(json["retries"], 1);
+        assert_eq!(json["cached"], 100);
+        assert_eq!(json["cache_created"], 40);
+        assert_eq!(json["model_ms"], 700);
     }
 }
 
@@ -393,8 +529,18 @@ impl AppState {
             );
         }
 
-        if let Err(error) = &scan {
-            eprintln!("[skills] scan failed: {error:#}");
+        // A scan no longer aborts on one bad root or entry: the skills it did
+        // find stay in the catalog and the failures arrive as `Ok(report)`.
+        // That makes the partial result silent unless it is printed here, and
+        // silence is the wrong answer to "my skills disappeared". The reason
+        // is rendered by `summary` so this shell and every other front end
+        // report a skipped path with the same words.
+        match &scan {
+            Ok(report) if !report.skipped.is_empty() => {
+                eprintln!("[skills] {}", report.summary());
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("[skills] scan failed: {error:#}"),
         }
 
         config.set_cwd(session.cwd.clone());
@@ -503,6 +649,11 @@ impl AppState {
             },
             "settings_path": Settings::path().display().to_string(),
             "last_error": self.last_error,
+            // The session's cumulative usage, pushed with every status so the
+            // page can draw the usage line without a second round trip. It is
+            // a read of rows the session already loaded — no I/O, no lock of
+            // its own.
+            "totals": totals_json(&nguruvilu::session::totals_of(&self.session)),
             "context": {
                 "window": self.config.policy.lock().expect("policy lock").window(&self.route.model).tokens,
                 "window_source": self.config.policy.lock().expect("policy lock").window(&self.route.model).source.as_str(),
@@ -528,6 +679,95 @@ impl AppState {
                 "running": self.running.contains(&s.id),
             }))
             .collect::<Vec<_>>()))
+    }
+
+    /// The usage ledger of one session — totals plus its most recent turns.
+    ///
+    /// Read-only and answered from the rows in memory, so this never waits on a
+    /// running turn and never writes. The rows of the open conversation were
+    /// loaded with it.
+    ///
+    /// `session` defaults to the open conversation. Asking for another one
+    /// re-reads it from the store, which is why one conversation's numbers
+    /// cannot leak into another's — and which means the caller must be someone
+    /// for whom a file read is acceptable: this runs wherever it is called,
+    /// including with the state lock held. Use
+    /// [`stats_outside_lock`](Self::stats_outside_lock) when the request may
+    /// name a session that is not the open one.
+    pub fn stats(&self, session: Option<&str>) -> Result<Value> {
+        let requested = session.map(str::trim).filter(|id| !id.is_empty());
+        let loaded;
+        let record: &Session = match requested {
+            Some(id) if id != self.session.id => {
+                loaded = self
+                    .store
+                    .load(id)?
+                    .ok_or_else(|| anyhow!("session not found: {id}"))?;
+                &loaded
+            }
+            _ => &self.session,
+        };
+        Ok(stats_json(
+            &record.id,
+            totals_json(&nguruvilu::session::totals_of(record)),
+            &record.stats,
+        ))
+    }
+
+    /// [`stats`](Self::stats) with the disk read outside the state lock.
+    ///
+    /// `stats` runs under the process-wide lock, so asking it about a session
+    /// that is not on screen reads that session's file with the whole shell
+    /// waiting behind the lock: every other session's events and every command
+    /// the page sends stop until the page of JSONL is parsed. This entry point
+    /// takes the lock only long enough to tell the two cases apart — the session
+    /// on screen is answered from memory with no I/O at all, and anything else
+    /// carries nothing out of the lock but a second handle on the store, which
+    /// is then read after the lock has been released.
+    ///
+    /// A caller already holding the lock must use [`stats`](Self::stats):
+    /// this function takes that same non-reentrant lock.
+    pub fn stats_outside_lock(state: &Mutex<AppState>, session: Option<&str>) -> Result<Value> {
+        let requested = session.map(str::trim).filter(|id| !id.is_empty());
+        let store = {
+            let guard = state.lock().expect("state lock");
+            // The usage rows of the open conversation are already in memory, so
+            // its own report costs no I/O and the in-memory path answers it right
+            // here. Only a request for another session needs anything carried out
+            // of the lock, and all it carries is a second handle on the store.
+            match requested {
+                Some(id) if id != guard.session.id => store_handle(&guard.store)?,
+                _ => return guard.stats(None),
+            }
+        };
+        let id = requested.expect("only a request for another session reaches here");
+        let record = store
+            .load(id)?
+            .ok_or_else(|| anyhow!("session not found: {id}"))?;
+        Ok(stats_json(
+            &record.id,
+            totals_json(&nguruvilu::session::totals_of(&record)),
+            &record.stats,
+        ))
+    }
+
+    /// The read-only configuration check, as an event.
+    ///
+    /// The same examination `ngu doctor` prints, asked from inside the running
+    /// shell: on a machine where the shell is the only front end there is, this
+    /// is the only way to see it. The failures it catches are the ones that look
+    /// like "nothing happened" rather than like an error — a settings file that
+    /// does not parse, a pack manifest naming an assembly that is gone, a skill
+    /// directory the scan walked past.
+    pub fn doctor(&self) -> Value {
+        let options = nguruvilu::doctor::Options {
+            sessions: self.store.root().to_path_buf(),
+            ..nguruvilu::doctor::Options::default()
+        };
+        let report = nguruvilu::doctor::run(&options);
+        let mut event = report.json();
+        event["summary"] = json!(report.summary());
+        event
     }
 
     /// Every stored message of the current session as renderable entries,
@@ -680,7 +920,19 @@ impl AppState {
     }
 
     /// Delete a stored session, moving to a new one when it was current.
+    ///
+    /// A turn still running for that session is stopped first. Deleting the file
+    /// underneath it would not stop the turn: it would keep appending, recreate
+    /// the file the user just removed, and leave the transcript split across a
+    /// deleted session and a fresh one.
     pub fn delete_session(&mut self, id: &str) -> Result<()> {
+        if let Some(stop) = self.cancels.remove(id) {
+            // The receiver may already be gone (the turn finished in between);
+            // sending into a closed watch channel is an error, not a failure of
+            // the delete.
+            let _ = stop.send(true);
+        }
+        self.running.remove(id);
         self.store.delete(id)?;
         if self.session.id == id {
             self.new_session()?;
@@ -776,6 +1028,9 @@ impl AppState {
                 self.settings.judge.clone()
             },
             extra_body: self.settings.extra_body.clone(),
+            // Keys this build does not know about are carried through: the panel
+            // saving a field must not delete what a plugin or a newer build wrote.
+            unknown: self.settings.unknown.clone(),
         };
         settings.save()?;
         self.settings = settings;
@@ -1206,6 +1461,94 @@ pub fn data_directory() -> PathBuf {
     sessions_root().parent().map(|dir| dir.join("webview")).unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// A second handle on the same store directory.
+///
+/// `AppState` owns the only `JsonlStore` and that type is a bare root path with
+/// no shared state behind it — every append and load is a stateless file
+/// operation under the root — so a handle opened at the same root is the same
+/// store. Opening one is how a caller carries the disk work out of the state
+/// lock without the store having to be shared or cloned.
+fn store_handle(store: &JsonlStore) -> Result<JsonlStore> {
+    JsonlStore::open(store.root())
+}
+
+/// Write the metadata rows a finished turn leaves behind, with no lock held.
+///
+/// Messages were already written by `on_message`, the moment each one was
+/// committed — a kill mid-turn loses only what never completed, never a whole
+/// turn's worth. What is left is the metadata that has no message to ride along
+/// with: the injections, the compactions, and the turn's usage. None of it is
+/// in-memory, which is why it can be done against a handle carried out of the
+/// state lock: the append costs no reader its turn.
+///
+/// Returns the usage row when it reached the file. The caller records that same
+/// row in the live session, and only a row that was actually written belongs
+/// there.
+fn write_turn_rows(
+    store: &JsonlStore,
+    session_id: &str,
+    outcome: &nguruvilu::agent::AgentOutcome,
+) -> Option<nguruvilu::session::TurnStats> {
+    // The user may have deleted this conversation mid-turn. The file is gone,
+    // and appending to it would resurrect an empty shell of a conversation the
+    // user asked to be rid of: the metadata rides the same loss its messages
+    // already took. A read that *fails* (rather than reporting "not there") is
+    // not evidence of deletion, so the appends still run on an error.
+    let still_stored = match store.load(session_id) {
+        Ok(found) => found.is_some(),
+        Err(error) => {
+            eprintln!("[store] could not check {session_id} before appending: {error:#}");
+            true
+        }
+    };
+    if !still_stored {
+        eprintln!(
+            "[store] session {session_id} was deleted mid-turn; skipping injection, \
+             compaction and usage rows"
+        );
+    }
+    if still_stored {
+        for record in &outcome.injections {
+            if let Err(error) = store.append_injection(session_id, record) {
+                eprintln!("[store] injection append failed: {error:#}");
+            }
+        }
+    }
+
+    // Record compactions after the messages they replace.
+    for compaction in &outcome.compactions {
+        if still_stored {
+            if let Err(error) = store.append_compaction(session_id, compaction) {
+                eprintln!("[store] compaction append failed: {error:#}");
+            }
+        }
+        eprintln!(
+            "[compacted {} messages into {} chars]",
+            compaction.replaced,
+            compaction.summary.chars().count()
+        );
+    }
+
+    if !still_stored {
+        return None;
+    }
+
+    // The turn's usage, appended to the session log: the one place that
+    // outlives this process. Token counts are spent money and a duration is the
+    // only honest measure of a slow turn, so both are recorded even when the
+    // turn ended on an error — what was spent was spent either way. A failed
+    // append is reported, never fatal: the answer already exists, and losing
+    // its ledger row must not also lose the turn.
+    let stats = nguruvilu::session::TurnStats::from_outcome(outcome);
+    match store.append_stats(session_id, &stats) {
+        Ok(()) => Some(stats),
+        Err(error) => {
+            eprintln!("[store] stats append failed: {error:#}");
+            None
+        }
+    }
+}
+
 /// Streams loop progress into the page.
 ///
 /// Text is forwarded the moment it arrives. An earlier version batched deltas
@@ -1330,13 +1673,42 @@ impl AgentObserver for UiObserver {
         // survivable: the file already holds every message the conversation
         // produced, so a restart reads exactly what happened — instead of
         // waiting for a turn-end batch the killed process never reaches.
-        let mut guard = self.state.lock().expect("state lock");
-        if let Err(error) = guard
-            .store
-            .append(&self.session, std::slice::from_ref(message))
-        {
+        //
+        // The write happens outside the state lock. The guard is held only long
+        // enough to take a handle on the store, so a slow disk delays this
+        // session's own append and nothing else: not the page's commands, and
+        // not another session's events.
+        //
+        // Writing outside the lock cannot reorder the appends, which is the
+        // property the append exists for: a session runs at most one turn at a
+        // time (`running` is keyed by session), so every append to one file
+        // comes from that session's single turn, in the order the agent
+        // committed the messages. Two appends for the same session cannot
+        // overlap, so dropping the lock lets no later message overtake an
+        // earlier one.
+        let handle = {
+            let guard = self.state.lock().expect("state lock");
+            store_handle(&guard.store)
+        };
+        let appended = match &handle {
+            Ok(store) => store.append(&self.session, std::slice::from_ref(message)),
+            // A handle could not be opened, which means the store directory
+            // itself is unusable. The message still goes through the handle the
+            // state holds, under the lock: a message that exists must reach the
+            // file even when the cheap copy of the handle cannot be made.
+            Err(_) => {
+                let guard = self.state.lock().expect("state lock");
+                guard.store.append(&self.session, std::slice::from_ref(message))
+            }
+        };
+        if let Err(error) = appended {
             eprintln!("[store] incremental append failed: {error:#}");
         }
+        // The lock is taken again only for the in-memory transcript. Whether
+        // this turn belongs to the conversation on screen is decided here
+        // rather than earlier: the user may have switched while the append was
+        // on its way to disk.
+        let mut guard = self.state.lock().expect("state lock");
         if guard.session.id == self.session {
             guard.session.messages.push(message.clone());
         }
@@ -1406,6 +1778,11 @@ pub fn try_steer(guard: &mut AppState, text: &str) -> Option<String> {
 /// [`run_turn_cascading`] to run. Settings are taken once, at the start, so a
 /// change landing while the turn runs applies to the next turn.
 ///
+/// `target` is the conversation this turn belongs to: an explicit id wins
+/// (background cascades and job wakes carry their own), `None` means the
+/// conversation the shell is showing. A target that is not on screen never
+/// takes the view — the text is parked in that session's inbox instead.
+///
 /// A failure keeps its progress: every message the agent committed is written
 /// as it happens, and the error is reported alongside it.
 ///
@@ -1413,14 +1790,44 @@ pub fn try_steer(guard: &mut AppState, text: &str) -> Option<String> {
 /// be claimed by this turn.
 pub async fn run_turn(
     state: Arc<Mutex<AppState>>,
+    target: Option<String>,
     text: String,
     sink: Arc<dyn EventSink>,
 ) -> Result<Option<String>> {
     // One turn per session, decided under the lock so two prompts racing for
     // the same history cannot both pass the check.
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let (session_id, client, config, messages, events, inbox) = {
+    let (session_id, client, config, messages, events, inbox, workspace) = {
         let mut guard = state.lock().expect("state lock");
+        // The conversation this turn belongs to, resolved once under the lock:
+        // an explicit target wins, without one the conversation on screen. A
+        // follow-up never re-reads "what is on screen now".
+        let target_session = match target {
+            Some(id) => id,
+            None => guard.session.id.clone(),
+        };
+        // The turn's conversation is not the one the user is looking at, and
+        // grabbing the view is the wrong behaviour: an implicit switch would
+        // yank the page mid-read and re-home the shared tool table to another
+        // conversation. The text waits in that session's inbox — its next turn
+        // (a later prompt there, or its next wake) claims the queue at the
+        // first step boundary and runs it where it belongs. Nothing is emitted
+        // to the page: it is showing the other conversation, and a prompt for
+        // one the user cannot see is not news.
+        if guard.session.id != target_session {
+            let parked = guard
+                .inboxes
+                .entry(target_session.clone())
+                .or_insert_with(|| Arc::new(std::sync::Mutex::new(VecDeque::new())));
+            parked.lock().expect("inbox").push_back(text);
+            eprintln!(
+                "[turn] parked prompt for session {target_session} ({} is on screen); it runs \
+                 when that session next gets a turn",
+                guard.session.id
+            );
+            drop(guard);
+            return Ok(None);
+        }
         // Steering, not a refusal: the message joins the running turn at its
         // next step boundary — or, when the turn ends before claiming it, the
         // cascade runs it as a follow-up turn.
@@ -1433,7 +1840,7 @@ pub async fn run_turn(
             }));
             return Ok(None);
         }
-        let session_id = guard.session.id.clone();
+        let session_id = target_session;
         // A new attempt supersedes the previous failure; leaving a stale error
         // on screen while a retry runs would be a lie.
         guard.last_error = None;
@@ -1457,6 +1864,7 @@ pub async fn run_turn(
             guard.session.messages.clone(),
             guard.kernel.events(),
             inbox,
+            guard.session.cwd.clone(),
         )
     };
     let observer = Arc::new(UiObserver::new(
@@ -1468,7 +1876,14 @@ pub async fn run_turn(
         .with_max_steps(50)
         .with_observer(Arc::clone(&observer) as Arc<dyn AgentObserver>)
         .with_cancel(stop_rx)
-        .with_inbox(inbox);
+        .with_inbox(inbox)
+        // This turn's session, fixed here rather than read from the shared
+        // registry on every tool call: switching conversations mid-turn must
+        // not re-home this turn's `bash` cwd, relative paths or job owner.
+        .with_identity(nguruvilu::tools::ToolIdentity::for_session(
+            session_id.clone(),
+            workspace.map(std::path::PathBuf::from),
+        ));
 
     events.emit(
         nguruvilu::events::PROMPT_SUBMIT,
@@ -1526,20 +1941,37 @@ pub async fn run_turn(
         ),
     }
 
-    let mut guard = state.lock().expect("state lock");
-    guard.running.remove(&session_id);
-    guard.cancels.remove(&session_id);
-    // Whatever arrived after this turn's last claim still deserves its turn:
-    // take the oldest pending message; the chained run's own first step claims
-    // the rest. A cancel cleared the queue already, so stopping stops the
-    // chain too.
-    let followup = guard
-        .inboxes
-        .get(&session_id)
-        .and_then(|queue| queue.lock().expect("inbox").pop_front());
-    let is_current = guard.session.id == session_id;
+    // The turn gives its slots back under a short lock, and carries out of it
+    // one thing for the file work below: a second handle on the store. Nothing
+    // is written while the lock is held, so a slow append costs this turn's own
+    // bookkeeping and nothing else — not the page's commands, and not another
+    // session's events.
+    let (followup, store) = {
+        let mut guard = state.lock().expect("state lock");
+        guard.running.remove(&session_id);
+        guard.cancels.remove(&session_id);
+        // Whatever arrived after this turn's last claim still deserves its turn:
+        // take the oldest pending message; the chained run's own first step
+        // claims the rest. A cancel cleared the queue already, so stopping stops
+        // the chain too.
+        let followup = guard
+            .inboxes
+            .get(&session_id)
+            .and_then(|queue| queue.lock().expect("inbox").pop_front());
+        // A handle opened at the same root is the same store, because the store
+        // is a bare root path with no shared state behind it. Taking that copy
+        // is what lets the rows be written with the lock released.
+        (followup, store_handle(&guard.store))
+    };
     let mut end: Option<Value> = None;
     let mut failure: Option<String> = None;
+    // What the turn leaves in memory, applied under the one lock taken after
+    // the disk work. The reduced history is a flag rather than a copy: it is
+    // only worth taking when this session is still the one on screen, which is
+    // decided under the lock that applies it.
+    let mut adopt_history = false;
+    let mut prompt_tokens: Option<usize> = None;
+    let mut usage_row: Option<nguruvilu::session::TurnStats> = None;
 
     match result {
         Ok(outcome) => {
@@ -1563,31 +1995,32 @@ pub async fn run_turn(
             // one was committed — a kill mid-turn loses only what never
             // completed, never a whole turn's worth. What remains here is the
             // metadata that has no message to ride along with.
-            for record in &outcome.injections {
-                if let Err(error) = guard.store.append_injection(&session_id, record) {
-                    eprintln!("[store] injection append failed: {error:#}");
+            //
+            // That metadata is written with the state lock released: the rows go
+            // out through the second handle taken above, so the page's commands
+            // and every other session's events stay live while the disk works.
+            // A handle that could not be opened means the store directory itself
+            // is unusable, which is the one case where falling back to the
+            // state's own handle makes sense: those appends are about to fail
+            // anyway, and the slower path still reports each failure instead of
+            // losing the row silently.
+            let usage = match &store {
+                Ok(store) => write_turn_rows(store, &session_id, &outcome),
+                Err(_) => {
+                    let guard = state.lock().expect("state lock");
+                    write_turn_rows(&guard.store, &session_id, &outcome)
                 }
-            }
+            };
 
-            // Record compactions after the messages they replace, then adopt
-            // the agent's reduced history so the live session matches the file.
-            for compaction in &outcome.compactions {
-                if let Err(error) = guard.store.append_compaction(&session_id, compaction) {
-                    eprintln!("[store] compaction append failed: {error:#}");
-                }
-                eprintln!(
-                    "[compacted {} messages into {} chars]",
-                    compaction.replaced,
-                    compaction.summary.chars().count()
-                );
-            }
-            if !outcome.compactions.is_empty() && is_current {
-                guard.session.messages = agent.messages().to_vec();
-            }
-
+            // The in-memory half of the tail: adopting the agent's reduced
+            // history so the live session matches the file, and remembering the
+            // prompt size and the usage row. All three need the lock, which is
+            // taken again below, after the writes.
+            adopt_history = !outcome.compactions.is_empty();
             if outcome.usage.input > 0 {
-                guard.last_prompt_tokens = Some(outcome.usage.input as usize);
+                prompt_tokens = Some(outcome.usage.input as usize);
             }
+            usage_row = usage;
 
             if let Some(error) = outcome.error {
                 failure = Some(error);
@@ -1616,6 +2049,32 @@ pub async fn run_turn(
             // Nothing to salvage here: every message the agent committed was
             // already written by `on_message` as it happened.
             failure = Some(format!("{error:#}"));
+        }
+    }
+
+    // Only memory is left, and only memory needs the lock. It is taken here,
+    // after the disk work, and held for the rest of the function exactly as
+    // before. Whether this session is the one on screen is decided now rather
+    // than before the writes: the user may have switched conversations while
+    // the rows were on their way out, and every update below belongs to the
+    // conversation being shown.
+    let mut guard = state.lock().expect("state lock");
+    let is_current = guard.session.id == session_id;
+    if adopt_history && is_current {
+        // The file holds the summary in place of the messages it replaced, so
+        // the live transcript follows the agent's reduced history or the page
+        // keeps drawing what the model no longer sees.
+        guard.session.messages = agent.messages().to_vec();
+    }
+    if let Some(tokens) = prompt_tokens {
+        guard.last_prompt_tokens = Some(tokens);
+    }
+    if let Some(row) = usage_row {
+        if is_current {
+            // The live session is the source of `describe`'s totals; the row
+            // just written must count there too, or the usage line would trail
+            // the turn that produced it by one.
+            guard.session.stats.push(row);
         }
     }
 
@@ -1666,14 +2125,38 @@ pub async fn run_turn(
 /// settles as "not Send". Here the runs are plain sequential awaits, so the
 /// queue drains until empty — and if another turn won the running slot in
 /// between, the message is queued for *it* to claim and this cascade ends.
+///
+/// The whole cascade belongs to the conversation its first turn started in:
+/// the target is resolved once, here, and every follow-up carries that id.
+/// Re-reading "what is on screen" for each link of the chain is how a
+/// background conversation ends up writing into whichever one the user
+/// switched to — the follow-up would run in the wrong session's history, with
+/// the wrong file behind it.
 pub async fn run_turn_cascading(
     state: Arc<Mutex<AppState>>,
+    target: Option<String>,
     text: String,
     sink: Arc<dyn EventSink>,
 ) -> Result<()> {
-    let mut next = run_turn(Arc::clone(&state), text, Arc::clone(&sink)).await?;
+    let target = match target {
+        Some(id) => id,
+        None => state.lock().expect("state lock").session.id.clone(),
+    };
+    let mut next = run_turn(
+        Arc::clone(&state),
+        Some(target.clone()),
+        text,
+        Arc::clone(&sink),
+    )
+    .await?;
     while let Some(text) = next {
-        next = run_turn(Arc::clone(&state), text, Arc::clone(&sink)).await?;
+        next = run_turn(
+            Arc::clone(&state),
+            Some(target.clone()),
+            text,
+            Arc::clone(&sink),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1731,9 +2214,16 @@ pub fn install_job_wake(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
             // the *owner's* sink (the install-time sink is only correct for
             // window/headless, not the multi-session SSE path). A distinct
             // event -- not "steer" -- so the page does not render the wake as
-            // if the user had typed it.
+            // if the user had typed it. The wake carries its owner's id: if
+            // the user has moved to another conversation, the turn parks in
+            // the owner's inbox rather than opening in the one on screen.
             let wake_state = Arc::clone(&state);
-            tokio::spawn(run_turn_cascading(wake_state, text.clone(), owner_sink.clone()));
+            tokio::spawn(run_turn_cascading(
+                wake_state,
+                Some(session.clone()),
+                text.clone(),
+                owner_sink.clone(),
+            ));
             owner_sink.emit(json!({
                 "ev": "job_wake",
                 "job": job_id,
@@ -1770,22 +2260,98 @@ mod tests {
     /// each event belonged to.
     struct RecordingSink {
         events: StdMutex<Vec<Value>>,
+        /// When each event was emitted, with its name and session.
+        ///
+        /// Concurrency is about ordering in time. A test that compares two
+        /// durations assumes both were produced under the same load; "B reached
+        /// the provider before A's turn ended" instead needs only the second
+        /// half to be a fact, so the sink records it.
+        stamps: StdMutex<Vec<(Instant, String, Option<String>)>>,
+        /// Run for every event as it is emitted.
+        ///
+        /// Whether a file already holds a row at the moment a turn reports
+        /// itself done is a fact about that moment, not about a later read: a
+        /// test that checks the disk after `run_turn` returned cannot tell a row
+        /// written before the event from one written after it.
+        hook: StdMutex<Option<Arc<dyn Fn(&Value) + Send + Sync>>>,
     }
 
     impl RecordingSink {
         fn new() -> Arc<Self> {
-            Arc::new(Self { events: StdMutex::new(Vec::new()) })
+            Arc::new(Self {
+                events: StdMutex::new(Vec::new()),
+                stamps: StdMutex::new(Vec::new()),
+                hook: StdMutex::new(None),
+            })
+        }
+
+        /// Run `hook` for every event emitted from here on.
+        fn watch(&self, hook: Arc<dyn Fn(&Value) + Send + Sync>) {
+            *self.hook.lock().expect("recording sink hook") = Some(hook);
         }
 
         fn events(&self) -> Vec<Value> {
             self.events.lock().expect("recording sink").clone()
         }
+
+        /// When the event named `name` was emitted for `session`.
+        fn stamp(&self, name: &str, session: &str) -> Option<Instant> {
+            self.stamps
+                .lock()
+                .expect("recording sink stamps")
+                .iter()
+                .find(|(_, event, event_session)| {
+                    event == name && event_session.as_deref() == Some(session)
+                })
+                .map(|(at, _, _)| *at)
+        }
     }
 
     impl EventSink for RecordingSink {
         fn emit(&self, event: Value) {
+            let name = event["ev"].as_str().unwrap_or_default().to_string();
+            let session = event["session"].as_str().map(str::to_string);
+            self.stamps
+                .lock()
+                .expect("recording sink stamps")
+                .push((Instant::now(), name, session));
+            // Taken out from under the hook's lock before it runs: the hook
+            // looks at the disk, and holding this lock while it did would make
+            // the check's own timing the thing it measures.
+            let hook = self.hook.lock().expect("recording sink hook").clone();
+            if let Some(hook) = hook {
+                hook(&event);
+            }
             self.events.lock().expect("recording sink").push(event);
         }
+    }
+
+    /// A hook that records, for `session`, whether its usage row was already in
+    /// the file when the turn reported itself done.
+    ///
+    /// The file is read through a handle opened here, at the moment of the
+    /// event, so what it reports is the disk and not the shell's in-memory
+    /// transcript.
+    fn usage_row_watcher(
+        root: &Path,
+        session: &str,
+        seen: &Arc<StdMutex<Vec<(String, bool)>>>,
+    ) -> Arc<dyn Fn(&Value) + Send + Sync> {
+        let root = root.to_path_buf();
+        let session = session.to_string();
+        let seen = Arc::clone(seen);
+        Arc::new(move |event: &Value| {
+            if event["ev"] != "turn_end" {
+                return;
+            }
+            let written = JsonlStore::open(&root)
+                .and_then(|store| store.load(&session))
+                .ok()
+                .flatten()
+                .map(|record| !record.stats.is_empty())
+                .unwrap_or(false);
+            seen.lock().expect("rows at done").push((session.clone(), written));
+        })
     }
 
     /// A provider that holds every answer for `delay` before sending it, and
@@ -1898,13 +2464,24 @@ mod tests {
             .set_model("mock-model", Some(&base))
             .expect("route points at the mock");
 
+        // A handle on the store directory, taken before any turn runs: what the
+        // watchers below record is the disk, not the shell's in-memory
+        // transcript.
+        let store_root = state.lock().expect("state lock").store.root().to_path_buf();
+        // Per session: was its usage row already in its file at the moment its
+        // turn reported itself done.
+        let rows_at_done: Arc<StdMutex<Vec<(String, bool)>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+
         // Session A starts its turn.
         state.lock().expect("state lock").new_session().expect("session A");
         let session_a = state.lock().expect("state lock").session.id.clone();
         let sink_a = RecordingSink::new();
+        sink_a.watch(usage_row_watcher(&store_root, &session_a, &rows_at_done));
         let sink_a_trait: Arc<dyn EventSink> = sink_a.clone();
         let task_a = tokio::spawn(run_turn(
             Arc::clone(&state),
+            None,
             "TASK-A: first task".into(),
             sink_a_trait,
         ));
@@ -1925,9 +2502,11 @@ mod tests {
         let session_b = state.lock().expect("state lock").session.id.clone();
         assert_ne!(session_a, session_b);
         let sink_b = RecordingSink::new();
+        sink_b.watch(usage_row_watcher(&store_root, &session_b, &rows_at_done));
         let sink_b_trait: Arc<dyn EventSink> = sink_b.clone();
         let task_b = tokio::spawn(run_turn(
             Arc::clone(&state),
+            None,
             "TASK-B: second task".into(),
             sink_b_trait,
         ));
@@ -1969,21 +2548,55 @@ mod tests {
         let labels: Vec<&str> = seen.iter().map(|(_, label)| label.as_str()).collect();
         assert!(labels.contains(&"TASK-A"), "{labels:?}");
         assert!(labels.contains(&"TASK-B"), "{labels:?}");
-        let gap = if seen[0].0 >= seen[1].0 {
-            seen[0].0.duration_since(seen[1].0)
-        } else {
-            seen[1].0.duration_since(seen[0].0)
-        };
+        // The ordering that proves overlap is "B reached the provider while A's
+        // turn was still running", not "the two arrivals are close together":
+        // how long a turn spends before its first request leaves the shell is
+        // machine load, and a gap comparison reads that as serialization.
+        let b_at = seen
+            .iter()
+            .find(|(_, label)| label == "TASK-B")
+            .map(|(at, _)| *at)
+            .expect("B reached the provider");
+        let a_ended = sink_a
+            .stamp("turn_end", &session_a)
+            .expect("A's turn end is stamped");
         assert!(
-            gap < delay,
-            "the second request arrived {gap:?} after the first — outside the \
-             {delay:?} hold, so the turns ran one after the other"
+            b_at < a_ended,
+            "B's request reached the provider after A's turn had already ended \
+             (A ended {:?} before B's request): the turns ran one after the other",
+            b_at.duration_since(a_ended)
         );
 
+        // The usage row was in the file when the turn reported itself done,
+        // read through a handle opened at that moment. The tail writes its rows
+        // with the state lock released, and that concession must not move them
+        // past the event the page redraws its usage line on.
+        let watched = rows_at_done.lock().expect("rows at done").clone();
+        for session in [session_a.as_str(), session_b.as_str()] {
+            let at_done = watched
+                .iter()
+                .find(|(seen, _)| seen.as_str() == session)
+                .map(|(_, written)| *written);
+            assert_eq!(
+                at_done,
+                Some(true),
+                "{session} had its usage row on disk when turn_end was emitted: {watched:?}"
+            );
+        }
+
         // Each session's file holds its own answer, and only its own.
-        let store = &state.lock().expect("state lock").store;
-        let a = store.load(&session_a).expect("load A").expect("session A exists");
-        let b = store.load(&session_b).expect("load B").expect("session B exists");
+        //
+        // The guard is scoped: `let store = &state.lock()…store;` extends the
+        // guard's temporary to the end of the test, and the `state.lock()` at
+        // the bottom of this function then waits on the lock it is itself
+        // holding — a self-deadlock that reads as a hung suite, not a failure.
+        let (a, b) = {
+            let guard = state.lock().expect("state lock");
+            (
+                guard.store.load(&session_a).expect("load A").expect("session A exists"),
+                guard.store.load(&session_b).expect("load B").expect("session B exists"),
+            )
+        };
         let text_of = |messages: &[nguruvilu::message::Message]| -> String {
             messages.iter().map(|m| m.text()).collect::<Vec<_>>().join("\n")
         };
@@ -1996,6 +2609,492 @@ mod tests {
 
         // Nothing left marked busy once both turns settled.
         assert!(state.lock().expect("state lock").running.is_empty());
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A turn whose session was deleted mid-turn writes no rows at all.
+    ///
+    /// The metadata of a finished turn belongs to the file the conversation
+    /// lives in. When the user deletes that conversation while the turn runs,
+    /// the tail must not write into what is left of it: rows appended to the
+    /// remnant would resurrect an empty shell of the conversation the user asked
+    /// to be rid of. What the mid-turn message writes leave behind is a
+    /// header-less file that no longer loads as a session, which is exactly the
+    /// state the deleted conversation already fails to pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_turn_whose_session_was_deleted_mid_turn_writes_no_rows() {
+        // Everything the shell persists lives under NGU_HOME, so this test
+        // gets a directory of its own and the real sessions stay untouched.
+        let home = std::env::temp_dir().join(format!("ngu-state-test-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("NGU_HOME", &home);
+
+        let delay = std::time::Duration::from_millis(1500);
+        let (base, _arrivals) = held_provider(delay).await;
+
+        let state = Arc::new(Mutex::new(AppState::bootstrap().expect("bootstrap")));
+        state
+            .lock()
+            .expect("state lock")
+            .set_model("mock-model", Some(&base))
+            .expect("route points at the mock");
+
+        state.lock().expect("state lock").new_session().expect("session A");
+        let session_a = state.lock().expect("state lock").session.id.clone();
+        let store_root = state.lock().expect("state lock").store.root().to_path_buf();
+        let sink = RecordingSink::new();
+        let sink_trait: Arc<dyn EventSink> = sink.clone();
+        let turn = tokio::spawn(run_turn(
+            Arc::clone(&state),
+            None,
+            "DELETED: mid-turn".into(),
+            sink_trait,
+        ));
+
+        // The deletion has to land while the turn is genuinely in flight, so
+        // wait for its running slot — taken before the request is sent — and
+        // delete afterwards.
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if state.lock().expect("state lock").running.contains(&session_a) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "session A never started running");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // The conversation is on disk before the delete, so what this test
+        // asserts is a row the tail chose not to write, not one with nowhere to
+        // go.
+        assert!(
+            JsonlStore::open(&store_root)
+                .expect("reopen the store")
+                .load(&session_a)
+                .expect("load A")
+                .is_some(),
+            "session A existed before the delete"
+        );
+        state.lock().expect("state lock").store.delete(&session_a).expect("delete A");
+
+        turn.await.expect("turn panicked").expect("turn returns");
+
+        // The deletion costs the rows, not the turn: the page still hears that
+        // the turn ended.
+        assert!(
+            sink.events().iter().any(|event| event["ev"] == "turn_end"
+                && event["session"].as_str() == Some(session_a.as_str())),
+            "the turn still reported its end: {:?}",
+            sink.events()
+        );
+
+        // No usage row for a session that is no longer there. The remnant the
+        // turn's own messages left is read raw: a header-based check takes it
+        // for "not a session", and a line the tail should never have written
+        // would hide behind that answer.
+        let path = store_root.join(format!("{session_a}.jsonl"));
+        if let Ok(remnant) = std::fs::read_to_string(&path) {
+            assert!(
+                !remnant.contains("\"type\":\"stats\""),
+                "a deleted session takes its usage row with it: {remnant}"
+            );
+            assert!(
+                !remnant.contains("\"type\":\"compaction\""),
+                "a deleted session takes its compaction rows with it: {remnant}"
+            );
+        }
+        assert!(
+            JsonlStore::open(&store_root)
+                .expect("reopen the store")
+                .load(&session_a)
+                .expect("load A")
+                .is_none(),
+            "a session deleted mid-turn is not reloadable afterwards"
+        );
+
+        // The compaction row is checked where a turn would actually write one.
+        // The mock provider cannot drive a real compaction, so the row is handed
+        // to the same function the tail uses, for the session just deleted.
+        let compacted = nguruvilu::agent::AgentOutcome {
+            text: "gone".to_string(),
+            steps: 1,
+            tool_calls: 0,
+            usage: nguruvilu::llm::TokenUsage { input: 40, output: 8, ..Default::default() },
+            new_messages: Vec::new(),
+            timing: nguruvilu::agent::TurnTiming::default(),
+            config_version: 1,
+            injections: Vec::new(),
+            compactions: vec![nguruvilu::compaction::Compaction {
+                replaced: 3,
+                summary: "earlier turns".to_string(),
+            }],
+            error: None,
+            retries: 0,
+        };
+        let store = JsonlStore::open(&store_root).expect("reopen the store");
+        assert!(
+            write_turn_rows(&store, &session_a, &compacted).is_none(),
+            "no usage row is reported written for a deleted session"
+        );
+        let after = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            !after.contains("\"type\":\"stats\"") && !after.contains("\"type\":\"compaction\""),
+            "a compaction-bearing turn adds no rows to a deleted session: {after}"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A cascade's follow-up belongs to the session its first turn started in.
+    ///
+    /// The user switches away while A's turn runs; the steering that arrives
+    /// too late for that turn to claim is the follow-up. The old code fed it
+    /// back through "what is on screen", so it ran in B and landed in B's
+    /// file — a whole answer for conversation A written into conversation B.
+    /// With the target carried through the chain, it runs in A.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cascades_followup_lands_in_a_even_after_switching_to_b() {
+        // Everything the shell persists lives under NGU_HOME, so this test
+        // gets a directory of its own and the real sessions stay untouched.
+        let home = std::env::temp_dir().join(format!("ngu-state-test-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("NGU_HOME", &home);
+
+        // The hold is what makes the switch observable: A's turn is genuinely
+        // in flight when the user moves to B, so anything the cascade does
+        // afterwards happens with B on screen.
+        let delay = std::time::Duration::from_millis(1500);
+        let (base, _arrivals) = held_provider(delay).await;
+
+        let state = Arc::new(Mutex::new(AppState::bootstrap().expect("bootstrap")));
+        state
+            .lock()
+            .expect("state lock")
+            .set_model("mock-model", Some(&base))
+            .expect("route points at the mock");
+
+        // Session A gets a conversation of its own.
+        state.lock().expect("state lock").new_session().expect("session A");
+        let session_a = state.lock().expect("state lock").session.id.clone();
+        let sink = RecordingSink::new();
+        let sink_dyn: Arc<dyn EventSink> = sink.clone();
+
+        // A's first turn starts, steering queued during it becomes the
+        // follow-up the cascade runs. Sent through the cascade, exactly the
+        // way a prompt enters the shell.
+        let cascade = tokio::spawn(run_turn_cascading(
+            Arc::clone(&state),
+            Some(session_a.clone()),
+            "TASK-A: follow me".into(),
+            Arc::clone(&sink_dyn),
+        ));
+
+        // Wait for A's turn to hold the running slot, then park the follow-up
+        // in A's inbox the way a steering message arrives.
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if state.lock().expect("state lock").running.contains(&session_a) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "session A never started running");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // The user switches to B while A runs.
+        state.lock().expect("state lock").new_session().expect("session B");
+        let session_b = state.lock().expect("state lock").session.id.clone();
+        assert_ne!(session_a, session_b);
+        // The late steering lands in A's inbox — A is no longer the
+        // conversation on screen, which is exactly the case this test is
+        // about. When the turn already finished between the switch and this
+        // push, the same text goes through the cascade entry a job wake uses:
+        // the point is where it ends up, not which door it came through.
+        let turn_still_running = {
+            let mut guard = state.lock().expect("state lock");
+            let running = guard.running.contains(&session_a);
+            if running {
+                guard
+                    .inboxes
+                    .entry(session_a.clone())
+                    .or_insert_with(|| Arc::new(StdMutex::new(VecDeque::new())))
+                    .lock()
+                    .expect("inbox")
+                    .push_back("TASK-A: second task".to_string());
+            }
+            running
+        };
+        if !turn_still_running {
+            run_turn_cascading(
+                Arc::clone(&state),
+                Some(session_a.clone()),
+                "TASK-A: second task".into(),
+                Arc::clone(&sink_dyn),
+            )
+            .await
+            .expect("parked cascade");
+        }
+
+        cascade.await.expect("cascade panicked").expect("cascade failed");
+
+        let text_of = |messages: &[nguruvilu::message::Message]| -> String {
+            messages.iter().map(|m| m.text()).collect::<Vec<_>>().join("\n")
+        };
+
+        // Nothing ran in B: the follow-up was aimed at A, and A is not on
+        // screen. This is the assertion the old code failed — it ran the
+        // follow-up in B and wrote A's answer into B's file.
+        {
+            let guard = state.lock().expect("state lock");
+            let b = guard.store.load(&session_b).expect("load B").expect("session B exists");
+            let b_text = text_of(&b.messages);
+            assert!(!b_text.contains("TASK-A"), "A's follow-up must not run in B: {b_text}");
+        }
+        // Not lost either: it waits in A's inbox until A gets a turn again —
+        // unless the running turn claimed the steering before the switch, in
+        // which case it is already in A's file.
+        let parked: Vec<String> = state
+            .lock()
+            .expect("state lock")
+            .inboxes
+            .get(&session_a)
+            .map(|queue| queue.lock().expect("inbox").iter().cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            parked.is_empty() || parked == vec!["TASK-A: second task".to_string()],
+            "A's inbox holds at most the text parked for A: {parked:?}"
+        );
+
+        // The user comes back to A; its next turn claims the parked text.
+        state
+            .lock()
+            .expect("state lock")
+            .open_session(&session_a)
+            .expect("back to A");
+        let sink_dyn: Arc<dyn EventSink> = sink.clone();
+        let mut next = run_turn(
+            Arc::clone(&state),
+            None,
+            "TASK-A: collecting".into(),
+            Arc::clone(&sink_dyn),
+        )
+        .await
+        .expect("turn after returning to A");
+        while let Some(text) = next {
+            next = run_turn(Arc::clone(&state), None, text, Arc::clone(&sink_dyn))
+                .await
+                .expect("follow-up turn for A");
+        }
+
+        // A's file holds both of its tasks and nothing of B's was touched.
+        let (a_text, b_text) = {
+            let guard = state.lock().expect("state lock");
+            let a = guard.store.load(&session_a).expect("load A").expect("session A exists");
+            let b = guard.store.load(&session_b).expect("load B").expect("session B exists");
+            (text_of(&a.messages), text_of(&b.messages))
+        };
+        assert!(a_text.contains("TASK-A: follow me"), "A ran its own first task: {a_text}");
+        assert!(
+            a_text.contains("TASK-A: second task"),
+            "A's follow-up ran in A: {a_text}"
+        );
+        assert!(a_text.contains("Mock reply for TASK-A"), "A has its answers: {a_text}");
+        assert!(!b_text.contains("TASK-A"), "B holds none of A's conversation: {b_text}");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A turn aimed at a conversation the user is not looking at must not
+    /// take the view: the text parks in the target's inbox, nothing runs, and
+    /// the conversation on screen is untouched. The parked text is claimed by
+    /// the target's next turn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_prompt_for_a_background_session_parks_instead_of_grabbing_the_view() {
+        let home = std::env::temp_dir().join(format!("ngu-state-test-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("NGU_HOME", &home);
+
+        let delay = std::time::Duration::from_millis(1500);
+        let (base, _arrivals) = held_provider(delay).await;
+
+        let state = Arc::new(Mutex::new(AppState::bootstrap().expect("bootstrap")));
+        state
+            .lock()
+            .expect("state lock")
+            .set_model("mock-model", Some(&base))
+            .expect("route points at the mock");
+
+        // A exists in the store; B is the conversation on screen.
+        state.lock().expect("state lock").new_session().expect("session A");
+        let session_a = state.lock().expect("state lock").session.id.clone();
+        state.lock().expect("state lock").new_session().expect("session B");
+        let session_b = state.lock().expect("state lock").session.id.clone();
+        let sink = RecordingSink::new();
+        let sink_trait: Arc<dyn EventSink> = sink.clone();
+
+        // A turn aimed at A while B is on screen: it must not switch.
+        let outcome = run_turn(
+            Arc::clone(&state),
+            Some(session_a.clone()),
+            "PARKED: not on screen".into(),
+            sink_trait,
+        )
+        .await
+        .expect("parked turn returns");
+        assert!(outcome.is_none(), "nothing runs for a parked prompt");
+        assert_eq!(
+            state.lock().expect("state lock").session.id,
+            session_b,
+            "the view stayed on B"
+        );
+        let events = sink.events();
+        assert!(
+            !events.iter().any(|event| event["ev"] == "turn_start"),
+            "no turn started while parked: {events:?}"
+        );
+        // The text waits where A's next turn will claim it.
+        let parked: Vec<String> = state
+            .lock()
+            .expect("state lock")
+            .inboxes
+            .get(&session_a)
+            .map(|queue| queue.lock().expect("inbox").iter().cloned().collect())
+            .unwrap_or_default();
+        assert_eq!(
+            parked,
+            vec!["PARKED: not on screen".to_string()],
+            "the prompt waits in A's inbox"
+        );
+        assert!(
+            state.lock().expect("state lock").running.is_empty(),
+            "a parked prompt never marked anything running"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A committed message reaches the file before `on_message` returns.
+    ///
+    /// The append now happens outside the state lock, and this is the property
+    /// that change could have broken without a single failing command: the
+    /// message must be on disk by the time the observer hands control back,
+    /// because the force-kill that a turn-end batch would lose can happen
+    /// immediately afterwards. The file is read through a handle that never
+    /// passed through the state lock, so what is asserted here is the disk, not
+    /// the in-memory transcript.
+    #[test]
+    fn an_observed_message_is_on_disk_when_on_message_returns() {
+        // Everything the shell persists lives under NGU_HOME, so this test
+        // gets a directory of its own and the real sessions stay untouched.
+        let home = std::env::temp_dir().join(format!("ngu-state-test-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("NGU_HOME", &home);
+
+        let state = Arc::new(Mutex::new(AppState::bootstrap().expect("bootstrap")));
+        let (session_id, root) = {
+            let guard = state.lock().expect("state lock");
+            (guard.session.id.clone(), guard.store.root().to_path_buf())
+        };
+
+        let sink: Arc<dyn EventSink> = RecordingSink::new();
+        let observer = UiObserver::new(sink, Arc::clone(&state), session_id.clone());
+        observer.on_message(&nguruvilu::message::Message::user("COMMITTED: written already"));
+
+        let stored = JsonlStore::open(&root)
+            .expect("reopen the store")
+            .load(&session_id)
+            .expect("load the session")
+            .expect("the session exists");
+        let on_disk: String =
+            stored.messages.iter().map(|message| message.text()).collect::<Vec<_>>().join("\n");
+        assert!(
+            on_disk.contains("COMMITTED: written already"),
+            "the message is on disk when on_message returns: {on_disk}"
+        );
+
+        // The transcript the page draws holds it too: this turn belongs to the
+        // conversation on screen.
+        let shown: String = state
+            .lock()
+            .expect("state lock")
+            .session
+            .messages
+            .iter()
+            .map(|message| message.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            shown.contains("COMMITTED: written already"),
+            "the on-screen transcript holds it: {shown}"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `stats_outside_lock` answers exactly what `stats` answers.
+    ///
+    /// The two entry points exist so the page can ask about a session that is
+    /// not on screen without parking the whole shell behind the state lock, and
+    /// they are interchangeable only if the JSON is identical. Both cases are
+    /// compared: the open conversation, answered from the rows already in
+    /// memory, and a stored one, answered by reading its file.
+    #[test]
+    fn stats_outside_lock_answers_the_same_json_as_stats() {
+        let home = std::env::temp_dir().join(format!("ngu-state-test-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("NGU_HOME", &home);
+
+        let state = Arc::new(Mutex::new(AppState::bootstrap().expect("bootstrap")));
+        let (session_a, session_b) = {
+            let mut guard = state.lock().expect("state lock");
+            let row = nguruvilu::session::TurnStats {
+                ts: "2026-01-01T00:00:00.000Z".to_string(),
+                steps: 2,
+                tool_calls: 1,
+                input: 100,
+                output: 20,
+                cached: 10,
+                cache_created: 5,
+                reasoning: 3,
+                model_ms: 40,
+                tools_ms: 7,
+                ..Default::default()
+            };
+            let session_a = guard.session.id.clone();
+            guard.new_session().expect("session B");
+            let session_b = guard.session.id.clone();
+            // B's ledger exists only in its file, so asking about it takes the
+            // load path; A is asked about as the open conversation, from
+            // memory. An empty ledger on both sides would compare equal for the
+            // wrong reason.
+            guard.store.append_stats(&session_b, &row).expect("B's stats row");
+            guard.open_session(&session_a).expect("back to A");
+            guard.session.stats.push(row);
+            (session_a, session_b)
+        };
+        assert_ne!(session_a, session_b);
+
+        for requested in [None, Some(session_b.as_str())] {
+            let under_lock = {
+                state
+                    .lock()
+                    .expect("state lock")
+                    .stats(requested)
+                    .expect("stats under the lock")
+            };
+            let outside =
+                AppState::stats_outside_lock(&state, requested).expect("stats outside the lock");
+            assert_eq!(outside, under_lock, "{requested:?} answers the same JSON");
+            // The page draws these three names; renaming one here would blank
+            // the usage line even though both entry points agreed.
+            assert!(outside.get("session").is_some(), "{requested:?} names its session");
+            assert!(outside.get("totals").is_some(), "{requested:?} carries totals");
+            assert!(outside.get("turns").is_some(), "{requested:?} carries the turn tail");
+            assert_eq!(outside["totals"]["turns"], 1, "{requested:?} totals its one turn");
+            assert_eq!(
+                outside["turns"].as_array().map(|turns| turns.len()),
+                Some(1),
+                "{requested:?} sends its one turn row"
+            );
+        }
+
+        // A session that does not exist fails through both doors; neither
+        // invents an empty ledger for it.
+        let missing = "20260101-000000-missing";
+        assert!(state.lock().expect("state lock").stats(Some(missing)).is_err());
+        assert!(AppState::stats_outside_lock(&state, Some(missing)).is_err());
 
         let _ = std::fs::remove_dir_all(&home);
     }

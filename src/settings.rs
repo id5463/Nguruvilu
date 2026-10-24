@@ -15,7 +15,8 @@
 //! 403 they cannot explain. An empty endpoint is reported as "not configured",
 //! which is actionable; a wrong endpoint is not.
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -24,8 +25,16 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_MODEL: &str = "deepseek-v4.1-flash";
 
 /// Settings as stored on disk.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// Unknown keys are **kept**, not rejected. `deny_unknown_fields` used to make
+/// one unrecognised key — a hand-typed one, a plugin's, or one written by a
+/// newer build — fail the whole parse, and [`Settings::load`] answered a failed
+/// parse with [`Settings::default`]. The next `ngu config set` then wrote that
+/// default back over the file, so a single typo cost the user their `api_key`,
+/// model, network tuning, search and judge credentials at once. The unknown keys
+/// land in [`Settings::unknown`] and are written back out unchanged.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     /// API base URL including the version segment, e.g. `https://host/v1`.
     #[serde(default)]
@@ -126,6 +135,91 @@ pub struct Settings {
     /// A null value removes a field the kernel would otherwise send.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub extra_body: serde_json::Map<String, serde_json::Value>,
+
+    /// Keys this build does not know about, kept verbatim.
+    ///
+    /// Round-trip rather than validation: a field written by a newer build, a
+    /// plugin, or a hand edit must survive being read and written by an older
+    /// one. This is also what replaces `deny_unknown_fields` — an unknown key is
+    /// stored here instead of being a parse error.
+    #[serde(flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unknown: BTreeMap<String, serde_json::Value>,
+}
+
+impl std::fmt::Debug for Settings {
+    /// Written by hand so a secret never reaches a log.
+    ///
+    /// `#[derive(Debug)]` would print `api_key` and `relay_token` in full, and
+    /// the first `eprintln!("{settings:?}")` added while chasing a route problem
+    /// would put both into a terminal scrollback and every bug report pasted
+    /// from it. Everything a diagnostic actually needs is here; the credentials
+    /// are not. Nested settings print as presence only, so this impl never
+    /// depends on how those types choose to render themselves.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Settings")
+            .field("base_url", &self.base_url)
+            .field("api_key", &mask(&self.api_key))
+            .field("model", &self.model)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("delivery", &self.delivery)
+            .field("degrade_on_stall", &self.degrade_on_stall)
+            .field("proxy", &self.proxy)
+            .field("context_window", &self.context_window)
+            .field("compact_percent", &self.compact_percent)
+            .field("compact_keep_recent", &self.compact_keep_recent)
+            .field("relay_url", &self.relay_url)
+            .field("relay_token", &mask(&self.relay_token))
+            .field("max_output_tokens", &self.max_output_tokens)
+            .field("search", &self.search.is_some())
+            .field("judge", &self.judge.is_some())
+            .field("extra_body", &self.extra_body.keys().collect::<Vec<_>>())
+            .field("unknown", &self.unknown.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// Everything but the first and last few characters, for display.
+fn mask(secret: &str) -> String {
+    let secret = secret.trim();
+    if secret.is_empty() {
+        return String::new();
+    }
+    let characters: Vec<char> = secret.chars().collect();
+    if characters.len() <= 10 {
+        return "*".repeat(characters.len());
+    }
+    let head: String = characters.iter().take(6).collect();
+    let tail: String = characters.iter().skip(characters.len() - 4).collect();
+    format!("{head}…{tail}")
+}
+
+/// Write a file that may hold credentials.
+///
+/// On Unix the file is created `0o600`: `settings.json` carries the API key, the
+/// relay token, and the search/judge credentials, and `0o644` in a `0o755`
+/// directory means every other local user can read them. `sync_all` is called
+/// before the rename so a crash just after it cannot leave the renamed file
+/// empty.
+fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, text)
+    }
 }
 
 fn default_compact_percent() -> u32 {
@@ -173,9 +267,17 @@ impl Settings {
     pub fn context_policy(&self, provider_window: Option<usize>) -> crate::window::DefaultContextPolicy {
         crate::window::DefaultContextPolicy {
             configured: self.context_window.filter(|t| *t > 0),
-            threshold_percent: self.compact_percent,
+            // The threshold is clamped here as well as in the policy: a
+            // hand-edited `600` would otherwise mean "never compact" (and a `0`
+            // "compact on every step"), and both are written by hand in a file
+            // this program does not prompt for.
+            threshold_percent: self.compact_percent.clamp(1, 95),
             keep_recent: self.compact_keep_recent.max(1),
             provider_window: provider_window.filter(|t| *t > 0),
+            // The output ceiling is part of the window: a prompt that fills the
+            // whole window leaves no room for the answer, and the provider
+            // rejects the request instead of compacting.
+            reserve: self.max_output_tokens.unwrap_or(0),
         }
     }
 
@@ -184,17 +286,7 @@ impl Settings {
     /// The settings panel has to show *something* so a user can tell whether a
     /// key is present, without putting the whole secret on screen.
     pub fn masked_key(&self) -> String {
-        let key = self.api_key.trim();
-        if key.is_empty() {
-            return String::new();
-        }
-        let chars: Vec<char> = key.chars().collect();
-        if chars.len() <= 10 {
-            return "*".repeat(chars.len());
-        }
-        let head: String = chars.iter().take(6).collect();
-        let tail: String = chars.iter().skip(chars.len() - 4).collect();
-        format!("{head}…{tail}")
+        mask(&self.api_key)
     }
 
     /// Where the settings file lives.
@@ -204,36 +296,110 @@ impl Settings {
         data_dir().join("settings.json")
     }
 
-    /// Read the settings file, or an empty set when there is none.
+    /// Read the settings file.
+    ///
+    /// Three outcomes, and the caller is meant to tell them apart:
+    ///
+    /// * no file → defaults (a first run, not a failure);
+    /// * a file that parses → those settings, including keys this build does not
+    ///   know (they are kept in [`Settings::unknown`] and written back);
+    /// * a file that does **not** parse → an error naming the file and the
+    ///   serde position. It is never answered with defaults, because the caller
+    ///   of a load is usually about to [`Settings::save`], and saving the
+    ///   defaults is how one broken key destroys a whole working configuration.
     pub fn load() -> Result<Self> {
-        let path = Self::path();
+        Self::load_from(&Self::path())
+    }
+
+    /// [`Settings::load`] against an explicit path.
+    pub fn load_from(path: &Path) -> Result<Self> {
         if !path.is_file() {
             return Ok(Self::default());
         }
-        let text = std::fs::read_to_string(&path)
+        let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?;
-        // A settings file a user hand-edited should not brick the app: fall
-        // back to defaults and let the panel show empty fields.
-        Ok(serde_json::from_str(&text).unwrap_or_default())
+        serde_json::from_str(&text).with_context(|| {
+            format!(
+                "{} is not valid settings; it was left untouched — fix it or move it aside \
+                 (nothing is written over an unreadable file)",
+                path.display()
+            )
+        })
     }
 
     /// Write the settings file, creating its directory.
     pub fn save(&self) -> Result<()> {
-        let path = Self::path();
+        self.save_to(&Self::path())
+    }
+
+    /// [`Settings::save`] against an explicit path.
+    ///
+    /// Refuses to replace a file that does not parse as settings. That check is
+    /// the real protection behind [`Settings::load`]: a caller that ignored the
+    /// load error, or built its [`Settings`] from defaults, cannot then flatten
+    /// the user's file — the write fails and the bytes stay as they were.
+    ///
+    /// The write itself is atomic (temp file, then rename) and leaves one
+    /// `settings.json.bak` from before the first overwrite, so a
+    /// half-written file is not a state this program can produce and a good
+    /// configuration that was once on disk stays recoverable.
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        // A settings file is where a clear-text endpoint gets chosen, and a
+        // hand-edit or a restored profile is where one usually comes from, so the
+        // route is checked before it can be written rather than after it has been
+        // used (see `crate::model::check_base_url`).
+        crate::model::check_base_url(&self.base_url)?;
+
+        if path.is_file() {
+            let existing = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            if let Err(error) = serde_json::from_str::<Self>(&existing) {
+                return Err(anyhow::anyhow!(
+                    "refusing to overwrite {}: it is not valid settings ({error}). \
+                     Fix it or move it aside first — nothing was written, so the file is \
+                     still exactly as it was",
+                    path.display()
+                ));
+            }
+        }
+
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, format!("{text}\n"))
-            .with_context(|| format!("writing {}", path.display()))?;
+
+        // One backup, taken before the first overwrite and kept from then on:
+        // the second save must not overwrite the copy of the file as the user
+        // last had it working.
+        let backup = path.with_extension("json.bak");
+        if path.is_file() && !backup.is_file() {
+            std::fs::copy(path, &backup).with_context(|| {
+                format!("backing up {} to {}", path.display(), backup.display())
+            })?;
+        }
+
+        let text = format!("{}\n", serde_json::to_string_pretty(self)?);
+        let temporary = path.with_extension("json.tmp");
+        write_private(&temporary, &text)
+            .with_context(|| format!("writing {}", temporary.display()))?;
+        std::fs::rename(&temporary, path)
+            .with_context(|| format!("replacing {}", path.display()))?;
         Ok(())
     }
 
     /// The effective settings: environment overrides the file, which overrides
     /// the defaults.
     pub fn resolve() -> Self {
-        let mut settings = Self::load().unwrap_or_default();
+        let mut settings = Self::load().unwrap_or_else(|error| {
+            // A read path may carry on with defaults, but not quietly: these two
+            // lines are the only thing that explains why every field suddenly
+            // reads as empty, and they keep the blame from landing on the
+            // provider. Writes stay refused (see `save_to`), so this cannot
+            // turn into data loss.
+            eprintln!("[settings] {error:#}");
+            eprintln!("[settings] continuing with defaults; the file on disk is untouched");
+            Self::default()
+        });
 
         if let Ok(value) = std::env::var("NGU_BASE_URL") {
             if !value.trim().is_empty() {
@@ -370,6 +536,7 @@ mod tests {
             search: None,
             judge: None,
             extra_body: serde_json::Map::new(),
+            ..Default::default()
         };
         assert!(settings.is_configured());
         assert!(settings.missing().is_empty());
@@ -395,6 +562,7 @@ mod tests {
             search: None,
             judge: None,
             extra_body: serde_json::Map::new(),
+            ..Default::default()
         };
         assert_eq!(settings.model_or_default(), DEFAULT_MODEL);
     }
@@ -425,43 +593,191 @@ mod tests {
         assert_eq!(Settings::default().masked_key(), "");
     }
 
-    #[test]
-    fn settings_round_trip_through_a_file() {
-        let dir = std::env::temp_dir().join(format!("ngu-settings-{}", uuid::Uuid::new_v4().simple()));
+    /// A scratch directory plus the settings path inside it.
+    fn scratch(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "ngu-settings-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("settings.json");
+        (dir, path)
+    }
 
-        let settings = Settings {
+    fn configured() -> Settings {
+        Settings {
             base_url: "https://example.test/v1".into(),
             api_key: "sk-round-trip".into(),
             model: "test-model".into(),
             reasoning_effort: "low".into(),
             delivery: "buffered".into(),
             degrade_on_stall: Some(false),
-            proxy: String::new(),
-            context_window: None,
-            compact_percent: 75,
-            compact_keep_recent: 8,
-            relay_url: String::new(),
-            relay_token: String::new(),
-            max_output_tokens: None,
-            network: crate::network::NetworkSettings::default(),
-            search: None,
-            judge: None,
-            extra_body: serde_json::Map::new(),
-        };
-        let text = serde_json::to_string_pretty(&settings).unwrap();
-        std::fs::write(&path, &text).unwrap();
-
-        let read: Settings = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(read.base_url, settings.base_url);
-        assert_eq!(read.api_key, settings.api_key);
-        assert_eq!(read.model, settings.model);
+            max_output_tokens: Some(4096),
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn a_corrupt_settings_file_falls_back_to_defaults() {
-        let parsed: Settings = serde_json::from_str("{ this is not json }").unwrap_or_default();
-        assert!(!parsed.is_configured());
+    fn settings_round_trip_through_a_file() {
+        let (_dir, path) = scratch("round-trip");
+        let settings = configured();
+        settings.save_to(&path).unwrap();
+
+        let read = Settings::load_from(&path).unwrap();
+        assert_eq!(read.base_url, settings.base_url);
+        assert_eq!(read.api_key, settings.api_key);
+        assert_eq!(read.model, settings.model);
+        assert_eq!(read.delivery, settings.delivery);
+        assert_eq!(read.max_output_tokens, settings.max_output_tokens);
+    }
+
+    #[test]
+    fn an_unknown_key_survives_a_load_and_save_round_trip() {
+        // The defect this pins down: `deny_unknown_fields` turned one
+        // unrecognised key into a failed parse, `load()` answered that with
+        // defaults, and the next save wrote the defaults over everything.
+        let (_dir, path) = scratch("unknown-key");
+        let original = serde_json::json!({
+            "base_url": "https://example.test/v1",
+            "api_key": "sk-keep-me",
+            "model": "test-model",
+            "a_field_from_a_newer_build": {"nested": [1, 2, 3]},
+            "another_unknown": "kept",
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&original).unwrap()).unwrap();
+
+        let mut settings = Settings::load_from(&path).unwrap();
+        assert_eq!(settings.api_key, "sk-keep-me", "the known fields load");
+        assert_eq!(settings.unknown.len(), 2, "{:?}", settings.unknown);
+
+        settings.model = "another-model".into();
+        settings.save_to(&path).unwrap();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["model"], "another-model");
+        assert_eq!(
+            written["a_field_from_a_newer_build"],
+            serde_json::json!({"nested": [1, 2, 3]}),
+            "an unknown key is written back, not eaten"
+        );
+        assert_eq!(written["another_unknown"], "kept");
+        assert_eq!(written["api_key"], "sk-keep-me", "and nothing else moved");
+    }
+
+    #[test]
+    fn a_corrupt_file_is_an_error_rather_than_defaults() {
+        let (_dir, path) = scratch("corrupt-load");
+        std::fs::write(&path, "{ this is not json }").unwrap();
+
+        let error = Settings::load_from(&path).expect_err("a broken file must not read as defaults");
+        let text = format!("{error:#}");
+        assert!(text.contains("settings.json"), "the path is named: {text}");
+        assert!(text.contains("line"), "the serde position is named: {text}");
+    }
+
+    #[test]
+    fn save_refuses_to_overwrite_a_file_that_does_not_parse() {
+        // The core of the fix: a caller that ignored the load error (or built
+        // its settings from defaults) must not be able to flatten the file.
+        let (_dir, path) = scratch("corrupt-save");
+        let original = "{\"api_key\": \"sk-still-here\", oops";
+        std::fs::write(&path, original).unwrap();
+
+        let error = Settings::default()
+            .save_to(&path)
+            .expect_err("an unreadable file must not be overwritten");
+        assert!(
+            format!("{error:#}").contains("nothing was written"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "the bytes are exactly as they were"
+        );
+        assert!(
+            !path.with_extension("json.bak").exists(),
+            "and no backup was invented for a file that was never read"
+        );
+    }
+
+    #[test]
+    fn save_leaves_one_backup_from_before_the_first_overwrite() {
+        let (_dir, path) = scratch("backup");
+        let mut settings = configured();
+        settings.save_to(&path).unwrap();
+        assert!(
+            !path.with_extension("json.bak").exists(),
+            "the first write creates the file, nothing to back up"
+        );
+
+        let first = std::fs::read_to_string(&path).unwrap();
+        settings.model = "second".into();
+        settings.save_to(&path).unwrap();
+        settings.model = "third".into();
+        settings.save_to(&path).unwrap();
+
+        let backup = path.with_extension("json.bak");
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            first,
+            "the backup is the file as it was before the first overwrite"
+        );
+        assert_eq!(
+            Settings::load_from(&path).unwrap().model,
+            "third",
+            "and the live file is the newest write"
+        );
+    }
+
+    #[test]
+    fn setting_one_field_leaves_every_other_field_alone() {
+        // The shape of `ngu config set`: load, change one field, save. Every
+        // field the command does not touch has to come back identical.
+        let (_dir, path) = scratch("set-one");
+        let before = configured();
+        before.save_to(&path).unwrap();
+
+        let mut after = Settings::load_from(&path).unwrap();
+        after.model = "switched-model".into();
+        after.save_to(&path).unwrap();
+
+        let reloaded = Settings::load_from(&path).unwrap();
+        assert_eq!(reloaded.model, "switched-model");
+        assert_eq!(reloaded.base_url, before.base_url);
+        assert_eq!(reloaded.api_key, before.api_key, "the key survives a set");
+        assert_eq!(reloaded.reasoning_effort, before.reasoning_effort);
+        assert_eq!(reloaded.delivery, before.delivery);
+        assert_eq!(reloaded.degrade_on_stall, before.degrade_on_stall);
+        assert_eq!(reloaded.max_output_tokens, before.max_output_tokens);
+        assert_eq!(reloaded.compact_percent, before.compact_percent);
+        assert_eq!(reloaded.compact_keep_recent, before.compact_keep_recent);
+        assert_eq!(reloaded.network.retry_attempts, before.network.retry_attempts);
+    }
+
+    #[test]
+    fn the_debug_output_masks_the_secret() {
+        let settings = Settings {
+            api_key: "sk-abcdefghijklmnop".into(),
+            relay_token: "relay-0123456789abcdef".into(),
+            ..Default::default()
+        };
+        let printed = format!("{settings:?}");
+        assert!(!printed.contains("sk-abcdefghijklmnop"), "{printed}");
+        assert!(!printed.contains("relay-0123456789abcdef"), "{printed}");
+        assert!(printed.contains("sk-abc"), "enough to identify it: {printed}");
+    }
+
+    #[test]
+    fn the_threshold_and_the_output_reserve_reach_the_policy() {
+        let settings = Settings {
+            compact_percent: 500,
+            max_output_tokens: Some(8192),
+            ..Default::default()
+        };
+        let policy = settings.context_policy(None);
+        assert_eq!(policy.threshold_percent, 95, "100% would mean never compact");
+        assert_eq!(policy.reserve, 8192, "the answer needs room inside the window");
     }
 }

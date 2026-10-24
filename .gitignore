@@ -3,6 +3,11 @@ node_modules/
 dist/
 build/
 target/
+# 验证用的私有构建目录：每个车道一个 target 才能并编不互锁，产物一律不入库
+target-*/
+test-logs/
+# 端到端自测用的假 home/假会话/假包：跑完就删，不进仓库
+test-scratch/
 *.tsbuildinfo
 
 # 运行时数据
@@ -69,3 +74,7 @@ tmp-jobs-e2e/
 fix-starter-paged.py
 
 verify-server.py
+
+server-seed-profile.py
+
+.audit/

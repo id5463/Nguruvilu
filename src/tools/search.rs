@@ -376,7 +376,9 @@ async fn search(
     let response = request.send().await.context("calling the search provider")?;
 
     let status = response.status();
-    let text = response.text().await.unwrap_or_default();
+    // Bounded and honest (see `judge::body_text`): a read error is no longer
+    // swallowed into an empty body, and an oversized one fails at the cap.
+    let text = super::judge::body_text(response, "the search provider").await?;
     if !status.is_success() {
         return Err(anyhow!(
             "{} returned {status}: {}",
@@ -399,17 +401,50 @@ async fn search(
         )));
     }
 
-    let mut out = format!("{} result(s) for '{query}':\n", hits.len());
-    for (index, hit) in hits.iter().enumerate() {
+    Ok(ToolOutput::text(render_hits(query, &hits)))
+}
+
+/// Render the hits for the transcript, bounded twice.
+///
+/// At most [`MAX_HITS`] hits and at most [`MAX_SNIPPET_CHARS`] of excerpt each:
+/// a provider that dumps everything it has would otherwise spend the context
+/// window on a list the model skims anyway, and one absurd excerpt would crowd
+/// out the others. What was cut is said, not silent — a truncated answer the
+/// model cannot see is a wrong answer.
+fn render_hits(query: &str, hits: &[Hit]) -> String {
+    const MAX_HITS: usize = 20;
+    const MAX_SNIPPET_CHARS: usize = 1024;
+
+    let hidden = hits.len().saturating_sub(MAX_HITS);
+    let mut out = if hidden > 0 {
+        format!(
+            "{} result(s) for '{query}' (showing the first {MAX_HITS}; {} not shown):\n",
+            hits.len(),
+            hidden
+        )
+    } else {
+        format!("{} result(s) for '{query}':\n", hits.len())
+    };
+    for (index, hit) in hits.iter().take(MAX_HITS).enumerate() {
+        let trimmed = hit.snippet.trim();
+        // Take one more than the cap so the truncation is a fact, not a guess;
+        // `Vec<char>` keeps the cut on a character boundary.
+        let mut chars: Vec<char> = trimmed.chars().take(MAX_SNIPPET_CHARS + 1).collect();
+        let cut = chars.len() > MAX_SNIPPET_CHARS;
+        chars.truncate(MAX_SNIPPET_CHARS);
+        let mut snippet: String = chars.into_iter().collect();
+        if cut {
+            snippet.push_str(" …(excerpt truncated)");
+        }
         out.push_str(&format!(
             "\n{}. {}\n   {}\n   {}\n",
             index + 1,
             hit.title,
             hit.url,
-            hit.snippet.trim()
+            snippet
         ));
     }
-    Ok(ToolOutput::text(out))
+    out
 }
 
 /// Read search settings from the environment, when set.
@@ -556,6 +591,47 @@ mod tests {
         // Nothing to cite, so nothing to report.
         let body = json!({ "results": [ { "title": "no url", "content": "x" } ] });
         assert!(parse_response(Dialect::Tavily, &body).is_empty());
+    }
+
+    #[test]
+    fn the_result_list_is_capped_and_says_what_was_hidden() {
+        // Twenty well-chosen hits beat two hundred lines the model skims; the
+        // provider's full list is still counted, so the caller knows there was
+        // more than what the transcript shows.
+        let hits: Vec<Hit> = (0..25)
+            .map(|n| Hit {
+                title: format!("hit {n}"),
+                url: format!("https://example.test/{n}"),
+                snippet: format!("snippet {n}"),
+            })
+            .collect();
+        let out = render_hits("probe", &hits);
+        assert!(out.contains("25 result(s)"), "{out}");
+        assert!(out.contains("showing the first 20"), "{out}");
+        assert!(out.contains("5 not shown"), "{out}");
+        assert!(out.contains("hit 19"), "the first twenty are shown: {out}");
+        assert!(!out.contains("hit 20"), "hit 21 is not: {out}");
+    }
+
+    #[test]
+    fn a_long_snippet_is_cut_at_a_kilobyte_and_says_so() {
+        // An absurd excerpt must not crowd out the others, and the cut is
+        // named: a truncated answer that reads as complete is a wrong answer.
+        let long: String = std::iter::repeat('详').take(3000).collect();
+        let hits = vec![Hit {
+            title: "one hit".into(),
+            url: "https://example.test/1".into(),
+            snippet: long,
+        }];
+        let out = render_hits("probe", &hits);
+        assert!(out.contains("(excerpt truncated)"), "{out}");
+        assert!(
+            out.matches('详').count() <= 1024,
+            "the excerpt is capped, not passed through: {} chars",
+            out.matches('详').count()
+        );
+        // A cut on a character boundary: no U+FFFD replacement snuck in.
+        assert!(!out.contains('\u{FFFD}'), "the cut is on a char boundary: {out}");
     }
 
     #[test]

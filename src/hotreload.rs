@@ -12,15 +12,18 @@
 //!    change is written into the prompt, never *whether* it may happen. Consent
 //!    gates scope, not capability.
 //!
-//! Scope is what consent is about: a session-scoped change is the default and
-//! needs no approval, because it cannot affect anyone else. A global change
-//! touches every session, so the policy table decides whether to ask.
+//! Consent is decided once, where a change takes effect, and for every scope:
+//! a `Deny` is the user saying "not this", and a session-scoped change the user
+//! denied is still one they denied. What keeps a session's own change from
+//! needing approval is the *default* rule — nobody decided otherwise — not a
+//! separate path that skips the check.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::plugin::Kernel;
 use crate::tools::ToolRegistry;
@@ -192,7 +195,7 @@ pub enum CachePolicy {
 }
 
 /// What a change alters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ChangeKind {
     /// The model route (provider, base URL, model).
@@ -282,6 +285,17 @@ pub enum ChangePayload {
     RemoveSkillRoot(String),
     /// Set the default cache policy.
     CachePolicy(CachePolicy),
+    /// The tool table was swapped by the kernel (a plugin load or unload).
+    ///
+    /// Carries a count rather than the table: a change is serialized and
+    /// persisted, and a live registry is not data. The swap itself happens in
+    /// [`Runtime::set_tools`]; this payload exists so that swap is a
+    /// first-class, authorized and audited change rather than a second door
+    /// into the same state.
+    Tools {
+        /// How many tools the new table holds.
+        count: usize,
+    },
 }
 
 impl ChangePayload {
@@ -294,6 +308,7 @@ impl ChangePayload {
                 ChangeKind::SkillRoots
             }
             ChangePayload::CachePolicy(_) => ChangeKind::CachePolicy,
+            ChangePayload::Tools { .. } => ChangeKind::Tool,
         }
     }
 
@@ -310,6 +325,7 @@ impl ChangePayload {
             ChangePayload::AddSkillRoot(path) => format!("add skill root {path}"),
             ChangePayload::RemoveSkillRoot(path) => format!("remove skill root {path}"),
             ChangePayload::CachePolicy(policy) => format!("cache policy → {policy:?}"),
+            ChangePayload::Tools { count } => format!("tool table → {count} tools"),
         }
     }
 }
@@ -456,29 +472,47 @@ impl Snapshot {
 /// The runtime: state, policy, and the audit trail of what changed.
 pub struct Runtime {
     state: RuntimeState,
+    /// Decisions that cover a whole kind, in every scope.
+    ///
+    /// Empty means nothing has been decided, which is not the same as "ask
+    /// about everything": [`Runtime::rule_for`] fills in the default for a
+    /// scope where no decision has been made.
     policy: HashMap<ChangeKind, Consent>,
+    /// Decisions the user asked to be remembered, keyed by the *value* they
+    /// were made about.
+    ///
+    /// Keyed by kind alone, one approval of a local endpoint allowed every
+    /// later route — including one pointing somewhere else — in every session.
+    /// A remembered decision now covers exactly what was approved.
+    remembered: BTreeSet<(ChangeKind, String)>,
     history: Vec<AppliedChange>,
-    pending: HashMap<String, PendingChange>,
+    /// Waiting changes, in the order they arrived.
+    ///
+    /// Keyed by a counter of its own: the id used to be `seq + 1`, and `seq`
+    /// only advances on commit, so two queued changes shared an id and the
+    /// second silently replaced the first — which then could be neither
+    /// approved nor audited.
+    pending: BTreeMap<u64, PendingChange>,
+    next_pending: u64,
     tools: Arc<ToolRegistry>,
     version: u64,
     seq: u64,
 }
 
 impl Runtime {
-    /// Build a runtime over a tool table, with the default policy.
+    /// Build a runtime over a tool table, with no decisions taken yet.
     ///
-    /// Session-scoped changes are allowed without asking; global ones ask;
-    /// nothing is denied by default.
+    /// Nothing decided means a session-scoped change is applied, because it
+    /// cannot reach anyone else, and a global one asks, because it reaches
+    /// every session. Nothing is denied.
     pub fn new(tools: Arc<ToolRegistry>) -> Self {
-        let mut policy = HashMap::new();
-        for kind in ChangeKind::all() {
-            policy.insert(kind, Consent::Ask);
-        }
         Self {
             state: RuntimeState::default(),
-            policy,
+            policy: HashMap::new(),
+            remembered: BTreeSet::new(),
             history: Vec::new(),
-            pending: HashMap::new(),
+            pending: BTreeMap::new(),
+            next_pending: 0,
             tools,
             version: 1,
             seq: 0,
@@ -526,22 +560,52 @@ impl Runtime {
     }
 
     /// Replace the tool table (a plugin load or unload changed it).
-    pub fn set_tools(&mut self, tools: Arc<ToolRegistry>) {
+    ///
+    /// A tool table is capability, so it takes the same door as every other
+    /// change: the rule for [`ChangeKind::Tool`] can refuse it, and the swap
+    /// leaves an entry in [`Runtime::history`] naming the kernel as the decider.
+    /// It used to be a second door that skipped both, which meant a turn could
+    /// be handed a table no rule had ever seen — and nothing recorded it.
+    ///
+    /// The outcome is returned rather than swallowed so a caller can report a
+    /// refusal; ignoring it still applies the swap whenever the policy allows.
+    pub fn set_tools(&mut self, tools: Arc<ToolRegistry>) -> ApplyOutcome {
+        if self.rule_for(ChangeKind::Tool) == Consent::Deny {
+            return ApplyOutcome::Denied("policy denies tool-table changes".into());
+        }
+        let count = tools.len();
         self.tools = tools;
         self.version += 1;
+        self.seq += 1;
+        let applied = AppliedChange {
+            seq: self.seq,
+            change: Change {
+                payload: ChangePayload::Tools { count },
+                scope: ChangeScope::Global,
+                persist: false,
+                cache_policy: None,
+            },
+            version: self.version,
+            decided_by: "kernel",
+        };
+        self.history.push(applied.clone());
+        ApplyOutcome::Applied(applied)
     }
 
     /// Apply a tool-table change coming from the kernel.
-    pub fn adopt_kernel_tools(&mut self, kernel: &Kernel) {
-        self.set_tools(Arc::new(kernel.tools().clone()));
+    pub fn adopt_kernel_tools(&mut self, kernel: &Kernel) -> ApplyOutcome {
+        self.set_tools(Arc::new(kernel.tools().clone()))
     }
 
-    /// Set the consent rule for one kind of change.
+    /// Set the consent rule for one kind of change, in every scope.
     pub fn set_consent(&mut self, kind: ChangeKind, consent: Consent) {
         self.policy.insert(kind, consent);
     }
 
-    /// The consent rule for one kind of change.
+    /// The rule recorded for one kind of change.
+    ///
+    /// `Ask` when nothing has been decided. This is the table as the user wrote
+    /// it; [`Runtime::rule_for`] is what applies a rule to an actual change.
     pub fn consent(&self, kind: ChangeKind) -> Consent {
         self.policy.get(&kind).cloned().unwrap_or(Consent::Ask)
     }
@@ -559,9 +623,35 @@ impl Runtime {
         &self.history
     }
 
-    /// Changes awaiting consent.
+    /// Changes awaiting consent, in the order they arrived.
     pub fn pending(&self) -> Vec<&PendingChange> {
         self.pending.values().collect()
+    }
+
+    /// The rule that applies to one change, in its own scope.
+    ///
+    /// An explicit decision covers every scope — a `Deny` is the user saying
+    /// "not this", and a session-scoped change they denied is still one they
+    /// denied. With nothing decided, a global change asks, because it reaches
+    /// every session, and a session change does not, because it cannot reach
+    /// anyone else. A remembered approval covers exactly the value it was made
+    /// about.
+    fn rule_for(&self, kind: ChangeKind) -> Consent {
+        self.policy.get(&kind).cloned().unwrap_or(Consent::Ask)
+    }
+
+    fn rule_for_change(&self, change: &Change) -> Consent {
+        if let Some(rule) = self.policy.get(&change.payload.kind()) {
+            return rule.clone();
+        }
+        if self.remembered.contains(&authorization(&change.payload)) {
+            return Consent::AutoAllow;
+        }
+        if change.scope.is_global() {
+            Consent::Ask
+        } else {
+            Consent::AutoAllow
+        }
     }
 
     /// Request a change.
@@ -574,62 +664,91 @@ impl Runtime {
         // leave a trace.
         validate(&change)?;
 
-        let consent = self.consent(kind);
+        // The tool table is not part of this state: the kernel swaps it through
+        // `set_tools`, which consults the same rule and writes the same history.
+        if matches!(&change.payload, ChangePayload::Tools { .. }) {
+            return Err(anyhow!(
+                "the tool table is swapped by the kernel, not by a change"
+            ));
+        }
 
-        if change.scope.is_global() {
-            match consent {
-                Consent::Deny => {
-                    return Ok(ApplyOutcome::Denied(format!(
-                        "policy denies global {} changes",
-                        kind.as_str()
-                    )));
-                }
-                Consent::Ask => {
-                    let id = format!("chg-{}", self.seq + 1);
-                    let pending = PendingChange {
-                        id: id.clone(),
-                        change: change.clone(),
-                        reason: format!(
-                            "global {} change affects every session",
-                            kind.as_str()
-                        ),
-                    };
-                    self.pending.insert(id, pending.clone());
-                    return Ok(ApplyOutcome::NeedsConsent(pending));
-                }
-                Consent::AutoAllow => {}
+        // One decision point, every scope. A `Deny` stops here whatever the
+        // scope, and an `Ask` queues here whatever the scope; nothing reaches
+        // `commit` without passing this.
+        match self.rule_for_change(&change) {
+            Consent::Deny => {
+                return Ok(ApplyOutcome::Denied(format!(
+                    "policy denies {} changes{}",
+                    kind.as_str(),
+                    if change.scope.is_global() {
+                        " in every session"
+                    } else {
+                        " in this session"
+                    }
+                )));
             }
+            Consent::Ask => {
+                self.next_pending += 1;
+                let token = self.next_pending;
+                let pending = PendingChange {
+                    id: format!("chg-{token}"),
+                    change: change.clone(),
+                    reason: if change.scope.is_global() {
+                        format!("global {} change affects every session", kind.as_str())
+                    } else {
+                        format!("a session-scoped {} change", kind.as_str())
+                    },
+                };
+                // Never overwrite: two waiting changes are two decisions.
+                debug_assert!(!self.pending.contains_key(&token));
+                self.pending.insert(token, pending.clone());
+                return Ok(ApplyOutcome::NeedsConsent(pending));
+            }
+            Consent::AutoAllow => {}
         }
 
         let decided_by = if change.scope.is_global() { "auto-allowed" } else { "session-scope" };
         self.commit(change, decided_by)
     }
 
+    /// The pending entry with this id.
+    fn take_pending(&mut self, id: &str) -> Result<PendingChange> {
+        let key = id
+            .strip_prefix("chg-")
+            .unwrap_or(id)
+            .parse::<u64>()
+            .ok()
+            .filter(|key| self.pending.contains_key(key))
+            .ok_or_else(|| anyhow!("no pending change '{id}'"))?;
+        Ok(self
+            .pending
+            .remove(&key)
+            .expect("filtered on contains_key"))
+    }
+
     /// Approve a pending change.
     pub fn approve(&mut self, id: &str) -> Result<ApplyOutcome> {
-        let pending = self
-            .pending
-            .remove(id)
-            .ok_or_else(|| anyhow!("no pending change '{id}'"))?;
+        let pending = self.take_pending(id)?;
         self.commit(pending.change, "approved")
     }
 
-    /// Approve a pending change and allow this kind automatically from now on.
+    /// Approve a pending change and let *this value* through automatically from
+    /// now on.
+    ///
+    /// The value, not the kind: approving a route to a local endpoint says
+    /// nothing about an endpoint on the internet, and approving one skill root
+    /// says nothing about another directory. A remembered decision that covered
+    /// the whole kind turned a single answer into a standing permission.
     pub fn approve_and_remember(&mut self, id: &str) -> Result<ApplyOutcome> {
-        let pending = self
-            .pending
-            .remove(id)
-            .ok_or_else(|| anyhow!("no pending change '{id}'"))?;
-        let kind = pending.change.payload.kind();
-        self.policy.insert(kind, Consent::AutoAllow);
+        let pending = self.take_pending(id)?;
+        let key = authorization(&pending.change.payload);
+        self.remembered.insert(key);
         self.commit(pending.change, "approved-and-remembered")
     }
 
     /// Reject a pending change. Nothing was applied.
     pub fn reject(&mut self, id: &str) -> Result<()> {
-        self.pending
-            .remove(id)
-            .ok_or_else(|| anyhow!("no pending change '{id}'"))?;
+        self.take_pending(id)?;
         Ok(())
     }
 
@@ -684,9 +803,47 @@ impl Runtime {
             ChangePayload::CachePolicy(policy) => {
                 self.state.cache_policy = *policy;
             }
+            // The table lives on the runtime, not in this state, and a live
+            // registry cannot be reconstructed from a payload: the kernel swaps
+            // it in `set_tools`.
+            ChangePayload::Tools { .. } => {
+                return Err(anyhow!(
+                    "the tool table is swapped by the kernel, not by a change"
+                ));
+            }
         }
         Ok(())
     }
+}
+
+/// What a remembered decision was about: the kind *and* the value.
+///
+/// Two approvals of different values are two decisions. Normalisation is
+/// deliberately conservative — surrounding whitespace and a trailing slash —
+/// because anything more would let a different endpoint pass as the same one.
+fn authorization(payload: &ChangePayload) -> (ChangeKind, String) {
+    let kind = payload.kind();
+    let value = match payload {
+        ChangePayload::ModelRoute(route) => format!(
+            "{}|{}",
+            route.base_url.trim().trim_end_matches('/'),
+            route.model.trim()
+        ),
+        // The persona is remembered by digest: it can be sixty kilobytes, and
+        // what matters is that the next one is the same one.
+        ChangePayload::Persona(text) => format!("#{}", hex_digest(text.trim())),
+        ChangePayload::AddSkillRoot(path) => format!("+{}", path.trim()),
+        ChangePayload::RemoveSkillRoot(path) => format!("-{}", path.trim()),
+        ChangePayload::CachePolicy(policy) => format!("{policy:?}"),
+        ChangePayload::Tools { count } => format!("{count}"),
+    };
+    (kind, value)
+}
+
+fn hex_digest(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 /// Reject a change that could never be valid, before any state moves.
@@ -708,6 +865,9 @@ fn validate(change: &Change) -> Result<()> {
             }
         }
         ChangePayload::CachePolicy(_) => {}
+        // Nothing to check: the table is swapped by the kernel, never applied
+        // as a change (see `Runtime::apply`).
+        ChangePayload::Tools { .. } => {}
     }
     Ok(())
 }
@@ -824,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn remembering_a_decision_updates_the_policy() {
+    fn remembering_a_decision_covers_the_value_that_was_approved() {
         let mut runtime = fresh_runtime();
         let pending = match runtime
             .apply(Change::global(ChangePayload::AddSkillRoot("/skills".into())))
@@ -835,14 +995,168 @@ mod tests {
         };
 
         runtime.approve_and_remember(&pending.id).unwrap();
-        assert_eq!(runtime.consent(ChangeKind::SkillRoots), Consent::AutoAllow);
+        assert_eq!(runtime.state().skill_roots, vec!["/skills".to_string()]);
 
-        // The next one of the same kind does not ask.
-        let next = runtime
-            .apply(Change::global(ChangePayload::AddSkillRoot("/more".into())))
+        // The same value does not ask again...
+        let again = runtime
+            .apply(Change::global(ChangePayload::AddSkillRoot("/skills".into())))
             .unwrap();
-        assert!(matches!(next, ApplyOutcome::Applied(_)));
-        assert_eq!(runtime.state().skill_roots.len(), 2);
+        assert!(matches!(again, ApplyOutcome::Applied(_)), "{again:?}");
+
+        // ...and a different value is a different decision. Remembering the
+        // *kind* would have turned one answer into a standing permission.
+        let other = runtime
+            .apply(Change::global(ChangePayload::AddSkillRoot(
+                "/somewhere-else".into(),
+            )))
+            .unwrap();
+        assert!(
+            matches!(other, ApplyOutcome::NeedsConsent(_)),
+            "one approval is not a standing permission for the kind: {other:?}"
+        );
+        assert_eq!(runtime.state().skill_roots, vec!["/skills".to_string()]);
+        assert_eq!(
+            runtime.consent(ChangeKind::SkillRoots),
+            Consent::Ask,
+            "nothing was decided about the kind as a whole"
+        );
+    }
+
+    #[test]
+    fn remembering_one_route_does_not_allow_another_endpoint() {
+        let mut runtime = fresh_runtime();
+        let local = ModelRoute {
+            provider: "ollama".into(),
+            base_url: "http://127.0.0.1:11434/v1".into(),
+            model: "local-model".into(),
+            ..Default::default()
+        };
+        let pending = match runtime
+            .apply(Change::global(ChangePayload::ModelRoute(local.clone())))
+            .unwrap()
+        {
+            ApplyOutcome::NeedsConsent(p) => p,
+            other => panic!("expected consent, got {other:?}"),
+        };
+        runtime.approve_and_remember(&pending.id).unwrap();
+
+        // The same route, spelled with a trailing slash, is the same decision.
+        let same = ModelRoute {
+            base_url: "http://127.0.0.1:11434/v1/".into(),
+            ..local.clone()
+        };
+        assert!(
+            matches!(
+                runtime
+                    .apply(Change::global(ChangePayload::ModelRoute(same)))
+                    .unwrap(),
+                ApplyOutcome::Applied(_)
+            ),
+            "the approved route is approved again"
+        );
+
+        // Another endpoint is another decision — approving a local ollama must
+        // not become permission to send traffic anywhere.
+        let elsewhere = ModelRoute {
+            base_url: "https://api.example.com/v1".into(),
+            ..local.clone()
+        };
+        assert!(matches!(
+            runtime
+                .apply(Change::global(ChangePayload::ModelRoute(elsewhere)))
+                .unwrap(),
+            ApplyOutcome::NeedsConsent(_)
+        ));
+
+        // And so is another model on the endpoint that was approved.
+        let remodelled = ModelRoute {
+            model: "another-model".into(),
+            ..local.clone()
+        };
+        assert!(matches!(
+            runtime
+                .apply(Change::global(ChangePayload::ModelRoute(remodelled)))
+                .unwrap(),
+            ApplyOutcome::NeedsConsent(_)
+        ));
+        assert_eq!(
+            runtime.state().model_route.base_url,
+            "http://127.0.0.1:11434/v1/"
+        );
+    }
+
+    #[test]
+    fn two_waiting_changes_keep_separate_ids_and_both_stay_answerable() {
+        let mut runtime = fresh_runtime();
+        let first = match runtime
+            .apply(Change::global(ChangePayload::Persona("one".into())))
+            .unwrap()
+        {
+            ApplyOutcome::NeedsConsent(p) => p,
+            other => panic!("expected consent, got {other:?}"),
+        };
+        let second = match runtime
+            .apply(Change::global(ChangePayload::AddSkillRoot("/two".into())))
+            .unwrap()
+        {
+            ApplyOutcome::NeedsConsent(p) => p,
+            other => panic!("expected consent, got {other:?}"),
+        };
+
+        assert_ne!(
+            first.id, second.id,
+            "two queued changes must not share an id: the second used to replace the first"
+        );
+        let ids: Vec<String> = runtime.pending().iter().map(|p| p.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![first.id.clone(), second.id.clone()],
+            "both wait, in arrival order, and neither is lost"
+        );
+
+        // Denying one is denying that one.
+        runtime.reject(&second.id).unwrap();
+        let left: Vec<String> = runtime.pending().iter().map(|p| p.id.clone()).collect();
+        assert_eq!(left, vec![first.id.clone()]);
+
+        // The one that was not denied is still approvable by its own id.
+        assert!(matches!(
+            runtime.approve(&first.id).unwrap(),
+            ApplyOutcome::Applied(_)
+        ));
+        assert!(runtime.pending().is_empty());
+        assert_eq!(runtime.state().persona, "one");
+        assert!(runtime.state().skill_roots.is_empty());
+    }
+
+    #[test]
+    fn a_kernel_tool_swap_is_consented_and_audited() {
+        let mut runtime = fresh_runtime();
+        let before = runtime.snapshot().tools;
+        let empty = Arc::new(ToolRegistry::new());
+
+        match runtime.set_tools(Arc::clone(&empty)) {
+            ApplyOutcome::Applied(applied) => {
+                assert_eq!(applied.decided_by, "kernel");
+                assert_eq!(applied.change.payload.kind(), ChangeKind::Tool);
+            }
+            other => panic!("a kernel swap applies, got {other:?}"),
+        }
+        assert_eq!(runtime.history().len(), 1, "the swap leaves a record");
+        assert!(
+            !Arc::ptr_eq(&runtime.snapshot().tools, &before),
+            "the table really changed"
+        );
+
+        // A refusal leaves the table where it was, and is not an apply.
+        runtime.set_consent(ChangeKind::Tool, Consent::Deny);
+        let denied = runtime.set_tools(Arc::clone(&before));
+        assert!(matches!(denied, ApplyOutcome::Denied(_)), "{denied:?}");
+        assert!(
+            Arc::ptr_eq(&runtime.snapshot().tools, &empty),
+            "a refused swap changes nothing"
+        );
+        assert_eq!(runtime.history().len(), 1, "a refusal is not an apply");
     }
 
     #[test]
@@ -937,19 +1251,66 @@ mod tests {
     fn the_default_policy_asks_for_global_and_allows_session() {
         let runtime = fresh_runtime();
         for (kind, consent) in runtime.policy_table() {
-            assert_eq!(consent, Consent::Ask, "{kind:?} defaults to asking");
+            assert_eq!(consent, Consent::Ask, "{kind:?} records no decision");
         }
 
-        // Session scope never consults the table.
+        // With nothing decided: a session's own change is applied, and a global
+        // one asks. The difference is the default rule, not a skipped check.
         let mut runtime = fresh_runtime();
-        runtime.set_consent(ChangeKind::Persona, Consent::Deny);
-        let outcome = runtime
+        let applied = runtime
             .apply(Change::session("s1", ChangePayload::Persona("ok".into())))
             .unwrap();
+        assert!(matches!(applied, ApplyOutcome::Applied(_)));
+        let asked = runtime
+            .apply(Change::global(ChangePayload::Persona("everyone".into())))
+            .unwrap();
+        assert!(matches!(asked, ApplyOutcome::NeedsConsent(_)));
+    }
+
+    #[test]
+    fn a_denial_reaches_every_scope_not_only_global() {
+        // A `Deny` is the user saying "not this". A session-scoped persona
+        // change is still a persona change, and used to slip past the denial
+        // entirely because consent was only consulted for global scope.
+        let mut runtime = fresh_runtime();
+        runtime.set_consent(ChangeKind::Persona, Consent::Deny);
+
+        let outcome = runtime
+            .apply(Change::session("s1", ChangePayload::Persona("no".into())))
+            .unwrap();
+
+        match outcome {
+            ApplyOutcome::Denied(reason) => assert!(reason.contains("denies"), "{reason}"),
+            other => panic!("a denied kind must refuse a session change too, got {other:?}"),
+        }
+        assert!(runtime.state().persona.is_empty());
+        assert!(runtime.history().is_empty());
+        assert!(runtime.pending().is_empty());
+    }
+
+    #[test]
+    fn an_ask_for_a_kind_queues_a_session_change_too() {
+        let mut runtime = fresh_runtime();
+        runtime.set_consent(ChangeKind::Persona, Consent::Ask);
+
+        let pending = match runtime
+            .apply(Change::session("s1", ChangePayload::Persona("ask me".into())))
+            .unwrap()
+        {
+            ApplyOutcome::NeedsConsent(p) => p,
+            other => panic!("expected consent, got {other:?}"),
+        };
+        assert!(pending.reason.contains("session"), "{:?}", pending.reason);
         assert!(
-            matches!(outcome, ApplyOutcome::Applied(_)),
-            "a denial governs global scope; a session cannot reach anyone else"
+            runtime.state().persona.is_empty(),
+            "nothing changes while it waits"
         );
+
+        assert!(matches!(
+            runtime.approve(&pending.id).unwrap(),
+            ApplyOutcome::Applied(_)
+        ));
+        assert_eq!(runtime.state().persona, "ask me");
     }
 
     #[test]
