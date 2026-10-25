@@ -1171,6 +1171,80 @@ fn board_json() -> Value {
     Value::Array(rows)
 }
 
+// ------------------------------------------- the mission a turn must not leave
+
+/// How much of each field [`running_mission`] hands to the agent loop.
+///
+/// The brief is read out into an injected message, not into a report: 160
+/// characters is the budget the panel and the worker prompt already give one
+/// line, and it is enough to say what the mission is without turning every
+/// batch of a long turn into a copy of `STATE.md`.
+const BRIEF_CLIP: usize = 160;
+
+/// What the agent loop needs to keep a turn pointed at a running mission.
+///
+/// A copy of the record's small text fields, not the record: the loop holds
+/// this only long enough to write a message, and handing it `Value`s of live
+/// mission state would invite someone to treat a stale copy as the truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissionBrief {
+    /// `m-20260101-000000`.
+    pub id: String,
+    /// What the mission is for.
+    pub objective: String,
+    /// The status as recorded. Only `running` produces a brief at all.
+    pub status: String,
+    /// The step the mission says comes next; empty when none was recorded.
+    pub step: String,
+    /// How anyone can tell it is finished; empty when none was given.
+    pub done_when: String,
+}
+
+/// The mission a turn must not walk away from, if there is one.
+///
+/// The agent loop asks this between steps and after every answer. While the
+/// active mission is `running`, ending the turn abandons work the model has
+/// already taken responsibility for, and only the model may decide a mission is
+/// over (`mission_advance` with `done` or `blocked`). So the question this
+/// answers is narrow — "is there work on disk that still says it is going?" —
+/// and it is answered from disk every time, because the same turn can change
+/// the answer.
+///
+/// Cheap and quiet by construction: nothing is created, nothing is cached, and
+/// every unreadable step (no workspace, no pointer, a corrupt pointer, a
+/// missing or half-written record) is "no mission" rather than an error. This
+/// is called from inside a turn, so a reader that could fail loudly would be
+/// able to end one.
+pub fn running_mission(workspace: &Path) -> Option<MissionBrief> {
+    let root = workspace.join("missions");
+    let id = active_id(&root).ok().flatten()?;
+    let record = read_json(&mission_dir(&root, &id).join("mission.json")).ok()?;
+    let field = |key: &str| -> String {
+        record
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(|text| clip(text.trim(), BRIEF_CLIP))
+            .unwrap_or_default()
+    };
+    // Only `running` keeps a turn open. `blocked` and `done` are the model
+    // saying it is no longer going; a shell that went round again anyway would
+    // be overruling the one party allowed to end a mission.
+    if field("status") != "running" {
+        return None;
+    }
+    let recorded_id = field("id");
+    Some(MissionBrief {
+        // The record's own id when it has one, the pointer's otherwise: both
+        // name the same mission, and a mission named wrongly in the injected
+        // message is worse than a slightly stale name.
+        id: if recorded_id.is_empty() { id } else { recorded_id },
+        objective: field("objective"),
+        status: field("status"),
+        step: field("step"),
+        done_when: field("done_when"),
+    })
+}
+
 /// The marker every mission answer ends with.
 ///
 /// The interface reads it to paint the mission bar; it costs a line and saves
@@ -2708,6 +2782,66 @@ mod tests {
             // A mission whose files are gone still lists, rather than vanishing.
             let listed = recall(json!({ "query": "anything" })).expect("recall is tolerant");
             assert!(listed.contains("hit(s)"), "{listed}");
+        });
+    }
+
+    /// The reader the agent loop keeps a turn open with.
+    ///
+    /// Everything except a running mission has to read as "no mission": the loop
+    /// consults this between steps, and a reader that could not tell "finished"
+    /// from "unreadable" would either abandon a live task or keep a dead one
+    /// alive forever.
+    #[test]
+    fn running_mission_reports_only_a_running_mission() {
+        in_workspace("brief-running", |dir| {
+            start_mission(dir, "ship the crawler");
+            let brief = running_mission(dir).expect("a running mission is reported");
+            assert!(brief.id.starts_with("m-"), "{brief:?}");
+            assert_eq!(brief.objective, "ship the crawler");
+            assert_eq!(brief.status, "running");
+            assert_eq!(brief.step, "write the failing test");
+            assert_eq!(brief.done_when, "the tests pass");
+
+            // The model blocking or finishing the mission is what lets a turn
+            // end, so the reader follows a status change in the same workspace
+            // rather than remembering the first answer it saw.
+            advance(json!({ "summary": "the site is down", "status": "blocked" }))
+                .expect("advance");
+            assert!(running_mission(dir).is_none(), "blocked is not running");
+
+            advance(json!({ "summary": "shipped", "status": "done" })).expect("advance");
+            assert!(running_mission(dir).is_none(), "done is not running");
+        });
+
+        // Nothing on disk at all.
+        let empty = std::env::temp_dir().join(format!(
+            "ngu-mission-brief-empty-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(running_mission(&empty).is_none(), "no missions directory");
+        let _ = std::fs::remove_dir_all(&empty);
+
+        // A pointer nothing can parse, a record nothing can parse, and a record
+        // that does not say what its status is: all "no mission", because this
+        // runs inside a turn and must never be able to end one.
+        in_workspace("brief-corrupt", |dir| {
+            let missions = dir.join("missions");
+            std::fs::create_dir_all(&missions).unwrap();
+            std::fs::write(missions.join("active.json"), "{ not json").unwrap();
+            assert!(running_mission(dir).is_none(), "a corrupt pointer is not a mission");
+
+            std::fs::write(missions.join("active.json"), "{\"mission\":\"m-x\"}").unwrap();
+            std::fs::create_dir_all(missions.join("m-x")).unwrap();
+            std::fs::write(missions.join("m-x").join("mission.json"), "oops").unwrap();
+            assert!(running_mission(dir).is_none(), "an unreadable record is not a mission");
+
+            std::fs::write(
+                missions.join("m-x").join("mission.json"),
+                "{\"id\":\"m-x\",\"objective\":\"?\"}",
+            )
+            .unwrap();
+            assert!(running_mission(dir).is_none(), "a missing status is not running");
         });
     }
 

@@ -26,6 +26,7 @@ use tokio::task::JoinSet;
 use crate::compaction::{self, Compaction, Summarizer};
 use crate::llm::{self, LlmClient, LlmEvent, PartialCallView, TokenUsage};
 use crate::message::{Message, ToolCall};
+use crate::tools::longhorizon::MissionBrief;
 use crate::tools::ToolRegistry;
 use crate::window::{self, ContextPolicy, ContextWindow};
 
@@ -223,6 +224,57 @@ const STOPPED: &str = "stopped by the user";
 /// enough for a real task to either finish or say that it cannot.
 pub const CONTINUATION_BATCHES: usize = 2;
 
+/// How many batches one turn may take while a long-horizon mission is running.
+///
+/// A running mission lifts [`CONTINUATION_BATCHES`]: the mission, not the shell,
+/// says when the work is over, so the turn keeps being granted batches for as
+/// long as the mission's status says `running` and the user has not stopped it.
+///
+/// This ceiling exists only so a wedged model cannot run forever: it is
+/// `MISSION_BATCH_CEILING × max_steps` steps of absolute limit, and reaching it
+/// is a bug report, not a normal outcome — a mission that is genuinely too large
+/// for one turn is what `mission_tick` is for, and a model that cannot decide
+/// whether to finish or block after this many rounds is not going to. The turn
+/// says so, naming the mission, and stops; the mission itself is untouched.
+const MISSION_BATCH_CEILING: usize = 64;
+
+/// The message the shell injects while a mission is still running.
+///
+/// Chinese, like the other text this loop inserts into a turn: the model that
+/// started the mission reads that message, and this one is a continuation of it.
+///
+/// It names the mission, its objective, the recorded next step and the done-when
+/// so the model can act on it without re-reading the mission files, and it names
+/// the only way out that is not "keep working": blocking the mission with a
+/// reason. Nothing here can end the mission — the shell has no opinion about
+/// whether the work is finished, and saying "give me your final answer" is
+/// exactly what made a turn end mid-task.
+fn mission_nudge(mission: &MissionBrief, total: usize) -> String {
+    format!(
+        "本回合已经连续 {total} 轮，任务 {id} 仍是 running（目标：{objective}；下一步：{step}；\
+         完成判据：{done_when}）。不要结束回合：继续推进任务（mission_tick / mission_advance）。\
+         如果你确实无法继续，调用 mission_advance 把状态改成 blocked 并说明原因。",
+        total = total,
+        id = mission.id,
+        objective = or_unset(&mission.objective),
+        step = or_unset(&mission.step),
+        done_when = or_unset(&mission.done_when),
+    )
+}
+
+/// `value`, or a placeholder for a field the mission never recorded.
+///
+/// A mission may be started with no `done_when` and no first step, and an
+/// injected message saying "完成判据：" and nothing reads as a field the model
+/// failed to fill in rather than one that was never asked for.
+fn or_unset(value: &str) -> &str {
+    if value.is_empty() {
+        "（未设）"
+    } else {
+        value
+    }
+}
+
 /// How much of a tool's failure is sent back to the model.
 ///
 /// `{error:#}` is the whole anyhow cause chain, written for a developer sitting
@@ -380,6 +432,8 @@ impl Agent {
     /// A turn may run up to `1 + CONTINUATION_BATCHES` batches of this length:
     /// a batch that spends its steps asks the model whether to continue instead
     /// of ending the turn, so `steps` bounds one batch and not the whole turn.
+    /// While a mission is running this is still the size of one batch, but the
+    /// number of batches is decided by the mission rather than by that constant.
     pub fn with_max_steps(mut self, steps: usize) -> Self {
         self.max_steps = steps.max(1);
         self
@@ -411,6 +465,22 @@ impl Agent {
     /// Whether a stop has already been requested for this turn.
     fn stop_requested(&self) -> bool {
         self.cancel.as_ref().is_some_and(|rx| *rx.borrow())
+    }
+
+    /// The mission this turn may not walk away from, if one is running.
+    ///
+    /// Read from the turn's own identity, not from the process: a mission is a
+    /// directory in one session's workspace, and a turn that was never bound to
+    /// a workspace is a nested worker (a subagent, a `mission_tick` worker) —
+    /// it already *is* one step of somebody else's mission, and holding it open
+    /// would mean a mission that cannot run its own steps.
+    ///
+    /// Re-read at every decision point rather than remembered for the turn: the
+    /// batch that just ran may have blocked or finished the mission, and that
+    /// status — not the step count — is what decides whether the turn may end.
+    fn running_mission(&self) -> Option<MissionBrief> {
+        let workspace = self.identity.as_ref()?.workspace.as_deref()?;
+        crate::tools::longhorizon::running_mission(workspace)
     }
 
 
@@ -447,6 +517,12 @@ impl Agent {
     /// The budget is `max_steps` per batch for `1 + CONTINUATION_BATCHES`
     /// batches: a spent batch asks the model whether to continue rather than
     /// ending the turn.
+    ///
+    /// One thing outranks all of that: a long-horizon mission whose record still
+    /// says `running`. Its turn does not end on a final answer and is not held to
+    /// `1 + CONTINUATION_BATCHES` — see [`MISSION_BATCH_CEILING`] for the only
+    /// bound that remains. The shell never decides that such a mission is
+    /// finished; it only refuses to walk away from it.
     pub async fn run(&mut self, prompt: &str) -> Result<AgentOutcome> {
         let user_message = Message::user(prompt);
         self.messages.push(user_message.clone());
@@ -510,425 +586,530 @@ impl Agent {
         // The cap bounds one batch of steps, not the whole turn. Spending a
         // batch without a final answer asks the model whether a round count
         // this long is normal, tells it to keep working, and earns another
-        // batch — see [`CONTINUATION_BATCHES`] for why that is bounded.
+        // batch — see [`CONTINUATION_BATCHES`] for why that is bounded, and
+        // [`MISSION_BATCH_CEILING`] for why a running mission outranks it.
         //
-        // One counter drives both. `step` is the global index, so `outcome.steps`
-        // and the observer report the work the turn actually did instead of
-        // restarting at 1 with every batch and hiding two of them from the
-        // ledger.
+        // One counter drives all of it. `step` is the global index across every
+        // batch, so `outcome.steps` and the observer report the work the turn
+        // actually did instead of restarting at 1 with every batch and hiding
+        // two of them from the ledger.
+        //
+        // The steps are counted by hand rather than by a range, because the
+        // allowance is no longer known when the turn starts: a mission that is
+        // still running earns batches the count cannot predict.
         //
         // `saturating_mul` rather than `*`: a caller passing a nonsensical cap
         // must get a very long turn, not a panic in the multiplication before
-        // the first step.
-        let step_budget = self.max_steps.saturating_mul(1 + CONTINUATION_BATCHES);
+        // the first step. `max(1)` likewise guards a future caller that writes
+        // the field directly: a batch that runs zero steps would spin.
+        let batch_size = self.max_steps.max(1);
+        let step_budget = batch_size.saturating_mul(1 + CONTINUATION_BATCHES);
+        let mut step: usize = 0;
         let mut renewals: usize = 0;
+        // Batches granted because a mission was running. Bounded by
+        // [`MISSION_BATCH_CEILING`], and counted separately from `renewals` so
+        // the two kinds of continuation never pay for each other's allowance.
+        let mut mission_batches: usize = 0;
 
-        for step in 1..=step_budget {
-            // A stop between steps ends the turn here: everything committed
-            // so far is already in the history and is reported with it.
-            if self.stop_requested() {
-                outcome.error = Some(STOPPED.to_string());
-                return Ok(outcome);
-            }
+        // One outer loop, one decision: whether the turn may end here. The inner
+        // loop is one batch and the code below it is the boundary between
+        // batches, so granting another batch — for a spent cap or for a mission
+        // — is a `continue` rather than a second copy of the step body.
+        'batches: loop {
+            // Whether this batch stopped early because the model produced a
+            // final answer, rather than because it spent its last step. The
+            // boundary says something different in each case: a model that just
+            // answered must not be asked whether a round count this long is
+            // normal.
+            let mut answered = false;
 
-            // Steering claimed at the boundary: what the user typed while this
-            // turn ran joins the history before the next request is built, so
-            // the model reads it on this very step. Claimed messages are
-            // committed like any other — they are model-visible from here on.
-            let inbox = self.inbox.clone();
-            if let Some(inbox) = inbox {
-                // A panic in another thread while the inbox was locked poisons
-                // the mutex. The queue itself is intact — it is a plain
-                // `VecDeque` with no invariant a torn write could break, and
-                // `drain` leaves it empty either way — so the step continues
-                // with what is there. Panicking here instead would fail every
-                // remaining step of the turn for a lock that has nothing left
-                // to corrupt.
-                let texts: Vec<String> = match inbox.lock() {
-                    Ok(mut queue) => queue.drain(..).collect(),
-                    Err(poisoned) => poisoned.into_inner().drain(..).collect(),
-                };
-                for text in texts {
-                    let message = Message::user(text);
-                    self.messages.push(message.clone());
-                    outcome.new_messages.push(message.clone());
-                    self.observer.on_message(&message);
+            for _ in 0..batch_size {
+                step += 1;
+                // A stop between steps ends the turn here: everything committed
+                // so far is already in the history and is reported with it.
+                if self.stop_requested() {
+                    outcome.error = Some(STOPPED.to_string());
+                    return Ok(outcome);
                 }
-            }
 
-            // The global step index, not the batch's: a caller reading
-            // `steps` must see the turn's whole work.
-            outcome.steps = step;
-            self.observer.on_step(step);
+                // Steering claimed at the boundary: what the user typed while this
+                // turn ran joins the history before the next request is built, so
+                // the model reads it on this very step. Claimed messages are
+                // committed like any other — they are model-visible from here on.
+                let inbox = self.inbox.clone();
+                if let Some(inbox) = inbox {
+                    // A panic in another thread while the inbox was locked poisons
+                    // the mutex. The queue itself is intact — it is a plain
+                    // `VecDeque` with no invariant a torn write could break, and
+                    // `drain` leaves it empty either way — so the step continues
+                    // with what is there. Panicking here instead would fail every
+                    // remaining step of the turn for a lock that has nothing left
+                    // to corrupt.
+                    let texts: Vec<String> = match inbox.lock() {
+                        Ok(mut queue) => queue.drain(..).collect(),
+                        Err(poisoned) => poisoned.into_inner().drain(..).collect(),
+                    };
+                    for text in texts {
+                        let message = Message::user(text);
+                        self.messages.push(message.clone());
+                        outcome.new_messages.push(message.clone());
+                        self.observer.on_message(&message);
+                    }
+                }
 
-            // Compact before the request, not after a failure. A provider that
-            // rejects an oversized prompt has already cost the round trip.
-            if let Some(tokens) = last_prompt_tokens {
-                let window = settings.policy.window(&settings.model);
-                if settings.policy.should_compact(tokens, window) {
-                    let client = self.summary_client(&settings.model);
-                    match self.compact(&client, window, settings.policy.as_ref()).await {
-                        Ok(Some(record)) => {
-                            outcome.compactions.push(record);
-                            // The prompt just changed size; the old measurement
-                            // no longer describes it.
-                            last_prompt_tokens = None;
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            // A failed summary must not end the turn: the
-                            // conversation can still continue, and the next step
-                            // will try again.
-                            eprintln!("[compaction] failed: {error:#}");
+                // The global step index, not the batch's: a caller reading
+                // `steps` must see the turn's whole work.
+                outcome.steps = step;
+                self.observer.on_step(step);
+
+                // Compact before the request, not after a failure. A provider that
+                // rejects an oversized prompt has already cost the round trip.
+                if let Some(tokens) = last_prompt_tokens {
+                    let window = settings.policy.window(&settings.model);
+                    if settings.policy.should_compact(tokens, window) {
+                        let client = self.summary_client(&settings.model);
+                        match self.compact(&client, window, settings.policy.as_ref()).await {
+                            Ok(Some(record)) => {
+                                outcome.compactions.push(record);
+                                // The prompt just changed size; the old measurement
+                                // no longer describes it.
+                                last_prompt_tokens = None;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                // A failed summary must not end the turn: the
+                                // conversation can still continue, and the next step
+                                // will try again.
+                                eprintln!("[compaction] failed: {error:#}");
+                            }
                         }
                     }
                 }
-            }
 
-            let (request, injection) = self.build_request(&settings);
-            if !injection.is_empty() {
-                self.observer.on_injection(&injection);
-                let mut texts = injection.prefix.clone();
-                texts.extend(injection.tail.iter().cloned());
-                texts.extend(injection.at_depth.iter().map(|(_, _, t)| t.clone()));
-                outcome.injections.push(crate::session::InjectionRecord {
-                    activated: injection.activated.clone(),
-                    relocated: injection.relocated.clone(),
-                    budget_used: injection.budget_used,
-                    texts,
-                });
-            }
-            // The route may name a different model than the client was built
-            // with; switching is a clone, not a reconnect.
-            let client = self.client.with_model(&settings.model);
-
-            // One step is one or more streaming attempts. A transient
-            // failure or an empty response is retried with backoff; only a
-            // permanent failure or the attempt budget ends the step in error,
-            // and even then the turn's progress so far is kept.
-            let mut attempt: u32 = 0;
-            let mut out = loop {
-                // A stop during the backoff ends the attempt loop without
-                // another request; the error branch below reports it.
-                if self.stop_requested() {
-                    let mut stopped = StepOutput::default();
-                    stopped.error = Some(anyhow::anyhow!(STOPPED));
-                    break stopped;
+                let (request, injection) = self.build_request(&settings);
+                if !injection.is_empty() {
+                    self.observer.on_injection(&injection);
+                    let mut texts = injection.prefix.clone();
+                    texts.extend(injection.tail.iter().cloned());
+                    texts.extend(injection.at_depth.iter().map(|(_, _, t)| t.clone()));
+                    outcome.injections.push(crate::session::InjectionRecord {
+                        activated: injection.activated.clone(),
+                        relocated: injection.relocated.clone(),
+                        budget_used: injection.budget_used,
+                        texts,
+                    });
                 }
-                attempt += 1;
-                let started = Instant::now();
-                let produced = self.stream_once(&client, &request, &schemas).await;
-                outcome.timing.model_ms += started.elapsed().as_millis();
+                // The route may name a different model than the client was built
+                // with; switching is a clone, not a reconnect.
+                let client = self.client.with_model(&settings.model);
 
-                match &produced.error {
-                    Some(error) => {
-                        // A provider that refuses an oversized prompt names the
-                        // window it enforces, and that is a fact about this
-                        // route rather than about the model id. It is recorded
-                        // here, before the retry decision, so the next
-                        // compaction check measures against it — the failure
-                        // itself still travels exactly as far as it did before.
-                        record_reported_window(error, &settings.model);
-                        let retry = llm::retryable(error);
-                        if retry && attempt < max_attempts {
-                            let message = format!("{error:#}");
+                // One step is one or more streaming attempts. A transient
+                // failure or an empty response is retried with backoff; only a
+                // permanent failure or the attempt budget ends the step in error,
+                // and even then the turn's progress so far is kept.
+                let mut attempt: u32 = 0;
+                let mut out = loop {
+                    // A stop during the backoff ends the attempt loop without
+                    // another request; the error branch below reports it.
+                    if self.stop_requested() {
+                        let mut stopped = StepOutput::default();
+                        stopped.error = Some(anyhow::anyhow!(STOPPED));
+                        break stopped;
+                    }
+                    attempt += 1;
+                    let started = Instant::now();
+                    let produced = self.stream_once(&client, &request, &schemas).await;
+                    outcome.timing.model_ms += started.elapsed().as_millis();
+
+                    match &produced.error {
+                        Some(error) => {
+                            // A provider that refuses an oversized prompt names the
+                            // window it enforces, and that is a fact about this
+                            // route rather than about the model id. It is recorded
+                            // here, before the retry decision, so the next
+                            // compaction check measures against it — the failure
+                            // itself still travels exactly as far as it did before.
+                            record_reported_window(error, &settings.model);
+                            let retry = llm::retryable(error);
+                            if retry && attempt < max_attempts {
+                                let message = format!("{error:#}");
+                                outcome.retries += 1;
+                                self.observer.on_step_retry(attempt as usize, &message);
+                                tokio::time::sleep(network.backoff(attempt)).await;
+                                continue;
+                            }
+                        }
+                        None if produced.is_empty() && attempt < max_attempts => {
                             outcome.retries += 1;
-                            self.observer.on_step_retry(attempt as usize, &message);
+                            self.observer.on_step_retry(
+                                attempt as usize,
+                                "the provider returned an empty response",
+                            );
                             tokio::time::sleep(network.backoff(attempt)).await;
                             continue;
                         }
+                        None => {}
                     }
-                    None if produced.is_empty() && attempt < max_attempts => {
-                        outcome.retries += 1;
-                        self.observer.on_step_retry(
-                            attempt as usize,
-                            "the provider returned an empty response",
-                        );
-                        tokio::time::sleep(network.backoff(attempt)).await;
-                        continue;
-                    }
-                    None => {}
+                    break produced;
+                };
+
+                outcome.usage.input += out.usage.input;
+                outcome.usage.output += out.usage.output;
+                outcome.usage.cached += out.usage.cached;
+                // Cache *writes* are billed at a premium and reasoning tokens are
+                // billed as output, so dropping either under-reports what the turn
+                // cost. Both are summed here for the same reason as the other
+                // counters: the ledger is the only place a user sees the bill.
+                outcome.usage.cache_created += out.usage.cache_created;
+                outcome.usage.reasoning += out.usage.reasoning;
+
+                // Remember the prompt size the provider just reported, so the next
+                // step can decide whether history needs reducing.
+                if out.usage.input > 0 {
+                    last_prompt_tokens = Some(out.usage.input as usize);
                 }
-                break produced;
-            };
 
-            outcome.usage.input += out.usage.input;
-            outcome.usage.output += out.usage.output;
-            outcome.usage.cached += out.usage.cached;
-            // Cache *writes* are billed at a premium and reasoning tokens are
-            // billed as output, so dropping either under-reports what the turn
-            // cost. Both are summed here for the same reason as the other
-            // counters: the ledger is the only place a user sees the bill.
-            outcome.usage.cache_created += out.usage.cache_created;
-            outcome.usage.reasoning += out.usage.reasoning;
+                // The step ended in failure. Whatever text arrived before it is
+                // committed — the transcript must show what the model actually
+                // said — and the error says why the loop stopped.
+                if let Some(error) = out.error.take() {
+                    if !out.text.is_empty() {
+                        let partial = Message::assistant_tools(Vec::new(), Some(out.text.clone()));
+                        self.messages.push(partial.clone());
+                        outcome.new_messages.push(partial);
+                        self.observer.on_message(self.messages.last().expect("just pushed"));
+                    }
+                    outcome.error = Some(format!("{error:#}"));
+                    return Ok(outcome);
+                }
 
-            // Remember the prompt size the provider just reported, so the next
-            // step can decide whether history needs reducing.
-            if out.usage.input > 0 {
-                last_prompt_tokens = Some(out.usage.input as usize);
-            }
+                // The attempt budget ran out on a response with nothing in it.
+                // Reporting this as an error matters: a silent end reads as a
+                // finished turn when the task never even started.
+                if out.is_empty() {
+                    outcome.error = Some(format!(
+                        "the model returned an empty response after {attempt} attempt(s)"
+                    ));
+                    return Ok(outcome);
+                }
 
-            // The step ended in failure. Whatever text arrived before it is
-            // committed — the transcript must show what the model actually
-            // said — and the error says why the loop stopped.
-            if let Some(error) = out.error.take() {
-                if !out.text.is_empty() {
-                    let partial = Message::assistant_tools(Vec::new(), Some(out.text.clone()));
-                    self.messages.push(partial.clone());
-                    outcome.new_messages.push(partial);
+                let indexed: Vec<(usize, PartialCallView)> = out
+                    .calls
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (i, c.clone()))
+                    .collect();
+                let mut tool_calls: Vec<ToolCall> = llm::assemble_calls(&indexed);
+                let text = out.text;
+
+                // Stopped between the answer and its tool calls: the calls never
+                // ran, so they are dropped rather than left unanswered — a tool
+                // call with no result is a request no provider accepts next turn.
+                let stopped_before_tools = self.stop_requested() && !tool_calls.is_empty();
+                if stopped_before_tools {
+                    tool_calls.clear();
+                }
+
+                let assistant = Message::assistant_tools(
+                    tool_calls.clone(),
+                    if text.is_empty() { None } else { Some(text.clone()) },
+                );
+                self.messages.push(assistant.clone());
+                outcome.new_messages.push(assistant);
+                self.observer.on_message(self.messages.last().expect("just pushed"));
+                // One string across a continuation chain: each cut-off segment
+                // appends to the answer it belongs to, a plain step replaces it.
+                if continuations > 0 {
+                    outcome.text.push_str(&text);
+                } else {
+                    outcome.text = text;
+                }
+
+                // The answer stops at the provider's output ceiling with no tool
+                // call to execute. Without a continuation the turn ends looking
+                // complete while the task is half-done — an interruption exactly
+                // where small models produce it most.
+                if out.finish_reason.as_deref() == Some("length")
+                    && tool_calls.is_empty()
+                    && continuations < MAX_CONTINUATIONS
+                    && !stopped_before_tools
+                {
+                    continuations += 1;
+                    let nudge = Message::user(
+                        "Your previous reply was cut off by the output token limit. \
+                         Continue exactly where you left off, without repeating \
+                         anything you already wrote.",
+                    );
+                    self.messages.push(nudge.clone());
+                    outcome.new_messages.push(nudge);
+                    self.observer.on_message(self.messages.last().expect("just pushed"));
+                    self.observer
+                        .on_continuation(&format!("step {step} hit the output limit"));
+                    continue;
+                }
+
+                if tool_calls.is_empty() {
+                    if stopped_before_tools {
+                        outcome.error = Some(STOPPED.to_string());
+                        return Ok(outcome);
+                    }
+                    // The model answered. Whether that ends the turn is not decided
+                    // here: a running mission says the work is not over, and the
+                    // boundary below is the one place that weighs the two. Breaking
+                    // out of the batch keeps this decision single instead of growing
+                    // a second copy of it under an `if`.
+                    answered = true;
+                    break;
+                }
+
+                // Dispatch every call concurrently, then restore call order.
+                let tools_started = Instant::now();
+                let mut set: JoinSet<(usize, ToolCall, Result<crate::tools::ToolOutput>)> = JoinSet::new();
+                // A stop that landed while the answer was being committed is seen
+                // *before* the batch starts. The user has already walked away, and
+                // starting a whole set of tools anyway spends side effects nobody
+                // will read. The calls are answered below regardless, so the
+                // history stays complete either way.
+                let mut stopped = self.stop_requested();
+                if !stopped {
+                    for (position, call) in tool_calls.iter().enumerate() {
+                        let registry = Arc::clone(&tools);
+                        let call = call.clone();
+                        let identity = identity.clone();
+                        self.observer.on_tool_start(&call.name, &call.arguments);
+                        set.spawn(async move {
+                            let result = registry
+                                .execute_as(identity, &call.name, &call.arguments)
+                                .await;
+                            (position, call, result)
+                        });
+                    }
+                }
+
+                let mut results: Vec<Option<(ToolCall, Result<crate::tools::ToolOutput>)>> =
+                    (0..tool_calls.len()).map(|_| None).collect();
+                // Collecting is cancellable: a bash call that runs for minutes
+                // must not outlive the user's decision to stop watching it.
+                let mut stop = self.cancel.clone();
+                let mut stop_closed = false;
+                'collect: loop {
+                    if stop_closed {
+                        stop = None;
+                        stop_closed = false;
+                    }
+                    let joined = if let Some(stop_rx) = &mut stop {
+                        tokio::select! {
+                            biased;
+                            requested = stop_flag(stop_rx) => {
+                                if requested {
+                                    stopped = true;
+                                    break 'collect;
+                                }
+                                stop_closed = true;
+                                continue 'collect;
+                            }
+                            joined = set.join_next() => joined,
+                        }
+                    } else {
+                        set.join_next().await
+                    };
+                    match joined {
+                        Some(Ok((position, call, result))) => results[position] = Some((call, result)),
+                        Some(Err(failed)) => {
+                            // The tool task died: a panic inside the handler, or an
+                            // abort from the runtime. Its slot stays empty and the
+                            // loop below answers that call explicitly.
+                            //
+                            // Escaping the turn with `failed` here (what this arm
+                            // used to do) skipped that fill-in with the assistant
+                            // message already committed: a `tool_call` with no
+                            // result. Every later request built from that history
+                            // is refused by the provider with a 400, so one
+                            // panicking tool cost the whole conversation instead of
+                            // one call.
+                            eprintln!("[tools] task failed: {failed}");
+                        }
+                        // Every task finished: nothing left to wait for.
+                        None => break 'collect,
+                    }
+                }
+                outcome.timing.tools_ms += tools_started.elapsed().as_millis();
+                if stopped {
+                    // The in-flight calls are killed; the answers below fill in
+                    // for them either way.
+                    set.abort_all();
+                }
+
+                // Images a tool produced cannot travel in its tool message: the
+                // format restricts that content to text. They are collected here and
+                // attached to one user message after all the tool results, which is
+                // the only place the format allows them.
+                let mut attached: Vec<(String, crate::message::ImageAttachment)> = Vec::new();
+
+                for (position, call) in tool_calls.iter().enumerate() {
+                    let result = match results[position].take() {
+                        Some((_, result)) => result,
+                        // Killed mid-call: the call still gets an answer, because
+                        // an unanswered tool call is a history the next request
+                        // cannot be built from.
+                        None if stopped => Err(anyhow::anyhow!(
+                            "stopped by the user before this tool call finished"
+                        )),
+                        // A task that died without a stop request: it panicked or
+                        // was aborted, so nothing was written into its slot. The
+                        // call is answered explicitly anyway — the same rule as
+                        // above, and this arm *is* reachable: a panicking tool is
+                        // exactly what lands here.
+                        None => Err(anyhow::anyhow!("tool panicked: {}", call.name)),
+                    };
+                    outcome.tool_calls += 1;
+                    let (ok, body) = match result {
+                        Ok(output) => {
+                            for image in output.images {
+                                attached.push((call.name.clone(), image));
+                            }
+                            (true, output.text)
+                        }
+                        Err(error) => (false, format!("error: {}", summarize_tool_error(&error))),
+                    };
+                    self.observer.on_tool_end(&call.name, ok, &body);
+                    let message = Message::tool_result(call.id.clone(), call.name.clone(), body);
+                    self.messages.push(message.clone());
+                    outcome.new_messages.push(message);
                     self.observer.on_message(self.messages.last().expect("just pushed"));
                 }
-                outcome.error = Some(format!("{error:#}"));
-                return Ok(outcome);
-            }
 
-            // The attempt budget ran out on a response with nothing in it.
-            // Reporting this as an error matters: a silent end reads as a
-            // finished turn when the task never even started.
-            if out.is_empty() {
-                outcome.error = Some(format!(
-                    "the model returned an empty response after {attempt} attempt(s)"
-                ));
-                return Ok(outcome);
-            }
+                if !attached.is_empty() {
+                    let mut text = String::from("Image(s) produced by the tool call above:");
+                    for (tool, image) in &attached {
+                        text.push_str(&format!(
+                            "\n- from {tool}: {}",
+                            image.label.as_deref().unwrap_or("image")
+                        ));
+                    }
+                    let message =
+                        Message::user_with_images(text, attached.into_iter().map(|(_, i)| i).collect());
+                    self.messages.push(message.clone());
+                    outcome.new_messages.push(message);
+                    self.observer.on_message(self.messages.last().expect("just pushed"));
+                }
 
-            let indexed: Vec<(usize, PartialCallView)> = out
-                .calls
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (i, c.clone()))
-                .collect();
-            let mut tool_calls: Vec<ToolCall> = llm::assemble_calls(&indexed);
-            let text = out.text;
-
-            // Stopped between the answer and its tool calls: the calls never
-            // ran, so they are dropped rather than left unanswered — a tool
-            // call with no result is a request no provider accepts next turn.
-            let stopped_before_tools = self.stop_requested() && !tool_calls.is_empty();
-            if stopped_before_tools {
-                tool_calls.clear();
-            }
-
-            let assistant = Message::assistant_tools(
-                tool_calls.clone(),
-                if text.is_empty() { None } else { Some(text.clone()) },
-            );
-            self.messages.push(assistant.clone());
-            outcome.new_messages.push(assistant);
-            self.observer.on_message(self.messages.last().expect("just pushed"));
-            // One string across a continuation chain: each cut-off segment
-            // appends to the answer it belongs to, a plain step replaces it.
-            if continuations > 0 {
-                outcome.text.push_str(&text);
-            } else {
-                outcome.text = text;
-            }
-
-            // The answer stops at the provider's output ceiling with no tool
-            // call to execute. Without a continuation the turn ends looking
-            // complete while the task is half-done — an interruption exactly
-            // where small models produce it most.
-            if out.finish_reason.as_deref() == Some("length")
-                && tool_calls.is_empty()
-                && continuations < MAX_CONTINUATIONS
-                && !stopped_before_tools
-            {
-                continuations += 1;
-                let nudge = Message::user(
-                    "Your previous reply was cut off by the output token limit. \
-                     Continue exactly where you left off, without repeating \
-                     anything you already wrote.",
-                );
-                self.messages.push(nudge.clone());
-                outcome.new_messages.push(nudge);
-                self.observer.on_message(self.messages.last().expect("just pushed"));
-                self.observer
-                    .on_continuation(&format!("step {step} hit the output limit"));
-                continue;
-            }
-
-            if tool_calls.is_empty() {
-                if stopped_before_tools {
+                // Every dispatched call now has an answer and the turn was asked
+                // to stop: report it instead of taking another step.
+                if stopped {
                     outcome.error = Some(STOPPED.to_string());
-                }
-                return Ok(outcome);
-            }
-
-            // Dispatch every call concurrently, then restore call order.
-            let tools_started = Instant::now();
-            let mut set: JoinSet<(usize, ToolCall, Result<crate::tools::ToolOutput>)> = JoinSet::new();
-            // A stop that landed while the answer was being committed is seen
-            // *before* the batch starts. The user has already walked away, and
-            // starting a whole set of tools anyway spends side effects nobody
-            // will read. The calls are answered below regardless, so the
-            // history stays complete either way.
-            let mut stopped = self.stop_requested();
-            if !stopped {
-                for (position, call) in tool_calls.iter().enumerate() {
-                    let registry = Arc::clone(&tools);
-                    let call = call.clone();
-                    let identity = identity.clone();
-                    self.observer.on_tool_start(&call.name, &call.arguments);
-                    set.spawn(async move {
-                        let result = registry
-                            .execute_as(identity, &call.name, &call.arguments)
-                            .await;
-                        (position, call, result)
-                    });
+                    return Ok(outcome);
                 }
             }
 
-            let mut results: Vec<Option<(ToolCall, Result<crate::tools::ToolOutput>)>> =
-                (0..tool_calls.len()).map(|_| None).collect();
-            // Collecting is cancellable: a bash call that runs for minutes
-            // must not outlive the user's decision to stop watching it.
-            let mut stop = self.cancel.clone();
-            let mut stop_closed = false;
-            'collect: loop {
-                if stop_closed {
-                    stop = None;
-                    stop_closed = false;
+            // A batch boundary, and the one place in this loop that decides
+            // whether the turn may end. Reached either because the batch spent
+            // its last step with tool calls still coming, or because the model
+            // produced a final answer and broke out above.
+            //
+            // The mission is re-read here rather than remembered from the top of
+            // the batch: a `mission_advance` inside the batch may have blocked or
+            // finished it, and that status — never a step count — is what makes a
+            // turn endable.
+            let mission = self.running_mission();
+
+            match mission {
+                // No mission: exactly what this loop did before, unchanged. An
+                // answer ends the turn, a spent allowance ends it, and a batch
+                // that ends without an answer asks the model whether a round
+                // count this long is normal.
+                None if answered => return Ok(outcome),
+                None if step >= step_budget => break 'batches,
+                None => {
+                    renewals += 1;
+                    let ask = format!(
+                        "本回合已经连续 {total} 轮（单批上限 {max}）没有给出最终答复。\
+                         对话轮数过长是否正常？如果还需要继续，就继续工作；如果已经可以收尾，请现在直接给出结论。",
+                        total = step,
+                        max = self.max_steps,
+                    );
+                    // Also on stderr: without it, a turn that keeps running past its
+                    // cap is indistinguishable from a stuck one in a terminal or a
+                    // desktop log.
+                    eprintln!(
+                        "[steps] {step} steps without a final answer; asking the model whether to continue"
+                    );
+                    // Committed exactly like steering: this is a user-role message,
+                    // so the model reads it on the next request and the transcript
+                    // shows it rather than leaving the turn inexplicably longer.
+                    let message = Message::user(ask);
+                    self.messages.push(message.clone());
+                    outcome.new_messages.push(message.clone());
+                    self.observer.on_message(&message);
+                    continue 'batches;
                 }
-                let joined = if let Some(stop_rx) = &mut stop {
-                    tokio::select! {
-                        biased;
-                        requested = stop_flag(stop_rx) => {
-                            if requested {
-                                stopped = true;
-                                break 'collect;
-                            }
-                            stop_closed = true;
-                            continue 'collect;
-                        }
-                        joined = set.join_next() => joined,
+                // The mission is still running, so the turn may not end — not
+                // because the model asked for more time, but because the work it
+                // took on is unfinished on disk. Nor may the shell end the
+                // mission: nothing in this file writes `mission.json`, and
+                // nothing here decides that work is done. It is named as still
+                // running, with the only two ways out — keep going, or block it
+                // with a reason — and the turn goes round again.
+                Some(mission) => {
+                    // A stop outranks the mission. The user walking away ends
+                    // the turn, and nothing is injected after it: a message
+                    // asking a model to keep working on a turn nobody is
+                    // watching is exactly the run-away this loop must not do.
+                    if self.stop_requested() {
+                        outcome.error = Some(STOPPED.to_string());
+                        return Ok(outcome);
                     }
-                } else {
-                    set.join_next().await
-                };
-                match joined {
-                    Some(Ok((position, call, result))) => results[position] = Some((call, result)),
-                    Some(Err(failed)) => {
-                        // The tool task died: a panic inside the handler, or an
-                        // abort from the runtime. Its slot stays empty and the
-                        // loop below answers that call explicitly.
-                        //
-                        // Escaping the turn with `failed` here (what this arm
-                        // used to do) skipped that fill-in with the assistant
-                        // message already committed: a `tool_call` with no
-                        // result. Every later request built from that history
-                        // is refused by the provider with a 400, so one
-                        // panicking tool cost the whole conversation instead of
-                        // one call.
-                        eprintln!("[tools] task failed: {failed}");
+                    mission_batches += 1;
+                    if mission_batches > MISSION_BATCH_CEILING {
+                        // Reaching this is a bug report, not an outcome: the
+                        // mission is still running after the ceiling worth of
+                        // batches, so no continuation count will ever satisfy
+                        // it. Say what happened, name the mission, and leave the
+                        // mission exactly as it is — the next turn (or
+                        // `mission_tick`) continues from disk.
+                        outcome.text = format!(
+                            "任务 {id} 仍是 running，但本回合已被任务批次上限（{ceiling} 批 × {max} 轮，\
+                             共 {limit} 轮）停下：只有模型能结束任务，而它既没有完成也没有说明阻塞。\
+                             任务本身没有被改动：继续它请用 mission_tick，或用 mission_advance 记录进度。",
+                            id = mission.id,
+                            ceiling = MISSION_BATCH_CEILING,
+                            max = batch_size,
+                            limit = MISSION_BATCH_CEILING.saturating_mul(batch_size),
+                        );
+                        return Ok(outcome);
                     }
-                    // Every task finished: nothing left to wait for.
-                    None => break 'collect,
+                    let nudge = mission_nudge(&mission, step);
+                    // On stderr for the same reason as the cap above: a turn
+                    // held open by a mission is otherwise indistinguishable from
+                    // a stuck one in a terminal or a desktop log.
+                    eprintln!(
+                        "[mission] {step} steps in, mission {} is still running; the turn continues",
+                        mission.id
+                    );
+                    // Committed like steering, because that is what it is: a
+                    // message the model reads on the next request, that the
+                    // transcript shows, and that survives the turn.
+                    let message = Message::user(nudge);
+                    self.messages.push(message.clone());
+                    outcome.new_messages.push(message.clone());
+                    self.observer.on_message(&message);
+                    continue 'batches;
                 }
-            }
-            outcome.timing.tools_ms += tools_started.elapsed().as_millis();
-            if stopped {
-                // The in-flight calls are killed; the answers below fill in
-                // for them either way.
-                set.abort_all();
-            }
-
-            // Images a tool produced cannot travel in its tool message: the
-            // format restricts that content to text. They are collected here and
-            // attached to one user message after all the tool results, which is
-            // the only place the format allows them.
-            let mut attached: Vec<(String, crate::message::ImageAttachment)> = Vec::new();
-
-            for (position, call) in tool_calls.iter().enumerate() {
-                let result = match results[position].take() {
-                    Some((_, result)) => result,
-                    // Killed mid-call: the call still gets an answer, because
-                    // an unanswered tool call is a history the next request
-                    // cannot be built from.
-                    None if stopped => Err(anyhow::anyhow!(
-                        "stopped by the user before this tool call finished"
-                    )),
-                    // A task that died without a stop request: it panicked or
-                    // was aborted, so nothing was written into its slot. The
-                    // call is answered explicitly anyway — the same rule as
-                    // above, and this arm *is* reachable: a panicking tool is
-                    // exactly what lands here.
-                    None => Err(anyhow::anyhow!("tool panicked: {}", call.name)),
-                };
-                outcome.tool_calls += 1;
-                let (ok, body) = match result {
-                    Ok(output) => {
-                        for image in output.images {
-                            attached.push((call.name.clone(), image));
-                        }
-                        (true, output.text)
-                    }
-                    Err(error) => (false, format!("error: {}", summarize_tool_error(&error))),
-                };
-                self.observer.on_tool_end(&call.name, ok, &body);
-                let message = Message::tool_result(call.id.clone(), call.name.clone(), body);
-                self.messages.push(message.clone());
-                outcome.new_messages.push(message);
-                self.observer.on_message(self.messages.last().expect("just pushed"));
-            }
-
-            if !attached.is_empty() {
-                let mut text = String::from("Image(s) produced by the tool call above:");
-                for (tool, image) in &attached {
-                    text.push_str(&format!(
-                        "\n- from {tool}: {}",
-                        image.label.as_deref().unwrap_or("image")
-                    ));
-                }
-                let message =
-                    Message::user_with_images(text, attached.into_iter().map(|(_, i)| i).collect());
-                self.messages.push(message.clone());
-                outcome.new_messages.push(message);
-                self.observer.on_message(self.messages.last().expect("just pushed"));
-            }
-
-            // Every dispatched call now has an answer and the turn was asked
-            // to stop: report it instead of taking another step.
-            if stopped {
-                outcome.error = Some(STOPPED.to_string());
-                return Ok(outcome);
-            }
-
-            // A multiple of the cap is a batch boundary: the batch that just
-            // ended spent its last step without a final answer, and every
-            // `return` above would already have ended the turn. Ask once, then
-            // carry on with the next batch.
-            if step % self.max_steps == 0 && step < step_budget {
-                renewals += 1;
-                let ask = format!(
-                    "本回合已经连续 {total} 轮（单批上限 {max}）没有给出最终答复。\
-                     对话轮数过长是否正常？如果还需要继续，就继续工作；如果已经可以收尾，请现在直接给出结论。",
-                    total = step,
-                    max = self.max_steps,
-                );
-                // Also on stderr: without it, a turn that keeps running past its
-                // cap is indistinguishable from a stuck one in a terminal or a
-                // desktop log.
-                eprintln!(
-                    "[steps] {step} steps without a final answer; asking the model whether to continue"
-                );
-                // Committed exactly like steering: this is a user-role message,
-                // so the model reads it on the next request and the transcript
-                // shows it rather than leaving the turn inexplicably longer.
-                let message = Message::user(ask);
-                self.messages.push(message.clone());
-                outcome.new_messages.push(message.clone());
-                self.observer.on_message(&message);
             }
         }
 
-        // Every batch is spent. The turn stops — that bound is what keeps a
-        // model that never concludes from acting and billing forever — and it
-        // says how many steps it really took and how often it was asked, so a
-        // capped turn is distinguishable from a finished one and greppable in a
-        // log.
+        // Every batch is spent and no mission was holding the turn open. The
+        // turn stops — that bound is what keeps a model that never concludes
+        // from acting and billing forever — and it says how many steps it really
+        // took and how often it was asked, so a capped turn is distinguishable
+        // from a finished one and greppable in a log.
+        //
+        // `step` rather than `step_budget`: they are the same number on this
+        // path, and the count keeps being honest if a mission held the turn open
+        // for a while before the model blocked it.
         outcome.text = format!(
             "stopped after {} steps without a final answer ({} continuation(s) asked)",
-            step_budget, renewals
+            step, renewals
         );
         Ok(outcome)
     }
@@ -2025,5 +2206,273 @@ mod tests {
             "the ask that started batch two, and none after the stop"
         );
         assert_eq!(continuation_asks(agent.messages()), 1);
+    }
+
+    // ------------------------------------------- a mission outlives the answer
+
+    /// The id every mission test in this file uses.
+    const MISSION_TEST_ID: &str = "m-20260101-000000";
+
+    /// The part of the mission message a test matches on.
+    ///
+    /// A fragment, like [`CONTINUATION_FRAGMENT`], so rewording the sentence the
+    /// model is asked does not break the tests that only care that it was asked.
+    const MISSION_FRAGMENT: &str = "仍是 running";
+
+    /// A scratch workspace holding one mission record and the pointer to it.
+    ///
+    /// Pinned through [`crate::tools::ToolIdentity`], never through a
+    /// process-global: the loop reads the mission from the identity the turn was
+    /// built with, so a test that rewrote a global would pass or fail on
+    /// whatever else happened to be running.
+    fn workspace_with_mission(tag: &str, status: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ngu-agent-mission-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mdir = dir.join("missions").join(MISSION_TEST_ID);
+        std::fs::create_dir_all(&mdir).expect("the mission directory");
+        std::fs::write(
+            mdir.join("mission.json"),
+            serde_json::json!({
+                "id": MISSION_TEST_ID,
+                "objective": "ship the crawler",
+                "status": status,
+                "step": "write the failing test",
+                "done_when": "the tests pass",
+            })
+            .to_string(),
+        )
+        .expect("the mission record");
+        std::fs::write(
+            dir.join("missions").join("active.json"),
+            serde_json::json!({ "mission": MISSION_TEST_ID }).to_string(),
+        )
+        .expect("the active pointer");
+        dir
+    }
+
+    /// How many of `messages` carry the mission message.
+    fn mission_nudges<'a>(messages: impl IntoIterator<Item = &'a Message>) -> usize {
+        messages
+            .into_iter()
+            .filter(|message| message.text().contains(MISSION_FRAGMENT))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_running_mission_keeps_the_turn_alive_after_a_final_answer() {
+        // The model answered; the mission on disk says the work is not over. The
+        // shell may not end that turn, and it may not end the mission either —
+        // only the model can — so it names the mission that is still running and
+        // goes round again. The ceiling is the only thing that stops it, and
+        // reaching the ceiling is the bug this test is looking for.
+        #[derive(Default)]
+        struct Counting {
+            seen: std::sync::atomic::AtomicUsize,
+        }
+
+        impl AgentObserver for Counting {
+            fn on_message(&self, message: &Message) {
+                if message.text().contains(MISSION_FRAGMENT) {
+                    self.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+
+        let dir = workspace_with_mission("running", "running");
+        // The provider repeats its last response and the cap is one step per
+        // batch, so every request is one batch and the batch count and the
+        // request count are the same number.
+        let (base, hits) = provider(vec![sse_answer("all done", "stop")]).await;
+        let seen = Arc::new(Counting::default());
+        let observing: Arc<dyn AgentObserver> = seen.clone();
+        let mut agent = agent_with_tools(base, tick_tools())
+            .with_max_steps(1)
+            .with_observer(observing)
+            .with_identity(crate::tools::ToolIdentity::for_session(
+                "test-session",
+                Some(dir.clone()),
+            ));
+
+        let outcome = agent.run("go").await.expect("the loop finishes");
+
+        // The first batch, plus every batch the mission bought, plus the one the
+        // ceiling refused. `steps` is the true total across all of them.
+        assert_eq!(
+            outcome.steps,
+            1 + MISSION_BATCH_CEILING,
+            "a running mission lifts the continuation cap and is stopped only by the ceiling"
+        );
+        assert!(
+            outcome.steps > 1 + CONTINUATION_BATCHES,
+            "the turn asked for far more than the no-mission allowance"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::Relaxed),
+            outcome.steps,
+            "every one of those steps was a real request"
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        // The message is committed, reported with the turn, and shown to the
+        // host that persists the transcript — a push-back the model never reads
+        // is not a push-back.
+        assert_eq!(
+            mission_nudges(&outcome.new_messages),
+            MISSION_BATCH_CEILING,
+            "one push-back per granted batch"
+        );
+        assert_eq!(mission_nudges(agent.messages()), MISSION_BATCH_CEILING);
+        assert_eq!(
+            seen.seen.load(std::sync::atomic::Ordering::Relaxed),
+            MISSION_BATCH_CEILING,
+            "the observer saw every one"
+        );
+
+        // It says what the model needs to act on, not just that time passed.
+        let first = outcome
+            .new_messages
+            .iter()
+            .find(|message| message.text().contains(MISSION_FRAGMENT))
+            .map(Message::text)
+            .expect("a push-back");
+        assert!(first.contains(MISSION_TEST_ID), "{first}");
+        assert!(first.contains("ship the crawler"), "the objective travels: {first}");
+        assert!(first.contains("write the failing test"), "the next step travels: {first}");
+        assert!(first.contains("the tests pass"), "the done-when travels: {first}");
+        assert!(
+            first.contains("mission_advance"),
+            "the only other way out is named: {first}"
+        );
+
+        // The turn ends naming the mission it could not finish, and nothing in
+        // this file touched the mission's own record on the way there.
+        assert!(outcome.text.contains(MISSION_TEST_ID), "{}", outcome.text);
+        assert!(outcome.text.contains(MISSION_FRAGMENT), "{}", outcome.text);
+        let record = std::fs::read_to_string(
+            dir.join("missions").join(MISSION_TEST_ID).join("mission.json"),
+        )
+        .expect("the record is still there");
+        assert!(
+            record.contains("\"running\""),
+            "the shell never ends a mission: {record}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_mission_that_is_not_running_lets_the_turn_end_immediately() {
+        // A finished mission is the model having decided the work is over — the
+        // one decision the shell must not second-guess — so the answer ends the
+        // turn exactly as it did before missions existed.
+        let dir = workspace_with_mission("done", "done");
+        let (base, hits) = provider(vec![sse_answer("all done", "stop")]).await;
+        let mut agent = agent_with_tools(base, tick_tools())
+            .with_max_steps(1)
+            .with_identity(crate::tools::ToolIdentity::for_session(
+                "test-session",
+                Some(dir.clone()),
+            ));
+
+        let outcome = agent.run("go").await.expect("the loop finishes");
+
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(outcome.text, "all done", "the model's answer is the turn's answer");
+        assert_eq!(outcome.steps, 1);
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one request, not another batch"
+        );
+        assert_eq!(mission_nudges(&outcome.new_messages), 0);
+        assert_eq!(mission_nudges(agent.messages()), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A workspace with no mission at all is the ordinary case, and it must
+        // stay exactly as cheap: one answer, one turn.
+        let empty = std::env::temp_dir().join(format!(
+            "ngu-agent-mission-none-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&empty).expect("a scratch workspace");
+        let (base, hits) = provider(vec![sse_answer("all done", "stop")]).await;
+        let mut agent = agent_with_tools(base, tick_tools())
+            .with_max_steps(1)
+            .with_identity(crate::tools::ToolIdentity::for_session(
+                "test-session",
+                Some(empty.clone()),
+            ));
+
+        let outcome = agent.run("go").await.expect("the loop finishes");
+
+        assert_eq!(outcome.text, "all done");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(mission_nudges(&outcome.new_messages), 0);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[tokio::test]
+    async fn a_stop_request_still_ends_a_turn_with_a_running_mission() {
+        // A running mission must not outlive the user's decision to stop. The
+        // stop lands at the top of the second step, after the message that kept
+        // the turn open is already committed — and nothing may be appended after
+        // it.
+        struct StopAtStep {
+            at: usize,
+            cancel: tokio::sync::watch::Sender<bool>,
+        }
+
+        impl AgentObserver for StopAtStep {
+            fn on_step(&self, step: usize) {
+                if step == self.at {
+                    let _ = self.cancel.send(true);
+                }
+            }
+        }
+
+        let dir = workspace_with_mission("stop", "running");
+        let (base, hits) = provider(vec![sse_answer("all done", "stop")]).await;
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let stopper: Arc<dyn AgentObserver> = Arc::new(StopAtStep { at: 2, cancel });
+        let mut agent = agent_with_tools(base, tick_tools())
+            .with_max_steps(1)
+            .with_observer(stopper)
+            .with_cancel(cancelled)
+            .with_identity(crate::tools::ToolIdentity::for_session(
+                "test-session",
+                Some(dir.clone()),
+            ));
+
+        let outcome = agent.run("go").await.expect("the loop still answers");
+
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some(STOPPED),
+            "a stop outranks the mission: {:?}",
+            outcome.error
+        );
+        assert_eq!(outcome.steps, 2, "the stop lands before that step's request");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "no request is made for the step the user stopped"
+        );
+        assert_eq!(
+            mission_nudges(&outcome.new_messages),
+            1,
+            "the message that kept the turn open, and none after the stop"
+        );
+        assert!(
+            outcome
+                .new_messages
+                .last()
+                .expect("the turn committed messages")
+                .text()
+                .contains(MISSION_FRAGMENT),
+            "nothing is injected after the stop"
+        );
+        assert_eq!(mission_nudges(agent.messages()), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

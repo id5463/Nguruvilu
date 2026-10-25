@@ -28,7 +28,12 @@
     position: fixed; inset: 0; width: 100%; height: 100dvh;
     display: grid;
     grid-template-columns: 200px minmax(0, 1fr) 360px;
-    grid-template-rows: minmax(0, 1fr) auto 26px;
+    /* Four bottom items in DOM order: the plugin dock above the composer
+       (#slot-above-composer, spans all columns), the composer itself, and the
+       26px status strip. The template needs a row for each — with only three
+       rows the composer was auto-placed into the fixed 26px strip and grew down
+       over the dock, which is exactly what "面板被遮挡" looked like. */
+    grid-template-rows: minmax(0, 1fr) auto auto 26px;
     font: 13px/1.55 ui-sans-serif, system-ui, "Segoe UI", sans-serif;
     background: var(--bg);
     color: var(--text);
@@ -303,6 +308,26 @@
   }
   @keyframes blink { to { visibility: hidden; } }
 
+  /* ---- above-composer slot（包带来的任务面板） ----
+     这块以前一条 grid-column 都没有。桌面网格是三列（200px 会话栏 / 正文 /
+     360px 详情），自动排布就把它塞进了第一列：面板只有 200px 宽，看起来被
+     侧栏盖住、还被挤成一条。现在它和输入条一样横跨整行，内容在中间一个够读
+     的宽度里居中，既不再躲进侧栏，也不再左右顶到屏幕边。 */
+  #slot-above-composer {
+    grid-column: 1 / -1;
+    display: flex;
+    justify-content: center;
+    /* 底边留 0：输入条靠自己的 border-top 划界，压上去就把那条线抹掉了。 */
+    padding: 8px 12px 0;
+  }
+  /* 只约束这一槽里的面板。同一个 .panel-fragment 也用在侧栏与详情栏，那里
+     空间本来就窄，写成全局 max-width 会把它们一起改掉。 */
+  #slot-above-composer > .panel-fragment {
+    width: 100%;
+    max-width: 880px;
+    margin: 0 auto;
+  }
+
   /* ---- composer ---- */
   #composer {
     grid-column: 1 / -1;
@@ -489,7 +514,10 @@
        the composer row shrank below its 61px content, covering the bottom of
        the conversation. The drawer is fixed, so it owns no row. */
     #stream { grid-row: 2; }
-    #slot-above-composer { grid-row: 3; }
+    /* 手机是单列网格，跨列在这里没有意义；左右各留 8px，面板不再贴着屏幕
+       边。底边仍是 0：输入条照旧靠自己的 border-top 和这一行分界。 */
+    #slot-above-composer { grid-row: 3; grid-column: auto; padding: 4px 8px 0; }
+    #slot-above-composer > .panel-fragment { max-width: none; }
     #composer { grid-row: 4; }
     #status { grid-row: 5; max-height: 40px; overflow: hidden; }
     #session-list .sess {
