@@ -1682,7 +1682,8 @@ fn active_mission_block(store_root: &Path, session_id: &str, cwd: Option<&str>) 
         block.push_str(&format!("- {id} [{}] {objective}\n", status_of(row)));
     }
     block.push_str(
-        "\n任务未结束不拦着回合结束：回合可以正常收尾；要推进就调用 mission_tick / mission_advance。",
+        "\n任务在 running 期间不因答复结束回合：直接做下一步，做完用 mission_advance 记录（summary + next），\
+         直到任务 done 或 blocked；不要问用户要不要继续。",
     );
     Some(block)
 }
@@ -3510,9 +3511,10 @@ mod tests {
             "先写一个失败的重试测试",
             "重试测试通过",
             // The owner's other question, answered in the prompt: a mission that
-            // outlives the turn does not keep the turn open.
-            "任务未结束不拦着回合结束",
-            "mission_tick / mission_advance",
+            // outlives the turn keeps the turn open, and progress is recorded with
+            // mission_advance.
+            "任务在 running 期间不因答复结束回合",
+            "mission_advance",
         ] {
             assert!(block.contains(expected), "missing {expected:?} in {block}");
         }

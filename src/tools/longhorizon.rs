@@ -8,14 +8,15 @@
 //!   which means the agent's own `read`/`write`/`edit` tools work on it, the
 //!   web interface can serve it, and a workspace snapshot covers it.
 //! * **The log is the memory.** `log.jsonl` is append-only and holds every
-//!   advance, checkpoint, mail and tick. Nothing here keeps history in RAM: the
+//!   advance, checkpoint and mail. Nothing here keeps history in RAM: the
 //!   file is the record, and `recall` searches it. That is what lets the context
 //!   stay small while the mission grows without bound.
 //! * **The process is the truth.** State is read from disk on every call, so a
 //!   restart loses nothing and a second process sees the same mission.
-//! * **`mission_tick` is one step.** It runs a fresh worker (a subagent with an
-//!   empty history) on the mission's current step and writes back what it did.
-//!   A long task is many short lives, not one long one.
+//! * **Nothing here runs a worker.** These tools only read and write mission
+//!   state; doing the work is the conversation's own job, on the tools it already
+//!   has. A tool that spawned an agent and waited for it would turn "the task is
+//!   in progress" into "the turn is blocked", which is the opposite of a task.
 //!
 //! # Robustness rules this module keeps
 //!
@@ -46,29 +47,8 @@ pub const STATUS: &str = "mission_status";
 pub const ADVANCE: &str = "mission_advance";
 pub const CHECKPOINT: &str = "mission_checkpoint";
 pub const RECALL: &str = "recall";
-pub const TICK: &str = "mission_tick";
 pub const POST: &str = "agent_post";
 pub const INBOX: &str = "agent_inbox";
-
-/// Most steps one tick's worker may take.
-const TICK_STEPS: usize = 12;
-
-/// How long one tick's worker may run before it is abandoned.
-///
-/// Step count bounds *how many* things the worker may do, never how long it
-/// spends doing them: a single `bash` call can hold a step for minutes and a
-/// retry loop for hours. Thirty minutes is generous for one mission step and
-/// short enough that a wedged worker does not hang a whole turn.
-const TICK_WALL_CLOCK_MS: u64 = 30 * 60 * 1000;
-
-/// Floor for a caller-supplied `timeout_ms`: below this the worker could not
-/// even report what it found, and any timeout would be indistinguishable from
-/// a failure of the step itself.
-const TICK_MIN_WALL_CLOCK_MS: u64 = 10 * 1000;
-
-/// Ceiling for `timeout_ms` — six hours, the same order as a mission's own
-/// useful lifetime.
-const TICK_MAX_WALL_CLOCK_MS: u64 = 6 * 60 * 60 * 1000;
 
 /// Most lines `recall` returns in one call.
 const RECALL_LIMIT: usize = 40;
@@ -76,9 +56,6 @@ const RECALL_LIMIT: usize = 40;
 /// Bytes read from one file while searching. Longer files are searched from
 /// the end: the recent past is what a long task usually needs.
 const RECALL_FILE_CAP: u64 = 4 * 1024 * 1024;
-
-/// How much of `STATE.md` a worker is handed.
-const STATE_CAP: usize = 200 * 1024;
 
 /// Log text kept per entry, so one runaway report cannot bloat the log.
 const LOG_TEXT_CAP: usize = 8 * 1024;
@@ -102,22 +79,20 @@ impl crate::plugin::Plugin for LongHorizon {
         PLUGIN
     }
 
-    /// The route publishes as a service and `mission_tick` runs a worker on it,
-    /// so the tool waits for the route rather than capturing a client.
+    /// No service is injected: every mission tool is a file operation on the
+    /// session workspace, and none of them talks to a model. A mission can be
+    /// started, read back and advanced in a session that has no route at all.
     fn inject(&self) -> Vec<String> {
-        vec![crate::model::SERVICE.to_string()]
+        Vec::new()
     }
 
-    fn apply(&self, ctx: &crate::plugin::PluginCtx) -> Result<crate::plugin::Contributions> {
-        let access = crate::model::ModelHandle::from_view(&ctx.services)
-            .ok_or_else(|| anyhow!("the session has not published a route"))?;
+    fn apply(&self, _ctx: &crate::plugin::PluginCtx) -> Result<crate::plugin::Contributions> {
         Ok(crate::plugin::Contributions::new()
             .tool(start_tool())
             .tool(status_tool())
             .tool(advance_tool())
             .tool(checkpoint_tool())
             .tool(recall_tool())
-            .tool(tick_tool(access))
             .tool(post_tool())
             .tool(inbox_tool())
             .ui(panel()))
@@ -511,7 +486,6 @@ fn panel() -> crate::ui::UiPanel {
       <ul id="mission-list" class="mp-list"><li class="mp-item mp-empty">还没有任务（让模型调用 mission_start 建一个）</li></ul>
       <div class="mp-actions">
         <button class="mp-action" data-act="status" type="button">刷新</button>
-        <button class="mp-action" data-act="tick" type="button">推进一步</button>
       </div>
     </div>
   </div>
@@ -739,7 +713,7 @@ function paintBoard(missions) {
   }
   // Newest first is the order the board hands over. The mission the card is
   // describing is the one a reader looks for first, and it is not always the
-  // newest — a tick on an older mission is exactly that case — so it is hoisted.
+  // newest — an advance on an older mission is exactly that case — so it is hoisted.
   const rows = board.slice();
   const at = shownId ? rows.findIndex((row) => row && row.id === shownId) : -1;
   if (at > 0) rows.unshift(rows.splice(at, 1)[0]);
@@ -816,8 +790,6 @@ if (head) {
 if (bar) {
   const refresh = bar.querySelector('[data-act="status"]');
   if (refresh) refresh.addEventListener("click", () => send("调用 mission_status，把当前长程任务的状态原样报告给我。"));
-  const tick = bar.querySelector('[data-act="tick"]');
-  if (tick) tick.addEventListener("click", () => send("调用 mission_tick 推进当前长程任务一步，然后汇报这一步的结果和下一步。"));
 }
 "##;
 
@@ -834,14 +806,16 @@ fn start_tool() -> ToolDef {
         "Start a long-horizon mission. A mission is state on disk \
          (<workspace>/missions/<id>/): an objective, a done-when, a current step, \
          an append-only log, checkpoints, and mailboxes. Use it for work that will \
-         not fit one conversation — it survives restarts and context compaction, \
-         and mission_tick runs one step of it in a fresh worker.",
+         not fit one conversation — it survives restarts and context compaction. \
+         A mission is state, not a runner: you do the work yourself in this \
+         conversation, on the tools you already have, and record each step with \
+         mission_advance.",
         json!({
             "type": "object",
             "properties": {
                 "objective": { "type": "string", "description": "What the mission is for, in one paragraph. This is the standing answer to 'why am I doing this'." },
                 "done_when": { "type": "string", "description": "How anyone can tell it is finished. Something checkable beats a feeling: a test that passes, a file that exists, a page that renders." },
-                "first_step": { "type": "string", "description": "Optional first step. A mission with a next step can be ticked immediately." }
+                "first_step": { "type": "string", "description": "Optional first step. A mission with a next step can be advanced right away." }
             },
             "required": ["objective"]
         }),
@@ -872,7 +846,7 @@ fn advance_tool() -> ToolDef {
             "type": "object",
             "properties": {
                 "summary": { "type": "string", "description": "What changed in this step. One or two lines." },
-                "next": { "type": "string", "description": "The next step, written so a worker with no memory of this conversation could start it." },
+                "next": { "type": "string", "description": "The next step, written so someone with no memory of this conversation could start it." },
                 "status": { "type": "string", "enum": ["running", "blocked", "done"], "description": "Mission status after this step." },
                 "note": { "type": "string", "description": "Optional longer note kept in the log only." }
             },
@@ -920,31 +894,6 @@ fn recall_tool() -> ToolDef {
         }),
         PLUGIN,
         |args| Box::pin(async move { recall(args).map(Into::into) }) as ToolFuture,
-    )
-}
-
-fn tick_tool(access: Arc<dyn crate::model::ModelAccess>) -> ToolDef {
-    ToolDef::new(
-        TICK,
-        "Run one step of the active mission in a fresh worker — a subagent with no \
-         memory of this conversation, handed the objective, the done-when, STATE.md \
-         and the current step. The worker's report is logged, and any 'Next step:' it \
-         names becomes the mission's next step. A long task is many of these, not one \
-         long conversation.",
-        json!({
-            "type": "object",
-            "properties": {
-                "step": { "type": "string", "description": "Step to run. Defaults to the mission's current step." },
-                "model": { "type": "string", "description": "Optional model for the worker. A cheaper model is usually right for mechanical steps." },
-                "max_steps": { "type": "integer", "description": "Steps the worker may take before giving up (default 12, max 40)." },
-                "timeout_ms": { "type": "integer", "description": "Wall-clock budget for the worker in milliseconds (default 1800000 = 30 minutes; max 6 hours). The worker is abandoned when it runs out." }
-            }
-        }),
-        PLUGIN,
-        move |args| {
-            let access = Arc::clone(&access);
-            Box::pin(async move { tick(access, args).await.map(Into::into) }) as ToolFuture
-        },
     )
 }
 
@@ -1176,9 +1125,9 @@ fn board_json() -> Value {
 /// How much of each field [`running_mission`] hands to the agent loop.
 ///
 /// The brief is read out into an injected message, not into a report: 160
-/// characters is the budget the panel and the worker prompt already give one
-/// line, and it is enough to say what the mission is without turning every
-/// batch of a long turn into a copy of `STATE.md`.
+/// characters is the budget the panel already gives one line, and it is enough
+/// to say what the mission is without turning every batch of a long turn into a
+/// copy of `STATE.md`.
 const BRIEF_CLIP: usize = 160;
 
 /// What the agent loop needs to keep a turn pointed at a running mission.
@@ -1342,7 +1291,6 @@ fn start(args: Value) -> Result<String> {
         "created_ms": now_ms(),
         "updated_ms": now_ms(),
         "advances": 0,
-        "ticks": 0,
         "checkpoints": [],
         "agents": {},
     });
@@ -1366,10 +1314,9 @@ fn start(args: Value) -> Result<String> {
         text.push_str(&format!("  done when: {done}\n"));
     }
     match record.get("step").and_then(|v| v.as_str()) {
-        Some(step) => text.push_str(&format!("  next step: {step}\n\n{TICK} runs it.\n")),
+        Some(step) => text.push_str(&format!("  next step: {step}\n")),
         None => text.push_str(&format!(
-            "\nNo step yet. Record one with {ADVANCE} (summary + next), then {TICK} \
-             runs it — or pass a step straight to {TICK}.\n"
+            "\nNo step yet. Record one with {ADVANCE} (summary + next).\n"
         )),
     }
     text.push_str(
@@ -1464,7 +1411,7 @@ fn recent_advances(dir: &Path, count: usize) -> Vec<String> {
         .filter(|entry| {
             matches!(
                 entry.get("kind").and_then(|k| k.as_str()),
-                Some("advance") | Some("tick") | Some("checkpoint")
+                Some("advance") | Some("checkpoint")
             )
         })
         .map(|entry| {
@@ -1514,9 +1461,8 @@ fn status(_args: Value) -> Result<String> {
         .cloned()
         .unwrap_or_default();
     out.push_str(&format!(
-        "  advances {} · ticks {} · checkpoints {}",
+        "  advances {} · checkpoints {}",
         record.get("advances").and_then(|v| v.as_u64()).unwrap_or(0),
-        record.get("ticks").and_then(|v| v.as_u64()).unwrap_or(0),
         checkpoints.len()
     ));
     if let Some(last) = checkpoints.last() {
@@ -1863,174 +1809,6 @@ fn read_tail(path: &Path, cap: u64) -> Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-// --------------------------------------------------------------- mission_tick
-
-/// The prompt a tick's worker is run with. Pure, so it can be tested.
-fn worker_prompt(record: &Value, state: &str, step: &str) -> String {
-    let objective = record
-        .get("objective")
-        .and_then(|v| v.as_str())
-        .unwrap_or("(none recorded)");
-    let done_when = record
-        .get("done_when")
-        .and_then(|v| v.as_str())
-        .unwrap_or("(no done-when recorded — judge sensibly and say what you assumed)");
-    format!(
-        "You are the worker for one step of a long mission. You have no memory of the \
-         conversation that set this up; everything you need is below.\n\n\
-         ## Mission objective\n{objective}\n\n\
-         ## Done when\n{done_when}\n\n\
-         ## State so far (STATE.md)\n{state}\n\n\
-         ## Your step\n{step}\n\n\
-         Do this step and only this step. Work with the tools you have, verify what \
-         you can (run it, test it, read it back), and do not start the next step. \
-         When you are done, reply with:\n\
-         1. what you changed or produced (paths),\n\
-         2. how you checked it,\n\
-         3. a line starting `Next step:` naming the single next thing to do.\n\
-         If the step cannot be done, say so plainly and name what is blocking it."
-    )
-}
-
-/// `30 minutes`, `2 hours` — a budget as the error message states it.
-fn format_wall_clock(budget: std::time::Duration) -> String {
-    let secs = budget.as_secs();
-    if secs >= 3600 && secs % 3600 == 0 {
-        format!("{} hours", secs / 3600)
-    } else if secs >= 60 {
-        format!("{} minutes", secs / 60)
-    } else {
-        format!("{secs} seconds")
-    }
-}
-
-async fn tick(access: Arc<dyn crate::model::ModelAccess>, args: Value) -> Result<String> {
-    let (dir, mut record) = active_mission()?;
-    let id = record
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("?")
-        .to_string();
-    let step = args
-        .get("step")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            record
-                .get("step")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
-        .ok_or_else(|| {
-            anyhow!(
-                "this mission has no current step. Pass one (`step`) or record one \
-                 with {ADVANCE} (summary + next)."
-            )
-        })?;
-    let state = std::fs::read_to_string(dir.join("STATE.md"))
-        .map(|text| clip(&text, STATE_CAP))
-        .unwrap_or_default();
-
-    let client = match args.get("model").and_then(|m| m.as_str()) {
-        Some(model) => access.client_for(model)?,
-        None => access.client()?,
-    };
-    let max_steps = args
-        .get("max_steps")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .unwrap_or(TICK_STEPS)
-        .clamp(1, 40);
-    // A step count is not a time bound: one step can sit inside a single `bash`
-    // call for an hour (the default bash timeout alone is two minutes). The
-    // wall clock is the bound that actually protects the turn.
-    let wall_clock = std::time::Duration::from_millis(
-        args.get("timeout_ms")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(TICK_WALL_CLOCK_MS)
-            .clamp(TICK_MIN_WALL_CLOCK_MS, TICK_MAX_WALL_CLOCK_MS),
-    );
-
-    let config: Arc<dyn crate::agent::TurnConfig> = Arc::new(
-        crate::agent::StaticConfig::new(access.system_prompt(), access.tools(), client.model())
-            .with_policy(access.context_policy()),
-    );
-    let mut agent = crate::agent::Agent::new(client, config, Vec::new())
-        .with_max_steps(max_steps);
-    let prompt = worker_prompt(&record, &state, &step);
-    let outcome = match tokio::time::timeout(wall_clock, agent.run(&prompt)).await {
-        Ok(outcome) => outcome,
-        // The worker future is dropped here, which cancels it: a mission that
-        // hangs must not hold the turn open indefinitely. Saying exactly that
-        // is better than an empty reply, and the log records it as the tick's
-        // error so the next tick sees what happened.
-        Err(_) => Err(anyhow!(
-            "the worker ran past its wall-clock budget of {} and was abandoned. Nothing \
-             it may have done is known to be undone — check the working tree before \
-             retrying, or raise timeout_ms (max {} s) for a genuinely long step.",
-            format_wall_clock(wall_clock),
-            TICK_MAX_WALL_CLOCK_MS / 1000
-        )),
-    };
-
-    let (text, failed) = match outcome {
-        Ok(outcome) => (outcome.text.clone(), outcome.error.clone()),
-        Err(error) => (format!("the worker could not run: {error:#}"), Some(format!("{error:#}"))),
-    };
-
-    // The next step, when the worker named one. A missing line is fine: the
-    // mission keeps its current step and the orchestrator decides.
-    let next = text
-        .lines()
-        .find_map(|line| {
-            let trimmed = line.trim().trim_start_matches(['-', '*', ' ']).trim();
-            for prefix in ["Next step:", "NEXT STEP:", "next step:", "下一步：", "下一步:"] {
-                if let Some(rest) = trimmed.strip_prefix(prefix) {
-                    let rest = rest.trim();
-                    if !rest.is_empty() {
-                        return Some(rest.to_string());
-                    }
-                }
-            }
-            None
-        });
-
-    log_entry(&dir, "tick", "worker", &text, next.as_deref())?;
-    if let Some(error) = &failed {
-        log_entry(&dir, "tick-error", "worker", error, None)?;
-    }
-    record["ticks"] = json!(record.get("ticks").and_then(|v| v.as_u64()).unwrap_or(0) + 1);
-    record["updated_ms"] = json!(now_ms());
-    if let Some(next) = &next {
-        record["step"] = json!(next);
-    }
-    write_atomic(
-        &dir.join("mission.json"),
-        serde_json::to_string_pretty(&record)?.as_bytes(),
-    )?;
-    let state_path = dir.join("STATE.md");
-    let current = std::fs::read_to_string(&state_path).unwrap_or_default();
-    let recent = recent_advances(&dir, 3);
-    write_atomic(
-        &state_path,
-        replace_generated(&current, &generated_block(&record, &recent)).as_bytes(),
-    )?;
-
-    let mut out = format!("{id} · step run: {step}\n\n{text}\n");
-    if let Some(error) = failed {
-        out.push_str(&format!("\nThe worker did not finish cleanly: {error}\n"));
-    }
-    match next {
-        Some(next) => out.push_str(&format!("\nNext step recorded: {next}\n")),
-        None => out.push_str(
-            "\nThe worker named no next step. Record one with mission_advance \
-             (summary + next), or pass one to the next mission_tick.\n",
-        ),
-    }
-    Ok(out + &marker(&record, json!({})))
-}
 
 // ------------------------------------------------------------------- mailbox
 
@@ -2843,21 +2621,6 @@ mod tests {
             .unwrap();
             assert!(running_mission(dir).is_none(), "a missing status is not running");
         });
-    }
-
-    #[test]
-    fn the_worker_prompt_carries_everything_a_memoryless_worker_needs() {
-        let record = json!({
-            "objective": "crawl the site",
-            "done_when": "every page is fetched",
-        });
-        let prompt = worker_prompt(&record, "# 任务\n进度：两页已抓", "抓第三页");
-        assert!(prompt.contains("crawl the site"));
-        assert!(prompt.contains("every page is fetched"));
-        assert!(prompt.contains("两页已抓"), "state travels with the step");
-        assert!(prompt.contains("抓第三页"));
-        assert!(prompt.contains("Next step:"), "the worker is asked for the next step");
-        assert!(prompt.contains("no memory"), "the worker is told it has no history");
     }
 
     #[test]

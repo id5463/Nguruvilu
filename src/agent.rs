@@ -224,66 +224,18 @@ const STOPPED: &str = "stopped by the user";
 /// enough for a real task to either finish or say that it cannot.
 pub const CONTINUATION_BATCHES: usize = 2;
 
-/// How many batches one turn may take while a long-horizon mission is running.
+/// What the shell says while a mission is still running.
 ///
-/// A running mission lifts [`CONTINUATION_BATCHES`]: the mission, not the shell,
-/// says when the work is over, so the turn keeps being granted batches for as
-/// long as the mission's status says `running` and the user has not stopped it.
+/// Two characters, on purpose. The mission's objective, its next step and its
+/// done-when are already in the system prompt of every request, and
+/// `mission_status` returns them again on demand; restating them here spent two
+/// hundred characters of every context window on text the model already had, in
+/// the one place a long task cannot afford it.
 ///
-/// This ceiling exists only so a wedged model cannot run forever: it is
-/// `MISSION_BATCH_CEILING × max_steps` steps of absolute limit, and reaching it
-/// is a bug report, not a normal outcome — a mission that is genuinely too large
-/// for one turn is what `mission_tick` is for, and a model that cannot decide
-/// whether to finish or block after this many rounds is not going to. The turn
-/// says so, naming the mission, and stops; the mission itself is untouched.
-const MISSION_BATCH_CEILING: usize = 64;
-
-/// How many continuation asks one turn may hand out while a running mission has
-/// produced **no** `mission_*` tool call since the previous ask.
-///
-/// The ask is an invitation, not a life sentence: a model that answers 「收到」
-/// to every nudge without ever touching a mission tool is telling us it will
-/// not engage, and holding the turn for [`MISSION_BATCH_CEILING`] batches turns
-/// that into a freeze the user reads as a hang. Any `mission_*` call resets the
-/// budget — engagement is what keeps the turn open, not the status line on disk.
-const MISSION_IDLE_NUDGES: usize = 2;
-
-/// The message the shell injects while a mission is still running.
-///
-/// Chinese, like the other text this loop inserts into a turn: the model that
-/// started the mission reads that message, and this one is a continuation of it.
-///
-/// It names the mission, its objective, the recorded next step and the done-when
-/// so the model can act on it without re-reading the mission files, and it names
-/// the only way out that is not "keep working": blocking the mission with a
-/// reason. Nothing here can end the mission — the shell has no opinion about
-/// whether the work is finished, and saying "give me your final answer" is
-/// exactly what made a turn end mid-task.
-fn mission_nudge(mission: &MissionBrief, total: usize) -> String {
-    format!(
-        "本回合已经连续 {total} 轮，任务 {id} 仍是 running（目标：{objective}；下一步：{step}；\
-         完成判据：{done_when}）。不要结束回合：继续推进任务（mission_tick / mission_advance）。\
-         如果你确实无法继续，调用 mission_advance 把状态改成 blocked 并说明原因。",
-        total = total,
-        id = mission.id,
-        objective = or_unset(&mission.objective),
-        step = or_unset(&mission.step),
-        done_when = or_unset(&mission.done_when),
-    )
-}
-
-/// `value`, or a placeholder for a field the mission never recorded.
-///
-/// A mission may be started with no `done_when` and no first step, and an
-/// injected message saying "完成判据：" and nothing reads as a field the model
-/// failed to fill in rather than one that was never asked for.
-fn or_unset(value: &str) -> &str {
-    if value.is_empty() {
-        "（未设）"
-    } else {
-        value
-    }
-}
+/// It says nothing about ending: nothing in this file can end a mission. The
+/// only ways out are the model recording `done` or `blocked`, or the user
+/// stopping the turn.
+const MISSION_NUDGE: &str = "继续";
 
 /// How much of a tool's failure is sent back to the model.
 ///
@@ -481,7 +433,7 @@ impl Agent {
     ///
     /// Read from the turn's own identity, not from the process: a mission is a
     /// directory in one session's workspace, and a turn that was never bound to
-    /// a workspace is a nested worker (a subagent, a `mission_tick` worker) —
+    /// a workspace is a nested worker (a subagent) —
     /// it already *is* one step of somebody else's mission, and holding it open
     /// would mean a mission that cannot run its own steps.
     ///
@@ -529,9 +481,9 @@ impl Agent {
     /// ending the turn.
     ///
     /// One thing outranks all of that: a long-horizon mission whose record still
-    /// says `running`. Its turn does not end on a final answer and is not held to
-    /// `1 + CONTINUATION_BATCHES` — see [`MISSION_BATCH_CEILING`] for the only
-    /// bound that remains. The shell never decides that such a mission is
+    /// says `running`. That turn has no batch count, no step ceiling and no wall
+    /// clock at all — it ends when the mission is `done`, when it is `blocked`,
+    /// or when the user stops it. The shell never decides that such a mission is
     /// finished; it only refuses to walk away from it.
     pub async fn run(&mut self, prompt: &str) -> Result<AgentOutcome> {
         let user_message = Message::user(prompt);
@@ -596,8 +548,8 @@ impl Agent {
         // The cap bounds one batch of steps, not the whole turn. Spending a
         // batch without a final answer asks the model whether a round count
         // this long is normal, tells it to keep working, and earns another
-        // batch — see [`CONTINUATION_BATCHES`] for why that is bounded, and
-        // [`MISSION_BATCH_CEILING`] for why a running mission outranks it.
+        // batch — see [`CONTINUATION_BATCHES`]. A running mission is the one
+        // exception: it is not capped at all, see [`MISSION_NUDGE`].
         //
         // One counter drives all of it. `step` is the global index across every
         // batch, so `outcome.steps` and the observer report the work the turn
@@ -616,16 +568,6 @@ impl Agent {
         let step_budget = batch_size.saturating_mul(1 + CONTINUATION_BATCHES);
         let mut step: usize = 0;
         let mut renewals: usize = 0;
-        // Batches granted because a mission was running. Bounded by
-        // [`MISSION_BATCH_CEILING`], and counted separately from `renewals` so
-        // the two kinds of continuation never pay for each other's allowance.
-        let mut mission_batches: usize = 0;
-        // `mission_*` tool calls so far. They are what the idle budget below is
-        // spent against: the nudge is an ask, and a model that answers it without
-        // ever touching a mission tool is telling us it will not engage.
-        let mut mission_calls: usize = 0;
-        // Continuation asks handed out since the last `mission_*` call.
-        let mut idle_nudges: usize = 0;
 
         // One outer loop, one decision: whether the turn may end here. The inner
         // loop is one batch and the code below it is the boundary between
@@ -879,18 +821,6 @@ impl Agent {
                 }
 
                 // Dispatch every call concurrently, then restore call order.
-                // A `mission_*` call is the only progress that justifies holding
-                // the turn open, so it resets the idle budget the boundary
-                // spends: engagement is the difference between a mission being
-                // worked and a mission being acknowledged.
-                let mission_calls_before = mission_calls;
-                mission_calls += tool_calls
-                    .iter()
-                    .filter(|call| call.name.starts_with("mission_"))
-                    .count();
-                if mission_calls != mission_calls_before {
-                    idle_nudges = 0;
-                }
                 let tools_started = Instant::now();
                 let mut set: JoinSet<(usize, ToolCall, Result<crate::tools::ToolOutput>)> = JoinSet::new();
                 // A stop that landed while the answer was being committed is seen
@@ -1075,9 +1005,7 @@ impl Agent {
                 // because the model asked for more time, but because the work it
                 // took on is unfinished on disk. Nor may the shell end the
                 // mission: nothing in this file writes `mission.json`, and
-                // nothing here decides that work is done. It is named as still
-                // running, with the only two ways out — keep going, or block it
-                // with a reason — and the turn goes round again.
+                // nothing here decides that work is done.
                 Some(mission) => {
                     // A stop outranks the mission. The user walking away ends
                     // the turn, and nothing is injected after it: a message
@@ -1087,47 +1015,21 @@ impl Agent {
                         outcome.error = Some(STOPPED.to_string());
                         return Ok(outcome);
                     }
-                    // The idle guard outranks the ceiling: a model that answers
-                    // every nudge with words and no `mission_*` call has said,
-                    // in the only language this loop can measure, that it will
-                    // not engage. MISSION_IDLE_NUDGES asks is the whole allowance
-                    // for that; ending the turn here is what keeps 「卡死」 from
-                    // being the product's answer to a polite model. The mission
-                    // is untouched — the next turn starts from the same disk.
-                    if idle_nudges >= MISSION_IDLE_NUDGES {
-                        outcome.text = format!(
-                            "任务 {id} 仍是 running，但模型已经 {nudges} 次没有用 mission_* 工具回应推进请求，\
-                             本回合到此为止以免看起来像卡死。任务本身没有被改动；\
-                             继续它请明确要求模型调用 mission_tick / mission_advance。",
-                            id = mission.id,
-                            nudges = idle_nudges,
-                        );
-                        return Ok(outcome);
-                    }
-                    mission_batches += 1;
-                    if mission_batches > MISSION_BATCH_CEILING {
-                        // Reaching this is a bug report, not an outcome: the
-                        // mission is still running after the ceiling worth of
-                        // batches, so no continuation count will ever satisfy
-                        // it. Say what happened, name the mission, and leave the
-                        // mission exactly as it is — the next turn (or
-                        // `mission_tick`) continues from disk.
-                        outcome.text = format!(
-                            "任务 {id} 仍是 running，但本回合已被任务批次上限（{ceiling} 批 × {max} 轮，\
-                             共 {limit} 轮）停下：只有模型能结束任务，而它既没有完成也没有说明阻塞。\
-                             任务本身没有被改动：继续它请用 mission_tick，或用 mission_advance 记录进度。",
-                            id = mission.id,
-                            ceiling = MISSION_BATCH_CEILING,
-                            max = batch_size,
-                            limit = MISSION_BATCH_CEILING.saturating_mul(batch_size),
-                        );
-                        return Ok(outcome);
-                    }
-                    let nudge = mission_nudge(&mission, step);
-                    idle_nudges += 1;
-                    // On stderr for the same reason as the cap above: a turn
-                    // held open by a mission is otherwise indistinguishable from
-                    // a stuck one in a terminal or a desktop log.
+                    // No ceiling, no idle budget, no wall clock. A mission that
+                    // is still running is a job the model accepted, and the only
+                    // question this loop is allowed to ask is "is it running?" —
+                    // a step cap here is exactly what turned a task into
+                    // something that stops and waits for the user.
+                    //
+                    // The nudge is 「继续」 and nothing else: the objective, the
+                    // next step and the done-when are already in the system
+                    // prompt of every request, so restating them bought nothing
+                    // and cost context in the one place a long task cannot
+                    // afford it.
+                    //
+                    // On stderr too, for the same reason as the cap above: a
+                    // turn held open by a mission is otherwise indistinguishable
+                    // from a stuck one in a terminal or a desktop log.
                     eprintln!(
                         "[mission] {step} steps in, mission {} is still running; the turn continues",
                         mission.id
@@ -1135,7 +1037,7 @@ impl Agent {
                     // Committed like steering, because that is what it is: a
                     // message the model reads on the next request, that the
                     // transcript shows, and that survives the turn.
-                    let message = Message::user(nudge);
+                    let message = Message::user(MISSION_NUDGE);
                     self.messages.push(message.clone());
                     outcome.new_messages.push(message.clone());
                     self.observer.on_message(&message);
@@ -2056,12 +1958,11 @@ mod tests {
     }
 
     /// A tool that only returns, so a script that keeps calling it spends steps
-    /// instead of measuring a tool's behaviour.
-    fn tick_tools() -> Arc<ToolRegistry> {
-        registry_with("tick", |_arguments| -> crate::tools::ToolFuture {
+    fn quiet_tools() -> Arc<ToolRegistry> {
+        registry_with("step", |_arguments| -> crate::tools::ToolFuture {
             Box::pin(async move {
                 let answered: Result<crate::tools::ToolOutput> =
-                    Ok(crate::tools::ToolOutput::text("tick"));
+                    Ok(crate::tools::ToolOutput::text("step"));
                 answered
             })
         })
@@ -2089,8 +1990,8 @@ mod tests {
         // asks whether a round count this long is normal, tells the model to
         // keep working, and grants a bounded number of batches of the same
         // length.
-        let (base, hits) = provider(vec![sse_tool_call("call_1", "tick", "{}")]).await;
-        let mut agent = agent_with_tools(base, tick_tools()).with_max_steps(2);
+        let (base, hits) = provider(vec![sse_tool_call("call_1", "step", "{}")]).await;
+        let mut agent = agent_with_tools(base, quiet_tools()).with_max_steps(2);
 
         let outcome = agent.run("go").await.expect("the loop finishes");
 
@@ -2158,13 +2059,13 @@ mod tests {
             }
         }
 
-        let (base, _) = provider(vec![sse_tool_call("call_1", "tick", "{}")]).await;
+        let (base, _) = provider(vec![sse_tool_call("call_1", "step", "{}")]).await;
         let recorder = Arc::new(Recorder::default());
         // Cloned through the binding, not `Arc::clone(&recorder)`: the turbofish
         // is inferred from the argument, so the unsizing to `dyn AgentObserver`
         // has to happen where the expected type is known.
         let observing: Arc<dyn AgentObserver> = recorder.clone();
-        let mut agent = agent_with_tools(base, tick_tools())
+        let mut agent = agent_with_tools(base, quiet_tools())
             .with_max_steps(1)
             .with_observer(observing);
 
@@ -2227,12 +2128,12 @@ mod tests {
             }
         }
 
-        let (base, hits) = provider(vec![sse_tool_call("call_1", "tick", "{}")]).await;
+        let (base, hits) = provider(vec![sse_tool_call("call_1", "step", "{}")]).await;
         let (cancel, cancelled) = tokio::sync::watch::channel(false);
         // Step 3 is the first step of the second batch, so batch one is spent
         // and its ask is in the history when the stop is requested.
         let stopper: Arc<dyn AgentObserver> = Arc::new(StopAtStep { at: 3, cancel });
-        let mut agent = agent_with_tools(base, tick_tools())
+        let mut agent = agent_with_tools(base, quiet_tools())
             .with_max_steps(2)
             .with_observer(stopper)
             .with_cancel(cancelled);
@@ -2258,12 +2159,6 @@ mod tests {
 
     /// The id every mission test in this file uses.
     const MISSION_TEST_ID: &str = "m-20260101-000000";
-
-    /// The part of the mission message a test matches on.
-    ///
-    /// A fragment, like [`CONTINUATION_FRAGMENT`], so rewording the sentence the
-    /// model is asked does not break the tests that only care that it was asked.
-    const MISSION_FRAGMENT: &str = "仍是 running";
 
     /// A scratch workspace holding one mission record and the pointer to it.
     ///
@@ -2298,29 +2193,55 @@ mod tests {
         dir
     }
 
-    /// How many of `messages` carry the mission message.
+    /// How many of `messages` are the bare continuation handed to a running
+    /// mission. Compared whole rather than by fragment: 「继续」 is short enough
+    /// to appear inside other injected text, and a `contains` would count those.
     fn mission_nudges<'a>(messages: impl IntoIterator<Item = &'a Message>) -> usize {
         messages
             .into_iter()
-            .filter(|message| message.text().contains(MISSION_FRAGMENT))
+            .filter(|message| message.text() == MISSION_NUDGE)
             .count()
     }
 
     #[tokio::test]
-    async fn a_running_mission_keeps_the_turn_alive_after_a_final_answer() {
+    async fn a_running_mission_never_ends_the_turn() {
         // The model answered; the mission on disk says the work is not over. The
-        // shell may not end that turn, and it may not end the mission either —
-        // only the model can — so it names the mission that is still running and
-        // goes round again. The ceiling is the only thing that stops it, and
-        // reaching the ceiling is the bug this test is looking for.
-        #[derive(Default)]
-        struct Counting {
+        // shell may not end that turn — and it may not cap it either: a step
+        // count here is what used to turn a task into something that stops and
+        // waits for the user. The turn goes round again until the mission itself
+        // stops running, which is a decision only the mission's record makes.
+        //
+        // The step at which the record is flipped to `blocked` is far past every
+        // bound the old version had (two idle asks, sixty-four batches), so this
+        // test fails if any of them comes back.
+        const BLOCK_AT: usize = 70;
+
+        struct BlockAt {
+            at: usize,
+            record: std::path::PathBuf,
             seen: std::sync::atomic::AtomicUsize,
         }
 
-        impl AgentObserver for Counting {
+        impl AgentObserver for BlockAt {
+            fn on_step(&self, step: usize) {
+                if step == self.at {
+                    std::fs::write(
+                        &self.record,
+                        serde_json::json!({
+                            "id": MISSION_TEST_ID,
+                            "objective": "ship the crawler",
+                            "status": "blocked",
+                            "step": "waiting on a decision only the user can make",
+                            "done_when": "the tests pass",
+                        })
+                        .to_string(),
+                    )
+                    .expect("the mission record is writable");
+                }
+            }
+
             fn on_message(&self, message: &Message) {
-                if message.text().contains(MISSION_FRAGMENT) {
+                if message.text() == MISSION_NUDGE {
                     self.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
@@ -2331,9 +2252,13 @@ mod tests {
         // batch, so every request is one batch and the batch count and the
         // request count are the same number.
         let (base, hits) = provider(vec![sse_answer("all done", "stop")]).await;
-        let seen = Arc::new(Counting::default());
+        let seen = Arc::new(BlockAt {
+            at: BLOCK_AT,
+            record: dir.join("missions").join(MISSION_TEST_ID).join("mission.json"),
+            seen: std::sync::atomic::AtomicUsize::new(0),
+        });
         let observing: Arc<dyn AgentObserver> = seen.clone();
-        let mut agent = agent_with_tools(base, tick_tools())
+        let mut agent = agent_with_tools(base, quiet_tools())
             .with_max_steps(1)
             .with_observer(observing)
             .with_identity(crate::tools::ToolIdentity::for_session(
@@ -2343,66 +2268,48 @@ mod tests {
 
         let outcome = agent.run("go").await.expect("the loop finishes");
 
-        // The first batch, plus every batch the mission bought, plus the one the
-        // ceiling refused. `steps` is the true total across all of them.
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
         assert_eq!(
-            outcome.steps,
-            1 + MISSION_IDLE_NUDGES,
-            "a running mission lifts the continuation cap; the idle budget ends the turn"
-        );
-        assert!(
-            outcome.steps < 1 + MISSION_BATCH_CEILING,
-            "the ceiling is the backstop for an engaged model, not for this one"
+            outcome.steps, BLOCK_AT,
+            "the turn ran until the mission stopped running, not until a count ran out"
         );
         assert_eq!(
             hits.load(std::sync::atomic::Ordering::Relaxed),
-            outcome.steps,
+            BLOCK_AT,
             "every one of those steps was a real request"
         );
-        assert!(outcome.error.is_none(), "{:?}", outcome.error);
-
-        // The message is committed, reported with the turn, and shown to the
-        // host that persists the transcript — a push-back the model never reads
-        // is not a push-back.
+        assert_eq!(outcome.text, "all done", "the answer that ended it is the model's");
         assert_eq!(
             mission_nudges(&outcome.new_messages),
-            MISSION_IDLE_NUDGES,
-            "one push-back per granted batch"
+            BLOCK_AT - 1,
+            "one continuation per step the mission held open"
         );
-        assert_eq!(mission_nudges(agent.messages()), MISSION_IDLE_NUDGES);
+        assert_eq!(mission_nudges(agent.messages()), BLOCK_AT - 1);
         assert_eq!(
             seen.seen.load(std::sync::atomic::Ordering::Relaxed),
-            MISSION_IDLE_NUDGES,
+            BLOCK_AT - 1,
             "the observer saw every one"
         );
 
-        // It says what the model needs to act on, not just that time passed.
-        let first = outcome
-            .new_messages
+        // The continuation is the two-character ask and nothing else: the
+        // mission's objective, next step and done-when already travel in the
+        // system prompt, and repeating them here is context the task cannot spare.
+        for message in agent
+            .messages()
             .iter()
-            .find(|message| message.text().contains(MISSION_FRAGMENT))
-            .map(Message::text)
-            .expect("a push-back");
-        assert!(first.contains(MISSION_TEST_ID), "{first}");
-        assert!(first.contains("ship the crawler"), "the objective travels: {first}");
-        assert!(first.contains("write the failing test"), "the next step travels: {first}");
-        assert!(first.contains("the tests pass"), "the done-when travels: {first}");
-        assert!(
-            first.contains("mission_advance"),
-            "the only other way out is named: {first}"
-        );
+            .filter(|message| message.text() == MISSION_NUDGE)
+        {
+            assert_eq!(message.text(), "继续");
+        }
 
-        // The turn ends naming the mission it could not finish, and nothing in
-        // this file touched the mission's own record on the way there.
-        assert!(outcome.text.contains(MISSION_TEST_ID), "{}", outcome.text);
-        assert!(outcome.text.contains("仍是 running"), "{}", outcome.text);
-        assert!(outcome.text.contains("mission_"), "{}", outcome.text);
+        // Nothing in this file wrote the mission's own record: the flip above was
+        // the test's, standing in for the model recording `blocked`.
         let record = std::fs::read_to_string(
             dir.join("missions").join(MISSION_TEST_ID).join("mission.json"),
         )
         .expect("the record is still there");
         assert!(
-            record.contains("\"running\""),
+            record.contains("\"blocked\""),
             "the shell never ends a mission: {record}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2415,7 +2322,7 @@ mod tests {
         // turn exactly as it did before missions existed.
         let dir = workspace_with_mission("done", "done");
         let (base, hits) = provider(vec![sse_answer("all done", "stop")]).await;
-        let mut agent = agent_with_tools(base, tick_tools())
+        let mut agent = agent_with_tools(base, quiet_tools())
             .with_max_steps(1)
             .with_identity(crate::tools::ToolIdentity::for_session(
                 "test-session",
@@ -2444,7 +2351,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&empty).expect("a scratch workspace");
         let (base, hits) = provider(vec![sse_answer("all done", "stop")]).await;
-        let mut agent = agent_with_tools(base, tick_tools())
+        let mut agent = agent_with_tools(base, quiet_tools())
             .with_max_steps(1)
             .with_identity(crate::tools::ToolIdentity::for_session(
                 "test-session",
@@ -2482,7 +2389,7 @@ mod tests {
         let (base, hits) = provider(vec![sse_answer("all done", "stop")]).await;
         let (cancel, cancelled) = tokio::sync::watch::channel(false);
         let stopper: Arc<dyn AgentObserver> = Arc::new(StopAtStep { at: 2, cancel });
-        let mut agent = agent_with_tools(base, tick_tools())
+        let mut agent = agent_with_tools(base, quiet_tools())
             .with_max_steps(1)
             .with_observer(stopper)
             .with_cancel(cancelled)
@@ -2516,7 +2423,7 @@ mod tests {
                 .last()
                 .expect("the turn committed messages")
                 .text()
-                .contains(MISSION_FRAGMENT),
+                == MISSION_NUDGE,
             "nothing is injected after the stop"
         );
         assert_eq!(mission_nudges(agent.messages()), 1);

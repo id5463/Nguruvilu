@@ -28,7 +28,7 @@ description: >
 <workspace>/missions/<id>/
   mission.json    结构化状态:status / step / advances / ticks / checkpoints / agents
   STATE.md        给人看和给模型看的叙述:目标、完成判据、决策、阻塞
-  log.jsonl       只追加的事实:每次推进、检查点、信件、tick 的产出
+  log.jsonl       只追加的事实:每次推进、检查点、信件的产出
   checkpoints/    里程碑快照(当时的 STATE.md + 任务记录)
   mailbox/        代理信箱,每人一个 jsonl
 ```
@@ -40,15 +40,13 @@ description: >
 ## 每一步的节奏
 
 1. **开工前**:`mission_status`(几十行的报告,不是读历史)。
-2. **推进一步**:要么自己干,要么 `mission_tick` 让一个**全新 worker** 干
-   ——worker 没有这段对话的记忆,所以它拿到的是 objective + done_when +
-   STATE.md + 这一步的完整描述。**把一步写成 worker 能独立完成的粒度**。
-   **这一步的描述里不得要求 worker 再调 `mission_tick`**:它已经在 tick 里,
-   再调就是套娃;想继续推进,让它做完这步,由外面再发一次。盘上的
-   `next step` 若写着"调用 tick",在 advance 时把它改写成这一步的**实质**
-   (做什么、留下什么),而不是动作菜单。
+2. **推进一步**:你自己干——用你手上的工具(bash / read / write / web_search …)
+   把当前这一步做掉。**这个包里没有"跑一步"的工具,也没有后台 worker**:
+   任务不会自己动,动它的是你在这个回合里的动作。执行中发现 `next step` 写得
+   不对,就按实际情况做,然后在 advance 时把 `next` 改写成真实的下一步。
 3. **干完立刻记账**:`mission_advance(summary, next, status?)`。
-   `next` 要写成下一个 worker 能直接接手的样子;**它能独立开工,才算写好了**。
+   `next` 要写成下一个接手者能直接开工的样子;任务 running 期间这一回合不会
+   因为给出答复而结束,所以你记完账就接着做下一步,不需要问用户要不要继续。
 4. **里程碑打卡**:`mission_checkpoint(label)` —— 回滚点和交接点都在这。
 5. **卡住了**:`mission_advance(status="blocked", summary=...)` 说明卡在哪、
    需要什么;然后停手或换路子,别在原地空转。
