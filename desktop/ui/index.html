@@ -1397,8 +1397,10 @@ function renderEntry(entry) {
 
   if (entry.role === "tool") {
     // A stored tool result is shown inline; the details panel keeps the latest.
-    stream.append(el("div", "tool-result", entry.text));
-    logInfo.replaceChildren(el("div", "tool-result", entry.text));
+    // The mission marker It carries is bookkeeping for the panel, not text: the
+    // stored message keeps it (the panel parses it there), the screen does not.
+    stream.append(el("div", "tool-result", visibleToolText(entry.text)));
+    logInfo.replaceChildren(el("div", "tool-result", visibleToolText(entry.text)));
     return;
   }
 
@@ -1918,9 +1920,21 @@ function appendToolCall(name, args) {
   scrollToEnd();
 }
 
+/// What a tool result looks like on screen.
+///
+/// Mission tools append `<!--mission-state {…}-->` to their answer so the
+/// mission panel can paint itself from it. That marker is bookkeeping: it was
+/// leaking into the transcript as raw JSON, which reads like a bug and hides the
+/// real answer. The stored message keeps it — the panel parses the text it is
+/// handed — so only the visible copy is stripped.
+function visibleToolText(text) {
+  return String(text == null ? "" : text).replace(/<!--mission-state[\s\S]*?-->/g, "").trimEnd();
+}
+
 function appendToolResult(ok, text) {
   flushPendingText();
-  const box = el("div", "tool-result" + (ok ? "" : " bad"), text);
+  const shown = visibleToolText(text);
+  const box = el("div", "tool-result" + (ok ? "" : " bad"), shown);
   if (live) {
     const seg = currentSegment();
     caret.remove();
@@ -1929,7 +1943,7 @@ function appendToolResult(ok, text) {
   } else {
     stream.append(box);
   }
-  logInfo.replaceChildren(el("div", "tool-result" + (ok ? "" : " bad"), text));
+  logInfo.replaceChildren(el("div", "tool-result" + (ok ? "" : " bad"), shown));
   scrollToEnd();
 }
 
