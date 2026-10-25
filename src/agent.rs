@@ -238,6 +238,16 @@ pub const CONTINUATION_BATCHES: usize = 2;
 /// says so, naming the mission, and stops; the mission itself is untouched.
 const MISSION_BATCH_CEILING: usize = 64;
 
+/// How many continuation asks one turn may hand out while a running mission has
+/// produced **no** `mission_*` tool call since the previous ask.
+///
+/// The ask is an invitation, not a life sentence: a model that answers 「收到」
+/// to every nudge without ever touching a mission tool is telling us it will
+/// not engage, and holding the turn for [`MISSION_BATCH_CEILING`] batches turns
+/// that into a freeze the user reads as a hang. Any `mission_*` call resets the
+/// budget — engagement is what keeps the turn open, not the status line on disk.
+const MISSION_IDLE_NUDGES: usize = 2;
+
 /// The message the shell injects while a mission is still running.
 ///
 /// Chinese, like the other text this loop inserts into a turn: the model that
@@ -610,6 +620,12 @@ impl Agent {
         // [`MISSION_BATCH_CEILING`], and counted separately from `renewals` so
         // the two kinds of continuation never pay for each other's allowance.
         let mut mission_batches: usize = 0;
+        // `mission_*` tool calls so far. They are what the idle budget below is
+        // spent against: the nudge is an ask, and a model that answers it without
+        // ever touching a mission tool is telling us it will not engage.
+        let mut mission_calls: usize = 0;
+        // Continuation asks handed out since the last `mission_*` call.
+        let mut idle_nudges: usize = 0;
 
         // One outer loop, one decision: whether the turn may end here. The inner
         // loop is one batch and the code below it is the boundary between
@@ -863,6 +879,18 @@ impl Agent {
                 }
 
                 // Dispatch every call concurrently, then restore call order.
+                // A `mission_*` call is the only progress that justifies holding
+                // the turn open, so it resets the idle budget the boundary
+                // spends: engagement is the difference between a mission being
+                // worked and a mission being acknowledged.
+                let mission_calls_before = mission_calls;
+                mission_calls += tool_calls
+                    .iter()
+                    .filter(|call| call.name.starts_with("mission_"))
+                    .count();
+                if mission_calls != mission_calls_before {
+                    idle_nudges = 0;
+                }
                 let tools_started = Instant::now();
                 let mut set: JoinSet<(usize, ToolCall, Result<crate::tools::ToolOutput>)> = JoinSet::new();
                 // A stop that landed while the answer was being committed is seen
@@ -1059,6 +1087,23 @@ impl Agent {
                         outcome.error = Some(STOPPED.to_string());
                         return Ok(outcome);
                     }
+                    // The idle guard outranks the ceiling: a model that answers
+                    // every nudge with words and no `mission_*` call has said,
+                    // in the only language this loop can measure, that it will
+                    // not engage. MISSION_IDLE_NUDGES asks is the whole allowance
+                    // for that; ending the turn here is what keeps 「卡死」 from
+                    // being the product's answer to a polite model. The mission
+                    // is untouched — the next turn starts from the same disk.
+                    if idle_nudges >= MISSION_IDLE_NUDGES {
+                        outcome.text = format!(
+                            "任务 {id} 仍是 running，但模型已经 {nudges} 次没有用 mission_* 工具回应推进请求，\
+                             本回合到此为止以免看起来像卡死。任务本身没有被改动；\
+                             继续它请明确要求模型调用 mission_tick / mission_advance。",
+                            id = mission.id,
+                            nudges = idle_nudges,
+                        );
+                        return Ok(outcome);
+                    }
                     mission_batches += 1;
                     if mission_batches > MISSION_BATCH_CEILING {
                         // Reaching this is a bug report, not an outcome: the
@@ -1079,6 +1124,7 @@ impl Agent {
                         return Ok(outcome);
                     }
                     let nudge = mission_nudge(&mission, step);
+                    idle_nudges += 1;
                     // On stderr for the same reason as the cap above: a turn
                     // held open by a mission is otherwise indistinguishable from
                     // a stuck one in a terminal or a desktop log.
@@ -2301,12 +2347,12 @@ mod tests {
         // ceiling refused. `steps` is the true total across all of them.
         assert_eq!(
             outcome.steps,
-            1 + MISSION_BATCH_CEILING,
-            "a running mission lifts the continuation cap and is stopped only by the ceiling"
+            1 + MISSION_IDLE_NUDGES,
+            "a running mission lifts the continuation cap; the idle budget ends the turn"
         );
         assert!(
-            outcome.steps > 1 + CONTINUATION_BATCHES,
-            "the turn asked for far more than the no-mission allowance"
+            outcome.steps < 1 + MISSION_BATCH_CEILING,
+            "the ceiling is the backstop for an engaged model, not for this one"
         );
         assert_eq!(
             hits.load(std::sync::atomic::Ordering::Relaxed),
@@ -2320,13 +2366,13 @@ mod tests {
         // is not a push-back.
         assert_eq!(
             mission_nudges(&outcome.new_messages),
-            MISSION_BATCH_CEILING,
+            MISSION_IDLE_NUDGES,
             "one push-back per granted batch"
         );
-        assert_eq!(mission_nudges(agent.messages()), MISSION_BATCH_CEILING);
+        assert_eq!(mission_nudges(agent.messages()), MISSION_IDLE_NUDGES);
         assert_eq!(
             seen.seen.load(std::sync::atomic::Ordering::Relaxed),
-            MISSION_BATCH_CEILING,
+            MISSION_IDLE_NUDGES,
             "the observer saw every one"
         );
 
@@ -2349,7 +2395,8 @@ mod tests {
         // The turn ends naming the mission it could not finish, and nothing in
         // this file touched the mission's own record on the way there.
         assert!(outcome.text.contains(MISSION_TEST_ID), "{}", outcome.text);
-        assert!(outcome.text.contains(MISSION_FRAGMENT), "{}", outcome.text);
+        assert!(outcome.text.contains("仍是 running"), "{}", outcome.text);
+        assert!(outcome.text.contains("mission_"), "{}", outcome.text);
         let record = std::fs::read_to_string(
             dir.join("missions").join(MISSION_TEST_ID).join("mission.json"),
         )
