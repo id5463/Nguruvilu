@@ -320,6 +320,12 @@
     /* 底边留 0：输入条靠自己的 border-top 划界，压上去就把那条线抹掉了。 */
     padding: 8px 12px 0;
   }
+  /* 没有面板时整条槽消失。留着一个有 padding 的空 flex 盒，就是卸载任务包之后
+     输入框上方那条 8px 的空白——用户会读成「留了个空 UI」。:empty 只在真的没
+     子元素时成立，有面板时行为不变。 */
+  #slot-above-composer:empty {
+    display: none;
+  }
   /* 只约束这一槽里的面板。同一个 .panel-fragment 也用在侧栏与详情栏，那里
      空间本来就窄，写成全局 max-width 会把它们一起改掉。 */
   #slot-above-composer > .panel-fragment {
