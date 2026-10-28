@@ -95,6 +95,14 @@ pub struct Settings {
     /// mentions this key must not describe a turn that is not allowed to run.
     #[serde(default = "default_max_steps")]
     pub max_steps: u32,
+    /// Default tool deadline in seconds — how long one `bash` call may run when
+    /// the model passes no `timeout_ms` of its own.
+    ///
+    /// The per-call argument still wins: this is the floor the model does not
+    /// have to think about. Seconds rather than milliseconds because the field
+    /// is written by hand and by the settings panel, and both count in seconds.
+    #[serde(default = "default_tool_timeout_secs")]
+    pub tool_timeout_secs: u64,
 
     /// Cloud relay URL the local app dials out to for remote control.
     ///
@@ -241,6 +249,10 @@ fn default_max_steps() -> u32 {
     50
 }
 
+fn default_tool_timeout_secs() -> u64 {
+    120
+}
+
 impl Settings {
     /// Whether the settings are complete enough to make a request.
     pub fn is_configured(&self) -> bool {
@@ -305,6 +317,19 @@ impl Settings {
         match self.max_steps {
             0 => default_max_steps() as usize,
             steps => (steps as usize).min(200),
+        }
+    }
+
+    /// The default tool deadline, in seconds, in the range a call can honour.
+    ///
+    /// `0` reads as "not set" and means the built-in default, not "no deadline":
+    /// this type derives `Default`, so a fresh install with no file would
+    /// otherwise get a zero-second deadline, i.e. a tool call that cannot even
+    /// start. The model's own per-call `timeout_ms` still wins over this.
+    pub fn tool_timeout_secs(&self) -> u64 {
+        match self.tool_timeout_secs {
+            0 => default_tool_timeout_secs(),
+            secs => secs.min(6 * 3600),
         }
     }
 
@@ -557,6 +582,7 @@ mod tests {
             compact_percent: 75,
             compact_keep_recent: 8,
             max_steps: 50,
+            tool_timeout_secs: 120,
             relay_url: String::new(),
             relay_token: String::new(),
             max_output_tokens: None,
@@ -584,6 +610,7 @@ mod tests {
             compact_percent: 75,
             compact_keep_recent: 8,
             max_steps: 50,
+            tool_timeout_secs: 120,
             relay_url: String::new(),
             relay_token: String::new(),
             max_output_tokens: None,
@@ -816,6 +843,29 @@ mod tests {
         // The product decision, in one line: a file that says nothing about
         // steps behaves exactly as the desktop always has.
         assert_eq!(Settings::default().max_steps(), 50);
+    }
+
+    #[test]
+    fn the_tool_deadline_defaults_to_two_minutes() {
+        assert_eq!(Settings::default().tool_timeout_secs(), 120);
+    }
+
+    #[test]
+    fn a_zero_tool_deadline_is_not_a_zero_second_deadline() {
+        // 0 reads as "not set": the type derives `Default`, so a fresh install
+        // with no file must not make every tool call instant.
+        assert_eq!(
+            Settings { tool_timeout_secs: 0, ..Default::default() }.tool_timeout_secs(),
+            120
+        );
+    }
+
+    #[test]
+    fn the_tool_deadline_is_read_from_the_file() {
+        let (_dir, path) = scratch("tool-deadline");
+        std::fs::write(&path, r#"{"model": "m", "tool_timeout_secs": 300}"#).unwrap();
+        let settings = Settings::load_from(&path).unwrap();
+        assert_eq!(settings.tool_timeout_secs(), 300);
     }
 
     #[test]

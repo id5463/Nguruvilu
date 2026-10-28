@@ -503,6 +503,11 @@ impl AppState {
 
         let policy: Arc<dyn ContextPolicy> = Arc::new(settings.context_policy(None));
 
+        // The tool deadline travels with the settings, the same way: the bash
+        // tool's global default follows the panel from boot, and again whenever
+        // `save_settings` writes a new value.
+        nguruvilu::tools::set_default_tool_timeout_ms(settings.tool_timeout_secs() * 1000);
+
         let runtime = Arc::new(Mutex::new(runtime));
         let skills = Arc::new(Mutex::new(skills));
         let policy = Arc::new(Mutex::new(policy));
@@ -712,6 +717,8 @@ impl AppState {
                 "configured_window": self.settings.context_window,
                 "last_prompt_tokens": self.last_prompt_tokens,
             },
+            "max_steps": self.settings.max_steps(),
+            "tool_timeout_secs": self.settings.tool_timeout_secs(),
         })
     }
 
@@ -1035,6 +1042,8 @@ impl AppState {
         context_window: Option<usize>,
         compact_percent: u32,
         compact_keep_recent: usize,
+        max_steps: Option<u32>,
+        tool_timeout_secs: Option<u64>,
         max_output_tokens: Option<usize>,
         search_provider: &str,
         search_api_key: &str,
@@ -1061,10 +1070,13 @@ impl AppState {
             context_window: context_window.filter(|t| *t > 0),
             compact_percent,
             compact_keep_recent: compact_keep_recent.max(1),
-            // Not a panel field: the shell's settings panel has no control for
-            // the step cap, and a save from it must not reset what the file or
-            // the command line chose.
-            max_steps: self.settings.max_steps,
+            // Panel fields since the owner asked for them in the UI: absent (or
+            // zero) keeps whatever the file or the command line chose, and the
+            // accessors clamp the nonsense out of both.
+            max_steps: max_steps.filter(|v| *v > 0).unwrap_or(self.settings.max_steps),
+            tool_timeout_secs: tool_timeout_secs
+                .filter(|v| *v > 0)
+                .unwrap_or(self.settings.tool_timeout_secs),
             // Not panel fields: a save from the panel must keep the stored relay
             // settings instead of clearing them.
             relay_url: self.settings.relay_url.clone(),
@@ -1108,6 +1120,9 @@ impl AppState {
             let mut policy = self.config.policy.lock().expect("policy lock");
             *policy = Arc::new(self.settings.context_policy(None));
         }
+        // The tool deadline follows the panel in the same breath: a save that
+        // only touched this field must still reach the bash tool's default.
+        nguruvilu::tools::set_default_tool_timeout_ms(self.settings.tool_timeout_secs() * 1000);
 
         // The route is what a turn actually reads, so it is rebuilt from the
         // settings that just changed — every field of it, not only the three

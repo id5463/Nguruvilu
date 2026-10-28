@@ -651,6 +651,7 @@
         <label class="field">
           <span class="cap" id="cap-window">Context window (tokens)</span>
           <input id="set-window" placeholder="128K, 1M, or a number" spellcheck="false">
+          <div class="hint" id="hint-window">纯数字按 token 算：写 256 就是 256 个 token（比系统提示还小，每轮都会压缩）；要 256K 就写 256K。</div>
         </label>
         <div class="row">
           <label class="field" style="flex:1">
@@ -666,13 +667,26 @@
           <span class="cap" id="cap-output">Max output tokens</span>
           <input id="set-max-output" placeholder="8K, or blank for provider default" spellcheck="false">
         </label>
+        <div class="row">
+          <label class="field" style="flex:1">
+            <span class="cap" id="cap-steps">Max steps per turn</span>
+            <input id="set-max-steps" placeholder="50" spellcheck="false">
+          </label>
+          <label class="field" style="flex:1">
+            <span class="cap" id="cap-tool-timeout">Tool timeout (sec)</span>
+            <input id="set-tool-timeout" placeholder="120" spellcheck="false">
+          </label>
+        </div>
         <details class="hint-more" id="more-context">
           <summary id="sum-context">How does the window and compaction behave?</summary>
           <div class="hint">
             Empty window means auto: the provider’s own number if it reports one,
             a built-in table for well-known models, otherwise a conservative 32k.
             When the prompt passes the threshold, the oldest messages are summarized
-            and replaced — tool-call pairs are never split.
+            and replaced — tool-call pairs are never split. What survives is one
+            summary plus the Keep recent count of newest messages; the summary
+            loses paths and numbers, so details belong in files, not only in chat.
+            Max steps caps one turn's model calls; Tool timeout caps one command.
           </div>
         </details>
       </div>
@@ -1033,6 +1047,8 @@ const setWindow = document.getElementById("set-window");
 const setPercent = document.getElementById("set-percent");
 const setKeep = document.getElementById("set-keep");
 const setMaxOutput = document.getElementById("set-max-output");
+const setMaxSteps = document.getElementById("set-max-steps");
+const setToolTimeout = document.getElementById("set-tool-timeout");
 // The search controls are built on demand (`ensureSearchSection`), so they are
 // null until the search pack is loaded. Everything that touches them guards.
 let setSearchProvider = null;
@@ -2383,6 +2399,8 @@ function renderSettings(status) {
     setPercent.value = String(ctx.threshold_percent || 75);
     setKeep.value = String(ctx.keep_recent || 8);
     setMaxOutput.value = status.max_output_tokens || "";
+    setMaxSteps.value = String(status.max_steps || 50);
+    setToolTimeout.value = String(status.tool_timeout_secs || 120);
     // The key is never sent back in full; an empty box means "unchanged".
     setApiKey.value = "";
     setApiKey.placeholder = status.api_key_masked
@@ -2908,6 +2926,11 @@ function saveSettings() {
     context_window: setWindow.value.trim(),
     compact_percent: parseInt(setPercent.value, 10) || 75,
     compact_keep_recent: parseInt(setKeep.value, 10) || 8,
+    // Zero means "leave it as stored": both accessors clamp, so a blank box
+    // never writes a turn that cannot take a step or a tool call that cannot
+    // start.
+    max_steps: parseInt(setMaxSteps.value, 10) || 0,
+    tool_timeout_secs: parseInt(setToolTimeout.value, 10) || 0,
     max_output_tokens: setMaxOutput.value.trim(),
   };
   if (setApiKey.value.trim() !== "") {

@@ -1094,6 +1094,10 @@ async fn run() -> Result<()> {
 
     let policy: Arc<dyn ContextPolicy> = Arc::new(settings.context_policy(None));
 
+    // The tool deadline is a process global: bash and every other deadline-less
+    // tool fall back to it, so one settings key covers the whole tool surface.
+    nguruvilu::tools::set_default_tool_timeout_ms(settings.tool_timeout_secs() * 1000);
+
     let runtime = Arc::new(Mutex::new(runtime));
     let skills = Arc::new(Mutex::new(skills));
     let policy = Arc::new(Mutex::new(policy));

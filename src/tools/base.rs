@@ -58,8 +58,9 @@ const MAX_BASH_OUTPUT: usize = 30_000;
 /// forever) while recording that the output was cut.
 const MAX_BASH_BUFFER: usize = 8 * 1024 * 1024;
 
-/// Default `bash` timeout.
-const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
+/// Default `bash` timeout, out of the box. The settings panel's tool deadline
+/// replaces it at boot: this is only the value the global starts with.
+pub(crate) const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
 
 /// Largest image the kernel will attach without warning.
 ///
@@ -174,7 +175,7 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<()> {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "Command to run" },
-                    "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (default 120000)" },
+                    "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (default: the settings panel's tool deadline, 120000 out of the box)" },
                     "cwd": { "type": "string", "description": "Working directory for the command" },
                     "background": { "type": "boolean", "description": "Run as a background job and return a job id immediately (default false)" },
                     "notify": { "type": "boolean", "description": "With background: wake you with a message when the job finishes, even if this turn has ended (default false)" }
@@ -595,7 +596,8 @@ async fn bash_tool(args: Value) -> Result<String> {
     let timeout = Duration::from_millis(
         args.get("timeout_ms")
             .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_BASH_TIMEOUT_MS),
+            .filter(|ms| *ms > 0)
+            .unwrap_or_else(super::default_tool_timeout_ms),
     );
     let cwd = match args.get("cwd").and_then(|c| c.as_str()) {
         Some(explicit) => Some(resolve_path(explicit)),

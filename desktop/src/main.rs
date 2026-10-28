@@ -816,6 +816,16 @@ pub(crate) async fn dispatch(
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize)
                 .unwrap_or(8);
+            // The step cap and the tool deadline are panel fields too now:
+            // absent (or zero) means "keep what the file or the CLI chose".
+            let max_steps = command
+                .get("max_steps")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            let tool_timeout_secs = command
+                .get("tool_timeout_secs")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u64);
             // Accepts a number or a sized string like 8K.
             let max_output = command
                 .get("max_output_tokens")
@@ -889,6 +899,8 @@ pub(crate) async fn dispatch(
                     context_window,
                     compact_percent,
                     keep_recent,
+                    max_steps,
+                    tool_timeout_secs,
                     max_output,
                     search_provider,
                     search_api_key,

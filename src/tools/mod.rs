@@ -252,6 +252,29 @@ pub fn current_workspace() -> Option<std::path::PathBuf> {
     CURRENT_WORKSPACE.with(|cell| cell.borrow().clone())
 }
 
+/// The default tool deadline in milliseconds, overridable from settings.
+///
+/// A process global rather than a field on the registry: the deadline belongs
+/// to the deployment (how long this machine is willing to let one command hold
+/// a turn), not to a conversation, and both hosts — CLI and desktop shell —
+/// set it once from the same `settings.json` key. A model's own `timeout_ms`
+/// argument still wins; this only supplies what it did not think about.
+static DEFAULT_TOOL_TIMEOUT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(base::DEFAULT_BASH_TIMEOUT_MS);
+
+/// Set the default tool deadline, in milliseconds. Zero is ignored: a
+/// misconfigured "0 seconds" would make every tool call instant.
+pub fn set_default_tool_timeout_ms(ms: u64) {
+    if ms > 0 {
+        DEFAULT_TOOL_TIMEOUT_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The default tool deadline in milliseconds.
+pub fn default_tool_timeout_ms() -> u64 {
+    DEFAULT_TOOL_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Scopes a session id and its workspace over every poll of an inner future.
 ///
 /// A thread-local set around `handler(args)` alone is empty by the time an

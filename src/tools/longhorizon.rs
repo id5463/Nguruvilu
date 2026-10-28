@@ -803,19 +803,15 @@ if (bar) {
 fn start_tool() -> ToolDef {
     ToolDef::new(
         START,
-        "Start a long-horizon mission. A mission is state on disk \
-         (<workspace>/missions/<id>/): an objective, a done-when, a current step, \
-         an append-only log, checkpoints, and mailboxes. Use it for work that will \
-         not fit one conversation — it survives restarts and context compaction. \
-         A mission is state, not a runner: you do the work yourself in this \
-         conversation, on the tools you already have, and record each step with \
-         mission_advance.",
+        "开一个长程任务：目标 + 完成判据（写成可检查的：哪个测试过、哪个文件在）落在 \
+         <workspace>/missions/<id>/。任务只是盘上的状态，不会自己动——干活的永远是当前对话；\
+         重启和上下文压缩都不丢。建完直接开始做第一步。",
         json!({
             "type": "object",
             "properties": {
-                "objective": { "type": "string", "description": "What the mission is for, in one paragraph. This is the standing answer to 'why am I doing this'." },
-                "done_when": { "type": "string", "description": "How anyone can tell it is finished. Something checkable beats a feeling: a test that passes, a file that exists, a page that renders." },
-                "first_step": { "type": "string", "description": "Optional first step. A mission with a next step can be advanced right away." }
+                "objective": { "type": "string", "description": "任务目标，一段话。" },
+                "done_when": { "type": "string", "description": "怎么算完成。写可检查的：测试通过、文件存在、页面能跑。不写「做好」「完善」这种词。" },
+                "first_step": { "type": "string", "description": "可选：第一步。写了它，任务一建好就能直接开干。" }
             },
             "required": ["objective"]
         }),
@@ -827,9 +823,7 @@ fn start_tool() -> ToolDef {
 fn status_tool() -> ToolDef {
     ToolDef::new(
         STATUS,
-        "Report the active mission: objective, status, current step, checkpoints, \
-         advances, unread mail, and the last few log entries. Cheap on purpose — \
-         call it at the start of a turn instead of reading the whole history.",
+        "看当前任务：状态、下一步、最近几条日志。几十行，别去读历史文件。每回合开工先调它。",
         json!({ "type": "object", "properties": {} }),
         PLUGIN,
         |args| Box::pin(async move { status(args).map(Into::into) }) as ToolFuture,
@@ -839,16 +833,15 @@ fn status_tool() -> ToolDef {
 fn advance_tool() -> ToolDef {
     ToolDef::new(
         ADVANCE,
-        "Record progress on the active mission: what was just done, what the next \
-         step is, and optionally a new status (running, blocked, done). Appends to \
-         the mission log and rewrites only the generated block of STATE.md.",
+        "记一步账：这步做了什么（summary）、下一步是什么（next）、状态改不改（running/blocked/done）。\
+         任务在 running 期间回合不会自己结束——记完账就接着做下一步，不要停下来问。",
         json!({
             "type": "object",
             "properties": {
-                "summary": { "type": "string", "description": "What changed in this step. One or two lines." },
-                "next": { "type": "string", "description": "The next step, written so someone with no memory of this conversation could start it." },
-                "status": { "type": "string", "enum": ["running", "blocked", "done"], "description": "Mission status after this step." },
-                "note": { "type": "string", "description": "Optional longer note kept in the log only." }
+                "summary": { "type": "string", "description": "这一步做了什么，一两行，写事实。" },
+                "next": { "type": "string", "description": "下一步，一句话能开工。" },
+                "status": { "type": "string", "enum": ["running", "blocked", "done"], "description": "记完这步后的状态。" },
+                "note": { "type": "string", "description": "可选：只进日志的长注。" }
             },
             "required": ["summary"]
         }),
@@ -860,14 +853,12 @@ fn advance_tool() -> ToolDef {
 fn checkpoint_tool() -> ToolDef {
     ToolDef::new(
         CHECKPOINT,
-        "Take a mission checkpoint: a named snapshot of STATE.md and the mission \
-         record under checkpoints/. This is the rollback point a long task needs — \
-         cheap, greppable, and independent of any VCS.",
+        "打里程碑：把 STATE.md 和任务记录存一份到 checkpoints/，这是回滚点。",
         json!({
             "type": "object",
             "properties": {
-                "label": { "type": "string", "description": "Short name for the point reached, e.g. 'milestone-1-crawler-done'." },
-                "note": { "type": "string", "description": "Optional note stored with the checkpoint." }
+                "label": { "type": "string", "description": "名字，如 'milestone-1-crawler-done'。" },
+                "note": { "type": "string", "description": "可选备注。" }
             },
             "required": ["label"]
         }),
@@ -879,16 +870,15 @@ fn checkpoint_tool() -> ToolDef {
 fn recall_tool() -> ToolDef {
     ToolDef::new(
         RECALL,
-        "Search the mission memory on disk — logs, STATE.md, checkpoints, mailboxes — \
-         and return matching lines with file and line number. This is how to recover a \
-         detail that fell out of the context window: search it, read the few lines that \
-         matter, and keep the window small.",
+        "在任务记忆（日志/STATE/检查点/信箱）里按行搜，返回命中的行和文件行号。\
+         上下文被压缩过、或者记不清某个细节（路径、数字、上次的决定）时用它——\
+         搜出来读那几行就行，不要把历史整段读回上下文。",
         json!({
             "type": "object",
             "properties": {
-                "query": { "type": "string", "description": "Words to look for. All of them must appear on the same line (case-insensitive)." },
-                "mission": { "type": "string", "description": "Mission id to search. Defaults to every mission in this workspace." },
-                "limit": { "type": "integer", "description": "Maximum matching lines to return (default 40, max 200)." }
+                "query": { "type": "string", "description": "关键词，同一行内全部命中才算（忽略大小写）。" },
+                "mission": { "type": "string", "description": "只搜某个任务。默认搜全部。" },
+                "limit": { "type": "integer", "description": "最多返回几行（默认 40，最大 200）。" }
             },
             "required": ["query"]
         }),
@@ -901,19 +891,15 @@ fn post_tool() -> ToolDef {
     ToolDef::new(
         POST,
         format!(
-            "Send a letter to another agent working on the active mission. Mail is written \
-             to that agent's mailbox on disk, so it is delivered whether or not the \
-             recipient is running — it is read at the start of the recipient's next turn. \
-             Use it to hand over findings, ask for something, or warn about a dead end. \
-             A body longer than {LETTER_BODY_CAP} characters is cut, and this tool's reply \
-             says so: write anything longer to a file and name the path in the letter."
+            "给另一个代理投信。信落盘，收件人不在跑也收得到，它下回合开头读到。\
+             信要短：超过 {LETTER_BODY_CAP} 字会被截断，长内容写文件、信里给路径。"
         ),
         json!({
             "type": "object",
             "properties": {
-                "to": { "type": "string", "description": "Recipient agent path, e.g. 'root' or 'worker-crawler'." },
-                "body": { "type": "string", "description": "The letter. Short and specific: what the recipient should know or do." },
-                "from": { "type": "string", "description": "Your own agent path. Defaults to 'root'." }
+                "to": { "type": "string", "description": "收件代理路径，如 'root' 或 'worker-crawler'。" },
+                "body": { "type": "string", "description": "信：短、具体，让对方知道该知道什么、该做什么。" },
+                "from": { "type": "string", "description": "发件人路径，默认 'root'。" }
             },
             "required": ["to", "body"]
         }),
@@ -926,18 +912,14 @@ fn inbox_tool() -> ToolDef {
     ToolDef::new(
         INBOX,
         format!(
-            "Read your mailbox for the active mission. Unread letters are returned and \
-             marked read, so the same letter is not delivered twice; pass mark_read=false \
-             to peek. Recipients that are not running still receive mail — it waits here. \
-             One read renders at most {INBOX_LETTER_CAP} letters or about \
-             {INBOX_RENDER_CAP} characters and reports how many are still unread; call it \
-             again to render the rest, which stay unread until they are shown."
+            "读自己的信。没读过的信读一次就标已读，不会重复投递；mark_read=false 先瞄一眼。\
+             一次最多渲染 {INBOX_LETTER_CAP} 封 / 约 {INBOX_RENDER_CAP} 字，剩下的再调一次接着看。"
         ),
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Whose mailbox to read. Defaults to 'root'." },
-                "mark_read": { "type": "boolean", "description": "Mark the returned letters read (default true)." }
+                "path": { "type": "string", "description": "读谁的信箱，默认 'root'。" },
+                "mark_read": { "type": "boolean", "description": "读完就标已读（默认 true）。" }
             }
         }),
         PLUGIN,
