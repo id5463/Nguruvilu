@@ -237,6 +237,14 @@ pub const CONTINUATION_BATCHES: usize = 2;
 /// stopping the turn.
 const MISSION_NUDGE: &str = "继续";
 
+/// The longest pause between one retry and the next while a mission holds the
+/// turn open.
+///
+/// The network backoff doubles per attempt and reaches 200 s at its cap; a
+/// mission waiting on a flaky route deserves one ask per half minute rather
+/// than a silence the user reads as a hang.
+const MISSION_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How much of a tool's failure is sent back to the model.
 ///
 /// `{error:#}` is the whole anyhow cause chain, written for a developer sitting
@@ -344,6 +352,32 @@ pub struct Agent {
     /// desktop does, on every switch) cannot move a running turn's workspace
     /// or its job attribution. `None` means "ask the registry at turn start".
     identity: Option<crate::tools::ToolIdentity>,
+    /// Whether this turn is somebody's subtask rather than a conversation.
+    ///
+    /// A subagent inherits the session's tool table, its route, and its
+    /// standing instructions — that is the point of [`crate::tools::subagent`]
+    /// — but not the *privileges of a conversation*. Two things must not
+    /// travel into it:
+    ///
+    /// * **The batch renewal.** A top-level turn that spends its steps asks the
+    ///   model whether the round count is normal and earns another batch, which
+    ///   is right for a long task someone is watching. A subtask was given a
+    ///   budget by its caller — the tool description states it — and quietly
+    ///   spending three times that is how a `delegate` call that promised
+    ///   twelve steps took half an hour and answered nothing.
+    /// * **The mission hold.** A mission keeps *its own* turn open until the
+    ///   record stops running. That record lives in the parent's workspace, and
+    ///   a subtask that is held open by it — or worse, advances it — is doing
+    ///   work nobody gave it, invisibly, for as long as the parent's mission
+    ///   lasts. [`Agent::as_subtask`] turns both off.
+    subtask: bool,
+    /// What a stop reports as this turn's error.
+    ///
+    /// [`STOPPED`] is the truth for a turn a person cancelled and a lie for one
+    /// the shell cut off at its own deadline: the parent model reads this string
+    /// as the reason its subtask did not finish, and "stopped by the user" sends
+    /// it looking for a user who did no such thing.
+    stop_reason: String,
 }
 
 impl Agent {
@@ -360,6 +394,8 @@ impl Agent {
             cancel: None,
             inbox: None,
             identity: None,
+            subtask: false,
+            stop_reason: STOPPED.to_string(),
         }
     }
 
@@ -396,6 +432,8 @@ impl Agent {
     /// of ending the turn, so `steps` bounds one batch and not the whole turn.
     /// While a mission is running this is still the size of one batch, but the
     /// number of batches is decided by the mission rather than by that constant.
+    /// A subtask ([`Agent::as_subtask`]) gets exactly this many steps and no
+    /// renewal at all.
     pub fn with_max_steps(mut self, steps: usize) -> Self {
         self.max_steps = steps.max(1);
         self
@@ -409,9 +447,31 @@ impl Agent {
 
     /// Make this turn stoppable: when the flag flips, the loop finishes at
     /// its next safe point, keeps every message it committed, and reports
-    /// "stopped by the user" as the turn's error.
+    /// [`Agent::with_stop_reason`] (by default "stopped by the user") as the
+    /// turn's error.
     pub fn with_cancel(mut self, cancel: tokio::sync::watch::Receiver<bool>) -> Self {
         self.cancel = Some(cancel);
+        self
+    }
+
+    /// Say why this turn stopped, in the words its reader needs.
+    ///
+    /// A host that cuts a turn off at its own deadline is not the user walking
+    /// away, and the error string is read by whoever asked for the turn — for a
+    /// subtask, that is the parent model deciding what to do next. "stopped by
+    /// the user" would send it looking for a user who did nothing.
+    pub fn with_stop_reason(mut self, reason: impl Into<String>) -> Self {
+        self.stop_reason = reason.into();
+        self
+    }
+
+    /// Run this turn as somebody's subtask: an exact step budget, and no hold
+    /// from the parent's mission.
+    ///
+    /// See the field documentation on [`Agent::subtask`] for why both are the
+    /// same switch rather than two knobs a caller can get wrong one at a time.
+    pub fn as_subtask(mut self) -> Self {
+        self.subtask = true;
         self
     }
 
@@ -441,6 +501,14 @@ impl Agent {
     /// batch that just ran may have blocked or finished the mission, and that
     /// status — not the step count — is what decides whether the turn may end.
     fn running_mission(&self) -> Option<MissionBrief> {
+        // A subtask is never held open by one. It inherits the parent's tools
+        // and may even be handed the parent's identity, so a mission found here
+        // would be work the parent accepted — and a subtask that advances or
+        // outlives it is exactly the runaway `delegate` must not produce. The
+        // parent's own turn is the one that owes the mission its time.
+        if self.subtask {
+            return None;
+        }
         let workspace = self.identity.as_ref()?.workspace.as_deref()?;
         crate::tools::longhorizon::running_mission(workspace)
     }
@@ -549,7 +617,9 @@ impl Agent {
         // batch without a final answer asks the model whether a round count
         // this long is normal, tells it to keep working, and earns another
         // batch — see [`CONTINUATION_BATCHES`]. A running mission is the one
-        // exception: it is not capped at all, see [`MISSION_NUDGE`].
+        // exception: it is not capped at all, see [`MISSION_NUDGE`]. A subtask
+        // is the other: it was given a budget by its caller and does not renew
+        // it — see [`Agent::as_subtask`].
         //
         // One counter drives all of it. `step` is the global index across every
         // batch, so `outcome.steps` and the observer report the work the turn
@@ -565,7 +635,8 @@ impl Agent {
         // the first step. `max(1)` likewise guards a future caller that writes
         // the field directly: a batch that runs zero steps would spin.
         let batch_size = self.max_steps.max(1);
-        let step_budget = batch_size.saturating_mul(1 + CONTINUATION_BATCHES);
+        let renewal_batches = if self.subtask { 0 } else { CONTINUATION_BATCHES };
+        let step_budget = batch_size.saturating_mul(1 + renewal_batches);
         let mut step: usize = 0;
         let mut renewals: usize = 0;
 
@@ -586,7 +657,7 @@ impl Agent {
                 // A stop between steps ends the turn here: everything committed
                 // so far is already in the history and is reported with it.
                 if self.stop_requested() {
-                    outcome.error = Some(STOPPED.to_string());
+                    outcome.error = Some(self.stop_reason.clone());
                     return Ok(outcome);
                 }
 
@@ -671,13 +742,25 @@ impl Agent {
                     // another request; the error branch below reports it.
                     if self.stop_requested() {
                         let mut stopped = StepOutput::default();
-                        stopped.error = Some(anyhow::anyhow!(STOPPED));
+                        stopped.error = Some(anyhow::anyhow!(self.stop_reason.clone()));
                         break stopped;
                     }
                     attempt += 1;
                     let started = Instant::now();
                     let produced = self.stream_once(&client, &request, &schemas).await;
                     outcome.timing.model_ms += started.elapsed().as_millis();
+
+                    // A running mission outranks the attempt budget. The turn is
+                    // holding work someone asked for, and a provider that is
+                    // briefly unreachable — a dropped connection, a gateway
+                    // restart — must not be able to end it: the mission is not
+                    // finished, so the turn is not finishable. It keeps asking,
+                    // with the network backoff (capped, so a long outage is one
+                    // ask per half minute rather than a tight loop), until the
+                    // route answers, the model blocks the mission, or the user
+                    // stops it. A mission that is no longer running falls back
+                    // to the ordinary budget.
+                    let mission_open = self.running_mission().is_some();
 
                     match &produced.error {
                         Some(error) => {
@@ -689,15 +772,20 @@ impl Agent {
                             // itself still travels exactly as far as it did before.
                             record_reported_window(error, &settings.model);
                             let retry = llm::retryable(error);
-                            if retry && attempt < max_attempts {
+                            if retry && (attempt < max_attempts || mission_open) {
                                 let message = format!("{error:#}");
                                 outcome.retries += 1;
                                 self.observer.on_step_retry(attempt as usize, &message);
-                                tokio::time::sleep(network.backoff(attempt)).await;
+                                let pause = if mission_open {
+                                    network.backoff(attempt).min(MISSION_RETRY_CAP)
+                                } else {
+                                    network.backoff(attempt)
+                                };
+                                tokio::time::sleep(pause).await;
                                 continue;
                             }
                         }
-                        None if produced.is_empty() && attempt < max_attempts => {
+                        None if produced.is_empty() && (attempt < max_attempts || mission_open) => {
                             outcome.retries += 1;
                             self.observer.on_step_retry(
                                 attempt as usize,
@@ -808,7 +896,7 @@ impl Agent {
 
                 if tool_calls.is_empty() {
                     if stopped_before_tools {
-                        outcome.error = Some(STOPPED.to_string());
+                        outcome.error = Some(self.stop_reason.clone());
                         return Ok(outcome);
                     }
                     // The model answered. Whether that ends the turn is not decided
@@ -911,7 +999,8 @@ impl Agent {
                         // an unanswered tool call is a history the next request
                         // cannot be built from.
                         None if stopped => Err(anyhow::anyhow!(
-                            "stopped by the user before this tool call finished"
+                            "{} before this tool call finished",
+                            self.stop_reason
                         )),
                         // A task that died without a stop request: it panicked or
                         // was aborted, so nothing was written into its slot. The
@@ -955,7 +1044,7 @@ impl Agent {
                 // Every dispatched call now has an answer and the turn was asked
                 // to stop: report it instead of taking another step.
                 if stopped {
-                    outcome.error = Some(STOPPED.to_string());
+                    outcome.error = Some(self.stop_reason.clone());
                     return Ok(outcome);
                 }
             }
@@ -1012,7 +1101,7 @@ impl Agent {
                     // asking a model to keep working on a turn nobody is
                     // watching is exactly the run-away this loop must not do.
                     if self.stop_requested() {
-                        outcome.error = Some(STOPPED.to_string());
+                        outcome.error = Some(self.stop_reason.clone());
                         return Ok(outcome);
                     }
                     // No ceiling, no idle budget, no wall clock. A mission that
@@ -1055,10 +1144,25 @@ impl Agent {
         // `step` rather than `step_budget`: they are the same number on this
         // path, and the count keeps being honest if a mission held the turn open
         // for a while before the model blocked it.
-        outcome.text = format!(
-            "stopped after {} steps without a final answer ({} continuation(s) asked)",
-            step, renewals
-        );
+        //
+        // A subtask reports this as a **failure**, not as a result. "stopped
+        // after 12 steps without a final answer" is a useful thing to print at
+        // the end of a conversation and a trap at the end of a subtask: the
+        // parent model asked a question, and reading a stop marker as the answer
+        // is how an actor-critic round ends up trusting a critic that never
+        // critiqued anything.
+        if self.subtask {
+            outcome.error = Some(format!(
+                "the subtask spent its {step}-step budget without a final answer \
+                 ({} renewal(s) asked)",
+                renewals
+            ));
+        } else {
+            outcome.text = format!(
+                "stopped after {} steps without a final answer ({} continuation(s) asked)",
+                step, renewals
+            );
+        }
         Ok(outcome)
     }
 
@@ -1092,7 +1196,7 @@ impl Agent {
                     biased;
                     requested = stop_flag(stop_rx) => {
                         if requested {
-                            out.error = Some(anyhow::anyhow!(STOPPED));
+                            out.error = Some(anyhow::anyhow!(self.stop_reason.clone()));
                             return out;
                         }
                         // Nobody is asking anymore; open the stream plainly.
@@ -1129,7 +1233,7 @@ impl Agent {
                     biased;
                     requested = stop_flag(stop_rx) => {
                         if requested {
-                            out.error = Some(anyhow::anyhow!(STOPPED));
+                            out.error = Some(anyhow::anyhow!(self.stop_reason.clone()));
                             break 'stream;
                         }
                         // Nobody is asking anymore; wait on the stream alone.
@@ -1588,6 +1692,82 @@ mod tests {
         format!(
             "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {frame}\n\ndata: [DONE]\n\n"
         )
+    }
+
+    /// The same provider, except the **first** connection is accepted, read and
+    /// then closed without a byte: the shape of a gateway that took the request
+    /// and died. Every later connection answers like `provider`, so a client
+    /// that retries lands on a working route.
+    ///
+    /// The request is drained first for the same reason `provider` drains it: a
+    /// close while the client is still writing is a race that turns the test
+    /// into a flake.
+    /// Connections the drop provider kills before it starts answering.
+    ///
+    /// More than the client's own connection retry budget, so the failure
+    /// reaches the agent loop's retry rather than being absorbed below it.
+    const DROPS: usize = 6;
+
+    async fn provider_dropping_first(
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = std::sync::Arc::clone(&hits);
+
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let index = served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                let mut head = Vec::new();
+                loop {
+                    let mut byte = [0u8; 1];
+                    match socket.read(&mut byte).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            head.push(byte[0]);
+                            if head.ends_with(b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let head_text = String::from_utf8_lossy(&head);
+                let declared = head_text
+                    .lines()
+                    .filter_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .next()
+                    .unwrap_or(0);
+                let mut remaining = declared;
+                let mut buf = [0u8; 4096];
+                while remaining > 0 {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => remaining = remaining.saturating_sub(read),
+                    }
+                }
+
+                if index < DROPS {
+                    // Read the request, then vanish: whatever the transport
+                    // layer calls this, the retry rule must treat it as worth
+                    // another ask. Several of them, because the client retries
+                    // a connection failure on its own before the agent loop ever
+                    // sees one.
+                    let _ = socket.shutdown().await;
+                    continue;
+                }
+                let body = sse_answer("all done", "stop");
+                let _ = socket.write_all(body.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        (format!("http://{addr}"), hits)
     }
 
     fn agent_against(base: String) -> Agent {
@@ -2316,6 +2496,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_dropped_connection_does_not_end_a_turn_with_a_running_mission() {
+        // The route accepts the request and closes without a byte — a gateway
+        // restart. The mission is running, so the turn may not end there: it
+        // asks again and finishes the work. Without this the first hiccup ends
+        // a task someone is waiting on.
+        const BLOCK_AT: usize = 2;
+
+        struct BlockAt {
+            at: usize,
+            record: std::path::PathBuf,
+            retries: std::sync::atomic::AtomicUsize,
+        }
+
+        impl AgentObserver for BlockAt {
+            fn on_step(&self, step: usize) {
+                if step == self.at {
+                    std::fs::write(
+                        &self.record,
+                        serde_json::json!({
+                            "id": MISSION_TEST_ID,
+                            "objective": "ship the crawler",
+                            "status": "blocked",
+                            "step": "the route came back and the work is done",
+                            "done_when": "the tests pass",
+                        })
+                        .to_string(),
+                    )
+                    .expect("the mission record is writable");
+                }
+            }
+
+            fn on_step_retry(&self, _attempt: usize, _reason: &str) {
+                self.retries
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let dir = workspace_with_mission("drop", "running");
+        let (base, hits) = provider_dropping_first().await;
+        let seen = Arc::new(BlockAt {
+            at: BLOCK_AT,
+            record: dir.join("missions").join(MISSION_TEST_ID).join("mission.json"),
+            retries: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let observing: Arc<dyn AgentObserver> = seen.clone();
+        let mut agent = agent_with_tools(base, quiet_tools())
+            .with_max_steps(1)
+            .with_observer(observing)
+            .with_identity(crate::tools::ToolIdentity::for_session(
+                "test-session",
+                Some(dir.clone()),
+            ));
+
+        let outcome = agent.run("go").await.expect("the loop finishes");
+
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(outcome.text, "all done", "the turn finished its work");
+        assert_eq!(outcome.steps, BLOCK_AT);
+        assert!(
+            outcome.retries >= 1,
+            "the dropped connection was retried, not fatal (retries={} hits={} steps={})",
+            outcome.retries,
+            hits.load(std::sync::atomic::Ordering::Relaxed),
+            outcome.steps
+        );
+        assert!(
+            seen.retries.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "the observer saw the retry, so the page can say why it is waiting"
+        );
+        assert!(
+            hits.load(std::sync::atomic::Ordering::Relaxed) >= DROPS + 2,
+            "the dropped attempts plus two answers"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn a_mission_that_is_not_running_lets_the_turn_end_immediately() {
         // A finished mission is the model having decided the work is over — the
         // one decision the shell must not second-guess — so the answer ends the
@@ -2428,5 +2685,97 @@ mod tests {
         );
         assert_eq!(mission_nudges(agent.messages()), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------- a subtask is not a turn
+
+    #[tokio::test]
+    async fn a_subtask_stops_at_its_budget_instead_of_asking_for_more() {
+        // A subtask's budget is the one its caller was told about. A top-level
+        // turn that spends its steps asks whether a round count this long is
+        // normal and earns another batch — right for a long task someone is
+        // watching, and exactly wrong for a `delegate` whose description
+        // promised twelve steps: the caller waits, sees nothing, and the tool
+        // comes back after three times what was promised. The budget is spent
+        // and the subtask reports failure instead of renewing.
+        let (base, hits) = provider(vec![sse_tool_call("call_1", "step", "{}")]).await;
+        let mut agent = agent_with_tools(base, quiet_tools()).as_subtask();
+
+        let outcome = agent.run("go").await.expect("the loop finishes");
+
+        assert_eq!(
+            outcome.steps, 1,
+            "one batch, and nothing after it: the budget is the whole budget"
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            continuation_asks(agent.messages()),
+            0,
+            "no subtask is asked whether a round count this long is normal"
+        );
+        let error = outcome.error.expect("a subtask without an answer has failed");
+        assert!(error.contains("1-step budget"), "{error}");
+        assert!(
+            outcome.text.is_empty(),
+            "the stop marker is not dressed up as an answer: {:?}",
+            outcome.text
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subtask_is_not_held_open_by_the_parents_mission() {
+        // The mission record lives in the parent's workspace, and a subtask may
+        // even inherit the parent's identity with it. Holding the subtask open
+        // until that mission stops running is the runaway `delegate` must not
+        // produce: the parent would wait inside one tool call, invisibly, for
+        // as long as its own mission lasts. The parent's turn is the one that
+        // owes the mission its time; the subtask ends when it has an answer.
+        let dir = workspace_with_mission("subtask", "running");
+        let (base, hits) = provider(vec![sse_answer("all done", "stop")]).await;
+        let mut agent = agent_with_tools(base, quiet_tools())
+            .as_subtask()
+            .with_identity(crate::tools::ToolIdentity::for_session(
+                "test-session",
+                Some(dir.clone()),
+            ));
+
+        let outcome = agent.run("go").await.expect("the loop finishes");
+
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(outcome.text, "all done");
+        assert_eq!(outcome.steps, 1, "the answer ends a subtask mid-mission");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(mission_nudges(agent.messages()), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_stop_reports_the_reason_the_turn_was_given() {
+        // The string a stopped turn reports is read by whoever asked for it. For
+        // a subtask cut off at its own wall clock that reader is the parent
+        // model, and "stopped by the user" would send it looking for a user who
+        // did no such thing — so the host that arms the deadline names what
+        // happened, and the loop repeats it verbatim.
+        let (base, hits) = provider(vec![sse_answer("all done", "stop")]).await;
+        let (stop, stopped) = tokio::sync::watch::channel(true);
+        let mut agent = agent_with_tools(base, quiet_tools())
+            .as_subtask()
+            .with_cancel(stopped)
+            .with_stop_reason("the subtask's time budget ran out");
+
+        let outcome = agent.run("go").await.expect("the loop answers the stop");
+
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("the subtask's time budget ran out"),
+            "{:?}",
+            outcome.error
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "no request is made for a turn already asked to stop"
+        );
+        drop(stop);
     }
 }

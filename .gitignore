@@ -16,6 +16,8 @@ test-scratch/
 workspace/
 tmp/
 *.log
+# delegate 子代理自己的 trace（每次调用一个 jsonl，落在会话工作区里）
+.ngu-subtasks/
 
 # 编辑器 / 系统
 .vscode/

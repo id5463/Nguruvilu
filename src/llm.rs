@@ -247,10 +247,17 @@ pub fn retryable(error: &anyhow::Error) -> bool {
         if let Some(failure) = cause.downcast_ref::<RequestError>() {
             return failure.retryable;
         }
-        // A request timeout seen at the transport layer means no response
-        // arrived, so repeating the request cannot duplicate a seen answer.
+        // Every transport-level failure is worth another ask: connection
+        // refused, reset, TLS torn down, DNS blip, a body that stopped early.
+        // None of them say anything about the request's contents, and none of
+        // them mean an answer was delivered — the request never produced one.
+        // This used to retry only timeouts, so a dropped connection ended a
+        // turn (and with it a running task) on the first hiccup.
+        //
+        // A builder error is different: a malformed URL cannot start working,
+        // so it stays final.
         if let Some(transport) = cause.downcast_ref::<reqwest::Error>() {
-            return transport.is_timeout();
+            return !transport.is_builder();
         }
         false
     })
@@ -2243,6 +2250,33 @@ mod retry_tests {
         let error = anyhow::anyhow!("unexpected failure");
         assert!(!retryable(&error));
     }
+
+    #[tokio::test]
+    async fn a_dropped_connection_is_worth_another_ask() {
+        // A name that cannot resolve stands in for a gateway that went away: a
+        // transport failure that is neither a timeout nor a builder error. The
+        // old rule retried only timeouts, so this ended the turn — and with it
+        // whatever task the turn was holding.
+        let error = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(5000))
+            .build()
+            .expect("a client")
+            .get("http://drops-this-connection.invalid/never")
+            .send()
+            .await
+            .expect_err("this name cannot resolve");
+        assert!(!error.is_builder(), "not a builder error: {error}");
+        assert!(
+            !error.is_timeout(),
+            "not a timeout either — the old rule already retried those: {error}"
+        );
+        let error = anyhow::Error::new(error);
+        assert!(
+            retryable(&error),
+            "a dropped connection must be retryable: {error:#}"
+        );
+    }
+
 
     #[test]
     fn a_fatal_provider_message_ends_the_step_instead_of_retrying() {

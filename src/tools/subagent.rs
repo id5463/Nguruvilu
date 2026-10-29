@@ -18,13 +18,26 @@
 //! The conversation. That is the point — the parent's transcript stays small.
 //! The cost is that the subagent cannot ask a follow-up question, so the task
 //! it is given has to stand on its own, and the tool description says so.
+//!
+//! # What bounds it
+//!
+//! Two budgets, both stated in the tool description, because a caller sizes a
+//! task against them: [`MAX_STEPS`] model rounds — the whole budget, not one
+//! batch of it; [`Agent::as_subtask`] switches off the batch renewal a
+//! conversation enjoys — and [`WALL_BUDGET_SECS`] of wall clock, because a step
+//! counts rounds and says nothing about how long one lasts. While it runs, the
+//! subtask is silent: it appends every step, tool call and message to a file
+//! under [`TRACE_DIR`] and the result names the path, so a slow subtask is
+//! distinguishable from a wedged one and the user can watch it work.
 
+use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
-use crate::agent::{Agent, StaticConfig};
+use crate::agent::{Agent, AgentObserver, SilentObserver, StaticConfig};
 use crate::model::ModelAccess;
 use crate::tools::{ToolDef, ToolFuture, ToolOutput};
 
@@ -39,7 +52,58 @@ pub const TOOL: &str = "delegate";
 /// Bounded because a subagent's loop is invisible: one that runs away spends
 /// the user's budget on something they cannot see. The parent's own limit is
 /// higher; this is deliberately lower.
+///
+/// This is the whole budget, not one batch of it: the turn is built with
+/// [`Agent::as_subtask`], which switches off the batch renewal a conversation
+/// enjoys. A subtask promised twelve steps must not quietly spend thirty-six —
+/// that is a caller waiting half an hour for a `delegate` the description said
+/// would come back sooner, which is the shape of the bug this budget exists to
+/// prevent.
 pub const MAX_STEPS: usize = 12;
+
+/// How long one subtask may run, wall clock, before it is cut off.
+///
+/// Steps bound how many model rounds a subtask takes; they say nothing about how
+/// long one round lasts. A slow route, a gateway that hangs, a tool of its own —
+/// each is inside the step count and outside any clock the parent can see. The
+/// parent is simply waiting: its tool call has not returned, and nothing in its
+/// transcript says whether the subtask is slow or wedged.
+///
+/// So the subtask carries a wall clock of its own, and the tool description
+/// states it, because a caller sizes a task against the budget it is given.
+/// Generous on purpose — fifteen minutes is a dozen slow steps — and finite on
+/// purpose: an answer that arrives is worth more than work that never does.
+pub const WALL_BUDGET_SECS: u64 = 15 * 60;
+
+/// Where a subtask's own transcript is written, relative to the session
+/// workspace.
+///
+/// A directory of the session's own, not the system temp: the point is that the
+/// user can open it, and a path under the workspace is one they already know.
+const TRACE_DIR: &str = ".ngu-subtasks";
+
+/// How much of a tool's arguments, result, or a message body one trace line
+/// keeps.
+///
+/// The trace is read by a person and possibly by a model, and it lives in the
+/// session's workspace: a 2 MB `read` result must not become a 2 MB line in a
+/// file somebody is tailing.
+const TRACE_ARGUMENTS: usize = 400;
+const TRACE_RESULT: usize = 600;
+const TRACE_REASON: usize = 300;
+const TRACE_MESSAGE: usize = 4000;
+
+/// Distinguishes two subtasks that started in the same millisecond.
+static TRACE_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// How many transcripts to keep in [`TRACE_DIR`].
+///
+/// The directory sits in the session workspace, and a conversation that
+/// delegates a lot writes one file per call — unbounded, it becomes the largest
+/// thing in a workspace nobody meant to fill with traces. The oldest go first
+/// because the newest is the one being read; fifty is enough to look back over
+/// a working session.
+const TRACE_KEEP: usize = 50;
 
 /// Register the plugin a pack loads to bring the tool in.
 ///
@@ -82,8 +146,14 @@ fn tool(access: Arc<dyn ModelAccess>) -> ToolDef {
              side investigation out of this transcript. \
              The subtask sees the same tools and the same model you do, but not \
              what was said here — so state everything it needs, including paths \
-             and what 'done' looks like. It cannot ask you anything, and it stops \
-             after {MAX_STEPS} steps."
+             and what 'done' looks like. It cannot ask you anything. \
+             It stops after {MAX_STEPS} steps or {minutes} minutes, whichever comes \
+             first — size the task to fit, and split it rather than promising more \
+             than it can finish. It is silent while it runs: every step and tool \
+             call is appended to its own transcript under {TRACE_DIR}/ in the \
+             working directory, named in the result, so read that file to see what \
+             it is doing while it works.",
+            minutes = WALL_BUDGET_SECS / 60,
         ),
         json!({
             "type": "object",
@@ -171,9 +241,67 @@ async fn delegate(access: Arc<dyn ModelAccess>, args: Value) -> Result<ToolOutpu
         .with_policy(access.context_policy()),
     );
 
-    // An empty history, then the task as the first user message.
-    let mut agent = Agent::new(client, config, Vec::new()).with_max_steps(MAX_STEPS);
-    let outcome = agent.run(task).await?;
+    // The subtask's own framing, ahead of the task itself. It runs under the
+    // session's standing instructions, and a persona that tells its model to
+    // split work up and hand the critique to another agent would spend this
+    // subtask's budget spawning a tree of its own — each layer invisible to the
+    // user, each taking steps. One paragraph says which job this is; the task
+    // stays the caller's words, verbatim, below it.
+    let prompt = format!(
+        "You are a subagent running one self-contained subtask. Do this work \
+         yourself with the tools you have and end your turn with the answer — \
+         no further subagents, no questions back.\n\nSubtask:\n{task}"
+    );
+
+    // A transcript nobody has to wait for. While the subtask runs, the parent's
+    // transcript shows only a tool call that has not returned; this file is the
+    // witness, named in the result below, so a slow subtask is distinguishable
+    // from a wedged one and a bad answer can be diagnosed rather than guessed.
+    let trace = new_trace_path();
+    let observer: Arc<dyn AgentObserver> = match &trace {
+        Some(path) => Arc::new(Trace::new(path.clone())),
+        None => Arc::new(SilentObserver),
+    };
+
+    // The wall clock. Steps count rounds; they do not bound one round, and a
+    // parent waiting on this call cannot tell "slow" from "never returning".
+    // The budget is stated in the tool description, so the caller knows what it
+    // is buying; the stop reason below is what the parent model reads when it
+    // fires, which is why it says what happened rather than blaming a user who
+    // did no such thing.
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let deadline = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(WALL_BUDGET_SECS)).await;
+        let _ = stop.send(true);
+    });
+
+    // An empty history, then the task as the first user message. The turn is a
+    // subtask: an exact step budget — no batch renewal — and no hold from the
+    // parent's mission, because the parent's turn is the one that owes the
+    // mission its time.
+    let mut agent = Agent::new(client, config, Vec::new())
+        .with_max_steps(MAX_STEPS)
+        .as_subtask()
+        .with_observer(observer)
+        .with_cancel(stopped)
+        .with_stop_reason(format!(
+            "the subtask's {WALL_BUDGET_SECS}-second wall-clock budget ran out before \
+             it finished; a narrower task, or one that needs less reading, would fit"
+        ));
+    let outcome = agent.run(&prompt).await;
+    // The budget no longer matters once the subtask is over; a sleeping timer
+    // that outlived it would be work nobody cancels.
+    deadline.abort();
+    let outcome = outcome?;
+
+    let trace_note = match &trace {
+        Some(path) => format!(
+            "\n\nIts own transcript — every step, tool call and message, in order — \
+             is at {}.",
+            path.display()
+        ),
+        None => String::new(),
+    };
 
     // A failed subtask reports the failure as the tool result, carrying any
     // partial answer with it: the parent model reads what went wrong instead
@@ -184,12 +312,20 @@ async fn delegate(access: Arc<dyn ModelAccess>, args: Value) -> Result<ToolOutpu
             message.push_str("\n\nPartial answer before the failure:\n");
             message.push_str(&outcome.text);
         }
+        message.push_str(&trace_note);
         return Err(anyhow!(message));
     }
 
     let mut text = format!(
-        "The subtask finished after {} step(s) and {} tool call(s).\n\n{}",
-        outcome.steps, outcome.tool_calls, outcome.text
+        "The subtask finished after {} step(s), {} tool call(s) and {} retry(ies) \
+         (model {} ms, tools {} ms).{}\n\n{}",
+        outcome.steps,
+        outcome.tool_calls,
+        outcome.retries,
+        outcome.timing.model_ms,
+        outcome.timing.tools_ms,
+        trace_note,
+        outcome.text
     );
     // A subtask that produced nothing is worth saying out loud: an empty answer
     // reads as "it found nothing", which is a different claim from "it ran out
@@ -201,6 +337,155 @@ async fn delegate(access: Arc<dyn ModelAccess>, args: Value) -> Result<ToolOutpu
         );
     }
     Ok(ToolOutput::text(text))
+}
+
+/// A fresh file for one subtask's transcript, or `None` when there is no
+/// workspace to put it in.
+///
+/// The path resolves from the identity the *call* runs under, so it lands in
+/// the session the parent conversation belongs to — the place its user already
+/// knows how to open.
+fn new_trace_path() -> Option<std::path::PathBuf> {
+    let workspace = crate::tools::current_workspace()?;
+    let dir = workspace.join(TRACE_DIR);
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        // A subtask must not fail because its transcript cannot be written:
+        // the answer is the product, the transcript is the evidence.
+        eprintln!("[subagent] no trace directory {}: {error}", dir.display());
+        return None;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or(0);
+    let seq = TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
+    prune_traces(&dir, TRACE_KEEP);
+    Some(dir.join(format!("{stamp}-{seq}.jsonl")))
+}
+
+/// Keep the newest `keep` transcripts in `dir`, removing the rest.
+///
+/// Names are `<millis>-<seq>.jsonl`, so ordering by name is ordering by time and
+/// no metadata has to be read per file. A removal that fails is ignored: a stale
+/// trace is a smaller problem than a subtask that cannot start.
+fn prune_traces(dir: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".jsonl"))
+        .collect();
+    if names.len() <= keep {
+        return;
+    }
+    // Oldest first, so `take(excess)` removes exactly the files that pushed the
+    // directory over the bound.
+    names.sort();
+    let excess = names.len() - keep;
+    for name in names.into_iter().take(excess) {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+}
+
+/// Writes the subtask's own transcript, one JSONL line per event.
+///
+/// A subtask is silent while it runs — nothing it says enters the parent's
+/// transcript until it answers — so a parent waiting on `delegate` sees a tool
+/// call that has not come back and has no way to tell a slow subtask from a
+/// wedged one. This file is that witness: every step, tool call, retry and
+/// message appends a line, and the tool result names the path, so the user or
+/// the parent model can read what the subtask is doing *while* it works.
+///
+/// Failures are reported and swallowed. A trace is evidence, not a product: an
+/// unwritable file must not fail the subtask it was watching.
+struct Trace {
+    path: std::path::PathBuf,
+}
+
+impl Trace {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Append one record.
+    fn line(&self, kind: &str, payload: Value) {
+        let record = json!({
+            "ts": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_millis())
+                .unwrap_or(0),
+            "kind": kind,
+            "payload": payload,
+        });
+        let Ok(mut line) = serde_json::to_string(&record) else {
+            return;
+        };
+        line.push('\n');
+        let written = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .and_then(|mut file| file.write_all(line.as_bytes()));
+        if let Err(error) = written {
+            eprintln!("[subagent] trace {}: {error}", self.path.display());
+        }
+    }
+}
+
+impl AgentObserver for Trace {
+    fn on_step(&self, step: usize) {
+        self.line("step", json!({ "step": step }));
+    }
+
+    fn on_tool_start(&self, name: &str, arguments: &str) {
+        self.line(
+            "tool.start",
+            json!({
+                "tool": name,
+                "arguments": crate::events::truncate(arguments, TRACE_ARGUMENTS),
+            }),
+        );
+    }
+
+    fn on_tool_end(&self, name: &str, ok: bool, result: &str) {
+        self.line(
+            "tool.end",
+            json!({
+                "tool": name,
+                "ok": ok,
+                "result": crate::events::truncate(result, TRACE_RESULT),
+            }),
+        );
+    }
+
+    fn on_step_retry(&self, attempt: usize, reason: &str) {
+        self.line(
+            "retry",
+            json!({
+                "attempt": attempt,
+                "reason": crate::events::truncate(reason, TRACE_REASON),
+            }),
+        );
+    }
+
+    fn on_message(&self, message: &crate::message::Message) {
+        // The heart of it: the subtask's own transcript, in order, including
+        // the final answer the parent is about to receive.
+        self.line(
+            "message",
+            json!({
+                "role": message.role.as_wire(),
+                "tool_calls": message
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.name.as_str())
+                    .collect::<Vec<_>>(),
+                "text": crate::events::truncate(message.text(), TRACE_MESSAGE),
+            }),
+        );
+    }
 }
 
 /// How deep delegation may nest.
@@ -474,5 +759,110 @@ mod tests {
             0,
             "a failed delegation left a count behind"
         );
+    }
+
+    #[test]
+    fn the_description_states_both_budgets_and_where_the_trace_goes() {
+        // A caller sizes its task against what it is told it is buying: how many
+        // steps, and how long. A budget discovered by waiting — the bundle of
+        // twenty minutes nobody warned about — is the bug this description
+        // exists to prevent, and a silent wait must be announced as silent so
+        // that it is not read as a hang.
+        let description = schema_of(&loaded_kernel())["function"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            description.contains(&MAX_STEPS.to_string()),
+            "{description}"
+        );
+        assert!(
+            description.contains(&format!("{} minutes", WALL_BUDGET_SECS / 60)),
+            "{description}"
+        );
+        assert!(description.contains(TRACE_DIR), "{description}");
+        assert!(description.contains("silent"), "{description}");
+    }
+
+    #[tokio::test]
+    async fn the_trace_records_what_the_subtask_did() {
+        // A subtask's answer is one message; what it did on the way is a file.
+        // That file is the only thing a user can read while `delegate` is still
+        // waiting, and the only way to diagnose an answer that came back thin.
+        let dir = std::env::temp_dir().join(format!(
+            "ngu-subagent-trace-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("trace.jsonl");
+
+        let trace = Trace::new(path.clone());
+        trace.on_step(1);
+        trace.on_tool_start("read", r#"{"path":"notes.md"}"#);
+        trace.on_tool_end("read", true, &"x".repeat(TRACE_RESULT * 2));
+        trace.on_step_retry(2, "the provider returned an empty response");
+        trace.on_message(&crate::message::Message::user("write the critique"));
+
+        let text = std::fs::read_to_string(&path).expect("the trace was written");
+        let records: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("every line is JSON"))
+            .collect();
+        assert_eq!(records.len(), 5, "{text}");
+
+        assert_eq!(records[0]["kind"], "step");
+        assert_eq!(records[0]["payload"]["step"], 1);
+        assert_eq!(records[1]["kind"], "tool.start");
+        assert_eq!(records[1]["payload"]["tool"], "read");
+        assert_eq!(records[2]["kind"], "tool.end");
+        assert_eq!(records[2]["payload"]["ok"], true);
+        assert!(
+            records[2]["payload"]["result"].as_str().unwrap().len() < TRACE_RESULT * 2,
+            "a huge tool result is cut, not copied whole into the trace"
+        );
+        assert_eq!(records[3]["kind"], "retry");
+        assert_eq!(records[4]["kind"], "message");
+        assert_eq!(records[4]["payload"]["role"], "user");
+        assert_eq!(records[4]["payload"]["text"], "write the critique");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_transcripts_are_pruned_and_newer_ones_kept() {
+        // The trace directory lives in the user's workspace: a session that
+        // delegates a lot writes one file per call, and nothing else would ever
+        // clean it up. Pruning by name is pruning by time, because the stamp
+        // leads the name and is fixed width.
+        let dir = std::env::temp_dir().join(format!(
+            "ngu-subagent-prune-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        for n in 0..(TRACE_KEEP + 5) {
+            std::fs::write(dir.join(format!("{n:013}-0.jsonl")), "{}").expect("a trace");
+        }
+        // Not a trace: never the pruner's business.
+        std::fs::write(dir.join("notes.txt"), "keep me").expect("a bystander");
+
+        prune_traces(&dir, TRACE_KEEP);
+
+        let mut kept: Vec<String> = std::fs::read_dir(&dir)
+            .expect("the directory reads")
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect();
+        kept.sort();
+        assert_eq!(kept.len(), TRACE_KEEP + 1, "{kept:?}");
+        assert!(kept.contains(&"notes.txt".to_string()), "{kept:?}");
+        assert!(
+            !kept.contains(&format!("{:013}-0.jsonl", 0)),
+            "the oldest went first: {kept:?}"
+        );
+        assert!(
+            kept.contains(&format!("{:013}-0.jsonl", TRACE_KEEP + 4)),
+            "the newest survived: {kept:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
