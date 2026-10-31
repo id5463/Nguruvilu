@@ -287,6 +287,12 @@
     display: block; font-size: 10px; text-transform: uppercase;
     letter-spacing: .08em; color: var(--bad); margin-bottom: 5px;
   }
+  /* The seam left by folding the oldest messages out of the live view. */
+  .folded {
+    text-align: center; font-size: 11px; color: var(--dim);
+    border-top: 1px dashed var(--line); border-bottom: 1px dashed var(--line);
+    padding: 8px 0; margin-bottom: 16px;
+  }
   /* Reasoning is the model thinking aloud. Shown collapsed by default
      because it is often longer than the answer, and toggleable because
      sometimes it is the most informative part. */
@@ -1421,8 +1427,8 @@ function renderEntry(entry) {
     // A stored tool result is shown inline; the details panel keeps the latest.
     // The mission marker It carries is bookkeeping for the panel, not text: the
     // stored message keeps it (the panel parses it there), the screen does not.
-    stream.append(el("div", "tool-result", visibleToolText(entry.text)));
-    logInfo.replaceChildren(el("div", "tool-result", visibleToolText(entry.text)));
+    stream.append(el("div", "tool-result", clipForDisplay(visibleToolText(entry.text))));
+    logInfo.replaceChildren(el("div", "tool-result", clipForDisplay(visibleToolText(entry.text))));
     return;
   }
 
@@ -1430,13 +1436,13 @@ function renderEntry(entry) {
   turn.append(el("div", "who", entry.role === "user" ? "you" : "kernel"));
 
   for (const call of entry.tool_calls || []) {
-    turn.append(el("div", "tool-call", "→ " + call.name + " " + call.arguments));
+    turn.append(el("div", "tool-call", "→ " + call.name + " " + clipForDisplay(call.arguments)));
   }
   if (entry.text) {
     const body = el("div", "body");
     // The assistant writes Markdown; the user's own words stay verbatim.
-    if (entry.role === "assistant") body.innerHTML = renderMarkdown(entry.text);
-    else body.textContent = entry.text;
+    if (entry.role === "assistant") body.innerHTML = renderMarkdown(clipForDisplay(entry.text));
+    else body.textContent = clipForDisplay(entry.text);
     turn.append(body);
   }
   for (const image of entry.images || []) appendImage(turn, image);
@@ -1953,9 +1959,46 @@ function visibleToolText(text) {
   return String(text == null ? "" : text).replace(/<!--mission-state[\s\S]*?-->/g, "").trimEnd();
 }
 
+/// How much of one entry the page paints.
+///
+/// A tool result can be megabytes (a log dump, a page's HTML). The stored
+/// message keeps every byte — that is what the session file is for — but a
+/// renderer that lays out megabytes goes unresponsive, and one such entry was
+/// enough to make a long session feel broken. The cap is generous for reading
+/// and small enough to stay smooth.
+const DISPLAY_TEXT_CAP = 20000;
+
+function clipForDisplay(text) {
+  const whole = String(text == null ? "" : text);
+  if (whole.length <= DISPLAY_TEXT_CAP) return whole;
+  return whole.slice(0, DISPLAY_TEXT_CAP) + "\n… 已截断显示（完整内容在会话记录里）";
+}
+
+/// How many message nodes the live view keeps before folding the oldest away.
+///
+/// The transcript arrives 40 entries at a time, but a *running* turn appends to
+/// the same list, so a tab left open for a day of streaming ends up holding
+/// thousands of nodes and every repaint pays for all of them. Folding the oldest
+/// keeps the page responsive; they are not lost — scrolling up asks the shell
+/// for them again, exactly as it does for history that was never drawn.
+const STREAM_MAX_NODES = 600;
+const STREAM_KEEP_NODES = 500;
+
+function trimStream() {
+  if (!stream || stream.children.length <= STREAM_MAX_NODES) return;
+  const drop = stream.children.length - STREAM_KEEP_NODES;
+  for (let i = 0; i < drop; i += 1) {
+    if (stream.firstChild) stream.firstChild.remove();
+  }
+  const folded = el("div", "folded", "…… 已折叠更早的内容（向上滚动可加载更早历史）");
+  const existing = stream.querySelector(".folded");
+  if (existing) existing.replaceWith(folded);
+  else stream.prepend(folded);
+}
+
 function appendToolResult(ok, text) {
   flushPendingText();
-  const shown = visibleToolText(text);
+  const shown = clipForDisplay(visibleToolText(text));
   const box = el("div", "tool-result" + (ok ? "" : " bad"), shown);
   if (live) {
     const seg = currentSegment();
@@ -1966,6 +2009,7 @@ function appendToolResult(ok, text) {
     stream.append(box);
   }
   logInfo.replaceChildren(el("div", "tool-result" + (ok ? "" : " bad"), shown));
+  trimStream();
   scrollToEnd();
 }
 
@@ -1976,6 +2020,9 @@ function endAssistantTurn() {
     caret.remove();
     live = null;
   }
+  // A turn boundary is the cheapest place to bound the live view: the nodes a
+  // whole conversation produced are all in the stream by now.
+  trimStream();
 }
 
 function appendUserTurn(text) {

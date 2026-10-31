@@ -283,17 +283,24 @@ pub fn summary_request(history: &[Message]) -> Vec<Message> {
     }
 
     vec![Message::user(format!(
-        "Summarize the conversation below so it can continue without the original messages.\n\
+        "Summarize the conversation below so work can continue without the original messages.\n\
          \n\
-         Preserve, in this order:\n\
-         1. What the user asked for, including any constraints or preferences they stated.\n\
-         2. What was already done — files created or changed, commands run, and their outcomes.\n\
-         3. Facts discovered that would be expensive to rediscover (paths, versions, error causes).\n\
-         4. What remains to be done.\n\
+         Write it as six fixed sections, in this order, with these headings:\n\
+         1. 「目标」— what the user asked for, with every constraint and preference they \
+         stated, quoted where the wording matters.\n\
+         2. 「已完成」— what was actually done: files created or changed (exact paths), \
+         commands run and their outcomes, accounts/URLs/credentials that were created or used.\n\
+         3. 「关键事实」— anything expensive to rediscover: paths, versions, error causes, \
+         endpoints, prices, IDs. Copy them verbatim; never paraphrase a path, a command or a \
+         number.\n\
+         4. 「未完成」— what remains, each item with its concrete next action.\n\
+         5. 「坑」— mistakes and dead ends already tried, so they are not repeated.\n\
+         6. 「下一步」— the single next action to take when work resumes.\n\
          \n\
-         Be specific and concrete. Keep file paths, identifiers, and numbers exactly as they \
-         appear. Do not add commentary about the summarization itself. Write prose, not a \
-         list of pleasantries.\n\
+         Rules: specific beats general; file paths, commands, identifiers, URLs and numbers \
+         travel verbatim; when a fact was stated more than once, keep the latest version; do \
+         not describe the summarization itself, do not add pleasantries, do not invent \
+         anything the transcript does not contain.\n\
          \n\
          Conversation:\n\
          {transcript}"
@@ -641,7 +648,11 @@ mod tests {
         assert!(text.contains("change the port to 8080"), "user request kept");
         assert!(text.contains("edit"), "tool call kept");
         assert!(text.contains("Summarize the conversation below"));
-        assert!(text.contains("What remains to be done"));
+        // The instructions are a fixed structure now: the remaining work and the
+        // single next action have sections of their own, so a resumed conversation
+        // knows what to do instead of reading prose for it.
+        assert!(text.contains("「未完成」"), "{text}");
+        assert!(text.contains("「下一步」"), "{text}");
     }
 
     #[test]
