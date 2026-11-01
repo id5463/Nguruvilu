@@ -816,6 +816,25 @@ pub(crate) async fn dispatch(
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize)
                 .unwrap_or(8);
+            // Tool-output thinning: four dials and a switch. Absent keeps
+            // whatever the file says, so an older page cannot erase them.
+            let tool_prune_enabled = command.get("tool_output_enabled").and_then(|v| v.as_bool());
+            let tool_prune_head = command
+                .get("tool_head_chars")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            let tool_prune_tail = command
+                .get("tool_tail_chars")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            let tool_prune_keep = command
+                .get("tool_keep_recent")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            let tool_keep_images = command
+                .get("tool_keep_images")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
             // The step cap and the tool deadline are panel fields too now:
             // absent (or zero) means "keep what the file or the CLI chose".
             let max_steps = command
@@ -902,6 +921,11 @@ pub(crate) async fn dispatch(
                     max_steps,
                     tool_timeout_secs,
                     max_output,
+                    tool_prune_enabled,
+                    tool_prune_head,
+                    tool_prune_tail,
+                    tool_prune_keep,
+                    tool_keep_images,
                     search_provider,
                     search_api_key,
                     search_endpoint,

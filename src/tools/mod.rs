@@ -22,6 +22,7 @@ pub mod jobs;
 pub mod longhorizon;
 pub mod pack;pub mod readers;
 pub mod search;
+pub mod spill;
 pub mod subagent;
 
 /// What a tool produced.
@@ -561,7 +562,30 @@ impl ToolRegistry {
                 }),
             ),
         }
-        result
+        // Every result worth keeping is spilled before it enters the history, so
+        // the pointer is in the transcript from the start: pruning may thin this
+        // text out later, and the way back has to already be there.
+        match result {
+            Ok(mut output) => {
+                if let Some(path) = spill::store(identity.session.as_deref(), name, &output.text) {
+                    output.text.push_str(&spill::marker_line(&path));
+                }
+                // Inline images are the heavier leak: a screenshot costs
+                // hundreds of kilobytes on every later step. Spilling the bytes
+                // now is what makes dropping one from a request reversible.
+                for image in output.images.iter_mut() {
+                    if image.stored.is_none() {
+                        if let Some(path) =
+                            spill::store_image(identity.session.as_deref(), name, &image.url)
+                        {
+                            image.stored = Some(path.display().to_string());
+                        }
+                    }
+                }
+                Ok(output)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Execute a tool by name with raw JSON arguments under the registry's
@@ -647,5 +671,111 @@ mod freeze_tests {
             frozen.get("late_probe").is_none(),
             "the turn's table is fixed"
         );
+    }
+
+    /// The funnel, not the helper: everything that later makes thinning reversible
+    /// has to be attached where every tool result passes, before it enters a
+    /// conversation.
+    #[tokio::test]
+    async fn a_large_result_leaves_the_funnel_with_a_pointer_to_its_full_text() {
+        let mut registry = ToolRegistry::with_base_tools().unwrap();
+        let body = "y".repeat(5_000);
+        let expected = body.clone();
+        registry.register(
+            ToolDef::new(
+                "big_text",
+                "a tool that answers at length",
+                json!({ "type": "object", "properties": {} }),
+                "test",
+                move |_| {
+                    let body = expected.clone();
+                    Box::pin(async move { Ok(ToolOutput::text(body)) }) as ToolFuture
+                },
+            ),
+            ConflictPolicy::Error,
+        )
+        .unwrap();
+
+        let session = format!("funnel-{}", std::process::id());
+        let output = registry
+            .execute_as(
+                ToolIdentity::for_session(&session, Some(PathBuf::from("."))),
+                "big_text",
+                "{}",
+            )
+            .await
+            .expect("the tool runs");
+
+        let pointer = spill::marker_of(&output.text)
+            .unwrap_or_else(|| panic!("the funnel left no pointer: {}", output.text));
+        let path = pointer
+            .trim()
+            .strip_prefix("[full output: ")
+            .and_then(|rest| rest.strip_suffix(']'))
+            .expect("the pointer names a path");
+        assert_eq!(
+            std::fs::read_to_string(path).expect("the spilled file reads back"),
+            body,
+            "the file holds what the model no longer has to re-read"
+        );
+        // The text the model sees is the original plus one line — never a loss.
+        assert!(output.text.starts_with(&body), "the head stays intact");
+
+        let _ = std::fs::remove_dir_all(spill::root_dir().join(&session));
+    }
+
+    /// A screenshot is the heavier leak, so its bytes leave the funnel on disk too.
+    #[tokio::test]
+    async fn an_inline_image_leaves_the_funnel_with_a_stored_copy() {
+        use base64::{engine::general_purpose, Engine as _};
+        let mut registry = ToolRegistry::with_base_tools().unwrap();
+        // A 1x1 PNG.
+        let png: Vec<u8> = vec![
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+            0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+            0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00,
+            0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
+            0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        let uri = format!("data:image/png;base64,{}", general_purpose::STANDARD.encode(&png));
+        let for_tool = uri.clone();
+        registry.register(
+            ToolDef::new(
+                "big_image",
+                "a tool that answers with a screenshot",
+                json!({ "type": "object", "properties": {} }),
+                "test",
+                move |_| {
+                    let uri = for_tool.clone();
+                    Box::pin(async move {
+                        Ok(ToolOutput::text("captured").with_image(crate::message::ImageAttachment::url(uri)))
+                    })
+                        as ToolFuture
+                },
+            ),
+            ConflictPolicy::Error,
+        )
+        .unwrap();
+
+        let session = format!("funnel-img-{}", std::process::id());
+        let output = registry
+            .execute_as(
+                ToolIdentity::for_session(&session, Some(PathBuf::from("."))),
+                "big_image",
+                "{}",
+            )
+            .await
+            .expect("the tool runs");
+
+        assert_eq!(output.images.len(), 1);
+        let image = &output.images[0];
+        assert_eq!(image.url, uri, "the model still sees the bytes it needs now");
+        let stored = image
+            .stored
+            .as_ref()
+            .unwrap_or_else(|| panic!("the funnel kept no copy: {:?}", image.stored));
+        assert_eq!(std::fs::read(stored).expect("the copy reads back"), png);
+
+        let _ = std::fs::remove_dir_all(spill::root_dir().join(&session));
     }
 }

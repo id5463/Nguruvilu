@@ -294,6 +294,17 @@ pub trait ContextPolicy: Send + Sync {
 
     /// How many recent messages to keep verbatim when compacting.
     fn keep_recent(&self) -> usize;
+
+    /// How much of an old tool result stays in the request.
+    ///
+    /// Separate from compaction on purpose: compaction rewrites the front of a
+    /// conversation once it passes a share of the window, while pruning thins
+    /// the middle on every request and consults no window at all. A session can
+    /// sit far below its compaction threshold and still spend a large prompt on
+    /// history it has finished with.
+    fn prune(&self) -> crate::compaction::PrunePolicy {
+        crate::compaction::PrunePolicy::default()
+    }
 }
 
 /// The kernel's default policy: configured window, or provider, or table, or floor.
@@ -313,6 +324,8 @@ pub struct DefaultContextPolicy {
     /// measured against the whole window leaves the output ceiling unaccounted
     /// for: a 32k prompt budget on a 32k window admits no answer at all.
     pub reserve: usize,
+    /// How much of an old tool result survives into the next request.
+    pub prune: crate::compaction::PrunePolicy,
 }
 
 impl Default for DefaultContextPolicy {
@@ -323,6 +336,7 @@ impl Default for DefaultContextPolicy {
             keep_recent: 8,
             provider_window: None,
             reserve: 0,
+            prune: crate::compaction::PrunePolicy::default(),
         }
     }
 }
@@ -382,6 +396,10 @@ impl ContextPolicy for DefaultContextPolicy {
 
     fn keep_recent(&self) -> usize {
         self.keep_recent
+    }
+
+    fn prune(&self) -> crate::compaction::PrunePolicy {
+        self.prune
     }
 }
 

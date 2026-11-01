@@ -454,6 +454,468 @@ pub fn replay(messages: Vec<Message>, compactions: &[Compaction]) -> Vec<Message
     history
 }
 
+/// How much of an old tool result stays in the request.
+///
+/// This is the second lever on context size, and the one that matters in long
+/// sessions. Compaction (above) rewrites the *front* of a conversation once it
+/// passes a fraction of the window; pruning rewrites the *middle* continuously
+/// and depends on no window at all.
+///
+/// The measured case it exists for: 2,749 steps, ~36万 tokens per step, and
+/// 3,245 tool results whose combined size was almost exactly that per-step
+/// figure. Nothing was wrong with the window — the history was simply never
+/// thinned, so every step re-read every old `bash` echo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrunePolicy {
+    /// Whether pruning runs at all.
+    pub enabled: bool,
+    /// Characters of the head of an old result that stay.
+    pub head_chars: usize,
+    /// Characters of the tail of an old result that stay.
+    pub tail_chars: usize,
+    /// How many of the newest tool results stay untouched.
+    pub keep_recent: usize,
+    /// How many of the newest inline images stay in the request.
+    ///
+    /// The heavier dial by far: one screenshot is hundreds of kilobytes of
+    /// base64, and it travels on *every* later step. The session this exists for
+    /// carried 62.9 MB of inline images against 2.0 MB of tool text.
+    pub keep_images: usize,
+}
+
+impl Default for PrunePolicy {
+    /// The "standard" preset: the newest eight results are exact, older ones
+    /// keep a readable head and tail, and every one of them keeps its pointer to
+    /// the spilled full output. Two of the newest images stay.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            head_chars: 4_000,
+            tail_chars: 1_000,
+            keep_recent: 8,
+            keep_images: 2,
+        }
+    }
+}
+
+impl PrunePolicy {
+    /// The "loose" preset: exactly what this kernel did before pruning existed.
+    pub fn loose() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
+    }
+
+    /// The "minimal" preset: small windows on old results.
+    pub fn minimal() -> Self {
+        Self {
+            enabled: true,
+            head_chars: 1_000,
+            tail_chars: 256,
+            keep_recent: 4,
+            keep_images: 1,
+        }
+    }
+
+    /// The "pointer only" preset: an old result becomes one line naming its file.
+    pub fn pointer_only() -> Self {
+        Self {
+            enabled: true,
+            head_chars: 0,
+            tail_chars: 0,
+            keep_recent: 1,
+            keep_images: 0,
+        }
+    }
+
+    /// Whether this policy would change anything at all.
+    pub fn is_noop(&self) -> bool {
+        !self.enabled
+    }
+}
+
+/// Thin out old tool results, leaving everything else alone.
+///
+/// The newest [`PrunePolicy::keep_recent`] tool results are returned untouched —
+/// they are the ones the model is working with. Older ones keep a head, a tail,
+/// and the `[full output: …]` pointer that `crate::tools::spill` put there, so
+/// thinning never removes the way back to the text.
+///
+/// Nothing is mutated and nothing is stored: the caller gets a view for one
+/// request. The session file keeps every original, which is what makes the knob
+/// safe to turn back up, and what keeps an audit honest.
+pub fn prune_tool_results(messages: &[Message], policy: &PrunePolicy) -> Vec<Message> {
+    if policy.is_noop() {
+        return messages.to_vec();
+    }
+    let tool_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role == crate::message::Role::Tool)
+        .map(|(index, _)| index)
+        .collect();
+    if tool_indices.len() <= policy.keep_recent {
+        return messages.to_vec();
+    }
+    let mut pruned = messages.to_vec();
+    for index in tool_indices
+        .iter()
+        .take(tool_indices.len() - policy.keep_recent)
+    {
+        let content = pruned[*index].content.clone().unwrap_or_default();
+        pruned[*index].content = Some(shrink(&content, policy));
+    }
+    pruned
+}
+
+/// Drop old inline images from the request, keeping the newest few.
+///
+/// A `data:` URI is the bytes themselves, base64-encoded, in every request that
+/// follows. Screenshots are also the least reproducible thing in a session — the
+/// page has usually moved on — so the rule here is: keep the newest
+/// [`PrunePolicy::keep_images`], and replace each older one with a note naming
+/// the file where its bytes were spilled.
+///
+/// Two things are never touched: a remote `https://` URL (it costs a few
+/// characters, not a payload), and an image whose bytes were never spilled —
+/// dropping those would be irreversible, so they stay.
+pub fn prune_images(messages: &[Message], policy: &PrunePolicy) -> Vec<Message> {
+    if policy.is_noop() {
+        return messages.to_vec();
+    }
+    if messages.iter().all(|message| message.images.is_empty()) {
+        return messages.to_vec();
+    }
+    let mut budget = policy.keep_images;
+    let mut replacements: Vec<Option<(Vec<crate::message::ImageAttachment>, Vec<String>)>> =
+        vec![None; messages.len()];
+    // Newest first, so the budget is spent on what the model is looking at now.
+    for index in (0..messages.len()).rev() {
+        let message = &messages[index];
+        if message.images.is_empty() {
+            continue;
+        }
+        let mut kept = Vec::with_capacity(message.images.len());
+        let mut dropped = Vec::new();
+        for image in message.images.iter().rev() {
+            let droppable = image.url.starts_with("data:") && image.stored.is_some();
+            if !droppable || budget > 0 {
+                if droppable {
+                    budget -= 1;
+                }
+                kept.push(image.clone());
+            } else {
+                dropped.push(image.stored.clone().unwrap_or_default());
+            }
+        }
+        kept.reverse();
+        if !dropped.is_empty() {
+            replacements[index] = Some((kept, dropped));
+        }
+    }
+    let mut pruned = messages.to_vec();
+    for (index, replacement) in replacements.into_iter().enumerate() {
+        let Some((kept, dropped)) = replacement else {
+            continue;
+        };
+        let note = format!(
+            "[已省略 {} 张旧图片（{}）— 需要时用 read 打开这些文件]",
+            dropped.len(),
+            dropped.join(", ")
+        );
+        pruned[index].images = kept;
+        pruned[index].content = Some(match pruned[index].content.as_deref() {
+            Some(text) if !text.is_empty() => format!("{text}\n{note}"),
+            _ => note,
+        });
+    }
+    pruned
+}
+
+/// One old tool result, reduced to what still earns its place.
+///
+/// Returns the text unchanged when thinning would not actually save anything:
+/// a note and a pointer can be longer than the result they replace, and a
+/// "thinned" message that grows is worse than no thinning at all.
+fn shrink(text: &str, policy: &PrunePolicy) -> String {
+    let pointer = crate::tools::spill::marker_of(text).unwrap_or("");
+    let bytes = text.len();
+    let with_pointer = |body: String| {
+        if pointer.is_empty() {
+            body
+        } else {
+            format!("{body}\n{pointer}")
+        }
+    };
+    if policy.head_chars == 0 && policy.tail_chars == 0 {
+        let first = text
+            .lines()
+            .find(|line| {
+                !line.trim().is_empty() && !line.trim_start().starts_with(crate::tools::spill::MARKER)
+            })
+            .map(str::trim)
+            .unwrap_or("");
+        let first: String = first.chars().take(160).collect();
+        let thinned = with_pointer(format!("[old tool output thinned: {bytes} chars · {first}]"));
+        return if thinned.len() < text.len() { thinned } else { text.to_string() };
+    }
+    // The pointer is stripped before measuring so it cannot be counted twice,
+    // and put back verbatim because it may be longer than the tail it would
+    // otherwise have to survive inside.
+    let body = match crate::tools::spill::marker_of(text) {
+        Some(pointer) => text.replace(pointer, ""),
+        None => text.to_string(),
+    };
+    let trimmed = body.trim_end();
+    let chars: Vec<char> = trimmed.chars().collect();
+    // Enough margin that the note and the pointer never make the result longer.
+    if chars.len() <= policy.head_chars + policy.tail_chars + 200 {
+        return with_pointer(trimmed.to_string());
+    }
+    let head: String = chars.iter().take(policy.head_chars).collect();
+    let tail: String = chars
+        .iter()
+        .skip(chars.len().saturating_sub(policy.tail_chars))
+        .collect();
+    let omitted = chars.len() - policy.head_chars - policy.tail_chars;
+    let thinned = with_pointer(format!("{head}\n… {omitted} chars thinned …\n{tail}"));
+    if thinned.len() < text.len() {
+        thinned
+    } else {
+        text.to_string()
+    }
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+    use crate::message::{Message, Role};
+
+    fn tool(text: &str) -> Message {
+        Message::tool_result("call-1", "bash", text)
+    }
+
+    fn user(text: &str) -> Message {
+        Message::user(text)
+    }
+
+    #[test]
+    fn the_newest_results_are_never_touched() {
+        let messages: Vec<Message> = (0..12)
+            .map(|index| tool(&format!("result {index} {}", "x".repeat(50_000))))
+            .collect();
+        let policy = PrunePolicy::default();
+        let pruned = prune_tool_results(&messages, &policy);
+        assert_eq!(pruned.len(), messages.len(), "nothing is added or removed");
+        for index in 4..12 {
+            assert_eq!(
+                pruned[index].content, messages[index].content,
+                "result {index} is among the newest {} and must be exact",
+                policy.keep_recent
+            );
+        }
+        assert!(
+            pruned[0].content.as_deref().unwrap().len() < messages[0].content.as_deref().unwrap().len(),
+            "the oldest result is thinned"
+        );
+        assert!(
+            pruned[0].content.as_deref().unwrap().contains("chars thinned"),
+            "the cut says so"
+        );
+    }
+
+    #[test]
+    fn non_tool_messages_are_never_changed() {
+        let mut messages = vec![user(&"y".repeat(9000))];
+        for index in 0..10 {
+            messages.push(tool(&format!("r{index} {}", "z".repeat(20_000))));
+        }
+        let pruned = prune_tool_results(&messages, &PrunePolicy::default());
+        assert_eq!(pruned[0].content, messages[0].content, "the question stays whole");
+        assert!(pruned[1].content.as_deref().unwrap().contains("chars thinned"));
+    }
+
+    #[test]
+    fn the_pointer_to_the_full_output_survives() {
+        let pointer = "[full output: /tmp/ngu/tool-output/s/bash-1.txt]";
+        let body = format!("line one\n{}\n{}", "m".repeat(6000), pointer);
+        let mut messages: Vec<Message> = (0..10).map(|index| tool(&format!("filler {index}"))).collect();
+        messages[0] = tool(&body);
+        let pruned = prune_tool_results(&messages, &PrunePolicy::default());
+        let thinned = pruned[0].content.as_deref().unwrap();
+        assert!(thinned.contains(pointer), "the way back is kept: {thinned}");
+    }
+
+    #[test]
+    fn a_pointer_only_result_becomes_one_line() {
+        let pointer = "[full output: /tmp/x.txt]";
+        let body = format!("{}\n{pointer}", "q".repeat(5000));
+        let mut messages: Vec<Message> = (0..10).map(|index| tool(&format!("filler {index}"))).collect();
+        messages[0] = tool(&body);
+        let pruned = prune_tool_results(&messages, &PrunePolicy::pointer_only());
+        let thinned = pruned[0].content.as_deref().unwrap();
+        assert!(thinned.starts_with("[old tool output thinned:"), "{thinned}");
+        assert!(thinned.contains(pointer), "{thinned}");
+        assert!(thinned.len() < 400, "one line, not a document: {}", thinned.len());
+    }
+
+    #[test]
+    fn a_loose_policy_changes_nothing() {
+        let messages: Vec<Message> = (0..20).map(|index| tool(&format!("r{index}"))).collect();
+        let pruned = prune_tool_results(&messages, &PrunePolicy::loose());
+        assert_eq!(pruned.len(), messages.len());
+        for (before, after) in messages.iter().zip(pruned.iter()) {
+            assert_eq!(before.content, after.content);
+        }
+    }
+
+    #[test]
+    fn a_short_history_is_left_alone() {
+        let messages: Vec<Message> = (0..3).map(|index| tool(&format!("r{index}"))).collect();
+        let pruned = prune_tool_results(&messages, &PrunePolicy::default());
+        assert_eq!(pruned[0].content, messages[0].content);
+    }
+
+    #[test]
+    fn a_result_shorter_than_the_windows_is_kept_whole() {
+        let mut messages: Vec<Message> = (0..10).map(|index| tool(&format!("r{index}"))).collect();
+        messages[0] = tool("short");
+        let pruned = prune_tool_results(&messages, &PrunePolicy::default());
+        assert_eq!(pruned[0].content.as_deref(), Some("short"));
+    }
+
+    #[test]
+    fn the_presets_are_ordered_from_most_to_least_detail() {
+        let loose = PrunePolicy::loose();
+        let standard = PrunePolicy::default();
+        let minimal = PrunePolicy::minimal();
+        let pointer = PrunePolicy::pointer_only();
+        assert!(loose.is_noop());
+        assert!(!standard.is_noop());
+        assert!(minimal.head_chars < standard.head_chars);
+        assert_eq!(pointer.head_chars + pointer.tail_chars, 0);
+    }
+
+    #[test]
+    fn the_role_is_preserved_so_providers_still_accept_the_request() {
+        let messages: Vec<Message> = (0..10).map(|index| tool(&format!("r{index}"))).collect();
+        let pruned = prune_tool_results(&messages, &PrunePolicy::default());
+        for message in pruned {
+            assert_eq!(message.role, Role::Tool);
+            assert_eq!(message.tool_call_id.as_deref(), Some("call-1"));
+        }
+    }
+
+    /// An inline image whose bytes were spilled (the droppable kind).
+    fn image(message: usize) -> Message {
+        Message::user_with_images(
+            "看看这个页面",
+            vec![crate::message::ImageAttachment::url(format!(
+                "data:image/png;base64,{}",
+                "a".repeat(4_000)
+            ))
+            .stored_at(format!("/tmp/img-{message}.png"))],
+        )
+    }
+
+    /// An inline image with no spilled copy: dropping it would lose it.
+    fn unspillable(message: usize) -> Message {
+        Message::user_with_images(
+            "看看这个页面",
+            vec![crate::message::ImageAttachment::url(format!(
+                "data:image/png;base64,{}",
+                "a".repeat(4_000)
+            ))],
+        )
+    }
+
+    fn remote(message: usize) -> Message {
+        Message::user_with_images(
+            "外链图",
+            vec![crate::message::ImageAttachment::url(format!(
+                "https://example.com/{message}.png"
+            ))],
+        )
+    }
+
+    #[test]
+    fn only_the_newest_images_stay_in_the_request() {
+        let messages: Vec<Message> = (0..6).map(image).collect();
+        let pruned = prune_images(&messages, &PrunePolicy::default());
+        assert_eq!(pruned.len(), messages.len(), "no message is dropped");
+        assert_eq!(pruned[5].images.len(), 1, "the newest stays");
+        assert_eq!(pruned[4].images.len(), 1, "and the one before it");
+        for index in 0..4 {
+            assert!(pruned[index].images.is_empty(), "older image {index} is dropped");
+            let content = pruned[index].content.as_deref().unwrap();
+            assert!(content.contains("已省略 1 张旧图片"), "{content}");
+            assert!(
+                content.contains(&format!("/tmp/img-{index}.png")),
+                "the note names the file: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_text_of_an_image_message_survives_the_drop() {
+        let messages = vec![image(0), image(1), image(2), image(3), image(4)];
+        let pruned = prune_images(&messages, &PrunePolicy {
+            keep_images: 1,
+            ..PrunePolicy::default()
+        });
+        assert!(
+            pruned[0].content.as_deref().unwrap().starts_with("看看这个页面"),
+            "what the model was told stays; what it was shown goes: {:?}",
+            pruned[0].content
+        );
+    }
+
+    #[test]
+    fn an_unspillable_image_is_never_dropped() {
+        // An image whose bytes were never written to disk cannot be re-read, so
+        // dropping it would be irreversible — it keeps its place instead.
+        let messages: Vec<Message> = (0..6)
+            .map(|index| if index == 0 { unspillable(index) } else { image(index) })
+            .collect();
+        let pruned = prune_images(&messages, &PrunePolicy {
+            keep_images: 1,
+            ..PrunePolicy::default()
+        });
+        assert_eq!(pruned[0].images.len(), 1, "the unspillable one stays");
+        assert_eq!(pruned[5].images.len(), 1, "and so does the newest");
+    }
+
+    #[test]
+    fn a_remote_url_is_left_in_place() {
+        let messages: Vec<Message> = (0..6).map(remote).collect();
+        let pruned = prune_images(&messages, &PrunePolicy {
+            keep_images: 0,
+            ..PrunePolicy::default()
+        });
+        for message in pruned {
+            assert_eq!(message.images.len(), 1, "a URL costs characters, not bytes");
+        }
+    }
+
+    #[test]
+    fn a_session_without_images_is_returned_untouched() {
+        let messages: Vec<Message> = (0..5).map(|index| tool(&format!("r{index}"))).collect();
+        let pruned = prune_images(&messages, &PrunePolicy::pointer_only());
+        assert_eq!(pruned.len(), messages.len());
+        assert_eq!(pruned[0].content, messages[0].content);
+    }
+
+    #[test]
+    fn a_loose_policy_drops_no_image() {
+        let messages: Vec<Message> = (0..6).map(image).collect();
+        let pruned = prune_images(&messages, &PrunePolicy::loose());
+        for message in pruned {
+            assert_eq!(message.images.len(), 1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

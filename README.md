@@ -659,7 +659,7 @@ cargo build --release --offline          # → target/release/ngu
 # 桌面(独立 crate,单文件,约 8.4 MB;界面是"母版",运行时服务的是 ui 包那份)
 cargo build --release --offline --manifest-path desktop/Cargo.toml
 
-# 测试:单元 + 动态库集成 + 内核集成 + CLI + 界面一致性,共 465 项
+# 测试:单元 + 动态库集成 + 内核集成 + CLI + 界面一致性,共 776 项
 cargo test --offline
 
 # 发布:出 dist/ 与桌面副本,打印 SHA256
@@ -678,7 +678,7 @@ pwsh -File release.ps1
 
 ## 状态
 
-**完整架构已实现:465 个测试通过(421 单元 + 9 动态库集成 + 28 内核集成 + 5 CLI + 2 界面)。**
+**完整架构已实现:776 个测试通过(721 单元 + 9 动态库集成 + 28 内核集成 + 6 CLI + 5 导出 + 5 统计 + 2 界面)。**
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
@@ -710,6 +710,7 @@ pwsh -File release.ps1
 | **全部热加载** | ✅ | `apply_change` 统一入口、会话/全局作用域、同意策略表、每轮快照 |
 | **插件事件总线** | ✅ | `ctx.observe` + effect 退订;`tool.start/end` 走工具表唯一漏斗;prompt/turn/session 由宿主发;审计 `events.jsonl`(5MB 轮转)+ `ngu events`;v1 观察式 —— veto 随 hooks 里程碑 |
 | **上下文注入引擎** | ✅ | 预算百分比+上限、触发、深度注入、分组竞争、递归激活 |
+| **上下文裁剪(Inline & Spill)** | ✅ | 发请求时裁旧工具回显(最近 N 条原样,更早留头/尾)与旧内联截图(只保留最近 N 张);完整内容落 `~/.nguruvilu/tool-output/`,模型用 `read` 就能重读;会话文件一字不改,所以随时可调可关 |
 | **工作区 git 快照** | ✅ | 每轮前后自动提交、历史、回滚(含删除新增文件) |
 | CLI | ✅ | 交互 / 打印 / JSON 三模式 + 20 个管理子命令 |
 | **桌面应用** | ✅ | `desktop/` 独立 crate:`ngu-desktop.exe` 约 8.4 MB 单文件,tao + wry + 系统 WebView2,三面板;界面母版编译进 exe,运行时服务 `ui` 包副本 |

@@ -86,6 +86,13 @@ pub struct ImageAttachment {
     /// What the image is, for the model and for a transcript reader. Not sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Where the same bytes also live on disk.
+    ///
+    /// Never sent: `llm.rs` builds `image_url` from `url` alone. It exists so
+    /// that dropping an old `data:` URI out of the request is reversible — the
+    /// note the model then sees names a file it can `read`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored: Option<String>,
 }
 
 impl ImageAttachment {
@@ -95,7 +102,14 @@ impl ImageAttachment {
             url: url.into(),
             detail: None,
             label: None,
+            stored: None,
         }
+    }
+
+    /// Record where the bytes were also written to disk.
+    pub fn stored_at(mut self, path: impl Into<String>) -> Self {
+        self.stored = Some(path.into());
+        self
     }
 
     /// Describe what the image is.

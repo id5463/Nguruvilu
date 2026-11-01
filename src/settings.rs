@@ -128,6 +128,10 @@ pub struct Settings {
     #[serde(default)]
     pub network: crate::network::NetworkSettings,
 
+    /// How much of a tool's output stays in the request, and for how long.
+    #[serde(default)]
+    pub tool_output: ToolOutputSettings,
+
     /// Web search, when configured.
     ///
     /// Absent means no web_search tool is registered at all — a tool that
@@ -241,6 +245,80 @@ fn default_compact_percent() -> u32 {
     75
 }
 
+/// How much of a tool's output stays in the request, and for how long.
+///
+/// Two dials for one measured problem: a long session re-sends every tool result
+/// it ever produced, so the per-step prompt grows to the size of that history.
+/// A measured session of 2,749 steps carried ~360k tokens per step, and its 3,245
+/// tool results added up to almost exactly that figure.
+///
+/// `head_chars`/`tail_chars` bound one *old* result; `keep_recent` decides how
+/// many of the newest stay exact. Both are view-time only — the session file
+/// keeps every original byte, so raising the dials restores detail immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOutputSettings {
+    /// Whether old tool results are thinned at all.
+    #[serde(default = "tool_output_enabled")]
+    pub enabled: bool,
+    /// Characters of the head of an old result that stay.
+    #[serde(default = "default_prune_head")]
+    pub head_chars: usize,
+    /// Characters of the tail of an old result that stay.
+    #[serde(default = "default_prune_tail")]
+    pub tail_chars: usize,
+    /// How many of the newest results stay untouched.
+    #[serde(default = "default_prune_keep")]
+    pub keep_recent: usize,
+    /// How many of the newest inline images stay in the request.
+    #[serde(default = "default_prune_images")]
+    pub keep_images: usize,
+}
+
+impl Default for ToolOutputSettings {
+    fn default() -> Self {
+        Self {
+            enabled: tool_output_enabled(),
+            head_chars: default_prune_head(),
+            tail_chars: default_prune_tail(),
+            keep_recent: default_prune_keep(),
+            keep_images: default_prune_images(),
+        }
+    }
+}
+
+impl ToolOutputSettings {
+    /// The policy these settings describe.
+    pub fn policy(&self) -> crate::compaction::PrunePolicy {
+        crate::compaction::PrunePolicy {
+            enabled: self.enabled,
+            head_chars: self.head_chars,
+            tail_chars: self.tail_chars,
+            keep_recent: self.keep_recent,
+            keep_images: self.keep_images,
+        }
+    }
+}
+
+fn tool_output_enabled() -> bool {
+    true
+}
+
+fn default_prune_images() -> usize {
+    2
+}
+
+fn default_prune_head() -> usize {
+    4_000
+}
+
+fn default_prune_tail() -> usize {
+    1_000
+}
+
+fn default_prune_keep() -> usize {
+    8
+}
+
 fn default_keep_recent() -> usize {
     8
 }
@@ -301,6 +379,7 @@ impl Settings {
             // whole window leaves no room for the answer, and the provider
             // rejects the request instead of compacting.
             reserve: self.max_output_tokens.unwrap_or(0),
+            prune: self.tool_output.policy(),
         }
     }
 

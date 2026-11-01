@@ -636,6 +636,17 @@ impl AppState {
         let mut running: Vec<&String> = self.running.iter().collect();
         running.sort();
         let running: Vec<String> = running.into_iter().cloned().collect();
+        // How much of an old tool result or inline image survives into the next
+        // request. Built outside the status object: this crate's `json!` already
+        // sits at the macro recursion limit, and one level less nesting is
+        // cheaper than raising the limit crate-wide.
+        let tool_output = json!({
+            "enabled": self.settings.tool_output.enabled,
+            "head_chars": self.settings.tool_output.head_chars,
+            "tail_chars": self.settings.tool_output.tail_chars,
+            "keep_recent": self.settings.tool_output.keep_recent,
+            "keep_images": self.settings.tool_output.keep_images,
+        });
         json!({
             "session": self.session.id,
             "title": self.session.title(),
@@ -716,6 +727,7 @@ impl AppState {
                 "keep_recent": self.settings.compact_keep_recent,
                 "configured_window": self.settings.context_window,
                 "last_prompt_tokens": self.last_prompt_tokens,
+                "tool_output": tool_output,
             },
             "max_steps": self.settings.max_steps(),
             "tool_timeout_secs": self.settings.tool_timeout_secs(),
@@ -1045,6 +1057,11 @@ impl AppState {
         max_steps: Option<u32>,
         tool_timeout_secs: Option<u64>,
         max_output_tokens: Option<usize>,
+        tool_prune_enabled: Option<bool>,
+        tool_prune_head: Option<usize>,
+        tool_prune_tail: Option<usize>,
+        tool_prune_keep: Option<usize>,
+        tool_keep_images: Option<usize>,
         search_provider: &str,
         search_api_key: &str,
         search_endpoint: &str,
@@ -1082,6 +1099,15 @@ impl AppState {
             relay_url: self.settings.relay_url.clone(),
             relay_token: self.settings.relay_token.clone(),
             max_output_tokens: max_output_tokens.filter(|t| *t > 0),
+            // Thinning dials come from the panel; a field the page did not send
+            // keeps what is stored, so an older page cannot erase them.
+            tool_output: nguruvilu::settings::ToolOutputSettings {
+                enabled: tool_prune_enabled.unwrap_or(self.settings.tool_output.enabled),
+                head_chars: tool_prune_head.unwrap_or(self.settings.tool_output.head_chars),
+                tail_chars: tool_prune_tail.unwrap_or(self.settings.tool_output.tail_chars),
+                keep_recent: tool_prune_keep.unwrap_or(self.settings.tool_output.keep_recent),
+                keep_images: tool_keep_images.unwrap_or(self.settings.tool_output.keep_images),
+            },
             network: self.settings.network.clone(),
             // A section the page does not show (its pack is unloaded) is not a
             // section the user cleared: absent means "keep what is stored",

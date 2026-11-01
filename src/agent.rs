@@ -1335,6 +1335,17 @@ impl Agent {
 
         let mut request = Vec::with_capacity(self.messages.len() + 4);
 
+        // The history is thinned for this request only. The session file keeps
+        // every original byte, so raising the limit later brings the detail back
+        // and an audit still sees what happened; nothing here mutates state.
+        //
+        // Two passes, in this order: old tool text first (a thinned result still
+        // keeps its pointer), then old inline images — the heavier of the two,
+        // since a screenshot travels on every later step as base64.
+        let policy = settings.policy.prune();
+        let thinned = crate::compaction::prune_tool_results(&self.messages, &policy);
+        let history = crate::compaction::prune_images(&thinned, &policy);
+
         if !settings.system_prompt.is_empty() {
             request.push(Message::system(&settings.system_prompt));
         }
@@ -1366,7 +1377,7 @@ impl Agent {
                 .push((*role, text.clone()));
         }
 
-        for (index, message) in self.messages.iter().enumerate() {
+        for (index, message) in history.iter().enumerate() {
             if let Some(fragments) = insert_at.get(&index) {
                 for (role, text) in fragments {
                     request.push(Message::of_role(*role, text.clone()));
@@ -1423,8 +1434,7 @@ mod tests {
     }
 
     #[test]
-    fn the_request_prepends_the_system_prompt_without_storing_it() {
-        let tools = Arc::new(ToolRegistry::with_base_tools().unwrap());
+    fn the_request_prepends_the_system_prompt_without_storing_it() {        let tools = Arc::new(ToolRegistry::with_base_tools().unwrap());
         let config: Arc<dyn TurnConfig> = Arc::new(StaticConfig::new("SYS", Arc::clone(&tools), "m"));
         let client = LlmClient::new(crate::llm::LlmConfig::new("http://localhost:1", "k", "m"))
             .expect("client builds");
@@ -1442,6 +1452,72 @@ mod tests {
         // An empty prompt contributes no message at all.
         let bare: Arc<dyn TurnConfig> = Arc::new(StaticConfig::new("", Arc::clone(&tools), "m"));
         assert_eq!(agent.build_request(&bare.settings()).0.len(), 1);
+    }
+
+    /// The whole point of thinning, end to end: what leaves this process is
+    /// smaller, what is stored is not.
+    #[test]
+    fn an_old_tool_result_and_image_leave_the_request_but_not_the_history() {
+        let tools = Arc::new(ToolRegistry::with_base_tools().unwrap());
+        let config: Arc<dyn TurnConfig> = Arc::new(StaticConfig::new("SYS", Arc::clone(&tools), "m"));
+
+        let mut history = Vec::new();
+        for index in 0..12 {
+            history.push(Message::tool_result(
+                format!("call-{index}"),
+                "bash",
+                format!("r{index} {}", "x".repeat(20_000)),
+            ));
+        }
+        for index in 0..6 {
+            history.push(Message::user_with_images(
+                "看看这个页面",
+                vec![crate::message::ImageAttachment::url(format!(
+                    "data:image/png;base64,{}",
+                    "A".repeat(40_000)
+                ))
+                .stored_at(format!("/tmp/img-{index}.png"))],
+            ));
+        }
+        let agent = Agent::new(
+            LlmClient::new(crate::llm::LlmConfig::new("http://localhost:1", "k", "m")).unwrap(),
+            Arc::clone(&config),
+            history,
+        );
+
+        let request = agent.build_request(&config.settings()).0;
+
+        // Twelve results, the newest eight exact: the older four say they were
+        // thinned instead of shipping twenty thousand characters each.
+        let thinned = request
+            .iter()
+            .filter(|message| message.text().contains("chars thinned"))
+            .count();
+        assert_eq!(thinned, 4, "the four oldest tool results are thinned");
+
+        // Six inline images, the newest two stay: the request carries a fraction
+        // of the bytes the history holds.
+        let sent_images: usize = request.iter().map(|message| message.images.len()).sum();
+        assert_eq!(sent_images, 2, "only the newest images travel");
+        let sent_bytes: usize = request
+            .iter()
+            .flat_map(|message| message.images.iter())
+            .map(|image| image.url.len())
+            .sum();
+        assert!(sent_bytes < 100_000, "{sent_bytes} bytes of image inline");
+
+        // And the dropped ones left a way back, not a hole.
+        let note = request
+            .iter()
+            .find(|message| message.text().contains("已省略"))
+            .expect("a note replaces the dropped images");
+        assert!(note.text().contains("/tmp/img-0.png"), "{}", note.text());
+
+        // The stored conversation keeps every byte: thinning is a view.
+        let stored = agent.messages();
+        assert_eq!(stored.len(), 18, "no message was dropped from history");
+        assert_eq!(stored[0].text().len(), 20_003, "the full tool result is kept");
+        assert_eq!(stored[12].images.len(), 1, "the old image is kept");
     }
 
     #[test]

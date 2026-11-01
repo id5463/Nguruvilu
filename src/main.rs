@@ -3904,6 +3904,28 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
                 "compaction:    at {}% of the window, keeping {} recent messages",
                 effective.compact_percent, effective.compact_keep_recent
             );
+            // The second lever on context size, and the one that does not wait
+            // for the window: what an old tool result or screenshot still
+            // travels in the request. Full copies live on disk either way.
+            let tool_output = &effective.tool_output;
+            println!(
+                "tool output:   {}",
+                if tool_output.enabled {
+                    format!(
+                        "older results keep {} head + {} tail chars (newest {} exact), newest {} image(s) inline; originals in {}",
+                        tool_output.head_chars,
+                        tool_output.tail_chars,
+                        tool_output.keep_recent,
+                        tool_output.keep_images,
+                        nguruvilu::tools::spill::root_dir().display()
+                    )
+                } else {
+                    format!(
+                        "kept whole — thinning is off (copies still land in {})",
+                        nguruvilu::tools::spill::root_dir().display()
+                    )
+                }
+            );
             println!(
                 "steps:         at most {} model step(s) per batch; the cap is asked about {} more time(s), each granting another batch",
                 effective.max_steps(),

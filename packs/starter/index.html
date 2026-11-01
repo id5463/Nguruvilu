@@ -675,6 +675,38 @@
             <input id="set-keep" placeholder="8" spellcheck="false">
           </label>
         </div>
+        <div class="row">
+          <label class="field" style="flex:1">
+            <span class="cap" id="cap-tool-preset">Tool output</span>
+            <select id="set-tool-preset">
+              <option value="loose">loose — keep everything</option>
+              <option value="standard">standard</option>
+              <option value="minimal">minimal</option>
+              <option value="pointer">pointer only</option>
+            </select>
+          </label>
+          <label class="field" style="flex:1">
+            <span class="cap" id="cap-tool-keep">Keep exact</span>
+            <input id="set-tool-keep" placeholder="8" spellcheck="false">
+          </label>
+        </div>
+        <div class="row">
+          <label class="field" style="flex:1">
+            <span class="cap" id="cap-tool-head">Older head chars</span>
+            <input id="set-tool-head" placeholder="4000" spellcheck="false">
+          </label>
+          <label class="field" style="flex:1">
+            <span class="cap" id="cap-tool-tail">Older tail chars</span>
+            <input id="set-tool-tail" placeholder="1000" spellcheck="false">
+          </label>
+        </div>
+        <div class="row">
+          <label class="field" style="flex:1">
+            <span class="cap" id="cap-tool-images">Keep recent images</span>
+            <input id="set-tool-images" placeholder="2" spellcheck="false">
+          </label>
+        </div>
+        <div class="hint" id="hint-tool-output">旧工具回显与旧截图只裁“发给模型的那一份”：会话文件永远保留原始内容，完整输出与图片存在 tool-output/ 目录里，模型可以用 read 重读。一张截图是几百 KB，会在之后每一步重传，所以它比文本更值得裁。preset 只是把这几个数字填好，之后照旧可以手改。</div>
         <label class="field">
           <span class="cap" id="cap-output">Max output tokens</span>
           <input id="set-max-output" placeholder="8K, or blank for provider default" spellcheck="false">
@@ -1067,6 +1099,59 @@ const setKeep = document.getElementById("set-keep");
 const setMaxOutput = document.getElementById("set-max-output");
 const setMaxSteps = document.getElementById("set-max-steps");
 const setToolTimeout = document.getElementById("set-tool-timeout");
+// Tool-output thinning: a preset fills the four numbers, and the numbers are
+// what is saved — the preset is a shortcut, not a stored mode.
+const setToolPreset = document.getElementById("set-tool-preset");
+const setToolKeep = document.getElementById("set-tool-keep");
+const setToolHead = document.getElementById("set-tool-head");
+const setToolTail = document.getElementById("set-tool-tail");
+const setToolImages = document.getElementById("set-tool-images");
+// A million means "as good as never": the shell clamps, and `loose` is what the
+// kernel did before thinning existed.
+const LOOSE = 1000000;
+const TOOL_PRESETS = {
+  loose: { keep: LOOSE, head: LOOSE, tail: LOOSE, images: LOOSE },
+  standard: { keep: 8, head: 4000, tail: 1000, images: 2 },
+  minimal: { keep: 4, head: 1000, tail: 256, images: 1 },
+  pointer: { keep: 1, head: 0, tail: 0, images: 0 },
+};
+function toolNumbers() {
+  return {
+    keep: parseInt(setToolKeep.value, 10) || 0,
+    head: parseInt(setToolHead.value, 10) || 0,
+    tail: parseInt(setToolTail.value, 10) || 0,
+    images: parseInt(setToolImages.value, 10),
+  };
+}
+// Which preset the current numbers match, for showing the select in sync.
+function toolPresetOf(values) {
+  for (const [name, preset] of Object.entries(TOOL_PRESETS)) {
+    if (
+      preset.keep === values.keep &&
+      preset.head === values.head &&
+      preset.tail === values.tail &&
+      preset.images === (Number.isFinite(values.images) ? values.images : preset.images)
+    ) {
+      return name;
+    }
+  }
+  return "standard";
+}
+for (const field of [setToolKeep, setToolHead, setToolTail, setToolImages]) {
+  field.addEventListener("input", () => {
+    setToolPreset.value = toolPresetOf(toolNumbers());
+  });
+}
+setToolPreset.addEventListener("change", () => {
+  const values = TOOL_PRESETS[setToolPreset.value];
+  if (!values) {
+    return;
+  }
+  setToolKeep.value = String(values.keep);
+  setToolHead.value = String(values.head);
+  setToolTail.value = String(values.tail);
+  setToolImages.value = String(values.images);
+});
 // The search controls are built on demand (`ensureSearchSection`), so they are
 // null until the search pack is loaded. Everything that touches them guards.
 let setSearchProvider = null;
@@ -2531,6 +2616,13 @@ function renderSettings(status) {
     setWindow.value = ctx.configured_window ? formatWindow(ctx.configured_window) : "";
     setPercent.value = String(ctx.threshold_percent || 75);
     setKeep.value = String(ctx.keep_recent || 8);
+    const toolOutput = ctx.tool_output || {};
+    const loose = toolOutput.enabled === false;
+    setToolKeep.value = String(loose ? LOOSE : (toolOutput.keep_recent ?? 8));
+    setToolHead.value = String(loose ? LOOSE : (toolOutput.head_chars ?? 4000));
+    setToolTail.value = String(loose ? LOOSE : (toolOutput.tail_chars ?? 1000));
+    setToolImages.value = String(loose ? LOOSE : (toolOutput.keep_images ?? 2));
+    setToolPreset.value = toolPresetOf(toolNumbers());
     setMaxOutput.value = status.max_output_tokens || "";
     setMaxSteps.value = String(status.max_steps || 50);
     setToolTimeout.value = String(status.tool_timeout_secs || 120);
@@ -3049,7 +3141,7 @@ for (const toggle of [showToolOutput, showImages]) {
 
 // ---------------------------------------------------------------- settings
 
-for (const field of [setBaseUrl, setApiKey, setModel, setEffort, setProxy, setWindow, setPercent, setKeep, setMaxOutput, setSearchProvider, setSearchKey, setSearchEndpoint, judgeEndpoint, judgeKey, judgeModel].filter(Boolean)) {
+for (const field of [setBaseUrl, setApiKey, setModel, setEffort, setProxy, setWindow, setPercent, setKeep, setToolPreset, setToolKeep, setToolHead, setToolTail, setToolImages, setMaxOutput, setSearchProvider, setSearchKey, setSearchEndpoint, judgeEndpoint, judgeKey, judgeModel].filter(Boolean)) {
   field.addEventListener("input", () => { settingsDirty = true; });
 }
 
@@ -3074,6 +3166,15 @@ function saveSettings() {
     max_steps: parseInt(setMaxSteps.value, 10) || 0,
     tool_timeout_secs: parseInt(setToolTimeout.value, 10) || 0,
     max_output_tokens: setMaxOutput.value.trim(),
+    // Thinning dials. The switch comes from the preset the box shows: `loose`
+    // means "never thin anything", which is what this kernel did before the
+    // feature existed. The numbers are sent even then, so picking `standard`
+    // later needs no other change.
+    tool_output_enabled: setToolPreset.value !== "loose",
+    tool_keep_recent: Math.min(parseInt(setToolKeep.value, 10) || 0, LOOSE),
+    tool_head_chars: Math.min(parseInt(setToolHead.value, 10) || 0, LOOSE),
+    tool_tail_chars: Math.min(parseInt(setToolTail.value, 10) || 0, LOOSE),
+    tool_keep_images: Math.min(parseInt(setToolImages.value, 10) || 0, LOOSE),
   };
   if (setApiKey.value.trim() !== "") {
     payload.api_key = setApiKey.value.trim();
