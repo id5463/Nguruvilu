@@ -14,6 +14,7 @@
     "cap-window": "上下文窗口(词元)",
     "cap-compact": "压缩阈值 %",
     "cap-keep": "保留最近",
+    "cap-tool-timeout": "工具时限上限(秒)",
     "cap-tool-preset": "工具输出",
     "cap-tool-keep": "保留最近条数",
     "cap-tool-head": "旧回显头部字符",

@@ -95,12 +95,20 @@ pub struct Settings {
     /// mentions this key must not describe a turn that is not allowed to run.
     #[serde(default = "default_max_steps")]
     pub max_steps: u32,
-    /// Default tool deadline in seconds — how long one `bash` call may run when
-    /// the model passes no `timeout_ms` of its own.
+    /// Tool deadline in seconds — the ceiling on one foreground `bash` call.
     ///
-    /// The per-call argument still wins: this is the floor the model does not
-    /// have to think about. Seconds rather than milliseconds because the field
-    /// is written by hand and by the settings panel, and both count in seconds.
+    /// It is both what a call gets when the model asks for nothing, and the most
+    /// a model may ask for: an argument above it is cut to this value and the
+    /// answer says so. It used to be only the default, and a measured session
+    /// showed requests of 300000, 600000 and 1500000 ms all honoured — one call
+    /// holding a turn for twenty-five minutes because a number was typed.
+    ///
+    /// Not a ceiling on everything: `background: true` jobs live until
+    /// `job_kill`, and a subagent or a pack tool may run long on purpose — that
+    /// work is a deliberate exception, not a leak.
+    ///
+    /// Seconds rather than milliseconds because the field is written by hand and
+    /// by the settings panel, and both count in seconds.
     #[serde(default = "default_tool_timeout_secs")]
     pub tool_timeout_secs: u64,
 

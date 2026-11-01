@@ -165,7 +165,7 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<()> {
             format!(
                 "Run a shell command and return its combined output.\n\
                  The command runs in {} — {} \n\
-                 Set timeout_ms to bound long-running commands. Output is truncated when very large.\n\
+                 Set timeout_ms to bound long-running commands — the settings' tool deadline is a ceiling, so a longer request is cut and the answer says so. Output is truncated when very large.\n\
                  Pass background: true to start the command as a job and return immediately; \
                  collect it later with job_output / job_list / job_kill (timeout_ms does not apply). \
                  With notify: true, the shell messages you when the job finishes — even after this turn ends.",
@@ -175,7 +175,7 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<()> {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "Command to run" },
-                    "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (default: the settings panel's tool deadline, 120000 out of the box)" },
+                    "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds, capped by the tool deadline in the settings (120000 out of the box): ask for more and the call is bounded to the ceiling and the answer names it. Use background: true for work that must outlive the step" },
                     "cwd": { "type": "string", "description": "Working directory for the command" },
                     "background": { "type": "boolean", "description": "Run as a background job and return a job id immediately (default false)" },
                     "notify": { "type": "boolean", "description": "With background: wake you with a message when the job finishes, even if this turn has ended (default false)" }
@@ -593,12 +593,25 @@ async fn bash_tool(args: Value) -> Result<String> {
         .get("command")
         .and_then(|c| c.as_str())
         .ok_or_else(|| anyhow!("missing required argument: command"))?;
-    let timeout = Duration::from_millis(
-        args.get("timeout_ms")
-            .and_then(|v| v.as_u64())
-            .filter(|ms| *ms > 0)
-            .unwrap_or_else(super::default_tool_timeout_ms),
+    // The settings deadline is a ceiling, not only a default. A measured session
+    // showed `timeout_ms` requests of 300000, 600000 and 1500000 ms all honoured,
+    // because the argument was accepted whenever it was merely positive — twenty
+    // five minutes of one call holding a turn. The cut is named to the model
+    // below: silently running short is how a caller keeps waiting for output that
+    // was never going to arrive.
+    let (timeout_ms, cut_from) = super::effective_timeout(
+        args.get("timeout_ms").and_then(|v| v.as_u64()),
+        super::default_tool_timeout_ms(),
     );
+    let timeout = Duration::from_millis(timeout_ms);
+    let cut_note = cut_from.map(|asked| {
+        format!(
+            "--- timeout_ms {asked} is above this machine's tool deadline; this call \
+             was bounded to {timeout_ms} ms. A command that must outlive the step \
+             belongs in bash with background: true — a job's lifetime is job_kill's, \
+             not the deadline's ---"
+        )
+    });
     let cwd = match args.get("cwd").and_then(|c| c.as_str()) {
         Some(explicit) => Some(resolve_path(explicit)),
         None => super::current_workspace(),
@@ -728,6 +741,10 @@ async fn bash_tool(args: Value) -> Result<String> {
                 stdout_capped.load(std::sync::atomic::Ordering::Relaxed)
                     || stderr_capped.load(std::sync::atomic::Ordering::Relaxed),
             );
+            if let Some(note) = &cut_note {
+                message.push('\n');
+                message.push_str(note);
+            }
             // `tree` is dropped here with kill-on-close still set: a last,
             // free guarantee that nothing of this command outlives its timeout.
             return Ok(message);
@@ -790,6 +807,10 @@ async fn bash_tool(args: Value) -> Result<String> {
         stdout_capped.load(std::sync::atomic::Ordering::Relaxed)
             || stderr_capped.load(std::sync::atomic::Ordering::Relaxed),
     );
+    if let Some(note) = &cut_note {
+        out.push('\n');
+        out.push_str(note);
+    }
 
     // Hand the tree back. Two cases, and the same call does both: if nothing
     // had to be stopped, clearing kill-on-close is what lets a stdio-redirected
@@ -1018,6 +1039,47 @@ mod bash_tests {
         assert!(
             output.contains("output ends here") || output.contains("background process"),
             "the truncation is named: {output}"
+        );
+    }
+
+    /// A bigger number must not buy more time — and the model is told the number
+    /// it actually got, rather than left to wonder why the call came back short.
+    ///
+    /// The hole this closes: a measured session had `timeout_ms` requests of
+    /// 300000, 600000 and 1500000 ms all honoured, because the argument was
+    /// accepted whenever it was merely positive.
+    #[tokio::test]
+    async fn a_timeout_above_the_tool_deadline_is_cut_and_says_so() {
+        let started = std::time::Instant::now();
+        let output = bash_tool(json!({ "command": "echo bounded", "timeout_ms": 1_500_000 }))
+            .await
+            .expect("the call returns");
+        assert!(
+            started.elapsed().as_secs() < 20,
+            "a one-second command must not be granted twenty-five minutes"
+        );
+        assert!(output.contains("bounded"), "{output}");
+        assert!(
+            output.contains("timeout_ms 1500000"),
+            "the asked-for value is named: {output}"
+        );
+        assert!(
+            output.contains("background: true"),
+            "and the way out is named: {output}"
+        );
+    }
+
+    /// Under the ceiling, the request stands as asked and nothing is said about
+    /// a cut: the deadline bounds the deployment's patience, it is not a floor.
+    #[tokio::test]
+    async fn a_timeout_under_the_deadline_is_not_reported_as_cut() {
+        let output = bash_tool(json!({ "command": "echo under", "timeout_ms": 60_000 }))
+            .await
+            .expect("the call returns");
+        assert!(output.contains("under"), "{output}");
+        assert!(
+            !output.contains("bounded to"),
+            "a request inside the deadline gets no lecture: {output}"
         );
     }
 

@@ -253,27 +253,55 @@ pub fn current_workspace() -> Option<std::path::PathBuf> {
     CURRENT_WORKSPACE.with(|cell| cell.borrow().clone())
 }
 
-/// The default tool deadline in milliseconds, overridable from settings.
+/// The tool deadline in milliseconds: both the default and the ceiling.
 ///
 /// A process global rather than a field on the registry: the deadline belongs
 /// to the deployment (how long this machine is willing to let one command hold
 /// a turn), not to a conversation, and both hosts — CLI and desktop shell —
-/// set it once from the same `settings.json` key. A model's own `timeout_ms`
-/// argument still wins; this only supplies what it did not think about.
+/// set it once from the same `settings.json` key.
+///
+/// It used to be only a default, and that turned out to be a hole a measured
+/// session walked straight through: a model asking for `timeout_ms: 1500000`
+/// was granted twenty-five minutes, because the argument was honoured whenever
+/// it was merely positive. The same key now caps it. `background: true` is the
+/// way out and is not capped — a job's lifetime belongs to `job_kill`, and a
+/// subagent's or a pack tool's long work is a deliberate exception to any
+/// per-call deadline.
 static DEFAULT_TOOL_TIMEOUT_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(base::DEFAULT_BASH_TIMEOUT_MS);
 
-/// Set the default tool deadline, in milliseconds. Zero is ignored: a
-/// misconfigured "0 seconds" would make every tool call instant.
+/// Set the tool deadline, in milliseconds. Zero is ignored: a misconfigured
+/// "0 seconds" would make every tool call instant.
 pub fn set_default_tool_timeout_ms(ms: u64) {
     if ms > 0 {
         DEFAULT_TOOL_TIMEOUT_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-/// The default tool deadline in milliseconds.
+/// The tool deadline in milliseconds: default and ceiling at once.
 pub fn default_tool_timeout_ms() -> u64 {
     DEFAULT_TOOL_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The deadline one foreground call actually gets.
+///
+/// Returns the duration and, when the request was cut, what was asked for — so
+/// the caller can say so out loud rather than silently running short. A model
+/// that asks for less than the ceiling gets exactly what it asked for: the
+/// ceiling is a limit on the deployment's patience, not a minimum.
+///
+/// `requested` of `None` or `0` means "no opinion": take the ceiling uncapped.
+pub(crate) fn effective_timeout(requested_ms: Option<u64>, ceiling_ms: u64) -> (u64, Option<u64>) {
+    let ceiling = if ceiling_ms == 0 {
+        base::DEFAULT_BASH_TIMEOUT_MS
+    } else {
+        ceiling_ms
+    };
+    match requested_ms {
+        Some(asked) if asked > 0 && asked > ceiling => (ceiling, Some(asked)),
+        Some(asked) if asked > 0 => (asked, None),
+        _ => (ceiling, None),
+    }
 }
 
 /// Scopes a session id and its workspace over every poll of an inner future.
@@ -609,6 +637,41 @@ mod freeze_tests {
     use super::*;
     use serde_json::json;
     use std::path::PathBuf;
+
+    /// The whole point of the change: the settings key bounds what a model may
+    /// ask for, instead of merely filling in what it forgot to ask for.
+    #[test]
+    fn the_tool_deadline_is_a_ceiling_and_not_only_a_default() {
+        // No opinion, or a zero: the ceiling, and nothing to report.
+        assert_eq!(effective_timeout(None, 120_000), (120_000, None));
+        assert_eq!(effective_timeout(Some(0), 120_000), (120_000, None));
+        // Under the ceiling, the request is honoured exactly — including at the
+        // boundary, where it is not a cut and must not be reported as one.
+        assert_eq!(effective_timeout(Some(800), 120_000), (800, None));
+        assert_eq!(effective_timeout(Some(120_000), 120_000), (120_000, None));
+        // Over the ceiling: cut, and the asked-for value comes back so the
+        // caller can say it out loud. These are the real numbers measured on a
+        // long server session, where the old code granted every one of them.
+        assert_eq!(
+            effective_timeout(Some(300_000), 120_000),
+            (120_000, Some(300_000))
+        );
+        assert_eq!(
+            effective_timeout(Some(600_000), 120_000),
+            (120_000, Some(600_000))
+        );
+        assert_eq!(
+            effective_timeout(Some(1_500_000), 120_000),
+            (120_000, Some(1_500_000)),
+            "twenty-five minutes must not be grantable by typing a bigger number"
+        );
+        // A nonsense ceiling of 0 falls back to the built-in, and a huge ask is
+        // still cut against it.
+        assert_eq!(
+            effective_timeout(Some(9_999_999), 0),
+            (base::DEFAULT_BASH_TIMEOUT_MS, Some(9_999_999))
+        );
+    }
 
     /// The table a turn copies at its start keeps a tool the live table drops.
     ///
