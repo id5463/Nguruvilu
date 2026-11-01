@@ -758,7 +758,13 @@
     <span id="slot-status-bar"></span>
     <button class="tiny phone-only" id="toggle-settings" type="button" aria-controls="details" aria-expanded="false">Settings</button>
     <label style="margin-left:auto; cursor:pointer; display:flex; gap:4px; align-items:center;">
-      <input type="checkbox" id="show-reasoning"> <span id="cap-reasoning">show thinking</span>
+      <input type="checkbox" id="show-reasoning"> <span id="cap-reasoning">thinking</span>
+    </label>
+    <label style="cursor:pointer; display:flex; gap:4px; align-items:center;">
+      <input type="checkbox" id="show-tool-output"> <span>tool output</span>
+    </label>
+    <label style="cursor:pointer; display:flex; gap:4px; align-items:center;">
+      <input type="checkbox" id="show-images"> <span>images</span>
     </label>
   </div>
 
@@ -1080,6 +1086,12 @@ const settingsPath = document.getElementById("settings-path");
 const modelOptions = document.getElementById("model-options");
 const modelList = document.getElementById("model-list");
 const showReasoning = document.getElementById("show-reasoning");
+// Two more switches of the same kind: what the transcript paints at all. Both
+// default to "off" — a tool result and an image are the two things that make a
+// long conversation heavy, and the model's next sentence is usually all the
+// reader wanted from them.
+const showToolOutput = document.getElementById("show-tool-output");
+const showImages = document.getElementById("show-images");
 
 const packList = document.getElementById("pack-list");
 const packsDir = document.getElementById("packs-dir");
@@ -1427,8 +1439,8 @@ function renderEntry(entry) {
     // A stored tool result is shown inline; the details panel keeps the latest.
     // The mission marker It carries is bookkeeping for the panel, not text: the
     // stored message keeps it (the panel parses it there), the screen does not.
-    stream.append(el("div", "tool-result", clipForDisplay(visibleToolText(entry.text))));
-    logInfo.replaceChildren(el("div", "tool-result", clipForDisplay(visibleToolText(entry.text))));
+    stream.append(toolResultNode(true, entry.text));
+    logInfo.replaceChildren(toolResultNode(true, entry.text));
     return;
   }
 
@@ -1785,6 +1797,13 @@ function renderSlots(panels) {
 /// Rendering it is the point: the user should see exactly what the model saw,
 /// not merely be told that an image exists.
 /// Expand or collapse a thinking box and keep its label in step.
+/// Expand or collapse a thinking box and keep its label in step.
+///
+/// Collapsed boxes hold no text nodes at all: the stream is where a long
+/// conversation gets heavy, and thinking is routinely several times longer than
+/// the answer it produced. The text is kept on the element and painted only
+/// while the box is open, so a transcript full of thinking costs nothing until
+/// someone asks to read it.
 function setReasoningExpanded(box, expanded) {
   box.classList.toggle("collapsed", !expanded);
   const toggle = box.querySelector(".toggle");
@@ -1792,6 +1811,15 @@ function setReasoningExpanded(box, expanded) {
     toggle.textContent = expanded
       ? "thinking (click to hide)"
       : "thinking (click to show)";
+  }
+  const thought = box.thoughtSpan;
+  if (!thought) return;
+  if (expanded) {
+    if (!thought.firstChild && box.thoughtText) {
+      thought.append(document.createTextNode(box.thoughtText));
+    }
+  } else {
+    thought.replaceChildren();
   }
 }
 
@@ -1803,11 +1831,13 @@ function setReasoningExpanded(box, expanded) {
 /// is wrong and the reason is visible in how it got there.
 function appendReasoning(delta) {
   const seg = currentSegment();
-  if (!seg.thought) {
+  if (!seg.reason) {
     const box = el("div", "reasoning" + (showReasoning.checked ? "" : " collapsed"));
     const toggle = el("span", "toggle");
     const thought = el("span", "thought");
     box.append(toggle, thought);
+    box.thoughtSpan = thought;
+    box.thoughtText = "";
     setReasoningExpanded(box, showReasoning.checked);
     // A collapsed strip expands from anywhere it is clicked: the small label
     // alone is easy to miss, and a preview strip reads as clickable. Once
@@ -1827,18 +1857,69 @@ function appendReasoning(delta) {
       box,
       seg.body || (caret.parentNode === seg.node ? caret : null)
     );
-    seg.thought = thought;
+    seg.reason = box;
   }
-  seg.thought.append(document.createTextNode(delta));
+  const box = seg.reason;
+  box.thoughtText += delta;
+  // Painted only while open; a collapsed box keeps the text on the element.
+  if (!box.classList.contains("collapsed")) {
+    box.thoughtSpan.append(document.createTextNode(delta));
+  }
   scrollToEnd();
+}
+
+/// One tool result, collapsed to a single line unless asked for.
+///
+/// A tool result is the biggest thing in a transcript — a log dump, a page's
+/// HTML — and most of the time the model's next sentence is all a reader wants
+/// from it. So the default is a one-line summary plus a button that paints the
+/// rest; the stored message keeps every byte either way.
+const TOOL_PREVIEW_CHARS = 160;
+
+function toolResultNode(ok, text) {
+  const full = clipForDisplay(visibleToolText(text));
+  const box = el("div", "tool-result" + (ok ? "" : " bad"));
+  if (showToolOutput.checked || full.length <= TOOL_PREVIEW_CHARS) {
+    box.textContent = full;
+    return box;
+  }
+  const line = full.split("\n", 1)[0].slice(0, TOOL_PREVIEW_CHARS);
+  box.append(document.createTextNode(line));
+  const more = el("button", "tiny more", "展开 " + full.length + " 字符");
+  more.addEventListener("click", (event) => {
+    event.stopPropagation();
+    box.replaceChildren(document.createTextNode(full));
+  });
+  box.append(more);
+  return box;
+}
+
+/// An attached image, loaded only when asked for.
+///
+/// A screenshot is megabytes of base64 in a data URL; painting every one of them
+/// costs memory and decode time, and a transcript of them is unreadable anyway.
+/// Collapsed, it is a line saying an image exists; the click is what decodes it.
+function imageNode(image) {
+  const img = document.createElement("img");
+  img.src = image.url;
+  img.alt = image.label || "attached image";
+  return img;
 }
 
 function appendImage(container, image) {
   const box = el("div", "attached");
-  const img = document.createElement("img");
-  img.src = image.url;
-  img.alt = image.label || "attached image";
-  box.append(img);
+  if (!showImages.checked) {
+    const load = el("button", "tiny more", "图片（点击加载）" + (image.label ? " · " + image.label : ""));
+    load.addEventListener("click", (event) => {
+      event.stopPropagation();
+      box.replaceChildren(imageNode(image));
+      if (image.label) box.append(el("span", "cap", image.label));
+    });
+    box.append(load);
+    container.append(box);
+    return;
+  }
+  box.append(imageNode(image));
   if (image.label) box.append(el("span", "cap", image.label));
   container.append(box);
 }
@@ -1998,8 +2079,7 @@ function trimStream() {
 
 function appendToolResult(ok, text) {
   flushPendingText();
-  const shown = clipForDisplay(visibleToolText(text));
-  const box = el("div", "tool-result" + (ok ? "" : " bad"), shown);
+  const box = toolResultNode(ok, text);
   if (live) {
     const seg = currentSegment();
     caret.remove();
@@ -2008,7 +2088,7 @@ function appendToolResult(ok, text) {
   } else {
     stream.append(box);
   }
-  logInfo.replaceChildren(el("div", "tool-result" + (ok ? "" : " bad"), shown));
+  logInfo.replaceChildren(toolResultNode(ok, text));
   trimStream();
   scrollToEnd();
 }
@@ -2957,6 +3037,15 @@ showReasoning.addEventListener("change", () => {
     setReasoningExpanded(box, showReasoning.checked);
   }
 });
+
+// Flipping either switch changes how *everything already drawn* should look, and
+// the page keeps no second copy of the transcript to re-render from. Asking the
+// shell for `ready` re-pushes the newest page of history and the status, which
+// repaints from scratch — the same path a reconnect takes, so it cannot drift
+// from the one that always works.
+for (const toggle of [showToolOutput, showImages]) {
+  toggle.addEventListener("change", () => toShell({ cmd: "ready" }));
+}
 
 // ---------------------------------------------------------------- settings
 

@@ -302,6 +302,12 @@ pub fn summary_request(history: &[Message]) -> Vec<Message> {
          not describe the summarization itself, do not add pleasantries, do not invent \
          anything the transcript does not contain.\n\
          \n\
+         Length: this summary is all that survives, so it has to be as long as the work it \
+         stands in for. A long conversation deserves a long summary — tens of thousands of \
+         characters is normal, and one that fits on a screen has thrown away the reason it \
+         exists. Never shorten it by dropping a fact; shorten the prose around the facts \
+         instead.\n\
+         \n\
          Conversation:\n\
          {transcript}"
     ))]
