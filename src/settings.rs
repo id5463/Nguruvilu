@@ -317,13 +317,28 @@ impl Default for ToolOutputSettings {
 
 impl ToolOutputSettings {
     /// The policy these settings describe.
+    ///
+    /// The two *counts* treat `0` as "not written" and fall back to the shipped
+    /// values: a panel box left empty, or a file written by an older build, must
+    /// not silently mean "thin every result in the history" — that turns a
+    /// context lever into a memory hole. `head_chars`/`tail_chars` keep `0` as a
+    /// real choice, because head 0 + tail 0 is the deliberate "pointer only"
+    /// preset.
     pub fn policy(&self) -> crate::compaction::PrunePolicy {
         crate::compaction::PrunePolicy {
             enabled: self.enabled,
             head_chars: self.head_chars,
             tail_chars: self.tail_chars,
-            keep_recent: self.keep_recent,
-            keep_images: self.keep_images,
+            keep_recent: if self.keep_recent == 0 {
+                default_prune_keep()
+            } else {
+                self.keep_recent
+            },
+            keep_images: if self.keep_images == 0 {
+                default_prune_images()
+            } else {
+                self.keep_images
+            },
         }
     }
 }
@@ -757,6 +772,26 @@ mod tests {
         // A written value is honoured, in seconds out.
         settings.mcp_timeout_secs = 90;
         assert_eq!(settings.budgets().mcp_timeout_ms, 90_000);
+    }
+
+    #[test]
+    fn a_zero_count_dial_thins_everything_never() {
+        // The bug this guards: an empty panel box used to post `0`, and `0` in a
+        // count dial meant "keep nothing recent" — every result in the history
+        // thinned, on a machine that was never configured that way.
+        let mut settings = Settings::default();
+        settings.tool_output.keep_recent = 0;
+        settings.tool_output.keep_images = 0;
+        let policy = settings.tool_output.policy();
+        assert_eq!(policy.keep_recent, default_prune_keep());
+        assert_eq!(policy.keep_images, default_prune_images());
+        // But zero in head/tail is a real choice: that is the "pointer only"
+        // preset, and nothing may silently override it.
+        settings.tool_output.head_chars = 0;
+        settings.tool_output.tail_chars = 0;
+        let policy = settings.tool_output.policy();
+        assert_eq!(policy.head_chars, 0);
+        assert_eq!(policy.tail_chars, 0);
     }
 
     #[test]

@@ -3212,10 +3212,19 @@ function saveSettings() {
     // feature existed. The numbers are sent even then, so picking `standard`
     // later needs no other change.
     tool_output_enabled: setToolPreset.value !== "loose",
-    tool_keep_recent: Math.min(parseInt(setToolKeep.value, 10) || 0, LOOSE),
+    // An empty box is not "keep nothing": it falls back to the shipped number.
+    // 0 stays reachable only by typing 0 into head/tail, which is the real
+    // "pointer only" choice.
+    tool_keep_recent: (() => {
+      const n = parseInt(setToolKeep.value, 10);
+      return Math.min(Number.isFinite(n) ? n : 8, LOOSE);
+    })(),
     tool_head_chars: Math.min(parseInt(setToolHead.value, 10) || 0, LOOSE),
     tool_tail_chars: Math.min(parseInt(setToolTail.value, 10) || 0, LOOSE),
-    tool_keep_images: Math.min(parseInt(setToolImages.value, 10) || 0, LOOSE),
+    tool_keep_images: (() => {
+      const n = parseInt(setToolImages.value, 10);
+      return Math.min(Number.isFinite(n) ? n : 2, LOOSE);
+    })(),
     // The runtime budgets travel as one object; the shell keeps whatever the
     // page did not send, so a blank or missing box never zeroes a deadline.
     budgets: {
