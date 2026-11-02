@@ -650,19 +650,25 @@ impl AppState {
         // Built here rather than inline: this crate's `json!` sits at the macro
         // recursion limit already.
         let budgets = json!({
+            // Effective numbers: a stored 0 means "not written", and the panel
+            // must not show a machine as capped at zero when it is not.
             "tool_timeout_secs": self.settings.tool_timeout_secs(),
-            "mcp_timeout_secs": self.settings.mcp_timeout_secs,
-            "subagent_max_steps": self.settings.subagent_max_steps,
-            "subagent_wall_secs": self.settings.subagent_wall_secs,
-            "subagent_max_depth": self.settings.subagent_max_depth,
-            "job_wait_secs": self.settings.job_wait_secs,
+            "mcp_timeout_secs": self.settings.mcp_timeout_secs.max(1),
+            "subagent_max_steps": self.settings.subagent_max_steps.max(1),
+            "subagent_wall_secs": self.settings.subagent_wall_secs.max(1),
+            "subagent_max_depth": self.settings.subagent_max_depth.max(1),
+            "job_wait_secs": self.settings.job_wait_secs.max(1),
         });
+        // The effective dials, not the stored ones: a count sitting at 0 means
+        // "not written", and a panel that shows 0 would tell the user their
+        // machine thins every result when it actually keeps eight.
+        let prune = self.settings.tool_output.policy();
         let tool_output = json!({
-            "enabled": self.settings.tool_output.enabled,
-            "head_chars": self.settings.tool_output.head_chars,
-            "tail_chars": self.settings.tool_output.tail_chars,
-            "keep_recent": self.settings.tool_output.keep_recent,
-            "keep_images": self.settings.tool_output.keep_images,
+            "enabled": prune.enabled,
+            "head_chars": prune.head_chars,
+            "tail_chars": prune.tail_chars,
+            "keep_recent": prune.keep_recent,
+            "keep_images": prune.keep_images,
         });
         json!({
             "session": self.session.id,

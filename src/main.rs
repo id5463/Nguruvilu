@@ -3957,7 +3957,10 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             // The second lever on context size, and the one that does not wait
             // for the window: what an old tool result or screenshot still
             // travels in the request. Full copies live on disk either way.
-            let tool_output = &effective.tool_output;
+            // Read through `policy()` — the effective numbers, not the stored
+            // ones: a count left at 0 means "not written", and printing the raw
+            // file would show a machine thinning everything when it keeps eight.
+            let tool_output = effective.tool_output.policy();
             println!(
                 "tool output:   {}",
                 if tool_output.enabled {
