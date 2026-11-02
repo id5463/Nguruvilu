@@ -59,6 +59,9 @@ pub const TOOL: &str = "delegate";
 /// that is a caller waiting half an hour for a `delegate` the description said
 /// would come back sooner, which is the shape of the bug this budget exists to
 /// prevent.
+///
+/// This is the shipped *default*; the number in force is
+/// `subagent_max_steps` in the settings, read at registration.
 pub const MAX_STEPS: usize = 12;
 
 /// How long one subtask may run, wall clock, before it is cut off.
@@ -73,6 +76,9 @@ pub const MAX_STEPS: usize = 12;
 /// states it, because a caller sizes a task against the budget it is given.
 /// Generous on purpose — fifteen minutes is a dozen slow steps — and finite on
 /// purpose: an answer that arrives is worth more than work that never does.
+///
+/// The shipped default; the number in force is `subagent_wall_secs` in the
+/// settings, read when the task is launched.
 pub const WALL_BUDGET_SECS: u64 = 15 * 60;
 
 /// Where a subtask's own transcript is written, relative to the session
@@ -137,24 +143,42 @@ impl crate::plugin::Plugin for Delegate {
     }
 }
 
+/// What `delegate` tells the model about itself.
+///
+/// A function of [`crate::tools::Budgets`] rather than a literal, so the
+/// sentence states the numbers in force — and so a test can ask what the
+/// description would say at any budget without rewriting a process global under
+/// the other tests' feet.
+pub(crate) fn description(budgets: crate::tools::Budgets) -> String {
+    let steps = budgets.subagent_max_steps;
+    let minutes = (budgets.subagent_wall_ms / 60_000).max(1);
+    let depth = budgets.subagent_max_depth;
+    format!(
+        "Run a self-contained subtask in a fresh agent with no memory of this \
+         conversation, and get back only its answer. Use it to keep a large \
+         side investigation out of this transcript. \
+         The subtask sees the same tools and the same model you do, but not \
+         what was said here — so state everything it needs, including paths \
+         and what 'done' looks like. It cannot ask you anything. \
+         It stops after {steps} steps or {minutes} minutes, whichever comes \
+         first — size the task to fit, and split it rather than promising more \
+         than it can finish. Both budgets are yours to move: `subagent_max_steps` \
+         and `subagent_wall_secs` in the settings panel; subagents may nest \
+         {depth} deep (`subagent_max_depth`). \
+         It is silent while it runs: every step and tool \
+         call is appended to its own transcript under {TRACE_DIR}/ in the \
+         working directory, named in the result, so read that file to see what \
+         it is doing while it works."
+    )
+}
+
 fn tool(access: Arc<dyn ModelAccess>) -> ToolDef {
+    // The budgets the caller is told about are the ones in force: registration
+    // runs after the host has published them, so this states real numbers.
+    let budgets = super::budgets();
     ToolDef::new(
         TOOL,
-        format!(
-            "Run a self-contained subtask in a fresh agent with no memory of this \
-             conversation, and get back only its answer. Use it to keep a large \
-             side investigation out of this transcript. \
-             The subtask sees the same tools and the same model you do, but not \
-             what was said here — so state everything it needs, including paths \
-             and what 'done' looks like. It cannot ask you anything. \
-             It stops after {MAX_STEPS} steps or {minutes} minutes, whichever comes \
-             first — size the task to fit, and split it rather than promising more \
-             than it can finish. It is silent while it runs: every step and tool \
-             call is appended to its own transcript under {TRACE_DIR}/ in the \
-             working directory, named in the result, so read that file to see what \
-             it is doing while it works.",
-            minutes = WALL_BUDGET_SECS / 60,
-        ),
+        description(budgets),
         json!({
             "type": "object",
             "properties": {
@@ -183,10 +207,12 @@ async fn run(access: Arc<dyn ModelAccess>, args: Value) -> Result<ToolOutput> {
     // transcript would show where the budget went. The scope is entered around
     // the body (below), so an error return ends it as surely as success.
     let current = delegation_depth();
-    if current >= MAX_DEPTH {
+    let budgets = super::budgets();
+    if current >= budgets.subagent_max_depth {
         return Err(anyhow!(
-            "subagents are already {MAX_DEPTH} deep; this one may not delegate further. \
-             Do the work here instead."
+            "subagents are already {} deep; this one may not delegate further. Do the \
+             work here instead, or raise `subagent_max_depth` in the settings panel.",
+            budgets.subagent_max_depth
         ));
     }
     // The scope *is* the guard: the value lives inside the future and ends
@@ -265,13 +291,14 @@ async fn delegate(access: Arc<dyn ModelAccess>, args: Value) -> Result<ToolOutpu
 
     // The wall clock. Steps count rounds; they do not bound one round, and a
     // parent waiting on this call cannot tell "slow" from "never returning".
-    // The budget is stated in the tool description, so the caller knows what it
-    // is buying; the stop reason below is what the parent model reads when it
-    // fires, which is why it says what happened rather than blaming a user who
-    // did no such thing.
+    // Both numbers come from settings, and the stop reason says so: the parent
+    // model reads that text, so it should learn which knob moves, not that some
+    // anonymous user set a limit.
+    let budgets = super::budgets();
+    let wall_secs = budgets.subagent_wall_ms / 1000;
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let deadline = tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(WALL_BUDGET_SECS)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(budgets.subagent_wall_ms)).await;
         let _ = stop.send(true);
     });
 
@@ -280,13 +307,15 @@ async fn delegate(access: Arc<dyn ModelAccess>, args: Value) -> Result<ToolOutpu
     // parent's mission, because the parent's turn is the one that owes the
     // mission its time.
     let mut agent = Agent::new(client, config, Vec::new())
-        .with_max_steps(MAX_STEPS)
+        .with_max_steps(budgets.subagent_max_steps)
         .as_subtask()
         .with_observer(observer)
         .with_cancel(stopped)
         .with_stop_reason(format!(
-            "the subtask's {WALL_BUDGET_SECS}-second wall-clock budget ran out before \
-             it finished; a narrower task, or one that needs less reading, would fit"
+            "the subtask ran out of its {wall_secs}-second wall clock (`subagent_wall_secs`) \
+             or its {}-step budget (`subagent_max_steps`) before it finished — both are \
+             editable in the settings panel, and a narrower task would also fit",
+            budgets.subagent_max_steps
         ));
     let outcome = agent.run(&prompt).await;
     // The budget no longer matters once the subtask is over; a sleeping timer
@@ -488,8 +517,9 @@ impl AgentObserver for Trace {
     }
 }
 
-/// How deep delegation may nest.
-const MAX_DEPTH: usize = 2;
+/// How deep delegation may nest — the shipped default; the number in force is
+/// `subagent_max_depth` in the settings, read on every call.
+pub const MAX_DEPTH: usize = 2;
 
 tokio::task_local! {
     /// Depth of delegation on this task.
@@ -657,6 +687,42 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(description.contains(&MAX_STEPS.to_string()), "{description}");
+    }
+
+    /// The sentence the model reads has to follow the settings. A description
+    /// stating a number the machine no longer uses is how a caller sizes a task
+    /// against a budget that does not exist — which is why this text is built
+    /// from [`crate::tools::Budgets`] and tested at two different budgets.
+    #[test]
+    fn the_description_states_the_budgets_it_was_built_with() {
+        let shipped = description(crate::tools::Budgets::default());
+        assert!(shipped.contains("12 steps"), "{shipped}");
+        assert!(shipped.contains("15 minutes"), "{shipped}");
+        assert!(shipped.contains("2 deep"), "{shipped}");
+
+        let moved = description(crate::tools::Budgets {
+            subagent_max_steps: 40,
+            subagent_wall_ms: 45 * 60_000,
+            subagent_max_depth: 5,
+            ..crate::tools::Budgets::default()
+        });
+        assert!(moved.contains("40 steps"), "{moved}");
+        assert!(moved.contains("45 minutes"), "{moved}");
+        assert!(moved.contains("5 deep"), "{moved}");
+        assert!(!moved.contains("12 steps"), "the old number must be gone");
+        // And each one names where to move it.
+        assert!(moved.contains("subagent_max_steps"), "{moved}");
+        assert!(moved.contains("subagent_wall_secs"), "{moved}");
+        assert!(moved.contains("subagent_max_depth"), "{moved}");
+    }
+
+    #[test]
+    fn a_wall_clock_of_under_a_minute_is_still_promised_as_a_minute() {
+        let text = description(crate::tools::Budgets {
+            subagent_wall_ms: 1_000,
+            ..crate::tools::Budgets::default()
+        });
+        assert!(text.contains("1 minutes"), "{text}");
     }
 
     #[tokio::test]

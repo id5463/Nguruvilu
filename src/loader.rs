@@ -299,7 +299,9 @@ impl Loader {
                     args: Vec::new(),
                     env: std::collections::HashMap::new(),
                     cwd: None,
-                    timeout_ms: entry.timeout_ms.unwrap_or(60_000),
+                    timeout_ms: entry
+                    .timeout_ms
+                    .unwrap_or_else(|| super::tools::budgets().mcp_timeout_ms),
                     url: Some(url),
                     headers: entry.headers.clone(),
                 }
@@ -323,7 +325,9 @@ impl Loader {
                         .is_empty()
                         .then(|| self.pack_dir.as_ref().map(|d| d.display().to_string()))
                         .flatten(),
-                    timeout_ms: entry.timeout_ms.unwrap_or(60_000),
+                    timeout_ms: entry
+                    .timeout_ms
+                    .unwrap_or_else(|| super::tools::budgets().mcp_timeout_ms),
                     url: None,
                     headers: std::collections::BTreeMap::new(),
                 }

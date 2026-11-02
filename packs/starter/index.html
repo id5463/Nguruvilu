@@ -721,6 +721,33 @@
             <input id="set-tool-timeout" placeholder="120" spellcheck="false">
           </label>
         </div>
+        <div class="row">
+          <label class="field" style="flex:1">
+            <span class="cap" id="cap-mcp-timeout">MCP request (sec)</span>
+            <input id="set-mcp-timeout" placeholder="60" spellcheck="false">
+          </label>
+          <label class="field" style="flex:1">
+            <span class="cap" id="cap-sub-steps">Subagent steps</span>
+            <input id="set-sub-steps" placeholder="12" spellcheck="false">
+          </label>
+        </div>
+        <div class="row">
+          <label class="field" style="flex:1">
+            <span class="cap" id="cap-sub-wall">Subagent wall (sec)</span>
+            <input id="set-sub-wall" placeholder="900" spellcheck="false">
+          </label>
+          <label class="field" style="flex:1">
+            <span class="cap" id="cap-sub-depth">Subagent depth</span>
+            <input id="set-sub-depth" placeholder="2" spellcheck="false">
+          </label>
+        </div>
+        <div class="row">
+          <label class="field" style="flex:1">
+            <span class="cap" id="cap-job-wait">Job wait (sec)</span>
+            <input id="set-job-wait" placeholder="30" spellcheck="false">
+          </label>
+        </div>
+        <div class="hint" id="hint-budgets">这些数字以前都写死在代码里（MCP 60 秒、子代理 12 步 / 15 分钟 / 2 层、job 等待 30 秒）。现在全部在这儿改，保存即对下一个调用生效；工具被它们截住时，回答里会点名是哪一个。</div>
         <details class="hint-more" id="more-context">
           <summary id="sum-context">How does the window and compaction behave?</summary>
           <div class="hint">
@@ -1099,6 +1126,12 @@ const setKeep = document.getElementById("set-keep");
 const setMaxOutput = document.getElementById("set-max-output");
 const setMaxSteps = document.getElementById("set-max-steps");
 const setToolTimeout = document.getElementById("set-tool-timeout");
+// Runtime budgets: what used to be constants in the kernel, now editable here.
+const setMcpTimeout = document.getElementById("set-mcp-timeout");
+const setSubSteps = document.getElementById("set-sub-steps");
+const setSubWall = document.getElementById("set-sub-wall");
+const setSubDepth = document.getElementById("set-sub-depth");
+const setJobWait = document.getElementById("set-job-wait");
 // Tool-output thinning: a preset fills the four numbers, and the numbers are
 // what is saved — the preset is a shortcut, not a stored mode.
 const setToolPreset = document.getElementById("set-tool-preset");
@@ -2626,6 +2659,14 @@ function renderSettings(status) {
     setMaxOutput.value = status.max_output_tokens || "";
     setMaxSteps.value = String(status.max_steps || 50);
     setToolTimeout.value = String(status.tool_timeout_secs || 120);
+    // Budgets ride on the status message; absent fields fall back to what the
+    // kernel itself would use, so a page older than this never blanks a box.
+    const budgets = status.budgets || {};
+    setMcpTimeout.value = String(budgets.mcp_timeout_secs || 60);
+    setSubSteps.value = String(budgets.subagent_max_steps || 12);
+    setSubWall.value = String(budgets.subagent_wall_secs || 900);
+    setSubDepth.value = String(budgets.subagent_max_depth || 2);
+    setJobWait.value = String(budgets.job_wait_secs || 30);
     // The key is never sent back in full; an empty box means "unchanged".
     setApiKey.value = "";
     setApiKey.placeholder = status.api_key_masked
@@ -3141,7 +3182,7 @@ for (const toggle of [showToolOutput, showImages]) {
 
 // ---------------------------------------------------------------- settings
 
-for (const field of [setBaseUrl, setApiKey, setModel, setEffort, setProxy, setWindow, setPercent, setKeep, setToolPreset, setToolKeep, setToolHead, setToolTail, setToolImages, setMaxOutput, setSearchProvider, setSearchKey, setSearchEndpoint, judgeEndpoint, judgeKey, judgeModel].filter(Boolean)) {
+for (const field of [setBaseUrl, setApiKey, setModel, setEffort, setProxy, setWindow, setPercent, setKeep, setMaxSteps, setToolTimeout, setMcpTimeout, setSubSteps, setSubWall, setSubDepth, setJobWait, setToolPreset, setToolKeep, setToolHead, setToolTail, setToolImages, setMaxOutput, setSearchProvider, setSearchKey, setSearchEndpoint, judgeEndpoint, judgeKey, judgeModel].filter(Boolean)) {
   field.addEventListener("input", () => { settingsDirty = true; });
 }
 
@@ -3175,6 +3216,15 @@ function saveSettings() {
     tool_head_chars: Math.min(parseInt(setToolHead.value, 10) || 0, LOOSE),
     tool_tail_chars: Math.min(parseInt(setToolTail.value, 10) || 0, LOOSE),
     tool_keep_images: Math.min(parseInt(setToolImages.value, 10) || 0, LOOSE),
+    // The runtime budgets travel as one object; the shell keeps whatever the
+    // page did not send, so a blank or missing box never zeroes a deadline.
+    budgets: {
+      mcp_timeout_secs: parseInt(setMcpTimeout.value, 10) || 0,
+      subagent_max_steps: parseInt(setSubSteps.value, 10) || 0,
+      subagent_wall_secs: parseInt(setSubWall.value, 10) || 0,
+      subagent_max_depth: parseInt(setSubDepth.value, 10) || 0,
+      job_wait_secs: parseInt(setJobWait.value, 10) || 0,
+    },
   };
   if (setApiKey.value.trim() !== "") {
     payload.api_key = setApiKey.value.trim();

@@ -606,10 +606,11 @@ async fn bash_tool(args: Value) -> Result<String> {
     let timeout = Duration::from_millis(timeout_ms);
     let cut_note = cut_from.map(|asked| {
         format!(
-            "--- timeout_ms {asked} is above this machine's tool deadline; this call \
-             was bounded to {timeout_ms} ms. A command that must outlive the step \
-             belongs in bash with background: true — a job's lifetime is job_kill's, \
-             not the deadline's ---"
+            "--- timeout_ms {asked} is above this machine's foreground budget \
+             ({timeout_ms} ms, set by `tool_timeout_secs` — editable in the settings \
+             panel or with `ngu config set --tool-timeout <sec>`, and it applies to the \
+             next call). A command that must outlive the step belongs in bash with \
+             background: true — a job's lifetime is job_kill's, not this budget's ---"
         )
     });
     let cwd = match args.get("cwd").and_then(|c| c.as_str()) {
@@ -726,8 +727,9 @@ async fn bash_tool(args: Value) -> Result<String> {
             let stdout = std::mem::take(&mut *stdout_buf.lock().unwrap_or_else(|e| e.into_inner()));
             let stderr = std::mem::take(&mut *stderr_buf.lock().unwrap_or_else(|e| e.into_inner()));
             let mut message = format!(
-                "command timed out after {} ms and was killed: {command}",
-                timeout.as_millis()
+                "command timed out after {} ms and was killed: {command}\n({})",
+                timeout.as_millis(),
+                super::budget_hint("this budget", "tool-timeout")
             );
             // Whatever was printed before the deadline still answers part of
             // the question -- dropping it would make a timed-out call

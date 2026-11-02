@@ -112,6 +112,27 @@ pub struct Settings {
     #[serde(default = "default_tool_timeout_secs")]
     pub tool_timeout_secs: u64,
 
+    /// How long one MCP request may take — the deadline that used to be a
+    /// hardcoded 60 seconds inside the loader, invisible in every interface.
+    #[serde(default = "default_mcp_timeout_secs")]
+    pub mcp_timeout_secs: u64,
+
+    /// Model rounds a subagent (`delegate`) may take. Was `MAX_STEPS = 12`.
+    #[serde(default = "default_subagent_steps")]
+    pub subagent_max_steps: usize,
+
+    /// Wall clock a subagent may run. Was `WALL_BUDGET_SECS = 15 * 60`.
+    #[serde(default = "default_subagent_wall_secs")]
+    pub subagent_wall_secs: u64,
+
+    /// How deep subagents may nest. Was `MAX_DEPTH = 2`.
+    #[serde(default = "default_subagent_depth")]
+    pub subagent_max_depth: usize,
+
+    /// The largest `wait_ms` a job read may block for. Was `MAX_WAIT_MS = 30_000`.
+    #[serde(default = "default_job_wait_secs")]
+    pub job_wait_secs: u64,
+
     /// Cloud relay URL the local app dials out to for remote control.
     ///
     /// Empty leaves remote control off. No default host is assumed.
@@ -339,7 +360,71 @@ fn default_tool_timeout_secs() -> u64 {
     120
 }
 
+fn default_mcp_timeout_secs() -> u64 {
+    60
+}
+
+fn default_subagent_steps() -> usize {
+    12
+}
+
+fn default_subagent_wall_secs() -> u64 {
+    15 * 60
+}
+
+fn default_subagent_depth() -> usize {
+    2
+}
+
+fn default_job_wait_secs() -> u64 {
+    30
+}
+
 impl Settings {
+    /// The runtime budgets these settings describe.
+    ///
+    /// Every accessor treats `0` as "not written" and falls back to the shipped
+    /// value: a settings file that predates a field, or one where somebody
+    /// cleared a box, must not hand out instant deadlines.
+    pub fn budgets(&self) -> crate::tools::Budgets {
+        // `0` means "not written" — a cleared box or a file that predates the
+        // field falls back to the shipped number rather than an instant budget.
+        let seconds = |value: u64, fallback: u64| -> u64 {
+            if value == 0 {
+                fallback
+            } else {
+                value.min(24 * 3600)
+            }
+        };
+        let count = |value: usize, fallback: usize| -> usize {
+            if value == 0 {
+                fallback
+            } else {
+                value.min(1_000_000)
+            }
+        };
+        crate::tools::Budgets {
+            tool_deadline_ms: seconds(self.tool_timeout_secs(), default_tool_timeout_secs()) * 1000,
+            mcp_timeout_ms: seconds(self.mcp_timeout_secs, default_mcp_timeout_secs()) * 1000,
+            subagent_max_steps: count(self.subagent_max_steps, default_subagent_steps()),
+            subagent_wall_ms: seconds(self.subagent_wall_secs, default_subagent_wall_secs()) * 1000,
+            subagent_max_depth: count(self.subagent_max_depth, default_subagent_depth()),
+            job_wait_max_ms: seconds(self.job_wait_secs, default_job_wait_secs()) * 1000,
+        }
+    }
+
+    /// Where one budget's setting lives, for the note that names it when it bites.
+    pub fn budget_keys() -> [(&'static str, &'static str); 6] {
+        [
+            ("tool deadline", "tool-timeout"),
+            ("MCP request", "mcp-timeout"),
+            ("subagent steps", "subagent-steps"),
+            ("subagent wall clock", "subagent-wall"),
+            ("subagent depth", "subagent-depth"),
+            ("job wait", "job-wait"),
+        ]
+    }
+
     /// Whether the settings are complete enough to make a request.
     pub fn is_configured(&self) -> bool {
         !self.base_url.trim().is_empty() && !self.api_key.trim().is_empty()
@@ -647,6 +732,39 @@ pub fn home_dir() -> PathBuf {    if let Ok(profile) = std::env::var("USERPROFIL
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_budgets_map_to_milliseconds_and_survive_an_empty_file() {
+        // A settings file that predates these keys must describe the shipped
+        // numbers, not a machine where every call times out instantly.
+        let settings: Settings = serde_json::from_str("{}").expect("defaults");
+        let budgets = settings.budgets();
+        assert_eq!(budgets.tool_deadline_ms, 120_000);
+        assert_eq!(budgets.mcp_timeout_ms, 60_000);
+        assert_eq!(budgets.subagent_max_steps, 12);
+        assert_eq!(budgets.subagent_wall_ms, 900_000);
+        assert_eq!(budgets.subagent_max_depth, 2);
+        assert_eq!(budgets.job_wait_max_ms, 30_000);
+    }
+
+    #[test]
+    fn a_zero_budget_means_not_written() {
+        let mut settings = Settings::default();
+        settings.mcp_timeout_secs = 0;
+        settings.subagent_max_steps = 0;
+        assert_eq!(settings.budgets().mcp_timeout_ms, 60_000);
+        assert_eq!(settings.budgets().subagent_max_steps, 12);
+        // A written value is honoured, in seconds out.
+        settings.mcp_timeout_secs = 90;
+        assert_eq!(settings.budgets().mcp_timeout_ms, 90_000);
+    }
+
+    #[test]
+    fn a_budget_that_could_never_be_honoured_is_clamped() {
+        let mut settings = Settings::default();
+        settings.subagent_wall_secs = u64::MAX;
+        assert!(settings.budgets().subagent_wall_ms <= 24 * 3600 * 1000);
+    }
 
     #[test]
     fn an_empty_settings_set_is_not_configured() {

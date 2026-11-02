@@ -835,6 +835,9 @@ pub(crate) async fn dispatch(
                 .get("tool_keep_images")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize);
+            // The runtime budgets come as one object; absent means the shell
+            // keeps whatever the file or a previous save chose.
+            let budgets = command.get("budgets").cloned().filter(|v| v.is_object());
             // The step cap and the tool deadline are panel fields too now:
             // absent (or zero) means "keep what the file or the CLI chose".
             let max_steps = command
@@ -926,6 +929,7 @@ pub(crate) async fn dispatch(
                     tool_prune_tail,
                     tool_prune_keep,
                     tool_keep_images,
+                    budgets,
                     search_provider,
                     search_api_key,
                     search_endpoint,

@@ -278,9 +278,144 @@ pub fn set_default_tool_timeout_ms(ms: u64) {
     }
 }
 
+/// The runtime budgets, none of which is a constant any more.
+///
+/// Every one of these used to be a `const` in the file that used it — twelve
+/// steps, fifteen minutes, thirty seconds, sixty seconds, two levels deep. A
+/// number that only a rebuild can change is not a setting: the deployment, the
+/// panel, and in turn the model could not move any of them, and the ones that
+/// bit hardest (the subagent's wall clock, the MCP deadline) were the ones
+/// nobody could see. They now come from `settings.json`, are editable in the
+/// settings panel, and are *named in the answer* whenever one of them cuts
+/// something short — so hitting a budget teaches which knob moves it.
+///
+/// `Budgets` is a process global, like the tool deadline already was: a budget
+/// belongs to the machine, not to a conversation, and both hosts set it from the
+/// same file — at boot, and again on every panel save.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Budgets {
+    /// How long one foreground `bash` call may hold the turn.
+    pub tool_deadline_ms: u64,
+    /// How long one MCP request may take.
+    pub mcp_timeout_ms: u64,
+    /// Model rounds a subagent may take.
+    pub subagent_max_steps: usize,
+    /// Wall clock a subagent may run.
+    pub subagent_wall_ms: u64,
+    /// How deep subagents may nest.
+    pub subagent_max_depth: usize,
+    /// The largest `wait_ms` a job read may block for.
+    pub job_wait_max_ms: u64,
+}
+
+impl Default for Budgets {
+    /// The shipped numbers are the old constants, unchanged: turning a hardcoded
+    /// value into a setting must not silently change behaviour.
+    fn default() -> Self {
+        Self {
+            tool_deadline_ms: base::DEFAULT_BASH_TIMEOUT_MS,
+            mcp_timeout_ms: 60_000,
+            subagent_max_steps: 12,
+            subagent_wall_ms: 15 * 60_000,
+            subagent_max_depth: 2,
+            job_wait_max_ms: 30_000,
+        }
+    }
+}
+
+/// The budgets in force. A zero anywhere reads as "the shipped value": a
+/// half-written settings file must not hand out instant deadlines.
+pub fn budgets() -> Budgets {
+    let stored = BUDGETS.load(std::sync::atomic::Ordering::Relaxed);
+    let fallback = Budgets::default();
+    let pick = |value: u64, default: u64| if value == 0 { default } else { value };
+    Budgets {
+        tool_deadline_ms: pick(stored.tool_deadline_ms, fallback.tool_deadline_ms),
+        mcp_timeout_ms: pick(stored.mcp_timeout_ms, fallback.mcp_timeout_ms),
+        subagent_max_steps: if stored.subagent_max_steps == 0 {
+            fallback.subagent_max_steps
+        } else {
+            stored.subagent_max_steps
+        },
+        subagent_wall_ms: pick(stored.subagent_wall_ms, fallback.subagent_wall_ms),
+        subagent_max_depth: if stored.subagent_max_depth == 0 {
+            fallback.subagent_max_depth
+        } else {
+            stored.subagent_max_depth
+        },
+        job_wait_max_ms: pick(stored.job_wait_max_ms, fallback.job_wait_max_ms),
+    }
+}
+
+/// A packed form of [`Budgets`], stored in six atomics so reading one needs no
+/// lock in the middle of a tool call.
+#[derive(Debug)]
+struct PackedBudgets {
+    tool_deadline_ms: std::sync::atomic::AtomicU64,
+    mcp_timeout_ms: std::sync::atomic::AtomicU64,
+    subagent_max_steps: std::sync::atomic::AtomicU64,
+    subagent_wall_ms: std::sync::atomic::AtomicU64,
+    subagent_max_depth: std::sync::atomic::AtomicU64,
+    job_wait_max_ms: std::sync::atomic::AtomicU64,
+}
+
+impl PackedBudgets {
+    fn store(&self, budgets: &Budgets) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.tool_deadline_ms.store(budgets.tool_deadline_ms, Relaxed);
+        self.mcp_timeout_ms.store(budgets.mcp_timeout_ms, Relaxed);
+        self.subagent_max_steps.store(budgets.subagent_max_steps as u64, Relaxed);
+        self.subagent_wall_ms.store(budgets.subagent_wall_ms, Relaxed);
+        self.subagent_max_depth.store(budgets.subagent_max_depth as u64, Relaxed);
+        self.job_wait_max_ms.store(budgets.job_wait_max_ms, Relaxed);
+    }
+
+    fn load(&self, _ordering: std::sync::atomic::Ordering) -> Budgets {
+        use std::sync::atomic::Ordering::Relaxed;
+        Budgets {
+            tool_deadline_ms: self.tool_deadline_ms.load(Relaxed),
+            mcp_timeout_ms: self.mcp_timeout_ms.load(Relaxed),
+            subagent_max_steps: self.subagent_max_steps.load(Relaxed) as usize,
+            subagent_wall_ms: self.subagent_wall_ms.load(Relaxed),
+            subagent_max_depth: self.subagent_max_depth.load(Relaxed) as usize,
+            job_wait_max_ms: self.job_wait_max_ms.load(Relaxed),
+        }
+    }
+}
+
+static BUDGETS: PackedBudgets = PackedBudgets {
+    tool_deadline_ms: std::sync::atomic::AtomicU64::new(base::DEFAULT_BASH_TIMEOUT_MS),
+    mcp_timeout_ms: std::sync::atomic::AtomicU64::new(60_000),
+    subagent_max_steps: std::sync::atomic::AtomicU64::new(12),
+    subagent_wall_ms: std::sync::atomic::AtomicU64::new(15 * 60_000),
+    subagent_max_depth: std::sync::atomic::AtomicU64::new(2),
+    job_wait_max_ms: std::sync::atomic::AtomicU64::new(30_000),
+};
+
+/// Publish the budgets for the whole process. Both hosts call this at boot and
+/// again on every settings save, so a panel change lands on the next tool call
+/// rather than the next launch.
+pub fn set_budgets(budgets: Budgets) {
+    BUDGETS.store(&budgets);
+    // The tool deadline keeps its own global too: it is read by `bash` and was
+    // published from settings long before this module existed.
+    set_default_tool_timeout_ms(budgets.tool_deadline_ms);
+}
+
 /// The tool deadline in milliseconds: default and ceiling at once.
 pub fn default_tool_timeout_ms() -> u64 {
     DEFAULT_TOOL_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Where a budget came from, for the note that names it when it bites.
+///
+/// A message that only says "timed out" sends the reader to a log; one that
+/// says which setting owns the number, and that it is editable, ends the hunt.
+pub fn budget_hint(what: &str, key: &str) -> String {
+    format!(
+        "{what} is set by `{key}` — change it in the settings panel, or with \
+         `ngu config set --{key} <value>`; it applies to the next call, no restart."
+    )
 }
 
 /// The deadline one foreground call actually gets.

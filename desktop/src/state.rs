@@ -454,6 +454,12 @@ impl AppState {
         // someone who has never set one, and changeable without a restart.
         let settings = Settings::resolve();
         let model = settings.model_or_default();
+        // The budgets are process globals read while tools are being
+        // *registered*, so they must be published before `Kernel::new` builds
+        // the table below — otherwise a tool's own description states the
+        // shipped default rather than the number this machine uses. The call
+        // further down republishes after the rest of the settings land.
+        nguruvilu::tools::set_budgets(settings.budgets());
 
         // Skills are scanned once at boot; the catalog is part of the prompt.
         let mut skills = SkillRegistry::with_roots(SkillRegistry::default_roots());
@@ -506,7 +512,7 @@ impl AppState {
         // The tool deadline travels with the settings, the same way: the bash
         // tool's global default follows the panel from boot, and again whenever
         // `save_settings` writes a new value.
-        nguruvilu::tools::set_default_tool_timeout_ms(settings.tool_timeout_secs() * 1000);
+        nguruvilu::tools::set_budgets(settings.budgets());
 
         let runtime = Arc::new(Mutex::new(runtime));
         let skills = Arc::new(Mutex::new(skills));
@@ -640,6 +646,17 @@ impl AppState {
         // request. Built outside the status object: this crate's `json!` already
         // sits at the macro recursion limit, and one level less nesting is
         // cheaper than raising the limit crate-wide.
+        // Every runtime budget, in the shape the panel fills its boxes from.
+        // Built here rather than inline: this crate's `json!` sits at the macro
+        // recursion limit already.
+        let budgets = json!({
+            "tool_timeout_secs": self.settings.tool_timeout_secs(),
+            "mcp_timeout_secs": self.settings.mcp_timeout_secs,
+            "subagent_max_steps": self.settings.subagent_max_steps,
+            "subagent_wall_secs": self.settings.subagent_wall_secs,
+            "subagent_max_depth": self.settings.subagent_max_depth,
+            "job_wait_secs": self.settings.job_wait_secs,
+        });
         let tool_output = json!({
             "enabled": self.settings.tool_output.enabled,
             "head_chars": self.settings.tool_output.head_chars,
@@ -730,6 +747,7 @@ impl AppState {
                 "tool_output": tool_output,
             },
             "max_steps": self.settings.max_steps(),
+            "budgets": budgets,
             "tool_timeout_secs": self.settings.tool_timeout_secs(),
         })
     }
@@ -1062,6 +1080,11 @@ impl AppState {
         tool_prune_tail: Option<usize>,
         tool_prune_keep: Option<usize>,
         tool_keep_images: Option<usize>,
+        // The runtime budgets, as one object: mcp_timeout_secs,
+        // subagent_max_steps, subagent_wall_secs, subagent_max_depth,
+        // job_wait_secs. A field the page did not send keeps what is stored — a
+        // partial save must not zero a deadline.
+        budgets: Option<Value>,
         search_provider: &str,
         search_api_key: &str,
         search_endpoint: &str,
@@ -1071,7 +1094,7 @@ impl AppState {
         judge_model: &str,
         judge_present: bool,
     ) -> Result<()> {
-        let settings = Settings {
+        let mut settings = Settings {
             base_url: base_url.trim().to_string(),
             api_key: api_key.trim().to_string(),
             model: model.trim().to_string(),
@@ -1099,6 +1122,13 @@ impl AppState {
             relay_url: self.settings.relay_url.clone(),
             relay_token: self.settings.relay_token.clone(),
             max_output_tokens: max_output_tokens.filter(|t| *t > 0),
+            // The budgets the old page never sends, kept as stored here and
+            // overwritten below when the new panel sends a `budgets` object.
+            mcp_timeout_secs: self.settings.mcp_timeout_secs,
+            subagent_max_steps: self.settings.subagent_max_steps,
+            subagent_wall_secs: self.settings.subagent_wall_secs,
+            subagent_max_depth: self.settings.subagent_max_depth,
+            job_wait_secs: self.settings.job_wait_secs,
             // Thinning dials come from the panel; a field the page did not send
             // keeps what is stored, so an older page cannot erase them.
             tool_output: nguruvilu::settings::ToolOutputSettings {
@@ -1132,6 +1162,36 @@ impl AppState {
             // saving a field must not delete what a plugin or a newer build wrote.
             unknown: self.settings.unknown.clone(),
         };
+        // The budgets the panel moves. Anything present must be usable, so a zero
+        // is dropped here rather than written: these numbers are read by the next
+        // tool call, and a zero would mean every call on this machine times out
+        // instantly. Absent means "keep what is stored".
+        if let Some(values) = budgets.as_ref() {
+            let taken = |key: &str| {
+                values
+                    .get(key)
+                    .and_then(|v| v.as_u64())
+                    .filter(|v| *v > 0)
+            };
+            if let Some(value) = taken("tool_timeout_secs") {
+                settings.tool_timeout_secs = value;
+            }
+            if let Some(value) = taken("mcp_timeout_secs") {
+                settings.mcp_timeout_secs = value;
+            }
+            if let Some(value) = taken("subagent_max_steps") {
+                settings.subagent_max_steps = value as usize;
+            }
+            if let Some(value) = taken("subagent_wall_secs") {
+                settings.subagent_wall_secs = value;
+            }
+            if let Some(value) = taken("subagent_max_depth") {
+                settings.subagent_max_depth = value as usize;
+            }
+            if let Some(value) = taken("job_wait_secs") {
+                settings.job_wait_secs = value;
+            }
+        }
         settings.save()?;
         self.settings = settings;
         // The panel just wrote the user's own file, so what it shows is now
@@ -1148,7 +1208,7 @@ impl AppState {
         }
         // The tool deadline follows the panel in the same breath: a save that
         // only touched this field must still reach the bash tool's default.
-        nguruvilu::tools::set_default_tool_timeout_ms(self.settings.tool_timeout_secs() * 1000);
+        nguruvilu::tools::set_budgets(self.settings.budgets());
 
         // The route is what a turn actually reads, so it is rebuilt from the
         // settings that just changed — every field of it, not only the three

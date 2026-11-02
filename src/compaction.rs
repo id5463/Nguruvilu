@@ -826,7 +826,8 @@ mod prune_tests {
             vec![crate::message::ImageAttachment::url(format!(
                 "data:image/png;base64,{}",
                 "a".repeat(4_000)
-            ))],
+            ))
+            .labelled(format!("img-{message}"))],
         )
     }
 

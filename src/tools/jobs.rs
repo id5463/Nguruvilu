@@ -47,9 +47,6 @@ const MAX_JOB_OUTPUT: usize = 256 * 1024;
 /// printer filling the data disk.
 const MAX_JOB_LOG: u64 = 32 * 1024 * 1024;
 
-/// Longest `job_output` will block waiting for a job to finish.
-const MAX_WAIT_MS: u64 = 30_000;
-
 /// How often a waiter re-checks whether the child has exited.
 const WAIT_POLL_MS: u64 = 100;
 
@@ -1295,7 +1292,7 @@ pub fn install(registry: &mut ToolRegistry) -> Result<()> {
                 "type": "object",
                 "properties": {
                     "id": { "type": "string", "description": "Job id from bash, e.g. job-1" },
-                    "wait_ms": { "type": "integer", "description": "Block up to this long for the job to finish (default 0, max 30000)" }
+                    "wait_ms": { "type": "integer", "description": "Block up to this long for the job to finish (default 0, max 30000 unless the settings say otherwise: `job_wait_secs`)" }
                 },
                 "required": ["id"]
             }),
@@ -1351,7 +1348,7 @@ async fn output_tool(args: Value) -> Result<String> {
         .get("wait_ms")
         .and_then(|v| v.as_u64())
         .unwrap_or(0)
-        .min(MAX_WAIT_MS);
+        .min(super::budgets().job_wait_max_ms);
     let deadline = Instant::now() + Duration::from_millis(wait_ms);
     while job.is_running() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;

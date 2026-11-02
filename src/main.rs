@@ -363,6 +363,25 @@ enum ConfigAction {
         /// Output token ceiling: 8K, 32K, or a plain count. Pass 0 to clear.
         #[arg(long)]
         max_output_tokens: Option<String>,
+        /// Foreground `bash` budget in seconds: how long one command may hold the
+        /// turn before the answer says it is taking too long.
+        #[arg(long)]
+        tool_timeout: Option<u64>,
+        /// How long one MCP request may take, in seconds.
+        #[arg(long)]
+        mcp_timeout: Option<u64>,
+        /// Model rounds a `delegate` subagent may take.
+        #[arg(long)]
+        subagent_steps: Option<usize>,
+        /// Wall clock a `delegate` subagent may run, in seconds.
+        #[arg(long)]
+        subagent_wall: Option<u64>,
+        /// How deep subagents may nest.
+        #[arg(long)]
+        subagent_depth: Option<usize>,
+        /// The longest `job_output` may block waiting, in seconds.
+        #[arg(long)]
+        job_wait: Option<u64>,
         /// Network tuning preset: default, reasoning, local, or flaky.
         #[arg(long)]
         network: Option<String>,
@@ -681,6 +700,10 @@ async fn run() -> Result<()> {
     // `Settings::resolve` already folds the environment in, so a machine-level
     // variable still wins over the file.
     let mut settings = Settings::resolve();
+    // The budgets are process globals read when tools are *registered*, so they
+    // go in before the kernel builds its table: a tool description written after
+    // this point states the numbers the machine actually uses.
+    nguruvilu::tools::set_budgets(settings.budgets());
     let api_key = cli
         .api_key
         .clone()
@@ -1096,7 +1119,7 @@ async fn run() -> Result<()> {
 
     // The tool deadline is a process global: bash and every other deadline-less
     // tool fall back to it, so one settings key covers the whole tool surface.
-    nguruvilu::tools::set_default_tool_timeout_ms(settings.tool_timeout_secs() * 1000);
+    nguruvilu::tools::set_budgets(settings.budgets());
 
     let runtime = Arc::new(Mutex::new(runtime));
     let skills = Arc::new(Mutex::new(skills));
@@ -3568,6 +3591,12 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             compact_keep_recent,
             max_steps,
             max_output_tokens,
+            tool_timeout,
+            mcp_timeout,
+            subagent_steps,
+            subagent_wall,
+            subagent_depth,
+            job_wait,
             network,
             request_timeout,
             pool_idle_timeout,
@@ -3634,6 +3663,27 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             if let Some(value) = max_output_tokens {
                 let tokens = nguruvilu::size::parse_size(value)?;
                 settings.max_output_tokens = if tokens == 0 { None } else { Some(tokens) };
+            }
+            // The budgets. Stored as written and clamped on the way out (in
+            // `Settings::budgets`), so `config show` reports what was set while
+            // no reader can ever see a zero-length deadline.
+            if let Some(value) = tool_timeout {
+                settings.tool_timeout_secs = *value;
+            }
+            if let Some(value) = mcp_timeout {
+                settings.mcp_timeout_secs = *value;
+            }
+            if let Some(value) = subagent_steps {
+                settings.subagent_max_steps = *value;
+            }
+            if let Some(value) = subagent_wall {
+                settings.subagent_wall_secs = *value;
+            }
+            if let Some(value) = subagent_depth {
+                settings.subagent_max_depth = *value;
+            }
+            if let Some(value) = job_wait {
+                settings.job_wait_secs = *value;
             }
             if let Some(name) = network {
                 settings.network = nguruvilu::network::NetworkSettings::preset(name)
@@ -3930,6 +3980,15 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
                 "steps:         at most {} model step(s) per batch; the cap is asked about {} more time(s), each granting another batch",
                 effective.max_steps(),
                 nguruvilu::agent::CONTINUATION_BATCHES
+            );
+            println!(
+                "budgets:       bash {}s, MCP {}s, subagent {} steps / {}s / depth {}, job wait {}s",
+                effective.budgets().tool_deadline_ms / 1000,
+                effective.budgets().mcp_timeout_ms / 1000,
+                effective.budgets().subagent_max_steps,
+                effective.budgets().subagent_wall_ms / 1000,
+                effective.budgets().subagent_max_depth,
+                effective.budgets().job_wait_max_ms / 1000,
             );
             println!(
                 "network:       request {}s, pool idle {}s, {} retry(ies) from {}ms",
