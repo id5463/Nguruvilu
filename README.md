@@ -659,7 +659,7 @@ cargo build --release --offline          # → target/release/ngu
 # 桌面(独立 crate,单文件,约 8.4 MB;界面是"母版",运行时服务的是 ui 包那份)
 cargo build --release --offline --manifest-path desktop/Cargo.toml
 
-# 测试:单元 + 动态库集成 + 内核集成 + CLI + 界面一致性,共 785 项
+# 测试:单元 + 动态库集成 + 内核集成 + CLI + 界面一致性,共 791 项
 cargo test --offline
 
 # 发布:出 dist/ 与桌面副本,打印 SHA256
@@ -678,7 +678,7 @@ pwsh -File release.ps1
 
 ## 状态
 
-**完整架构已实现:785 个测试通过(730 单元 + 9 动态库集成 + 28 内核集成 + 6 CLI + 5 导出 + 5 统计 + 2 界面)。**
+**完整架构已实现:791 个测试通过(736 单元 + 9 动态库集成 + 28 内核集成 + 6 CLI + 5 导出 + 5 统计 + 2 界面)。**
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
@@ -712,7 +712,9 @@ pwsh -File release.ps1
 | **上下文注入引擎** | ✅ | 预算百分比+上限、触发、深度注入、分组竞争、递归激活 |
 | **上下文裁剪(Inline & Spill)** | ✅ | 发请求时裁旧工具回显(最近 N 条原样,更早留头/尾)与旧内联截图(只保留最近 N 张);完整内容落 `~/.nguruvilu/tool-output/`,模型用 `read` 就能重读;会话文件一字不改,所以随时可调可关 |
 | **工具时限=天花板** | ✅ | `tool_timeout_secs` 既是缺省也是上限:模型自填的 `timeout_ms` 超过就被截,并且**在回答里说明被截到多少、怎么办**(`background: true`)。管的是 bash 前台调用;后台作业、子代理、包工具不受它管——长活是它们的正当用途 |
+| **长程模式 = 一个包** | ✅ | `packs/ticket`：主代理就是这条对话——开票、派 worker、发预算、跟子代理对话验收。票是工作区里的文件(`tickets/<id>/`)、worker 是内核后台作业(`background+notify`)、完成判定是 worker 自己写的 `report.json`。**零内核改动、零编译、可随包借送**；包里带代码的方式是 MCP(`node files/ticket-mcp.mjs`)，面板由 `look.json` 的 `panels` 声明 |
 | **运行时预算全部可调** | ✅ | 以前写死在代码里的五个数字现在都在设置里:`tool_timeout_secs` / `mcp_timeout_secs` / `subagent_max_steps` / `subagent_wall_secs` / `subagent_max_depth` / `job_wait_secs`;设置面板同一屏可改、`ngu config set --tool-timeout …` 等旗标可改、`ngu config show` 会列出;保存即对下一个调用生效。被任何一个截住时,回答会点名是哪个旋钮 |
+| **严格网关只收一条 system** | ✅ | 实测 vLLM 类 OpenAI 网关会对 `[system, system, system, user]` 回 `400 System message must be at the beginning`——它管的是**条数**不是顺序。现在人格 + 常驻规则在请求里合成**一条** system 块，每段原文逐字保留；宽松网关不受影响 |
 | **工作区 git 快照** | ✅ | 每轮前后自动提交、历史、回滚(含删除新增文件) |
 | CLI | ✅ | 交互 / 打印 / JSON 三模式 + 20 个管理子命令 |
 | **桌面应用** | ✅ | `desktop/` 独立 crate:`ngu-desktop.exe` 约 8.4 MB 单文件,tao + wry + 系统 WebView2,三面板;界面母版编译进 exe,运行时服务 `ui` 包副本 |

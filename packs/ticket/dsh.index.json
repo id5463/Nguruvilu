@@ -1,0 +1,17 @@
+{
+  "formatVersion": 1,
+  "game": "nguruvilu",
+  "name": "ticket",
+  "description": "长程模式：把这条对话变成主代理——开票、派 worker、发预算、验收结果。票与事实全在工作区盘上，零内核改动，随时可借可卸载",
+  "versionId": "1.0.0",
+  "license": "MIT",
+  "kernelVersion": "0.1.0",
+  "dependencies": { "nguruvilu": ">=0.1.0" },
+  "soul": "soul.md",
+  "mcp": "mcp.json",
+  "look": "look.json",
+  "skills": [
+    { "id": "ticket-protocol", "source": "./skills/ticket-protocol", "license": "MIT" },
+    { "id": "ticket-review", "source": "./skills/ticket-review", "license": "MIT" }
+  ]
+}

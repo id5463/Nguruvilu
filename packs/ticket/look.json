@@ -1,0 +1,14 @@
+{
+  "themes": [],
+  "panels": [
+    {
+      "id": "ticket-board",
+      "slot": "above-composer",
+      "title": "票",
+      "order": 40,
+      "html": "<div id='tk-line' style='font-size:11.5px;color:var(--text,#e8edf2)'>还没有票</div><div id='tk-need' style='font-size:11px;color:var(--accent,#7ddc9a);margin-top:2px;min-height:13px'></div>",
+      "script": "const ngu = window.ngu;\nconst line = panel.querySelector('#tk-line');\nconst need = panel.querySelector('#tk-need');\nfunction paint(state){\n  if(!state){ line.textContent = '还没有票：用 ticket_open 开一张'; need.textContent=''; return; }\n  line.textContent = '活票 ' + state.open + ' · 在跑 ' + state.running + ' · 待验收 ' + state.delivered + ' · 卡住 ' + state.stuck + ' · 已关 ' + state.closed;\n  need.textContent = (state.attention && state.attention.length) ? ('要处理：' + state.attention.join(' ')) : '';\n}\nfunction scan(text){\n  if(typeof text !== 'string') return;\n  const m = text.match(/<!--ticket-state (\\{[^}]*\\})-->/);\n  if(!m) return;\n  try { paint(JSON.parse(m[1])); } catch (e) {}\n}\nif (ngu && typeof ngu.on === 'function') {\n  ngu.on('tool_end', function(ev){ scan(ev && ev.result); });\n}\nline.title = '票看板：来自主代理每次 ticket_* 调用的结果标记';"
+    }
+  ],
+  "strings": {}
+}

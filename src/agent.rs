@@ -1346,14 +1346,31 @@ impl Agent {
         let thinned = crate::compaction::prune_tool_results(&self.messages, &policy);
         let history = crate::compaction::prune_images(&thinned, &policy);
 
+        // The leading block is ONE message, not several.
+        //
+        // Measured against a real route: a vLLM-shaped OpenAI-compatible gateway
+        // answers `400 System message must be at the beginning` when a `system`
+        // message sits at any index after 0 — and a persona plus two standing
+        // injection rules is exactly that. The check is about the *count*, not
+        // the order, so sending [system, system, system, user] fails even though
+        // every system is at the front. Tolerant gateways never cared; strict ones
+        // refuse the turn outright, which looks like a broken key rather than a
+        // shape the provider dislikes.
+        //
+        // Joined with a blank line, the bytes of each fragment stay verbatim, so a
+        // pack's rule text is still exactly what its author wrote.
+        let mut head: Vec<&str> = Vec::new();
         if !settings.system_prompt.is_empty() {
-            request.push(Message::system(&settings.system_prompt));
+            head.push(&settings.system_prompt);
         }
         // A prefix fragment is a standing rule: it belongs above the history,
         // and under CacheFirst the engine has already moved it elsewhere rather
         // than dropping it.
         for text in &injection.prefix {
-            request.push(Message::system(text.clone()));
+            head.push(text.as_str());
+        }
+        if !head.is_empty() {
+            request.push(Message::system(head.join("\n\n")));
         }
 
         // Depth is counted from the end, so depth 1 means "immediately before
@@ -1421,6 +1438,49 @@ fn record_reported_window(error: &anyhow::Error, model: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gate this exists for: a strict OpenAI-compatible route answers
+    /// `400 System message must be at the beginning` for a request whose second
+    /// message is also `system`. One leading block, whatever the pack config.
+    #[test]
+    fn the_leading_block_is_one_message_even_with_injections() {
+        let tools = Arc::new(ToolRegistry::with_base_tools().unwrap());
+        let mut engine = crate::context::InjectionEngine::new();
+        engine.add(
+            crate::context::InjectionEntry::constant("r1", "用中文回答。")
+                .at(crate::context::PositionKind::Prefix),
+        );
+        engine.add(
+            crate::context::InjectionEntry::constant("r2", "不要开场白。")
+                .at(crate::context::PositionKind::Prefix),
+        );
+
+        let config: Arc<dyn TurnConfig> = Arc::new(
+            StaticConfig::new("你是编程助手", Arc::clone(&tools), "m")
+                .with_policy(Arc::new(window::DefaultContextPolicy::default())),
+        );
+        let client = LlmClient::new(crate::llm::LlmConfig::new("http://localhost:1", "k", "m"))
+            .expect("client builds");
+        let mut agent = Agent::new(client, Arc::clone(&config), vec![Message::user("问题")]);
+        agent.set_injection(Arc::new(engine));
+
+        let (request, _) = agent.build_request(&config.settings());
+        let leading = request
+            .iter()
+            .take_while(|m| m.role == crate::message::Role::System)
+            .count();
+        assert_eq!(leading, 1, "exactly one leading system message: {request:?}");
+        assert_eq!(request[0].role, crate::message::Role::System);
+        assert_eq!(
+            request[1].role,
+            crate::message::Role::User,
+            "the history follows the single block"
+        );
+        let text = request[0].text();
+        for fragment in ["你是编程助手", "用中文回答。", "不要开场白。"] {
+            assert!(text.contains(fragment), "the block keeps {fragment:?} verbatim");
+        }
+    }
 
     #[test]
     fn a_static_config_reports_its_settings() {
@@ -1540,10 +1600,18 @@ mod tests {
 
         let (request, injection) = agent.build_request(&config.settings());
         assert_eq!(injection.activated, vec!["rule"]);
-        assert_eq!(request.len(), 3, "system, injected rule, history");
-        assert_eq!(request[0].text(), "SYS");
-        assert_eq!(request[1].text(), "never edit vendor/");
-        assert_eq!(request[2].text(), "hi");
+        // The rule is above the history — and inside the same leading block as
+        // the persona, because a strict gateway refuses a second `system`
+        // message. Verbatim text, one envelope.
+        assert_eq!(request.len(), 2, "one leading block, then the history");
+        assert_eq!(request[0].role, crate::message::Role::System);
+        assert!(request[0].text().contains("SYS"), "persona kept");
+        assert!(
+            request[0].text().contains("never edit vendor/"),
+            "rule kept verbatim: {}",
+            request[0].text()
+        );
+        assert_eq!(request[1].text(), "hi");
 
         // Injected text never enters the recorded history.
         assert_eq!(agent.messages().len(), 1);

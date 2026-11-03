@@ -279,9 +279,35 @@ impl Loader {
         Ok(Outcome::Loaded)
     }
 
-    /// Load an MCP server and register its tools.
-    async fn load_mcp(&mut self, step: &PlannedStep) -> Result<Outcome> {
-        let entry = step
+    /// Where a stdio MCP server should run from.
+///
+/// A server that ships inside the pack names its own files by relative path
+/// (`args: ["files/ticket-mcp.mjs"]`), and the child process inherits the *host's*
+/// working directory unless told otherwise — which is wherever `ngu` happened to
+/// start, so the script is simply not there and the server dies on contact with
+/// "closed the connection". So: when the command or one of the arguments resolves
+/// to a file inside the pack, the pack directory is the working directory.
+///
+/// A server pulled from npm or git is left exactly as it was: its command is
+/// resolved elsewhere, and moving its cwd into the pack could silently change
+/// where it writes profiles and temp files.
+fn pack_cwd(pack_dir: Option<&std::path::Path>, command: &str, args: &[String]) -> Option<String> {
+    let directory = pack_dir?;
+    let inside = |candidate: &str| {
+        let path = std::path::Path::new(candidate);
+        // An absolute path already says where it lives; only a relative one that
+        // actually resolves inside the pack means "this server came with the pack".
+        !path.is_absolute() && directory.join(path).is_file()
+    };
+    if inside(command) || args.iter().any(|arg| inside(arg)) {
+        Some(directory.display().to_string())
+    } else {
+        None
+    }
+}
+
+/// Load an MCP server and register its tools.
+    async fn load_mcp(&mut self, step: &PlannedStep) -> Result<Outcome> {        let entry = step
             .mcp
             .as_ref()
             .ok_or_else(|| anyhow!("mcp step '{}' has no server definition", step.id))?;
@@ -310,21 +336,23 @@ impl Loader {
                 let command = entry.command.clone().ok_or_else(|| {
                     anyhow!("mcp '{}' uses stdio but declares no command", step.id)
                 })?;
+                // Decided before the struct literal: `command` is moved into the
+                // spec below, and field initialisers run in written order.
+                let cwd = Self::pack_cwd(self.pack_dir.as_deref(), &command, &entry.args);
+                // A pack that re-invokes the CLI cannot know where the host
+                // binary lives: its MCP child inherits the *host's* PATH, which
+                // need not contain `ngu` at all (a desktop build run straight
+                // from a target directory is the normal case). Measured: the
+                // ticket pack's worker launch burned six steps hunting for the
+                // executable and never started. So every stdio MCP server gets
+                // `NGU_EXE` — the host's own path — unless it declared its own.
+                let env = mcp_env(&entry.env);
                 McpSpec {
                     id: step.id.clone(),
                     command,
                     args: entry.args.clone(),
-                    env: entry
-                        .env
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                    cwd: entry
-                        .base
-                        .source
-                        .is_empty()
-                        .then(|| self.pack_dir.as_ref().map(|d| d.display().to_string()))
-                        .flatten(),
+                    env,
+                    cwd,
                     timeout_ms: entry
                     .timeout_ms
                     .unwrap_or_else(|| super::tools::budgets().mcp_timeout_ms),
@@ -807,6 +835,24 @@ fn plugin_name(source: &str, fallback: &str) -> String {
     fallback.to_string()
 }
 
+/// The environment a stdio MCP server starts with.
+///
+/// Declared entries win; `NGU_EXE` is added when the pack did not name one,
+/// because the host's own path is not otherwise discoverable from inside a
+/// plugin — and a pack that shells out to `ngu` (starting a worker, checking a
+/// flag) needs exactly that. `${VAR}` references are left untouched on purpose:
+/// substitution happens where the values are known.
+fn mcp_env(declared: &std::collections::BTreeMap<String, String>) -> std::collections::HashMap<String, String> {
+    let mut env: std::collections::HashMap<String, String> =
+        declared.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    if !env.contains_key("NGU_EXE") {
+        if let Ok(exe) = std::env::current_exe() {
+            env.insert("NGU_EXE".to_string(), exe.display().to_string());
+        }
+    }
+    env
+}
+
 fn scope_name(scope: Scope) -> &'static str {
     match scope {
         Scope::Session => "session",
@@ -820,6 +866,74 @@ fn label(step: &PlannedStep) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pack_carried_script_runs_from_the_pack() {
+        // The bug this pins: the rendered assembly writes `source: "stdio:node
+        // files/x.mjs"`, so an emptiness test on `source` was never true and the
+        // child got the host's cwd instead — the script was not there, and the
+        // pack's MCP server died with "closed the connection".
+        let pack = temp_pack_dir();
+        std::fs::create_dir_all(pack.join("files")).unwrap();
+        std::fs::write(pack.join("files").join("server.mjs"), "//x").unwrap();
+        let cwd = super::Loader::pack_cwd(
+            Some(&pack),
+            "node",
+            &["files/server.mjs".to_string(), "--verbose".to_string()],
+        );
+        assert_eq!(cwd, Some(pack.display().to_string()), "a relative file inside the pack decides");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_server_from_the_registry_keeps_its_own_working_directory() {
+        // npm/git servers resolve their command elsewhere, and moving their cwd
+        // into the pack could change where they write profiles and temp files.
+        let pack = temp_pack_dir();
+        let cwd = super::Loader::pack_cwd(Some(&pack), "chrome-devtools-mcp", &["--headless".to_string()]);
+        assert_eq!(cwd, None, "nothing here names a file inside the pack");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn an_absolute_path_is_not_a_pack_claim() {
+        let pack = temp_pack_dir();
+        std::fs::create_dir_all(pack.join("files")).unwrap();
+        std::fs::write(pack.join("files").join("x.mjs"), "//x").unwrap();
+        let outside = pack.join("files").join("x.mjs");
+        assert_eq!(
+            super::Loader::pack_cwd(Some(&pack), "node", &[outside.to_string_lossy().to_string()]),
+            None,
+            "an absolute path already says where it lives"
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn no_pack_directory_means_no_opinion() {
+        assert_eq!(super::Loader::pack_cwd(None, "node", &["files/x.mjs".to_string()]), None);
+    }
+
+    /// The ticket pack's worker launch failed in a real run because `ngu` was not
+    /// on the shell's PATH and the pack had no way to learn where the host lives.
+    #[test]
+    fn every_stdio_server_is_told_where_the_host_is() {
+        let env = super::mcp_env(&std::collections::BTreeMap::new());
+        let exe = env.get("NGU_EXE").expect("NGU_EXE is published");
+        assert!(std::path::Path::new(exe).is_absolute(), "an absolute path: {exe}");
+
+        // A pack that declared its own value keeps it: a wrapper script or a
+        // pinned older CLI is the author's call, not the loader's.
+        let mut declared = std::collections::BTreeMap::new();
+        declared.insert("NGU_EXE".to_string(), "/opt/pinned/ngu".to_string());
+        let env = super::mcp_env(&declared);
+        assert_eq!(env.get("NGU_EXE").map(String::as_str), Some("/opt/pinned/ngu"));
+    }
+
+    fn temp_pack_dir() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("ngu-mcp-cwd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
     use super::*;
     use crate::assembly::Assembly;
     use crate::plugin::{Contributions, Plugin, PluginCtx};

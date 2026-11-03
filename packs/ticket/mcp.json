@@ -1,0 +1,11 @@
+{
+  "servers": [
+    {
+      "id": "ticket",
+      "transport": "stdio",
+      "command": "node",
+      "args": ["files/ticket-mcp.mjs"],
+      "scope": "session"
+    }
+  ]
+}

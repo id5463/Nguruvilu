@@ -602,6 +602,43 @@ mod tests {
         assert_eq!(panels[0].id, "clock");
     }
 
+    /// The shipped ticket pack, read as an author would ship it: not a fixture
+    /// invented to match the parser, but the file the pack really carries. A
+    /// panel that does not parse, lands in no slot, or paints from a marker the
+    /// tools never emit would otherwise only show up as a blank strip in a
+    /// someone's interface.
+    #[test]
+    fn the_ticket_pack_ships_a_panel_the_shell_can_place() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/packs/ticket/look.json");
+        let look: LookFile = serde_json::from_str(&std::fs::read_to_string(path).unwrap())
+            .expect("packs/ticket/look.json parses as a look file");
+        assert_eq!(look.panels.len(), 1, "the ticket pack ships one panel");
+        let panel = &look.panels[0];
+        assert_eq!(panel.id, "ticket-board");
+        assert_eq!(panel.slot, crate::ui::UiSlot::AboveComposer);
+        let script = panel.script.clone().expect("the panel repaints itself");
+        assert!(
+            script.contains("ticket-state"),
+            "the panel listens for the marker the tools emit: {script}"
+        );
+        assert!(script.contains("ngu.on"), "and subscribes through the panel SDK");
+
+        // And it actually reaches a fiber, not just a struct.
+        let mut kernel = crate::plugin::Kernel::new();
+        let dir = scratch("ticket-look");
+        let mut manifest = PackManifest::new("ticket", "1.0.0");
+        manifest.look = Some("look.json".into());
+        write_manifest(&dir, &manifest).unwrap();
+        std::fs::copy(path, dir.join("look.json")).unwrap();
+        apply(&mut kernel, &dir, &manifest).unwrap();
+        let panels = kernel.ui_panels();
+        assert!(
+            panels.iter().any(|p| p.id == "ticket-board"),
+            "the ticket panel is registered: {panels:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_theme_with_an_unknown_token_is_refused_by_name() {
         let dir = scratch("bad-token");

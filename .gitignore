@@ -82,3 +82,5 @@ server-seed-profile.py
 .audit/
 # 参考用的外部仓库浅克隆(只读参考,只学设计不复制代码,不入库)
 .refs/
+
+echo-requests.jsonl
