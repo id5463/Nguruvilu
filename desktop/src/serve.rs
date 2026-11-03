@@ -833,7 +833,28 @@ async fn handle(
         // complaint. `safe_relative` is still the router: a path that would
         // climb out of the interface directory answers 404, exactly as a
         // missing file does.
-        Route::Ui => ui_response(path),
+        Route::Ui => {
+            let (status, content_type, body) = ui_response(path);
+            if status != 200 {
+                (status, content_type, body)
+            } else {
+                // The page is ~148 KB and this used to answer
+                // `Cache-Control: no-store` with no compression, so every open
+                // and every switch re-downloaded it in full over the tunnel.
+                // Now a re-open costs a 304, and the first load costs a quarter.
+                let etag = nguruvilu::assets::etag(&body);
+                respond_ui(
+                    &mut stream,
+                    content_type,
+                    &body,
+                    &etag,
+                    &request.if_none_match,
+                    request.accept_gzip,
+                )
+                .await;
+                return;
+            }
+        }
         // Route existence is not a secret any more either: the door that is not
         // there says 405 or 404 in the open, so a page that fetches the wrong
         // thing can be debugged from the browser it is running in.
@@ -1308,6 +1329,12 @@ struct Request {
     /// Raw bytes, kept raw because `/upload` carries files that are not UTF-8;
     /// `/cmd` decodes on its own where JSON needs it.
     body: Vec<u8>,
+    /// The client's validator for this resource, straight from the head. It is
+    /// not a credential and not a gate: it is the difference between answering
+    /// a 148 KB page and answering `304 Not Modified`.
+    if_none_match: String,
+    /// Whether the client can take gzip. Read here because the head is dropped.
+    accept_gzip: bool,
 }
 
 /// The largest body this server will read, in bytes.
@@ -1540,6 +1567,17 @@ async fn read_request(stream: &mut TcpStream) -> ReadOutcome {
     body_bytes.truncate(content_length);
 
     ReadOutcome::Request(Request {
+        // Read while the head is still in hand. Two headers, not a general map:
+        // they exist so an interface file can be answered with 304 or gzip, and
+        // nothing else here reads a request header at all.
+        if_none_match: head
+            .headers
+            .get("if-none-match")
+            .cloned()
+            .unwrap_or_default(),
+        accept_gzip: nguruvilu::assets::accepts_gzip(
+            head.headers.get("accept-encoding").map(String::as_str).unwrap_or(""),
+        ),
         method: head.method,
         target: head.target,
         body: body_bytes,
@@ -1578,6 +1616,48 @@ async fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: 
     );
     if stream.write_all(head.as_bytes()).await.is_ok() {
         let _ = stream.write_all(body).await;
+    }
+}
+
+/// Answer one interface asset: `304` when the caller already has this exact
+/// body, gzip when it can take it, otherwise the plain bytes.
+///
+/// The point of all three is traffic, not features: opening or switching the
+/// interface on a phone used to re-fetch 148 KB each time because the response
+/// was `no-store` and uncompressed.
+async fn respond_ui(
+    stream: &mut TcpStream,
+    content_type: &str,
+    body: &[u8],
+    etag: &str,
+    if_none_match: &str,
+    gzip_ok: bool,
+) {
+    let cache = format!(
+        "ETag: {etag}\r\nCache-Control: {}\r\nVary: Accept-Encoding\r\n",
+        nguruvilu::assets::UI_CACHE_CONTROL
+    );
+    if !if_none_match.is_empty() && if_none_match.trim() == etag {
+        let head = format!(
+            "HTTP/1.1 304 Not Modified\r\n{cache}Content-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let _ = stream.write_all(head.as_bytes()).await;
+        return;
+    }
+
+    let (payload, encoding) = match (gzip_ok, nguruvilu::assets::gzip(body)) {
+        (true, Some(packed)) => (packed, "Content-Encoding: gzip\r\n"),
+        _ => (body.to_vec(), ""),
+    };
+    let head = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: {content_type}\r\n\
+         Content-Length: {}\r\n\
+         {cache}{encoding}Connection: close\r\n\r\n",
+        payload.len()
+    );
+    if stream.write_all(head.as_bytes()).await.is_ok() {
+        let _ = stream.write_all(&payload).await;
     }
 }
 

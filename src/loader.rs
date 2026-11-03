@@ -325,9 +325,7 @@ fn pack_cwd(pack_dir: Option<&std::path::Path>, command: &str, args: &[String]) 
                     args: Vec::new(),
                     env: std::collections::HashMap::new(),
                     cwd: None,
-                    timeout_ms: entry
-                    .timeout_ms
-                    .unwrap_or_else(|| super::tools::budgets().mcp_timeout_ms),
+                    timeout_ms: entry.timeout_ms,
                     url: Some(url),
                     headers: entry.headers.clone(),
                 }
@@ -353,9 +351,7 @@ fn pack_cwd(pack_dir: Option<&std::path::Path>, command: &str, args: &[String]) 
                     args: entry.args.clone(),
                     env,
                     cwd,
-                    timeout_ms: entry
-                    .timeout_ms
-                    .unwrap_or_else(|| super::tools::budgets().mcp_timeout_ms),
+                    timeout_ms: entry.timeout_ms,
                     url: None,
                     headers: std::collections::BTreeMap::new(),
                 }

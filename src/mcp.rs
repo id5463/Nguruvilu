@@ -45,9 +45,16 @@ pub struct McpSpec {
     /// Working directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// Per-call timeout.
-    #[serde(default = "default_timeout")]
-    pub timeout_ms: u64,
+    /// Per-call timeout, when the declaration names one.
+    ///
+    /// `None` means "follow the process budget" (`mcp_timeout_secs`), and the
+    /// number is then read **at each call** rather than captured at connect.
+    /// That distinction is the whole point: the settings panel republishes the
+    /// budget while a server is already running, and a deadline frozen at
+    /// handshake time would ignore it — measured as "changing the MCP timeout in
+    /// the panel does nothing".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
     /// Endpoint for the `streamable-http` transport; `None` means stdio.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
@@ -55,10 +62,6 @@ pub struct McpSpec {
     /// every request to the endpoint.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
-}
-
-fn default_timeout() -> u64 {
-    60_000
 }
 
 impl McpSpec {
@@ -70,7 +73,7 @@ impl McpSpec {
             args,
             env: HashMap::new(),
             cwd: None,
-            timeout_ms: default_timeout(),
+            timeout_ms: None,
             url: None,
             headers: BTreeMap::new(),
         }
@@ -84,11 +87,23 @@ impl McpSpec {
             args: Vec::new(),
             env: HashMap::new(),
             cwd: None,
-            timeout_ms: default_timeout(),
+            timeout_ms: None,
             url: Some(url.into()),
             headers,
         }
     }
+}
+
+/// The deadline for one MCP call.
+///
+/// Read **at each call**, not captured at connect: `mcp_timeout_secs` is a
+/// process budget that the settings panel republishes and that `ngu config set`
+/// writes, and a deadline frozen during the handshake ignored both — which is
+/// what "I change the MCP timeout and nothing happens" was. A declaration that
+/// names its own number keeps it; everything else follows the process.
+fn deadline_for(declared: Option<u64>) -> std::time::Duration {
+    let ms = declared.unwrap_or_else(|| crate::tools::budgets().mcp_timeout_ms as u64);
+    std::time::Duration::from_millis(ms.max(1_000))
 }
 
 /// One tool advertised by a server.
@@ -122,7 +137,9 @@ pub struct McpClient {
     /// The HTTP wiring, present exactly when [`McpSpec::url`] was.
     http: Option<HttpSession>,
     tools: Vec<McpTool>,
-    timeout: Duration,
+    /// A declaration's own number, if it named one. `None` follows the process
+    /// budget, which is read at each call — see [`Client::deadline`].
+    declared_timeout_ms: Option<u64>,
 }
 
 /// The requests one connection is waiting on, and the answers that belonged to
@@ -561,7 +578,7 @@ pub(crate) fn resolve_program(command: &str) -> std::path::PathBuf {
             child: Some(Mutex::new(child)),
             http: None,
             tools: Vec::new(),
-            timeout: Duration::from_millis(spec.timeout_ms),
+            declared_timeout_ms: spec.timeout_ms,
         };
 
         client.initialize().await?;
@@ -596,7 +613,7 @@ pub(crate) fn resolve_program(command: &str) -> std::path::PathBuf {
             child: None,
             http: Some(http),
             tools: Vec::new(),
-            timeout: Duration::from_millis(spec.timeout_ms),
+            declared_timeout_ms: spec.timeout_ms,
         };
         client.initialize().await?;
         client.tools = client.list_tools().await?;
@@ -819,7 +836,7 @@ pub(crate) fn resolve_program(command: &str) -> std::path::PathBuf {
             child: Some(Mutex::new(child)),
             http: None,
             tools: Vec::new(),
-            timeout: Duration::from_secs(60),
+            declared_timeout_ms: None,
         }
     }
 
@@ -846,7 +863,7 @@ pub(crate) fn resolve_program(command: &str) -> std::path::PathBuf {
             return Err(error);
         }
 
-        match tokio::time::timeout(self.timeout, receiver).await {
+        match tokio::time::timeout(deadline_for(self.declared_timeout_ms), receiver).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => {
                 self.pending.lock().await.forget(id);
@@ -865,7 +882,7 @@ pub(crate) fn resolve_program(command: &str) -> std::path::PathBuf {
                 Err(anyhow!(
                     "MCP server '{}' timed out after {:?} on {method}{late}",
                     self.server,
-                    self.timeout
+                    deadline_for(self.declared_timeout_ms)
                 ))
             }
         }
@@ -909,13 +926,13 @@ pub(crate) fn resolve_program(command: &str) -> std::path::PathBuf {
             request = request.header("Mcp-Session-Id", session);
         }
 
-        let response = tokio::time::timeout(self.timeout, request.send())
+        let response = tokio::time::timeout(deadline_for(self.declared_timeout_ms), request.send())
             .await
             .map_err(|_| {
                 anyhow!(
                     "MCP server '{}' timed out after {:?} on {method}",
                     self.server,
-                    self.timeout
+                    deadline_for(self.declared_timeout_ms)
                 )
             })?
             .with_context(|| format!("posting to MCP server '{}' at {}", self.server, http.url))?;
@@ -1116,6 +1133,26 @@ mod tests {
     /// helper lives with the test that asks for the old contract.
     fn flatten_content(result: &Value) -> String {
         flatten_result(result).text
+    }
+
+    /// The knob the panel moves has to reach a live connection. This is the
+    /// defect that made "change the MCP timeout in the UI" a no-op: the deadline
+    /// was captured during the handshake, so a republished budget never reached
+    /// an already-connected server.
+    #[test]
+    fn an_mcp_deadline_follows_the_process_budget_at_call_time() {
+        let saved = crate::tools::budgets();
+        let mut moved = saved;
+        moved.mcp_timeout_ms = 3_000;
+        crate::tools::set_budgets(moved);
+        let followed = deadline_for(None).as_millis();
+        crate::tools::set_budgets(saved);
+
+        assert_eq!(followed, 3_000, "the number in force is read per call, not at connect");
+        // A declaration keeps its own number.
+        assert_eq!(deadline_for(Some(45_000)).as_millis(), 45_000);
+        // A nonsense number still yields a usable deadline instead of a spin.
+        assert!(deadline_for(Some(1)).as_millis() >= 1_000);
     }
 
     #[test]

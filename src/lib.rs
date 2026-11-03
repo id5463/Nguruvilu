@@ -21,6 +21,7 @@
 
 pub mod agent;
 pub mod assembly;
+pub mod assets;
 pub mod compaction;
 pub mod content;
 pub mod context;
