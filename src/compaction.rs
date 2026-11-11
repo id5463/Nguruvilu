@@ -58,13 +58,28 @@ pub struct Compaction {
 }
 
 impl Compaction {
-    /// The marker that prefixes a summary message, so a reader can tell a
-    /// summary from something the user actually typed.
+    /// The marker that prefixes a summary message, so a reader — and
+    /// [`is_summary`](Self::is_summary) — can tell a summary from something the
+    /// user actually typed. Kept as the first line so sessions written before
+    /// the framing below still read correctly.
     pub const MARKER: &'static str = "[summary of earlier conversation]";
+
+    /// What the successor model is told about the summary it inherits.
+    ///
+    /// Wording follows codex's `SUMMARY_PREFIX`: the shortest framing that tells
+    /// a resuming model "this is a handoff, not speech from the user, and the
+    /// tool state comes with it". Without it a summary reads like an
+    /// instruction from the user and gets argued with or restated.
+    pub const HANDOFF: &'static str = "Another language model started to solve this \
+problem and produced a summary of its thinking process. You also have access to the \
+state of the tools that were used by that language model. Use this to build on the \
+work that has already been done and avoid duplicating work. Here is the summary \
+produced by the other language model, use the information in this summary to assist \
+with your own analysis:";
 
     /// The message that stands in for the summarized run.
     pub fn message(&self) -> Message {
-        Message::user(format!("{}\n{}", Self::MARKER, self.summary))
+        Message::user(format!("{}\n{}\n{}", Self::MARKER, Self::HANDOFF, self.summary))
     }
 
     /// Whether a message is a compaction summary.
@@ -283,35 +298,33 @@ pub fn summary_request(history: &[Message]) -> Vec<Message> {
     }
 
     vec![Message::user(format!(
-        "Summarize the conversation below so work can continue without the original messages.\n\
-         \n\
-         Write it as six fixed sections, in this order, with these headings:\n\
-         1. 「目标」— what the user asked for, with every constraint and preference they \
-         stated, quoted where the wording matters.\n\
-         2. 「已完成」— what was actually done: files created or changed (exact paths), \
-         commands run and their outcomes, accounts/URLs/credentials that were created or used.\n\
-         3. 「关键事实」— anything expensive to rediscover: paths, versions, error causes, \
-         endpoints, prices, IDs. Copy them verbatim; never paraphrase a path, a command or a \
-         number.\n\
-         4. 「未完成」— what remains, each item with its concrete next action.\n\
-         5. 「坑」— mistakes and dead ends already tried, so they are not repeated.\n\
-         6. 「下一步」— the single next action to take when work resumes.\n\
-         \n\
-         Rules: specific beats general; file paths, commands, identifiers, URLs and numbers \
-         travel verbatim; when a fact was stated more than once, keep the latest version; do \
-         not describe the summarization itself, do not add pleasantries, do not invent \
-         anything the transcript does not contain.\n\
-         \n\
-         Length: this summary is all that survives, so it has to be as long as the work it \
-         stands in for. A long conversation deserves a long summary — tens of thousands of \
-         characters is normal, and one that fits on a screen has thrown away the reason it \
-         exists. Never shorten it by dropping a fact; shorten the prose around the facts \
-         instead.\n\
-         \n\
-         Conversation:\n\
-         {transcript}"
+        "{transcript}\n\n---\n\n{}",
+        SUMMARY_INSTRUCTION
     ))]
 }
+
+/// What the summarizer is asked for: codex's four-bullet handoff, verbatim in
+/// substance.
+///
+/// The six fixed sections this replaced were mine, and they were wrong for the
+/// model: a rigid template spends output on headings and invites a `(none)` stub
+/// per empty section, which is the opposite of what a summary that *is* the
+/// memory needs. A competent model already knows what a handoff contains; the
+/// instruction only has to name the four things that matter and get out of the
+/// way. The one addition to codex's wording is the closing sentence: this turn
+/// exists to produce text, and a tool call here means the turn produced nothing.
+const SUMMARY_INSTRUCTION: &str = "You are performing a CONTEXT CHECKPOINT \
+COMPACTION. Create a handoff summary for another LLM that will resume the task.\n\
+\n\
+Include:\n\
+- Current progress and key decisions made\n\
+- Important context, constraints, or user preferences\n\
+- What remains to be done (clear next steps)\n\
+- Any critical data, examples, or references needed to continue\n\
+\n\
+Be concise, structured, and focused on helping the next LLM seamlessly continue the \
+work. Preserve exact paths, commands, identifiers and numbers. Do not call any tools; \
+reply with the summary only.";
 
 /// How a summary is produced.
 ///
@@ -389,24 +402,48 @@ pub async fn summarize(
     history: &[Message],
 ) -> anyhow::Result<String> {
     let request = summarizer.request(history);
-    let mut rx = client.chat_stream(&request, &[]).await?;
-
-    let mut text = String::new();
-    while let Some(event) = rx.recv().await {
-        match event? {
-            crate::llm::LlmEvent::TextDelta(delta) => text.push_str(&delta),
-            crate::llm::LlmEvent::Finished { .. } => break,
-            _ => {}
+    // Two attempts, because the failure this guards against is a *decision* by
+    // the model, not a bug: measured on a real route, two of four summaries came
+    // back as a tool call instead of a summary, and the text before the call was
+    // stored as if it were the whole thing (1,005 characters standing in for
+    // 2,160 messages). The same shape covers an empty reply, a reply cut at the
+    // token cap, and a refusal — none of them is a summary, and none of them may
+    // be written to disk as one.
+    let mut complaint = String::from("no attempt ran");
+    for attempt in 1..=2 {
+        let mut rx = client.chat_stream(&request, &[]).await?;
+        let mut text = String::new();
+        let mut reason = String::new();
+        while let Some(event) = rx.recv().await {
+            match event? {
+                crate::llm::LlmEvent::TextDelta(delta) => text.push_str(&delta),
+                crate::llm::LlmEvent::Finished { reason: why } => {
+                    reason = why.unwrap_or_default().to_ascii_lowercase();
+                    break;
+                }
+                _ => {}
+            }
         }
-    }
 
-    let accepted = summarizer.accept(&text);
-    if accepted.trim().is_empty() {
-        return Err(anyhow::anyhow!(
-            "the summarizer returned nothing; refusing to replace history with an empty summary"
-        ));
+        let accepted = summarizer.accept(&text);
+        let cut = reason.contains("length");
+        let sidetracked = reason.contains("tool");
+        if !accepted.trim().is_empty() && !cut && !sidetracked {
+            return Ok(accepted);
+        }
+        complaint = if accepted.trim().is_empty() {
+            format!("attempt {attempt}: no text at all (finish reason '{reason}')")
+        } else {
+            format!(
+                "attempt {attempt}: {} characters, then finish reason '{reason}'",
+                accepted.chars().count()
+            )
+        };
     }
-    Ok(accepted)
+    Err(anyhow::anyhow!(
+        "refusing to compact: the summarizer produced no usable summary ({complaint}). \
+         The history is kept as it was."
+    ))
 }
 
 /// Replace a leading run of messages with a summary.
@@ -1116,12 +1153,30 @@ mod tests {
         let text = request[0].text();
         assert!(text.contains("change the port to 8080"), "user request kept");
         assert!(text.contains("edit"), "tool call kept");
-        assert!(text.contains("Summarize the conversation below"));
-        // The instructions are a fixed structure now: the remaining work and the
-        // single next action have sections of their own, so a resumed conversation
-        // knows what to do instead of reading prose for it.
-        assert!(text.contains("「未完成」"), "{text}");
-        assert!(text.contains("「下一步」"), "{text}");
+
+        // The instruction is codex's four-bullet handoff, and deliberately NOT a
+        // fixed section template: a rigid template spends output on headings and
+        // invites a `(none)` stub per empty section, which is the opposite of
+        // what a summary that *is* the memory needs.
+        assert!(text.contains("CONTEXT CHECKPOINT COMPACTION"), "{text}");
+        for bullet in ["Current progress", "Important context", "What remains to be done", "critical data"] {
+            assert!(text.contains(bullet), "missing {bullet:?}");
+        }
+        assert!(text.contains("Do not call any tools"), "a tool call here produces nothing");
+        assert!(!text.contains("「未完成」"), "no fixed section template: {text}");
+        // The instruction comes last, so the final thing the model reads is the ask.
+        let instruction_at = text.find("CONTEXT CHECKPOINT COMPACTION").unwrap();
+        let transcript_at = text.find("change the port to 8080").unwrap();
+        assert!(transcript_at < instruction_at, "transcript first, instruction last");
+    }
+
+    #[test]
+    fn a_summary_message_says_it_is_a_handoff_from_another_model() {
+        let message = Compaction { replaced: 3, summary: "the work so far".into() }.message();
+        let text = message.text();
+        assert!(Compaction::is_summary(&message), "still detectable as a summary");
+        assert!(text.contains("Another language model started to solve this problem"), "{text}");
+        assert!(text.contains("the work so far"), "the summary itself is kept verbatim");
     }
 
     #[test]
