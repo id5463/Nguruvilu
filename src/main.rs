@@ -39,9 +39,14 @@ use nguruvilu::skills::{register_skill_tool, SkillRegistry};
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a coding agent. Your working directory is the \
 process working directory. Use the tools to inspect and change files, and to run commands. \
-Prefer `read` over shelling out to view files, and `edit` for surgical changes. Keep answers \
-short and concrete. When you tell the user about a file, give its absolute path — a bare or \
-relative name is not something they can open.";
+Prefer `read` over shelling out to view files, and `edit` for surgical changes. \
+Prefer a dedicated tool over a shell command whenever one exists: an `mcp__*` tool is a \
+working integration with a real service (its auth, its endpoints, its parsing), and \
+re-deriving that work with `bash` and `curl` usually fails in a way that looks like bad \
+data rather than a bug. When the task names a service — mail, a course platform, a \
+browser, an issue tracker — look for its tools before reaching for the shell. \
+Keep answers short and concrete. When you tell the user about a file, give its absolute \
+path — a bare or relative name is not something they can open.";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -593,7 +598,26 @@ impl nguruvilu::model::ModelAccess for CliModelAccess {
             .expect("runtime lock")
             .snapshot()
             .system_prompt(&self.base_prompt);
-        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog() {
+        let tool_names = self.tools().names();
+        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog_with_tools(&tool_names) {
+            prompt.push_str("\n\n");
+            prompt.push_str(&catalog);
+        }
+        prompt
+    }
+
+    /// The base rules for a nested agent — deliberately without the persona.
+    ///
+    /// The persona is written for the agent the user talks to. When it says
+    /// "you are the planner, delegate what can be delegated", a subtask that
+    /// inherits it treats that as its own job and spends its budget spawning
+    /// more subtasks instead of doing the work it was handed. The operating
+    /// rules (working-directory convention, how to report) and the skill
+    /// catalog are what a subtask actually needs, so those stay.
+    fn subagent_prompt(&self) -> String {
+        let mut prompt = self.base_prompt.clone();
+        let tool_names = self.tools().names();
+        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog_with_tools(&tool_names) {
             prompt.push_str("\n\n");
             prompt.push_str(&catalog);
         }
@@ -626,7 +650,8 @@ impl TurnConfig for CliConfig {
             }
         }
 
-        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog() {
+        let tool_names = snapshot.tools.names();
+        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog_with_tools(&tool_names) {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&catalog);
         }

@@ -292,14 +292,48 @@ impl SkillRegistry {
 
     /// The catalog block injected into the prompt, or `None` when empty.
     pub fn catalog(&self) -> Option<String> {
+        self.catalog_with_tools(&[])
+    }
+
+    /// The catalog, plus which tools each skill's MCP server actually provides.
+    ///
+    /// The tool table is where the model looks for an action, and a skill's
+    /// instructions are a *second* lookup. Measured in a real session, that gap
+    /// was decisive: with six `mcp__moodle-herzen__*` tools among 114 and a
+    /// perfectly good skill description, the model ran
+    /// `bash` + `find / -name "*moodle*"` 441 times against 198 calls to the
+    /// tools themselves. Nothing in the prompt said the two were the same
+    /// thing, so the familiar shell won.
+    ///
+    /// A skill named `moodle` owns the tools whose name starts with
+    /// `mcp__moodle`, which is how the MCP host namespaces them. Listing them
+    /// beside the skill is the whole fix: the model now reads "here is the
+    /// skill, and here are the exact tools it governs".
+    pub fn catalog_with_tools(&self, tools: &[String]) -> Option<String> {
         if self.skills.is_empty() {
             return None;
         }
         let mut out = String::from(
-            "Available skills. Load one with the `skill` tool when it applies:\n",
+            "Available skills. Load one with the `skill` tool when it applies. \
+             A skill that owns MCP tools lists them; use those tools directly \
+             rather than re-implementing the service with `bash`.\n",
         );
         for skill in self.skills.values() {
             out.push_str(&skill.catalog_line());
+            let owned: Vec<&String> = tools
+                .iter()
+                .filter(|tool| {
+                    let name = tool.as_str();
+                    name.starts_with(&format!("mcp__{}__", skill.id))
+                        || name.starts_with(&format!("mcp__{}-", skill.id))
+                })
+                .collect();
+            if !owned.is_empty() {
+                let mut names: Vec<&str> = owned.iter().map(|t| t.as_str()).collect();
+                names.sort_unstable();
+                out.push_str("  tools: ");
+                out.push_str(&names.join(", "));
+            }
             out.push('\n');
         }
         Some(out)
@@ -633,6 +667,56 @@ mod tests {
         assert_eq!(body.trim(), "Body");
     }
 
+
+    #[test]
+    fn a_skill_names_the_mcp_tools_it_governs() {
+        // Measured in a real session: six `mcp__moodle-herzen__*` tools sat in a
+        // table of 114 beside a perfectly good `moodle` skill description, and
+        // the model still ran `bash` + `find / -name "*moodle*"` 441 times
+        // against 198 calls to the tools themselves. Nothing in the prompt said
+        // the skill and the tools were the same thing, so the shell won.
+        let root = temp_root("skill-tools");
+        let dir = root.join("moodle");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: moodle\ndescription: Herzen Moodle homework.\n---\n\nSteps.\n",
+        )
+        .unwrap();
+
+        let mut registry = SkillRegistry::with_roots([root]);
+        registry.scan().unwrap();
+
+        let tools = vec![
+            "bash".to_string(),
+            "mcp__moodle-herzen__moodle_status".to_string(),
+            "mcp__moodle-herzen__moodle_submit".to_string(),
+            "mcp__other__unrelated".to_string(),
+        ];
+        let catalog = registry.catalog_with_tools(&tools).expect("catalog");
+        assert!(
+            catalog.contains("mcp__moodle-herzen__moodle_status"),
+            "the skill must name its own tools: {catalog}"
+        );
+        assert!(
+            catalog.contains("mcp__moodle-herzen__moodle_submit"),
+            "{catalog}"
+        );
+        assert!(
+            !catalog.contains("mcp__other__unrelated"),
+            "another server's tools are not this skill's: {catalog}"
+        );
+        assert!(
+            !catalog.contains("tools: bash"),
+            "a base tool is not a skill's MCP tool: {catalog}"
+        );
+        // Without a tool table the catalog still renders: an embedder that has
+        // not built one yet must not lose its skills.
+        assert!(registry
+            .catalog_with_tools(&[])
+            .expect("catalog")
+            .contains("moodle: Herzen Moodle homework."));
+    }
     #[test]
     fn a_claude_code_shaped_skill_end_to_end() {
         let root = temp_root("claude-shape");
