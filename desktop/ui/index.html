@@ -348,6 +348,16 @@
     padding: 10px 12px;
     display: flex; gap: 8px; align-items: flex-end;
   }
+  /* 宽屏时把输入条的内容收进一条居中带，和上面那块任务面板同宽（880px）。
+     以前输入框 flex:1 把整行吃满：框的左边缘贴到屏幕左边、发送键甩到最右边，
+     与居中的正文不在一条中轴上。窄屏（手机）保持原来的贴边。
+     用 padding 而不是新套一层容器：DOM 不变，就不动任何选择器与脚本。 */
+  @media (min-width: 861px) {
+    #composer {
+      padding-left: max(12px, calc((100% - 880px) / 2));
+      padding-right: max(12px, calc((100% - 880px) / 2));
+    }
+  }
   #input {
     flex: 1; resize: none; min-height: 38px; max-height: 160px;
     background: var(--panel); color: var(--text);
@@ -647,7 +657,7 @@
           <span class="cap" id="cap-effort">Thinking effort</span>
           <select id="set-effort">
             <option value="">provider default</option>
-            <option value="none">none &mdash; no thinking</option>
+            <option value="off">off &mdash; no thinking</option>
             <option value="minimal">minimal &mdash; cheapest</option>
             <option value="low">low</option>
             <option value="medium">medium</option>
@@ -1759,7 +1769,11 @@ function panelSdk(panelId) {
     "  function reportHeight() {",
     "    if (!document.body) return;",
     "    var height = Math.ceil(document.body.getBoundingClientRect().height);",
-    "    if (!height || Math.abs(height - reported) < 8) return;",
+    // 收起的面板按 0 报：以前 `if (!height ...) return` 把 0 一并丢掉，于是
+    // 一条"我没东西可显示"的面板永远收不起来，壳子只能按 40px 最小高度画。
+    "    if (height <= 1) height = 0;",
+    "    if (height === reported) return;",
+    "    if (height > 0 && Math.abs(height - reported) < 8) return;",
     "    reported = height;",
     "    parent.postMessage({",
     '      ngu: "panel", panelId: panelId, requestId: null,',
@@ -1818,7 +1832,12 @@ window.addEventListener("message", (event) => {
   if (cmd === "panel:resize") {
     const height = Number(args.height);
     if (Number.isFinite(height)) {
-      frame.style.height = Math.min(Math.max(Math.round(height), 40), 480) + "px";
+      // 内容为 0 就把这一帧连同外框一起收起来。以前这里最小 40px，于是任何
+      // "此刻没有东西可显示"的面板都会在输入框上方留一条空白带——一条永远
+      // 空着的横条不是留白，是把输入框往下推。
+      const empty = Math.round(height) <= 0;
+      frame.style.height = empty ? "0px" : Math.min(Math.max(Math.round(height), 40), 480) + "px";
+      if (frame.parentElement) frame.parentElement.style.display = empty ? "none" : "";
     }
     return;
   }

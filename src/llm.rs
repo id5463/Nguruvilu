@@ -283,6 +283,61 @@ pub struct LlmClient {
     /// spend 400 ms instead of half an hour; [`LlmClient::new`] fills it from
     /// [`stream_total_budget`].
     stream_budget: std::time::Duration,
+    /// An effort spelling this endpoint has already refused, if any.
+    ///
+    /// Effort levels are not a standard vocabulary — the same request means
+    /// `minimal` to one gateway and `off` to another — and a gateway that does
+    /// not know a word rejects the *whole* request with 400 rather than ignoring
+    /// the field. Discovering that on every turn costs a turn each time, so the
+    /// first refusal is remembered and later bodies are built without the field.
+    /// Shared across clones for the same reason as `degraded`: a subagent on this
+    /// route would otherwise re-learn it, one wasted turn at a time.
+    ///
+    /// A clone is not the only way this client is rebuilt: the desktop builds a
+    /// fresh client for every turn, so a per-client slot alone would relearn the
+    /// same refusal once per turn — one 400 round trip per turn, forever. The
+    /// learned refusal therefore also lives in REFUSED_EFFORTS, keyed by
+    /// endpoint, and a new client starts from what this process already knows.
+    refused_effort: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// Effort spellings this process has already seen an endpoint refuse.
+///
+/// Keyed by endpoint plus effort, because the rejection is a property of the
+/// endpoint's vocabulary and not of the client object: one gateway refusing
+/// `minimal` says nothing about another gateway, and a user may have both
+/// configured as profiles. A process-lifetime table rather than a file: the fact
+/// is cheap to rediscover once per run and worthless to persist, and an endpoint
+/// that gains a word in an upgrade must not inherit an old refusal.
+static REFUSED_EFFORTS: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
+
+fn refused_key(base_url: &str, effort: &str) -> String {
+    format!(
+        "{}\u{1}{}",
+        base_url.trim().trim_end_matches('/').to_ascii_lowercase(),
+        effort.trim()
+    )
+}
+
+/// Whether this process has already seen this endpoint refuse this effort.
+fn effort_already_refused(base_url: &str, effort: &str) -> bool {
+    let key = refused_key(base_url, effort);
+    REFUSED_EFFORTS
+        .lock()
+        .expect("refused table")
+        .as_ref()
+        .map(|seen| seen.contains(&key))
+        .unwrap_or(false)
+}
+
+/// Record a refusal for the rest of the process.
+fn remember_refused_effort(base_url: &str, effort: &str) {
+    let key = refused_key(base_url, effort);
+    let mut table = REFUSED_EFFORTS.lock().expect("refused table");
+    table
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(key);
 }
 
 impl LlmClient {
@@ -315,12 +370,24 @@ impl LlmClient {
         };
 
         let http = builder.build().context("building HTTP client")?;
+        // Seed from what this process already learned about this endpoint: the
+        // desktop builds a client per turn, and a refusal rediscovered every
+        // turn would cost a 400 on every turn.
+        let wanted = config.reasoning_effort.clone().unwrap_or_default();
+        let seed = if !wanted.trim().is_empty()
+            && effort_already_refused(&config.base_url, wanted.trim())
+        {
+            Some(wanted.trim().to_string())
+        } else {
+            None
+        };
         Ok(Self {
             http,
             config,
             shaper: Arc::new(crate::request::Passthrough),
             degraded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stream_budget: stream_total_budget(),
+            refused_effort: Arc::new(std::sync::Mutex::new(seed)),
         })
     }
 
@@ -420,15 +487,61 @@ impl LlmClient {
     /// answer itself did not complete.
     pub async fn chat_stream(&self, messages: &[Message], tools: &[Value]) -> Result<mpsc::Receiver<Result<LlmEvent>>> {
         let body = self.build_body(messages, tools);
-        // The mode is read back off the finished body rather than taken from the
-        // config, because the shaper has the last word on it: an `extraBody`
-        // that says `"stream": false` means a single JSON answer, and reading
-        // that answer as SSE would lose every word of it without an error.
+        // One retry without the effort field, and only for the failure that
+        // names it. A gateway whose vocabulary for effort differs from ours
+        // rejects the whole request over one word; asking again with the
+        // field absent is the difference between a turn the user can use and
+        // a 400 they cannot act on. The refusal is remembered, so this costs
+        // one extra round trip per route rather than one per turn.
+        let refused_word = body
+            .get("reasoning_effort")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        match (self.dispatch(body).await, refused_word) {
+            (Err(error), Some(word)) if self.endpoint_refused_effort(&error) => {
+                // The endpoint names `reasoning_effort` in its rejection, so the
+                // field is the problem and not the turn. Ask once more without
+                // it -- and say so, because a setting that silently stops being
+                // sent is one the user will report as broken.
+                self.note_refused_effort(&word);
+                eprintln!(
+                    "[llm] this endpoint does not accept reasoning_effort = {word:?}; sending this route without it from now on"
+                );
+                self.dispatch(self.build_body(messages, tools)).await
+            }
+            (outcome, _) => outcome,
+        }
+    }
+
+    /// Send a body that has already been built, by the mode it asks for.
+    ///
+    /// The mode is read back off the finished body rather than taken from the
+    /// config, because the shaper has the last word on it: an `extraBody` that
+    /// says `"stream": false` means a single JSON answer, and reading that
+    /// answer as SSE would lose every word of it without an error.
+    async fn dispatch(&self, body: Value) -> Result<mpsc::Receiver<Result<LlmEvent>>> {
         if asks_for_stream(&body) {
             self.open_stream(body).await
         } else {
             self.open_buffered(body).await
         }
+    }
+
+    /// Whether this failure is the endpoint rejecting our effort spelling.
+    ///
+    /// Narrow on purpose: a 400 that names `reasoning_effort` says the word is
+    /// wrong, while any other 400 is about the request as a whole and must
+    /// reach the caller unchanged.
+    fn endpoint_refused_effort(&self, error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<RequestError>()
+                .map(|failure| {
+                    failure.status == Some(400)
+                        && failure.message.contains("reasoning_effort")
+                })
+                .unwrap_or(false)
+        })
     }
 
     /// Send a streaming completion request.
@@ -744,6 +857,30 @@ impl LlmClient {
 
     /// Whether an error is the peer closing a connection mid-request.
 
+    /// The effort spelling this endpoint has already refused, if any.
+    pub fn refused_effort(&self) -> Option<String> {
+        self.refused_effort
+            .lock()
+            .expect("refused lock")
+            .clone()
+    }
+
+    /// Remember that this endpoint does not accept this effort spelling.
+    ///
+    /// Returns whether it was news. The caller that saw the 400 asks again once
+    /// without the field; every later request omits it for free rather than
+    /// earning the same rejection on each turn. Recorded both on this client
+    /// and in the process-wide table, because the next turn gets a different
+    /// client object.
+    pub fn note_refused_effort(&self, effort: &str) -> bool {
+        remember_refused_effort(&self.config.base_url, effort);
+        let mut slot = self.refused_effort.lock().expect("refused lock");
+        if slot.as_deref() == Some(effort) {
+            return false;
+        }
+        *slot = Some(effort.to_string());
+        true
+    }
     fn build_body(&self, messages: &[Message], tools: &[Value]) -> Value {
         let wire: Vec<Value> = messages.iter().map(to_wire).collect();
         let mut body = json!({
@@ -767,7 +904,16 @@ impl LlmClient {
         // is a different endpoint.
         if let Some(effort) = &self.config.reasoning_effort {
             let effort = effort.trim();
-            if !effort.is_empty() && effort != "default" {
+            // A spelling this endpoint has already refused is not sent
+            // again: the rejection is about the word, not about the turn,
+            // so repeating it would fail every request in the session.
+            let refused = self
+                .refused_effort
+                .lock()
+                .expect("refused lock")
+                .clone()
+                .unwrap_or_default();
+            if !effort.is_empty() && effort != "default" && effort != refused {
                 body["reasoning_effort"] = json!(effort);
             }
         }
@@ -1788,16 +1934,26 @@ mod body_tests {
     }
 
     fn client_with(effort: Option<&str>, extra: serde_json::Map<String, serde_json::Value>) -> LlmClient {
-        let mut config = LlmConfig::new("http://localhost:1/v1", "k", "test-model");
+        client_at("http://localhost:1/v1", effort).with_shaper(crate::request::from_extra_fields(extra))
+    }
+
+    /// A client against a named endpoint.
+    ///
+    /// The endpoint matters to the tests now: a refused effort is remembered
+    /// process-wide keyed by endpoint, so two tests sharing `localhost:1` would
+    /// share each other's learned refusals.
+    fn client_at(base_url: &str, effort: Option<&str>) -> LlmClient {
+        let mut config = LlmConfig::new(base_url, "k", "test-model");
         config.reasoning_effort = effort.map(str::to_string);
-        LlmClient::new(config)
-            .unwrap()
-            .with_shaper(crate::request::from_extra_fields(extra))
+        LlmClient::new(config).unwrap()
     }
 
     #[test]
     fn reasoning_effort_reaches_the_request_body() {
-        let client = client_with(Some("minimal"), serde_json::Map::new());
+        // A distinct endpoint per test: refusals are remembered process-wide,
+        // keyed by endpoint, so a shared one would let one test's learned
+        // refusal silence another test's assertion.
+        let client = client_at("https://effort-sent.example/v1", Some("minimal"));
         let body = client.preview_body(&[Message::user("hi")], &[]);
         assert_eq!(
             body["reasoning_effort"], "minimal",
@@ -1807,17 +1963,85 @@ mod body_tests {
 
     #[test]
     fn an_empty_or_default_effort_is_not_sent() {
-        for value in ["", "  ", "default"] {
-            let client = client_with(Some(value), serde_json::Map::new());
+        for (index, value) in ["", "  ", "default"].iter().enumerate() {
+            let client = client_at(&format!("https://effort-empty-{index}.example/v1"), Some(value));
             let body = client.preview_body(&[Message::user("hi")], &[]);
             assert!(
                 body.get("reasoning_effort").is_none(),
                 "{value:?} should mean 'let the provider decide': {body}"
             );
         }
-        let client = client_with(None, serde_json::Map::new());
+        let client = client_at("https://effort-none.example/v1", None);
         let body = client.preview_body(&[Message::user("hi")], &[]);
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn a_refused_effort_is_not_sent_again() {
+        // Measured against a real gateway: it answers 400 for the whole request
+        // when it does not know the effort word, so a spelling it has already
+        // refused must not be repeated — otherwise every turn fails on a
+        // setting the user cannot see.
+        let client = client_at("https://effort-refused.example/v1", Some("minimal"));
+        let first = client.preview_body(&[Message::user("hi")], &[]);
+        assert_eq!(first["reasoning_effort"], "minimal", "{first}");
+
+        assert!(client.note_refused_effort("minimal"), "the first refusal is news");
+        let second = client.preview_body(&[Message::user("hi")], &[]);
+        assert!(
+            second.get("reasoning_effort").is_none(),
+            "a refused word must be dropped, not retried: {second}"
+        );
+        assert_eq!(client.refused_effort().as_deref(), Some("minimal"));
+    }
+
+    #[test]
+    fn a_fresh_client_on_the_same_endpoint_keeps_the_refusal() {
+        // The desktop builds a new client for every turn, and `refused_effort`
+        // used to be per-client state — so the same 400 was paid once per turn,
+        // forever. The learned refusal has to outlive the client object, and it
+        // has to be scoped to the endpoint: another gateway is another
+        // vocabulary.
+        let endpoint = "https://refusal-probe-1.example/v1";
+        let mut config = LlmConfig::new(endpoint, "k", "m");
+        config.reasoning_effort = Some("minimal".into());
+        let first = LlmClient::new(config.clone()).unwrap();
+        first.note_refused_effort("minimal");
+
+        let second = LlmClient::new(config).unwrap();
+        assert_eq!(
+            second.refused_effort().as_deref(),
+            Some("minimal"),
+            "a new client on the same endpoint must start from what was learned"
+        );
+        let body = second.preview_body(&[Message::user("hi")], &[]);
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "the refused word must not be sent by the next turn's client either: {body}"
+        );
+
+        // Another endpoint keeps its own vocabulary.
+        let mut elsewhere = LlmConfig::new("https://refusal-probe-2.example/v1", "k", "m");
+        elsewhere.reasoning_effort = Some("minimal".into());
+        let other = LlmClient::new(elsewhere).unwrap();
+        assert!(
+            other.refused_effort().is_none(),
+            "a refusal at one endpoint says nothing about another"
+        );
+        let body = other.preview_body(&[Message::user("hi")], &[]);
+        assert_eq!(body["reasoning_effort"], "minimal", "{body}");
+    }
+
+    #[test]
+    fn a_different_effort_after_a_refusal_is_still_sent() {
+        // The refusal is about one word, not about the field: picking another
+        // level must work without restarting the session.
+        let client = client_with(Some("minimal"), serde_json::Map::new());
+        client.note_refused_effort("minimal");
+        let mut switched = client.clone();
+        switched.config.reasoning_effort = Some("high".into());
+        let body = switched.preview_body(&[Message::user("hi")], &[]);
+        assert_eq!(body["reasoning_effort"], "high", "{body}");
     }
 
     #[test]
