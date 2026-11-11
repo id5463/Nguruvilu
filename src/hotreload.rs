@@ -460,11 +460,20 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// The system prompt this snapshot implies, given a base prompt.
+    ///
+    /// Order is a cache decision, not a stylistic one. A prompt cache matches on
+    /// a **prefix**, so the bytes most likely to change must come last: the base
+    /// prompt is compiled into the binary and identical across every turn and
+    /// every session, while the persona is a join over the packs that happen to
+    /// be loaded and changes whenever one is loaded, unloaded, or edited.
+    ///
+    /// Written persona-first, every pack toggle invalidated the cache for the
+    /// entire prompt — base included — on the very first token.
     pub fn system_prompt(&self, base: &str) -> String {
         if self.persona.trim().is_empty() {
             base.to_string()
         } else {
-            format!("{}\n\n{}", self.persona.trim(), base)
+            format!("{}\n\n{}", base, self.persona.trim())
         }
     }
 }
@@ -1340,15 +1349,23 @@ mod tests {
     }
 
     #[test]
-    fn the_system_prompt_combines_persona_and_base() {
+    fn the_system_prompt_puts_the_stable_base_before_the_persona() {
+        // Prefix order is a cache decision. The base prompt is compiled in and
+        // identical every turn; the persona is a join over whatever packs are
+        // loaded. Written persona-first, toggling one pack invalidated the cache
+        // for the base prompt too.
         let mut runtime = fresh_runtime();
         runtime
             .apply(Change::session("s1", ChangePayload::Persona("Be terse.".into())))
             .unwrap();
         let snapshot = runtime.snapshot();
         let prompt = snapshot.system_prompt("You are an agent.");
-        assert!(prompt.starts_with("Be terse."));
-        assert!(prompt.contains("You are an agent."));
+        assert!(prompt.starts_with("You are an agent."), "{prompt}");
+        assert!(prompt.contains("Be terse."), "{prompt}");
+        assert!(
+            prompt.find("You are an agent.") < prompt.find("Be terse."),
+            "the stable half must come first: {prompt}"
+        );
 
         // With no persona the base prompt is used unchanged.
         let plain = fresh_runtime();

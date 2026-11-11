@@ -438,6 +438,34 @@ impl InjectionEngine {
         Ok(engine)
     }
 
+    /// Fold another pack's engine into this one, instead of replacing it.
+    ///
+    /// A pack's `injections.json` used to *replace* the standing engine, so
+    /// installing a second pack that carries rules silently deleted the first
+    /// one's — the rules were still on disk, still enabled, and simply not
+    /// there. Measured on a real machine with two packs carrying rules: only the
+    /// alphabetically last one's text ever reached the model.
+    ///
+    /// Entries are appended in pack-name order, which keeps the result
+    /// deterministic, and an id that is already present is skipped: two packs
+    /// that both ship `chinese-only` mean one rule, not two contradictory
+    /// copies of the same sentence.
+    ///
+    /// The tuning knobs (budget, scan scope, recursion) keep the standing file's
+    /// values: they describe the user's own machine, not any one pack.
+    pub fn absorb(&mut self, other: InjectionEngine) {
+        for entry in other.entries {
+            if self.entries.iter().any(|kept| kept.id == entry.id) {
+                eprintln!(
+                    "[injections] a second entry with id {:?} was ignored: ids must be unique \
+                     across everything a session loads",
+                    entry.id
+                );
+                continue;
+            }
+            self.entries.push(entry);
+        }
+    }
     /// Load the default file, treating "no file" as "no entries".
     ///
     /// A missing file is the normal case for someone who has never written one,

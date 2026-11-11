@@ -48,7 +48,25 @@ pub trait ModelAccess: Send + Sync {
     fn tools(&self) -> Arc<ToolRegistry>;
 
     /// Standing instructions for a nested agent.
+    /// Standing instructions for a nested agent.
     fn system_prompt(&self) -> String;
+
+    /// Standing instructions for a nested agent — the *base* rules only.
+    ///
+    /// A subagent needs the operating rules (its working directory convention,
+    /// how to report results) and must not inherit the session's persona. The
+    /// persona is written for the agent the user is talking to: it says "you are
+    /// the planner, delegate what can be delegated", and a subtask that reads
+    /// that as its own job will spend its budget handing work to further
+    /// subagents instead of doing the task it was given. The framing paragraph
+    /// in `tools::subagent` cannot undo it either, because it arrives after the
+    /// system prompt rather than instead of it.
+    ///
+    /// Defaults to the full prompt so an embedder that has no separate base gets
+    /// today's behaviour rather than an empty one.
+    fn subagent_prompt(&self) -> String {
+        self.system_prompt()
+    }
 
     /// The context policy in force, so a subagent compacts like its parent.
     fn context_policy(&self) -> Arc<dyn ContextPolicy>;

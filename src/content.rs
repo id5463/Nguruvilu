@@ -319,8 +319,12 @@ impl AdoptedContent {
         let mut injections = crate::context::InjectionEngine::load_default();
         for (_, content) in installed_content(packs_dir)? {
             content.fold_settings(&mut settings);
+            // Merged, not replaced. Assigning here meant only the last pack in
+            // name order had its rules in force, and every other pack's
+            // `injections.json` was silently dead — the file was present, the
+            // pack was enabled, and the text never reached the model.
             if let Some(rules) = content.injections {
-                injections = rules;
+                injections.absorb(rules);
             }
         }
         let persona = installed_persona(packs_dir)?;

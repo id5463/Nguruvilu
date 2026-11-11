@@ -260,7 +260,7 @@ async fn delegate(access: Arc<dyn ModelAccess>, args: Value) -> Result<ToolOutpu
     // exactly the permissions and conventions the session has.
     let config: Arc<dyn crate::agent::TurnConfig> = Arc::new(
         StaticConfig::new(
-            access.system_prompt(),
+            access.subagent_prompt(),
             access.tools(),
             client.model(),
         )
