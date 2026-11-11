@@ -247,7 +247,26 @@ impl nguruvilu::model::ModelAccess for DesktopModelAccess {
             .expect("runtime lock")
             .snapshot()
             .system_prompt(&self.base_prompt);
-        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog() {
+        let tool_names = self.tools().names();
+        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog_with_tools(&tool_names) {
+            prompt.push_str("\n\n");
+            prompt.push_str(&catalog);
+        }
+        prompt
+    }
+
+    /// The base rules for a nested agent — deliberately without the persona.
+    ///
+    /// The persona is written for the agent the user talks to. When it says
+    /// "you are the planner, delegate what can be delegated", a subtask that
+    /// inherits it treats that as its own job and spends its budget spawning
+    /// more subtasks instead of doing the work it was handed. The operating
+    /// rules (working-directory convention, how to report) and the skill
+    /// catalog are what a subtask actually needs, so those stay.
+    fn subagent_prompt(&self) -> String {
+        let mut prompt = self.base_prompt.clone();
+        let tool_names = self.tools().names();
+        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog_with_tools(&tool_names) {
             prompt.push_str("\n\n");
             prompt.push_str(&catalog);
         }
@@ -333,7 +352,8 @@ impl TurnConfig for SharedConfig {
                 system_prompt.push_str(&block);
             }
         }
-        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog() {
+        let tool_names = snapshot.tools.names();
+        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog_with_tools(&tool_names) {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&catalog);
         }
@@ -867,33 +887,45 @@ impl AppState {
         event
     }
 
-    /// Every stored message of the current session as renderable entries,
-    /// oldest first. Pagination slices this list; it is not sent whole.
-    fn all_entries(&self) -> Vec<Value> {
-        self.session
-            .messages
-            .iter()
-            .map(|message| {
-                let role = match message.role {
-                    nguruvilu::message::Role::System => "system",
-                    nguruvilu::message::Role::User => "user",
-                    nguruvilu::message::Role::Assistant => "assistant",
-                    nguruvilu::message::Role::Tool => "tool",
-                };
-                json!({
-                    "role": role,
-                    "text": message.text(),
-                    "tool_calls": message.tool_calls.iter().map(|c| json!({
-                        "name": c.name,
-                        "arguments": c.arguments,
-                    })).collect::<Vec<_>>(),
-                    "images": message.images.iter().map(|i| json!({
-                        "url": i.url,
-                        "label": i.label,
-                    })).collect::<Vec<_>>(),
-                })
-            })
-            .collect()
+    /// One stored message as a renderable entry.
+    fn entry(message: &nguruvilu::message::Message) -> Value {
+        let role = match message.role {
+            nguruvilu::message::Role::System => "system",
+            nguruvilu::message::Role::User => "user",
+            nguruvilu::message::Role::Assistant => "assistant",
+            nguruvilu::message::Role::Tool => "tool",
+        };
+        json!({
+            "role": role,
+            "text": message.text(),
+            "tool_calls": message.tool_calls.iter().map(|c| json!({
+                "name": c.name,
+                "arguments": c.arguments,
+            })).collect::<Vec<_>>(),
+            "images": message.images.iter().map(|i| json!({
+                "url": i.url,
+                "label": i.label,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// The entries in `[first, end)`, oldest first.
+    ///
+    /// The conversion used to run over the whole history and then throw most of
+    /// it away: `transcript` asked for the newest 40 and paid to build every
+    /// message in an 8 MB session first. On the machine this was measured on, a
+    /// long session's tool results are megabytes each, so the wasted work was
+    /// proportional to the conversation and ran on every reconnect, every
+    /// session switch, and every `ready` — which is what "the page feels slow"
+    /// was.
+    fn entries_between(&self, first: usize, end: usize) -> Vec<Value> {
+        let messages = &self.session.messages;
+        let first = first.min(messages.len());
+        let end = end.min(messages.len());
+        if first >= end {
+            return Vec::new();
+        }
+        messages[first..end].iter().map(Self::entry).collect()
     }
 
     /// The newest page of the transcript, plus the failure line if one is set.
@@ -903,10 +935,9 @@ impl AppState {
     /// number of stored entries and `first` the absolute index of the first
     /// entry returned, so the page can request earlier history by `first`.
     pub fn transcript(&self) -> Value {
-        let all = self.all_entries();
-        let total = all.len();
+        let total = self.session.messages.len();
         let first = total.saturating_sub(TRANSCRIPT_PAGE);
-        let mut entries: Vec<Value> = all[first..].to_vec();
+        let mut entries = self.entries_between(first, total);
 
         // A failure belongs in the transcript, not only in a status line: it is
         // what a user scrolls back to read, and re-rendering the session must
@@ -932,11 +963,10 @@ impl AppState {
     /// out-of-range `before` clamps to the stored length, so a stale page
     /// request cannot panic or return entries that do not exist.
     pub fn transcript_before(&self, before: usize) -> Value {
-        let all = self.all_entries();
-        let total = all.len();
+        let total = self.session.messages.len();
         let (first, end) = page_before(total, before);
         json!({
-            "entries": all[first..end].to_vec(),
+            "entries": self.entries_between(first, end),
             "total": total,
             "first": first,
         })
