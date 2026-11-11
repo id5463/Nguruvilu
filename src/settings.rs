@@ -329,16 +329,11 @@ impl ToolOutputSettings {
             enabled: self.enabled,
             head_chars: self.head_chars,
             tail_chars: self.tail_chars,
-            keep_recent: if self.keep_recent == 0 {
-                default_prune_keep()
-            } else {
-                self.keep_recent
-            },
-            keep_images: if self.keep_images == 0 {
-                default_prune_images()
-            } else {
-                self.keep_images
-            },
+            // 0 就是 0。以前这里把 0 当成"没写"、回落到 8/2，那是为了绕开面板把空
+            // 输入框写成 0 的老毛病；面板现在不再那么干了，所以"我手动写 0"必须
+            // 被照字面执行。缺失的字段仍然由 serde 的 default 补，两件事分开。
+            keep_recent: self.keep_recent,
+            keep_images: self.keep_images,
         }
     }
 }
@@ -775,18 +770,23 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_count_dial_thins_everything_never() {
-        // The bug this guards: an empty panel box used to post `0`, and `0` in a
-        // count dial meant "keep nothing recent" — every result in the history
-        // thinned, on a machine that was never configured that way.
+    fn a_zero_dial_means_zero_not_a_missing_field() {
+        // 曾经这里反过来断言"0 视为没写、回落 8/2"，那是为了绕开面板把空输入框
+        // 写成 0 的老毛病。面板已经不这么干了，所以"我亲手写 0"必须照字面执行：
+        // 缺字段由 serde 的 default 补，写 0 就是 0。
         let mut settings = Settings::default();
         settings.tool_output.keep_recent = 0;
         settings.tool_output.keep_images = 0;
         let policy = settings.tool_output.policy();
-        assert_eq!(policy.keep_recent, default_prune_keep());
-        assert_eq!(policy.keep_images, default_prune_images());
-        // But zero in head/tail is a real choice: that is the "pointer only"
-        // preset, and nothing may silently override it.
+        assert_eq!(policy.keep_recent, 0, "0 means keep none, literally");
+        assert_eq!(policy.keep_images, 0);
+
+        // 缺失才是默认值。
+        let absent: Settings = serde_json::from_str("{}").expect("defaults");
+        assert_eq!(absent.tool_output.policy().keep_recent, default_prune_keep());
+        assert_eq!(absent.tool_output.policy().keep_images, default_prune_images());
+
+        // head/tail 的 0 一直是真选择（"只留指针"档），不许被覆盖。
         settings.tool_output.head_chars = 0;
         settings.tool_output.tail_chars = 0;
         let policy = settings.tool_output.policy();
