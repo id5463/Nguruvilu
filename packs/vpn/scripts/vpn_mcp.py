@@ -276,7 +276,7 @@ def handle(msg):
         return {
             "protocolVersion": msg.get("params", {}).get("protocolVersion", "2024-11-05"),
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "vpn", "version": "1.0.0"},
+            "serverInfo": {"name": "vpn-nodes", "version": "1.0.0"},
         }
     if method == "tools/list":
         return {
