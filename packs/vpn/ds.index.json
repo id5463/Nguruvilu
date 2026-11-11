@@ -1,0 +1,20 @@
+{
+  "formatVersion": 1,
+  "game": "nguruvilu",
+  "name": "vpn",
+  "versionId": "1.0.0",
+  "license": "MIT",
+  "description": "管理本机 mihomo(Clash Meta)代理节点：查当前节点、测每个节点的真实延迟、切换节点（通过 mihomo 的 REST API）",
+  "kernelVersion": "0.1.0",
+  "dependencies": {
+    "nguruvilu": ">=0.1.0"
+  },
+  "mcp": "mcp.json",
+  "skills": [
+    {
+      "id": "vpn",
+      "source": "skills/vpn",
+      "license": "MIT"
+    }
+  ]
+}

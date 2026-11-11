@@ -80,6 +80,11 @@ class Moodle:
         for k, v in (sess.get("cookies") or {}).items():
             self.s.cookies.set(k, v, domain="moodle.herzen.spb.ru")
         self._logged = False
+        # Written by `ensure()` from the page's own JSON. Initialised here
+        # because other paths (submit, edit parsing) read it, and an
+        # AttributeError reads as a broken tool rather than as "not logged in".
+        self.sesskey = None
+        self.username = ""
 
     # ---------- auth ----------
     def _login(self):
@@ -424,6 +429,10 @@ class Moodle:
         raise RuntimeError("upload failed: " + str(last))
 
     def submit_files(self, aid, paths, dry_run=True):
+        # Logged-in state is a precondition, not an assumption: parse_edit_page
+        # reads self.sesskey, and an expired session answers every page with the
+        # login wall. ensure() is what logs in and fills sesskey.
+        self.ensure()
         edit_url, view_html = self.find_edit_url(aid)
         if not edit_url:
             return {"editable": False, "reason": "no submission edit link on view page",

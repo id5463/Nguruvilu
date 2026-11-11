@@ -1,0 +1,11 @@
+{
+  "servers": [
+    {
+      "id": "vpn",
+      "transport": "stdio",
+      "command": "python3",
+      "args": ["scripts/vpn_mcp.py"],
+      "scope": "session"
+    }
+  ]
+}
