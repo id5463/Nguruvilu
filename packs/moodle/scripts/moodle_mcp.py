@@ -43,6 +43,26 @@ def write_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=1)
     os.replace(tmp, path)
 
+def _is_login_wall(r):
+    """Whether a response is the login page rather than the page asked for.
+
+    Moodle answers an expired session with a 200 and the login form; nothing in
+    the status code, the length, or the content type says so. The two markers
+    below are the ones its own pages carry -- the form's `logintoken` input and
+    the "you are not logged in" line -- and neither appears on a module page.
+    """
+    try:
+        text = r.text or ""
+    except Exception:
+        return False
+    if "login/index.php" in (r.url or ""):
+        return True
+    if 'name="logintoken"' in text:
+        return True
+    low = text.lower()
+    return ("вы не вошли в систему" in low) or ("you are not logged in" in low)
+
+
 def strip_tags(html):
     html = re.sub(r"<script.*?</script>", " ", html, flags=re.S | re.I)
     html = re.sub(r"<style.*?</style>", " ", html, flags=re.S | re.I)
@@ -178,6 +198,19 @@ class Moodle:
         url = f"{BASE}/mod/{typ}/view.php?id={aid}"
         try:
             r = self.s.get(url, timeout=40)
+            # A session that expired mid-run is answered with the login wall,
+            # not with an error. Parsed as if it were the module page it yields
+            # the university's contact details as the assignment title and no
+            # failure at all, which is worse than an error: the model reads it
+            # as fact. Re-login once and ask again before believing anything.
+            if _is_login_wall(r):
+                self._logged = False
+                self.ensure()
+                r = self.s.get(url, timeout=40)
+                if _is_login_wall(r):
+                    return {"error": "session expired and re-login did not take; "
+                                     "check the credentials in ~/.nguruvilu/moodle_auth.json",
+                            "url": url}
         except Exception as e:
             return {"error": str(e)[:120], "url": url}
         h = r.text
@@ -271,6 +304,9 @@ class Moodle:
             if u.startswith("/"):
                 u = BASE + u
             return u, h
+        # Newer Moodle: add/edit submission is a GET form -> view.php?id=X&action=editsubmission
+        if re.search(r'name="action"\s+value="editsubmission"|action=editsubmission', h):
+            return f"{BASE}/mod/assign/view.php?id={aid}&action=editsubmission", h
         return None, h
 
     def parse_edit_page(self, url):
@@ -283,28 +319,69 @@ class Moodle:
         repo = re.search(r'"repo_id"\s*:\s*(\d+)', h)
         env = re.search(r'"env"\s*:\s*"([^"]+)"', h)
         form = re.search(r'<form[^>]*id="editsubmissionform"[^>]*action="([^"]*)"', h)
+        # New-style moodleform: draft itemid + context + hidden fields
+        fm = re.search(r'id="id_files_filemanager"[^>]*value="(\d+)"|value="(\d+)"[^>]*id="id_files_filemanager"', h)
+        draft = (fm.group(1) or fm.group(2)) if fm else None
+        ctx = re.search(r'"contextid":\s*(\d+)', h)
+        lm = re.search(r'name="lastmodified"\s+type="hidden"\s+value="(\d+)"|value="(\d+)"\s+name="lastmodified"', h)
+        uid = re.search(r'name="userid"\s+type="hidden"\s+value="(\d+)"|value="(\d+)"\s+name="userid"', h)
+        # enclosing form action for the moodleform (posts to view.php)
+        fa = None
+        if draft:
+            i = h.find('id="id_files_filemanager"')
+            j = h.rfind('<form', 0, i)
+            if j > 0:
+                am = re.search(r'<form[^>]*action="([^"]*)"', h[j:j + 400])
+                if am:
+                    fa = am.group(1).replace("&amp;", "&")
         return {
             "url": url, "sesskey": sk,
             "repo_id": int(repo.group(1)) if repo else None,
             "env": env.group(1) if env else None,
-            "form_action": form.group(1) if form else url,
-            "has_editor": "editsubmissionform" in h,
+            "form_action": form.group(1) if form else fa,
+            "has_editor": ("editsubmissionform" in h) or bool(draft),
+            "draft_itemid": draft,
+            "contextid": ctx.group(1) if ctx else None,
+            "lastmodified": (lm.group(1) or lm.group(2)) if lm else None,
+            "userid": (uid.group(1) or uid.group(2)) if uid else None,
             "html_len": len(h),
         }
 
     def upload_draft(self, path, edit, file_id=1):
-        """Try Moodle ajax upload endpoints; returns draft itemid or raises."""
+        """Upload one file into the form's draft area; returns draft itemid or raises."""
         fname = os.path.basename(path)
         with open(path, "rb") as f:
             data = f.read()
+        ctype = "application/pdf" if fname.lower().endswith(".pdf") else \
+                ("application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                 if fname.lower().endswith(".docx") else "application/octet-stream")
+        draft = edit.get("draft_itemid")
+        # Preferred: current Moodle filepicker upload (multipart field MUST be repo_upload_file)
+        if draft:
+            form = {
+                "repo_id": "3", "pwd": "", "itemid": draft, "title": fname,
+                "env": edit.get("env") or "filemanager",
+                "accepted_types": "", "maxbytes": "5242880", "areamaxbytes": "-1",
+                "ctx_id": str(edit.get("contextid") or ""), "sesskey": edit.get("sesskey") or "",
+                "filepath": "/",
+            }
+            try:
+                r = self.s.post(f"{BASE}/repository/repository_ajax.php?action=upload", data=form,
+                                files={"repo_upload_file": (fname, data, ctype)}, timeout=120)
+                j = r.json() if r.status_code == 200 else None
+                if isinstance(j, dict) and (j.get("url") or j.get("id")):
+                    return int(draft)
+            except Exception:
+                pass
+        # Legacy fallbacks (older flows)
         endpoints = [
-            f"{BASE}/lib/ajax/upload.php?sesskey={urllib.parse.quote(edit['sesskey'])}",
+            f"{BASE}/lib/ajax/upload.php?sesskey={urllib.parse.quote(edit['sesskey'] or '')}",
             f"{BASE}/repository/repository_ajax.php?action=upload",
         ]
         last = None
         for url in endpoints:
             form = {
-                "repo_id": str(edit.get("repo_id") or 1),
+                "repo_id": str(edit.get("repo_id") or 3),
                 "sesskey": edit["sesskey"] or "",
                 "title": fname,
                 "env": edit.get("env") or "editor",
@@ -312,9 +389,13 @@ class Moodle:
                 "maxbytes": "0",
                 "areamaxbytes": "0",
             }
+            if draft:
+                form["itemid"] = draft
+                form["ctx_id"] = str(edit.get("contextid") or "")
+                form["filepath"] = "/"
             try:
                 r = self.s.post(url, data=form,
-                                files={"file": (fname, data, "application/octet-stream")}, timeout=120)
+                                files={"repo_upload_file": (fname, data, ctype)}, timeout=120)
             except Exception as e:
                 last = str(e)
                 continue
@@ -324,6 +405,8 @@ class Moodle:
                 except Exception:
                     j = None
                 if isinstance(j, dict):
+                    if j.get("url") and draft:
+                        return int(draft)
                     itemid = None
                     if j.get("draftitemid") is not None:
                         itemid = j["draftitemid"]
@@ -354,7 +437,36 @@ class Moodle:
         itemid = None
         for p in paths:
             itemid = self.upload_draft(p, edit)
-        # save submission
+        # --- save & submit ---
+        if edit.get("draft_itemid") and edit.get("form_action"):
+            # New-style moodleform POST (verified against Moodle 4.x on this site)
+            data = {
+                "lastmodified": edit.get("lastmodified") or "",
+                "id": str(aid),
+                "userid": edit.get("userid") or "",
+                "action": "savesubmission",
+                "sesskey": edit.get("sesskey") or "",
+                "_qf__mod_assign_submission_form": "1",
+                "mform_isexpanded_id_submissionheader": "1",
+                "files_filemanager": edit["draft_itemid"],
+            }
+            h = ""
+            submitted = False
+            status = ""
+            for label in ("Submit for grading", "Отправить на проверку",
+                          "Save changes", "Сохранить изменения"):
+                data["submitbutton"] = label
+                r = self.s.post(edit["form_action"], data=data, timeout=60, allow_redirects=True)
+                h = r.text
+                st = re.search(r"(?:Submission status|Состояние отправки)\s*(.{0,140})", strip_tags(h))
+                status = st.group(1) if st else ""
+                if re.search(r"Submitted for grading|Отправлено на проверку|На проверке", status, re.I):
+                    submitted = True
+                    break
+            result.update({"posted": True, "http": r.status_code, "submitted": submitted,
+                           "status_hint": status, "item_id": itemid})
+            return result
+        # --- legacy flow ---
         data = {
             "id": str(aid),
             "action": "editsubmission",
@@ -438,7 +550,7 @@ def tool_call(name, args):
         if refresh or not cache.get("items"):
             cache = md.scan(refresh=True)
         items = cache.get("items") or {}
-        out, new, changed = [], [], []
+        out, new, changed, homework_rows = [], [], [], []
         for key, it in items.items():
             if it.get("type") not in types:
                 continue
@@ -447,8 +559,8 @@ def tool_call(name, args):
             row = {"k": key, "t": it.get("title", "")[:110], "c": it.get("course", "")[:60],
                    "due": it.get("due", ""), "st": (it.get("status") or "")[:90], "url": it.get("url", "")}
             out.append(row)
-            if it.get("first_seen", "9999") >= cache.get("scanned_at", "")[:10]:
-                pass
+            if it.get("label_color") in ("red", "purple"):
+                homework_rows.append(row)
             if it.get("changed_at"):
                 changed.append(row)
         # new = items whose first_seen equals latest scan date
