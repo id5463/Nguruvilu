@@ -902,10 +902,32 @@ impl AppState {
                 "name": c.name,
                 "arguments": c.arguments,
             })).collect::<Vec<_>>(),
-            "images": message.images.iter().map(|i| json!({
-                "url": i.url,
-                "label": i.label,
-            })).collect::<Vec<_>>(),
+            // A `data:` URI is the bytes themselves, base64-encoded. Sending
+            // them to the page again is the single largest thing this shell
+            // does: one measured session was 14.7 MB of stored messages, 91.5%
+            // of it 104 inline screenshots, and the newest-40 window still
+            // carried 849 KB of that in every `ready` push.
+            //
+            // The page cannot render bytes it already has a copy of, so it gets
+            // a reference instead: `src` is only set for a real URL (an https
+            // link costs a few characters), and an inline image becomes
+            // `inline: true` plus the path its bytes were spilled to. The page
+            // asks for those bytes once, through `/file`, and caches them.
+            "images": message.images.iter().map(|i| {
+                let inline = i.url.starts_with("data:");
+                if inline {
+                    json!({
+                        "inline": true,
+                        "stored": i.stored,
+                        "label": i.label,
+                    })
+                } else {
+                    json!({
+                        "src": i.url,
+                        "label": i.label,
+                    })
+                }
+            }).collect::<Vec<_>>(),
         })
     }
 
@@ -1434,7 +1456,7 @@ impl AppState {
         let manifest = nguruvilu::pack::read_manifest(dir)?;
         let archive = match out {
             Some(path) => path.to_path_buf(),
-            None => dir.join(format!("{}-{}.dshpack", manifest.name, manifest.version_id)),
+            None => dir.join(format!("{}-{}.ngupack", manifest.name, manifest.version_id)),
         };
         let packed = nguruvilu::pack::pack(dir, &archive)?;
         let contents = nguruvilu::pack::inspect(dir)?;

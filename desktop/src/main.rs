@@ -439,12 +439,12 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
                     let parent = DialogParent::new(parent_window, parent_display);
                     match name.as_str() {
                         "pick_install" | "pick_verify" => rfd::FileDialog::new()
-                            .set_title("Choose a .dshpack archive")
-                            .add_filter("pack archive", &["dshpack"])
+                            .set_title("Choose a .ngupack archive")
+                            .add_filter("pack archive", &["ngupack", "dshpack"])
                             .set_parent(&parent)
                             .pick_file(),
                         "pick_pack" => rfd::FileDialog::new()
-                            .set_title("Choose a pack directory (it must contain dsh.index.json)")
+                            .set_title("Choose a pack directory (it must contain ds.index.json)")
                             .set_parent(&parent)
                             .pick_folder(),
                         _ => None,
@@ -647,7 +647,15 @@ pub(crate) async fn dispatch(
                 (guard.sessions()?, guard.transcript(), guard.describe())
             };
             emit(&sink, json!({ "ev": "sessions", "list": sessions }));
-            emit(&sink, json!({ "ev": "transcript", "entries": transcript }));
+            // `transcript` is already `{entries, total, first}`; spreading it
+            // keeps the page's shape and avoids a second serialisation of every
+            // entry — that wrap was 849 KB of a 914 KB initial push.
+            emit(&sink, json!({
+                "ev": "transcript",
+                "entries": transcript["entries"],
+                "total": transcript["total"],
+                "first": transcript["first"],
+            }));
             emit(&sink, json!({ "ev": "status", "status": status }));
             // Plugin panels and the theme they imply, pushed with the rest of
             // the initial state so the page never paints the wrong palette.
@@ -775,7 +783,15 @@ pub(crate) async fn dispatch(
                 (guard.sessions()?, guard.transcript(), guard.describe())
             };
             emit(&sink, json!({ "ev": "sessions", "list": sessions }));
-            emit(&sink, json!({ "ev": "transcript", "entries": transcript }));
+            // `transcript` is already `{entries, total, first}`; spreading it
+            // keeps the page's shape and avoids a second serialisation of every
+            // entry — that wrap was 849 KB of a 914 KB initial push.
+            emit(&sink, json!({
+                "ev": "transcript",
+                "entries": transcript["entries"],
+                "total": transcript["total"],
+                "first": transcript["first"],
+            }));
             emit(&sink, json!({ "ev": "status", "status": status }));
         }
 
