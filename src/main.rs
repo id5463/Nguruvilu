@@ -3307,6 +3307,8 @@ fn ui_command(dir: Option<&PathBuf>, as_json: bool) -> Result<()> {
             entry: "index.html".into(),
             // `ngu eject` hands out a complete interface, so this is the base.
             base: true,
+            overlay_order: 0,
+            overlays: true,
             source: None,
             sha256: None,
         }),

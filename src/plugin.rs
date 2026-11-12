@@ -142,6 +142,11 @@ pub struct Contributions {
     /// appends them, so a small restyle never has to ship a whole page. See
     /// `LookFile::css` for why this exists.
     pub css: Vec<String>,
+    /// Named interface points this plugin hangs code on.
+    ///
+    /// Keyed by point name, holding the script text; the page evaluates it once
+    /// after load. Empty for a plugin that only restyles. See `LookFile::hooks`.
+    pub hooks: std::collections::BTreeMap<String, String>,
     /// Services this plugin provides, by name.
     pub services: Vec<(String, Arc<dyn Any + Send + Sync>)>,
     /// Tools this plugin registers.
@@ -210,6 +215,15 @@ impl Contributions {
     /// Add a stylesheet fragment, appended after the interface's own sheet.
     pub fn css(mut self, rules: impl Into<String>) -> Self {
         self.css.push(rules.into());
+        self
+    }
+
+    /// Hang scripts on named interface points.
+    pub fn hooks(
+        mut self,
+        map: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        self.hooks.extend(map);
         self
     }
 
@@ -516,6 +530,9 @@ pub struct Fiber {
     /// Stylesheet rules this fiber contributes, appended after the built-in
     /// sheet. Kept on the fiber so they unload with it.
     pub css: Vec<String>,
+    /// Interface points this fiber hangs code on. Kept here for the same
+    /// reason: unloading the pack must take its hooks with it.
+    pub hooks: std::collections::BTreeMap<String, String>,
     /// Sessions that have asked for this instance.
     ///
     /// The reference count that makes session isolation real: an instance is
@@ -698,6 +715,7 @@ struct Staged {
     themes: Vec<crate::theme::Theme>,
     strings: std::collections::BTreeMap<String, String>,
     css: Vec<String>,
+    hooks: std::collections::BTreeMap<String, String>,
     services: Vec<((String, RealmId), Arc<dyn Any + Send + Sync>)>,
     tools: Vec<ToolDef>,
     readers: Vec<crate::tools::readers::ReaderSpec>,
@@ -939,6 +957,39 @@ impl Kernel {
         out
     }
 
+    /// The scripts every active plugin hangs on interface points, merged.
+    ///
+    /// Merged rather than picked, because several packs may extend the same
+    /// point — that is the whole point of named hooks. Sorted by point name and
+    /// then by fiber id, so the order two packs run in is the same on every
+    /// start rather than whatever the map happened to iterate first.
+    pub fn resolved_hooks(&self) -> std::collections::BTreeMap<String, String> {
+        let mut fibers: Vec<&Fiber> = self
+            .fibers
+            .values()
+            .filter(|fiber| fiber.state == FiberState::Active)
+            .collect();
+        fibers.sort_by_key(|fiber| fiber.id);
+        let mut merged: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for fiber in fibers {
+            for (point, script) in &fiber.hooks {
+                // Two scripts on one point are concatenated rather than one
+                // replacing the other: both packs asked to run there, and the
+                // later one is the more specific choice only for *values*, not
+                // for code.
+                let entry = merged.entry(point.clone()).or_default();
+                if !entry.is_empty() {
+                    entry.push_str("
+;
+");
+                }
+                entry.push_str(script);
+            }
+        }
+        merged
+    }
+
     /// Register a plugin definition without loading an instance.
     pub fn define(&mut self, plugin: Arc<dyn Plugin>) {
         self.plugins.insert(plugin.name().to_string(), plugin);
@@ -1016,6 +1067,7 @@ impl Kernel {
                 themes: Vec::new(),
                 strings: std::collections::BTreeMap::new(),
                 css: Vec::new(),
+                hooks: std::collections::BTreeMap::new(),
                 users: BTreeSet::new(),
                 effects: Vec::new(),
                 epoch: Epoch::Inactive,
@@ -1464,6 +1516,7 @@ impl Kernel {
             fiber.themes.clear();
             fiber.strings.clear();
             fiber.css.clear();
+            fiber.hooks.clear();
         }
         self.version += 1;
     }
@@ -1607,6 +1660,7 @@ impl Kernel {
             themes,
             strings,
             css,
+            hooks,
             services: provided,
             tools: provided_tools,
             readers,
@@ -1682,6 +1736,7 @@ impl Kernel {
             themes,
             strings,
             css,
+            hooks,
             services: staged_services,
             tools: staged_tools,
             readers,
@@ -1704,6 +1759,7 @@ impl Kernel {
             themes,
             strings,
             css,
+            hooks,
             services,
             tools,
             readers,
@@ -1751,6 +1807,7 @@ impl Kernel {
             target.themes = themes;
             target.strings = strings;
             target.css = css;
+            target.hooks = hooks;
             target.effects = effects;
             target.epoch = epoch;
             target.state = FiberState::Active;

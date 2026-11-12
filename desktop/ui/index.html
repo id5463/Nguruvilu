@@ -257,6 +257,10 @@
     <span id="stats"></span>
     <span id="timing"></span>
     <span id="slot-status-bar"></span>
+    <!-- 挂接点专用：这个容器永远不会被 renderSlots 清空。
+         面板插槽（上面那个）每次重画都会 replaceChildren，
+         所以把挂接点的内容放进那里，它会被一起清掉。 -->
+    <span id="hook-status-bar"></span>
     <button class="tiny phone-only" id="toggle-settings" type="button" aria-controls="details" aria-expanded="false">Settings</button>
     <label style="margin-left:auto; cursor:pointer; display:flex; gap:4px; align-items:center;">
       <input type="checkbox" id="show-reasoning"> <span id="cap-reasoning">thinking</span>
@@ -797,6 +801,67 @@ let busy = false;
 // push. Without this, an incoming status would overwrite what they are typing.
 let settingsDirty = false;
 
+// ------------------------------------------------------------------ hooks
+//
+// Named points the page offers, so a pack can extend a rendering step instead
+// of replacing the document. The shape is deliberately the one Patchouli uses
+// for add-ons: the host names the point (`session.row.end`), and a pack hangs
+// code on it — `@At("TAIL")` there, `nguHook(...)` here. Without this a pack
+// that wanted one badge next to a session had to ship a copy of the whole page,
+// which is the cost this removes.
+//
+// Safety boundary: a hook receives elements and data, and runs *in this
+// document*. That is more access than a panel gets (panels live in a sandboxed
+// iframe and cannot read the token), so the rule is: a hook may decorate what
+// it is handed and nothing else. It is not given `toShell`, and it is wrapped
+// so a throwing hook cannot take the transcript down with it — a bug in a pack
+// must cost that pack's decoration, not the page.
+const hooks = new Map();   // point -> [fn, ...]
+
+/// Register code on a point. Returns an unsubscribe function.
+///
+/// A handler registered twice is refused rather than stacked. The common way to
+/// hit that is a pack hanging one script on several points: the script then runs
+/// once per point and registers the *same* function each time, which showed up
+/// as three badges in every session row. Refusing the duplicate makes that a
+/// no-op instead of a doubled decoration, and the pack's other points still
+/// work.
+function nguHook(point, fn) {
+  if (typeof point !== "string" || typeof fn !== "function") return () => {};
+  if (!hooks.has(point)) hooks.set(point, []);
+  const list = hooks.get(point);
+  if (list.includes(fn)) {
+    return () => {
+      const at = list.indexOf(fn);
+      if (at >= 0) list.splice(at, 1);
+    };
+  }
+  list.push(fn);
+  return () => {
+    const at = list.indexOf(fn);
+    if (at >= 0) list.splice(at, 1);
+  };
+}
+
+/// Run every handler on a point. One that throws is reported and skipped.
+function runHook(point, ...args) {
+  const list = hooks.get(point);
+  if (!list || list.length === 0) return;
+  for (const fn of list.slice()) {
+    try {
+      fn(...args);
+    } catch (error) {
+      notice("挂接点 " + point + " 出错: " + error.message, true);
+    }
+  }
+}
+
+/// Whether anything is listening, so a hot path can skip the call entirely.
+function hookHas(point) {
+  const list = hooks.get(point);
+  return !!list && list.length > 0;
+}
+
 function el(tag, cls, text) {
   const node = document.createElement(tag);
   if (cls) node.className = cls;
@@ -1184,6 +1249,41 @@ function applyPackCss(css) {
     document.head.append(node);
   }
   node.textContent = typeof css === "string" ? css : "";
+}
+
+/// Run the scripts packs hung on interface points.
+///
+/// Each script is evaluated once, in its own scope, the first time it arrives —
+/// a pack's hook file is not a snippet to paste repeatedly, it registers itself
+/// with `ngu.hook(...)` and returns. Re-sending on every state push would stack
+/// another copy of the same registration on each render, which is why the code
+/// remembers what it has already run and only runs what is new.
+///
+/// The script runs in this document, so it can reach the DOM it is handed. It is
+/// *not* given `toShell` and cannot read the token: what a hook may do is
+/// decorate, and the boundary is that it was never handed the means to do more.
+const ranHooks = new Set();
+function applyPackHooks(hooks) {
+  if (!hooks || typeof hooks !== "object") return;
+  // Point names are the keys; the script is the value. Sorted so two packs on
+  // one point run in a stable order.
+  for (const point of Object.keys(hooks).sort()) {
+    const script = hooks[point];
+    if (typeof script !== "string" || !script.trim()) continue;
+    // The identity of "already run" is the script text itself: editing a pack's
+    // hook file changes it, and a changed script should run again.
+    const key = point + " " + script;
+    if (ranHooks.has(key)) continue;
+    ranHooks.add(key);
+    try {
+      // `ngu.hook` is what the script uses; it is passed in explicitly rather
+      // than relied on from `window`, so the script cannot mistake the page for
+      // its own scope.
+      new Function("ngu", script)(window.ngu);
+    } catch (error) {
+      notice("挂接脚本 " + point + " 执行失败: " + error.message, true);
+    }
+  }
 }
 
 function applyTheme(event) {
@@ -2268,6 +2368,15 @@ function renderSessionRow(s) {
   });
   row.append(del);
 
+  // `session.row.end`: the pack can add a badge or a marker after the delete
+  // button. It gets the row and the session data; nothing else.
+  //
+  // The row is fresh on every render, so a hook that appends is naturally
+  // idempotent — but only if the row it decorates is the row that gets used.
+  // It is: `renderSessionRow` builds a node and the caller keeps it, so nothing
+  // survives from the previous pass.
+  runHook("session.row.end", row, s);
+
   if (!s.current) {
     row.addEventListener("click", () => toShell({ cmd: "open_session", id: s.id }));
   }
@@ -2455,6 +2564,17 @@ function renderStatus(status) {
   toolInfo.replaceChildren();
   for (const name of status.tools || []) toolInfo.append(el("span", "chip", name));
 
+  // `status.rendered`: the state snapshot is on screen. Handlers get the status
+  // object and `#hook-status-bar`.
+  //
+  // Not `#slot-status-bar`: that one belongs to panels and `renderSlots` empties
+  // it on every panel update, so a hook's badge kept vanishing the moment
+  // anything pushed a new panel set. Two owners, two containers — the hook's
+  // survives a panel rebuild, and a panel update cannot delete what it does not
+  // own. (Passing a non-existent id was the earlier bug here: handlers got null
+  // and returned early, silently.)
+  runHook("status.rendered", status, document.getElementById("hook-status-bar"));
+
   setBusy(!!status.busy);
   if (!status.configured) {
     document.getElementById("dot").className = "dot unset";
@@ -2571,7 +2691,10 @@ function dispatchEvent_(event) {
   postToPanels(event);
 }
 
-window.ngu = { on, onAny, send: sendCommand, state, receive };
+// `hook` is the extension point packs get: it decorates what the page hands
+// over, and deliberately does not include `send` or the token — a hook runs in
+// this document, so it must not be a route to the shell.
+window.ngu = { on, onAny, send: sendCommand, state, receive, hook: nguHook };
 
 // 内置界面自己的事件处理。它走的是同一个总线 —— 没有私有通道,所以一个包带来
 // 的界面能做内置界面能做的任何事。
@@ -2594,6 +2717,9 @@ onAny((name, event) => {
         break;
       case "ui_css":
         applyPackCss(event.css);
+        break;
+      case "ui_hooks":
+        applyPackHooks(event.hooks);
         break;
       case "models":
         renderModels(event.list);
@@ -2730,6 +2856,10 @@ onAny((name, event) => {
         // Flush before closing the turn, or the last frame of text is lost.
         flushPendingText();
         endAssistantTurn();
+        // `turn.end`: after the turn is closed, with its accounting. A pack
+        // that wants to show or send the numbers hooks here instead of
+        // scraping the DOM.
+        runHook("turn.end", event);
         setBusy(false);
         document.getElementById("timing").textContent =
           event.steps + " steps \u00b7 " + event.tool_calls + " tools" +

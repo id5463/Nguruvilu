@@ -239,12 +239,33 @@ pub struct UiDecl {
     /// The pack that ships the interface declares `base: true`.
     #[serde(default)]
     pub base: bool,
+    /// Where this pack sits among the overlays. Higher wins.
+    ///
+    /// Overlays are ordered, not merged by name: a pack that wants its
+    /// stylesheet to land after another's has to be able to say so, the same
+    /// way Patchouli's `sortnum` orders entries inside a category. Ties fall
+    /// back to the pack name so two runs never resolve differently.
+    #[serde(default)]
+    pub overlay_order: i32,
+    /// Whether this interface accepts overlays from other packs at all.
+    ///
+    /// The analogue of `use_resource_pack: true` in a Patchouli `book.json`.
+    /// Defaults to true for an overlay (it is only supplying files, so it has
+    /// nothing to protect) and is what the base pack can switch off when it
+    /// wants its page served exactly as shipped.
+    #[serde(default = "default_true")]
+    pub overlays: bool,
     /// Where the interface comes from, when it is fetched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     /// sha256 of the fetched directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+}
+
+/// Serde default for fields that are on unless a manifest turns them off.
+fn default_true() -> bool {
+    true
 }
 
 fn default_entry() -> String {
@@ -259,6 +280,8 @@ impl UiDecl {
             title: String::new(),
             entry: default_entry(),
             base: false,
+            overlay_order: 0,
+            overlays: true,
             source: None,
             sha256: None,
         }
@@ -1009,6 +1032,20 @@ pub struct LookFile {
     /// trusting it with the interface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub css: Option<String>,
+
+    /// Named points this pack hangs code on, and the script that does it.
+    ///
+    /// The shape Patchouli add-ons use: the host names a point
+    /// (`session.row.end`), the add-on supplies the code that runs there. Here
+    /// the point names are the page's own — see `runHook` in the interface —
+    /// and the scripts are evaluated in the page after it has loaded, in the
+    /// order the packs resolved.
+    ///
+    /// This is what lets a pack extend a rendering step instead of replacing
+    /// the document, which was the only option before: one badge in the session
+    /// list used to cost a copy of the whole 3 000-line page.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hooks: BTreeMap<String, String>,
 }
 
 /// `injections.json`: the injection engine's own serialised form.

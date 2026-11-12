@@ -93,3 +93,103 @@ fn element_bindings_used_by_the_script_are_declared() {
         missing.join(", ")
     );
 }
+
+/// The overlay rules a pack declares must round-trip through the manifest.
+///
+/// These three fields decide whether two packs can serve one interface at
+/// once, which is the whole reason overlays exist. They are read by
+/// `resolve_ui_stack` and nothing else, so a silent rename or a dropped
+/// default would only show up as "my pack's files stopped appearing" — with no
+/// error anywhere. Pinning them here makes that a failing test instead.
+#[test]
+fn interface_overlay_fields_survive_a_manifest_round_trip() {
+    let json = r#"{
+        "formatVersion": 1,
+        "game": "nguruvilu",
+        "name": "overlay-demo",
+        "versionId": "1.0.0",
+        "license": "MIT",
+        "kernelVersion": "0.1.0",
+        "ui": {
+            "id": "ui",
+            "title": "叠加示例",
+            "entry": "index.html",
+            "base": false,
+            "overlayOrder": 7,
+            "overlays": true
+        }
+    }"#;
+    let manifest: nguruvilu::pack::PackManifest =
+        serde_json::from_str(json).expect("the manifest parses");
+    let ui = manifest.ui.as_ref().expect("ui is declared");
+
+    assert!(!ui.base, "an overlay must not claim to own the document");
+    assert_eq!(ui.overlay_order, 7, "overlayOrder must survive");
+    assert!(ui.overlays, "overlays default on and must round-trip");
+
+    // And the defaults, which are what an author who writes nothing gets: an
+    // overlay that owns nothing can never take the page away from its base.
+    let minimal = r#"{
+        "formatVersion": 1,
+        "game": "nguruvilu",
+        "name": "minimal",
+        "versionId": "1.0.0",
+        "license": "MIT",
+        "kernelVersion": "0.1.0",
+        "ui": { "id": "ui", "entry": "index.html" }
+    }"#;
+    let m: nguruvilu::pack::PackManifest =
+        serde_json::from_str(minimal).expect("the minimal manifest parses");
+    let ui = m.ui.as_ref().expect("ui is declared");
+    assert!(!ui.base, "saying nothing must not make a pack the base");
+    assert_eq!(ui.overlay_order, 0, "overlayOrder defaults to 0");
+    assert!(ui.overlays, "overlays default to on");
+}
+
+/// `hooks` in a look file are file names, and the interface has to offer the
+/// points they name.
+///
+/// Two failure modes this catches, both silent before: a look file whose hooks
+/// are inlined script text (unreadable, but it parses), and a pack hanging code
+/// on a point the page never runs (the code loads and does nothing, forever).
+#[test]
+fn look_file_hooks_name_files_and_real_points() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    let look_text = std::fs::read_to_string(root.join("packs/hook-demo/look.json"))
+        .expect("the demo pack's look file");
+    let look: serde_json::Value =
+        serde_json::from_str(&look_text).expect("look.json parses");
+    let hooks = look
+        .get("hooks")
+        .and_then(|v| v.as_object())
+        .expect("the demo pack declares hooks");
+
+    // Each value is a file that exists next to the manifest, not inline code.
+    for (point, file) in hooks {
+        let name = file.as_str().unwrap_or_else(|| {
+            panic!("hook '{point}' must name a file, not embed its text")
+        });
+        assert!(
+            !name.contains('\n'),
+            "hook '{point}' looks like inline script; hooks name files so the \
+             code stays readable and editable"
+        );
+        assert!(
+            root.join("packs/hook-demo").join(name).is_file(),
+            "hook '{point}' names {name}, which is not in the pack"
+        );
+    }
+
+    // Every point a pack uses must be one the page actually runs.
+    let html = std::fs::read_to_string(root.join("desktop/ui/index.html"))
+        .expect("the built-in interface");
+    for point in hooks.keys() {
+        let needle = format!("runHook(\"{point}\"");
+        assert!(
+            html.contains(&needle),
+            "hook point '{point}' is declared by a pack but the page never runs \
+             it — the pack's code would load and do nothing"
+        );
+    }
+}

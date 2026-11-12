@@ -1,0 +1,8 @@
+{
+  "css": "/* 挂接点示例用的样式：包自己带样式，不改基础界面 */\n.hook-demo-badge {\n  font-size: 9px;\n  color: var(--dim);\n  border: 1px solid var(--line);\n  border-radius: 7px;\n  padding: 0 5px;\n  margin-left: 4px;\n}\n.hook-demo-chip {\n  font-size: 10px;\n  color: var(--accent);\n  margin-left: 10px;\n}\n",
+  "hooks": {
+    "session.row.end": "session-row.js",
+    "turn.end": "turn-end.js",
+    "status.rendered": "status-bar.js"
+  }
+}

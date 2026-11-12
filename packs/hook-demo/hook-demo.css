@@ -1,0 +1,14 @@
+/* 挂接点示例用的样式：包自己带样式，不改基础界面 */
+.hook-demo-badge {
+  font-size: 9px;
+  color: var(--dim);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 0 5px;
+  margin-left: 4px;
+}
+.hook-demo-chip {
+  font-size: 10px;
+  color: var(--accent);
+  margin-left: 10px;
+}
