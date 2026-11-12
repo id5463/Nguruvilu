@@ -1028,7 +1028,7 @@ stages:
         )
         .with_pack_dir(&dir);
         std::fs::write(
-            dir.join("dsh.index.json"),
+            dir.join(crate::pack::MANIFEST_NAME),
             r#"{"formatVersion":1,"game":"nguruvilu","name":"origin-pack","versionId":"1.0.0","license":"MIT","kernelVersion":"0.1.0","dependencies":{"nguruvilu":">=0.1.0"}}"#,
         )
         .unwrap();

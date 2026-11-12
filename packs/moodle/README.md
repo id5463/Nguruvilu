@@ -10,7 +10,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `dsh.index.json` | 清单:引用 `mcp.json` + 内联脚本 + 技能 `skills/moodle` |
+| `ds.index.json` | 清单:引用 `mcp.json` + 内联脚本 + 技能 `skills/moodle` |
 | `mcp.json` | 服务器 `moodle-herzen`:stdio,`python <pack>/scripts/moodle_mcp.py`,scope session |
 | `scripts/moodle_mcp.py` | MCP 服务器本体 |
 | `skills/moodle/SKILL.md` | 使用技能(按需加载,只占一行目录) |

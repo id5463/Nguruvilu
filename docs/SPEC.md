@@ -2,7 +2,7 @@
 
 本文档是 Nguruvilu 的**唯一权威规格**。所有实现必须服从本文档;与本文档冲突的代码是错的。
 
-**Nguruvilu** 是独立 agent 内核,CLI 名 `ngu`,语言 **Rust**。它与 dshd 家族是内核与发行版的关系:内核独立演进,dshd 是使用方之一。
+**Nguruvilu** 是独立 agent 内核,CLI 名 `ngu`,语言 **Rust**。
 
 ## 架构层次
 
@@ -15,7 +15,7 @@
                       ↕ 扩展点(见 1.4)
 ┌─ 动态加载层(Yellow)─────────────────────────┐
 │  职责:动态加载、卸载、热替换                  │
-│  分发格式:整合包(.dshpack)                   │
+│  分发格式:整合包(.ngupack)                   │
 └───────────────────────────────────────────────┘
                       ↕ 加载
 ┌─ 可加载对象(三者平级)────────────────────────┐
@@ -517,7 +517,7 @@ KV cache 是**前缀缓存**:前缀中任一 token 变化,从该位置起全部�
 ```
 → **直到历史末尾的前缀仍可复用**
 
-来源:DSH `packages/core/system-prompt` 与 `packages/core/agent-loop` 的决策规则。
+来源:参考过的 agent 内核在 system-prompt 与 agent-loop 上的决策规则。
 
 ### 4.4 prompt 分区(与档位无关,直接采用)
 
@@ -825,8 +825,8 @@ HTTP 客户端必须复用连接(keep-alive / 连接池),不得每请求重新�
 选它的理由:
 
 1. **热加载天然成立**——重新加载脚本文件即可,无 Rust 的 ABI 与卸载难题
-2. **现有 dshd 的 JS 代码可直接搬为插件**(White 隧道、文件盒、Yellow 逻辑)
-3. **Pi / DSH 的插件设计可借鉴**(它们也是 JS/TS)
+2. **已有的 JS 代码可直接搬为插件**(隧道、文件盒等实现)
+3. **Pi 的插件设计可借鉴**(它也是 JS/TS)
 4. 体积小,符合单文件可执行的目标
 
 **性能边界由 7.10 保证**:每轮必经路径全在 Rust 内,脚本只服务插件层。
@@ -883,7 +883,7 @@ HTTP 客户端必须复用连接(keep-alive / 连接池),不得每请求重新�
 | **加载** | 插件 / MCP / 技能(三者平级,见 10.2) |
 | **卸载** | 运行时移除;副作用由 effect 保证清理(见 2.4) |
 | **热替换** | 同一对象的新版本替换旧版本,依赖方经 epoch 自动重载(见 2.3) |
-| **分发** | 整合包(`.dshpack`)格式 |
+| **分发** | 整合包(`.ngupack`)格式 |
 
 ### 10.2 可加载对象(平级)
 
@@ -895,24 +895,24 @@ HTTP 客户端必须复用连接(keep-alive / 连接池),不得每请求重新�
 
 三者**没有从属关系**:技能不是插件的子集,MCP 也不是插件的一种。它们都是 Yellow 的加载对象。
 
-### 10.3 整合包(`.dshpack`)
+### 10.3 整合包(`.ngupack`)
 
 整合包是一个 **zip 归档**,含三部分:
 
 | 文件 | 作用 |
 |---|---|
-| `dsh.index.json` | 身份:名称、版本、协议、构建时的内核版本、依赖范围 |
+| `ds.index.json` | 身份:名称、版本、协议、构建时的内核版本、依赖范围 |
 | `assembly.yaml` | 装配:加载什么、什么顺序(见 10.4) |
 | 其余文件 | 装配引用的内容(技能目录、插件载荷等) |
 
 **容器选择 zip 而非 tar**:任何平台上的任何普通工具都能打开它、查看内容、取出单个文件,不必依赖本内核。条目使用 deflate 压缩,并保留文件模式,所以包里带的脚本在解包后仍可执行。
 
-**身份与装配分离是有意的**:`dsh.index.json` 说明"这个包是什么",`assembly.yaml` 说明"它加载什么、什么顺序"。前者可以在不执行任何加载逻辑的前提下检查来源与协议。
+**身份与装配分离是有意的**:`ds.index.json` 说明"这个包是什么",`assembly.yaml` 说明"它加载什么、什么顺序"。前者可以在不执行任何加载逻辑的前提下检查来源与协议。
 
 **命令**:
 
 ```
-ngu pack <目录> [--out <文件>]      # 目录须含 dsh.index.json
+ngu pack <目录> [--out <文件>]      # 目录须含 ds.index.json
 ngu verify <文件>                   # 校验清单合法性、是否含装配、协议是否声明
 ngu install <文件> [--into <目录>]  # 安装到 <packs>/<name>-<version>/
 ngu packs                           # 列出已安装
@@ -941,29 +941,29 @@ stages:
   - name: foundation
     plugins:
       - id: fs-tools
-        source: "npm:@dshd/fs-tools@^1.2"
+        source: "npm:@acme/fs-tools@^1.2"
         order: 10
       - id: shell-tools
-        source: "npm:@dshd/shell-tools@^1.0"
+        source: "npm:@acme/shell-tools@^1.0"
         order: 20
 
   - name: services
     plugins:
       - id: compaction
-        source: "npm:@dshd/compaction@^0.5"
+        source: "npm:@acme/compaction@^0.5"
         order: 10
         config:
           threshold_tokens: 150000
           keep_recent_turns: 20
       - id: mcp-client
-        source: "npm:@dshd/mcp-client@^1.0"
+        source: "npm:@acme/mcp-client@^1.0"
         order: 20
         after: [compaction]
 
   - name: extensions
     plugins:
       - id: search
-        source: "npm:@dshd/search@^2.0"
+        source: "npm:@acme/search@^2.0"
         order: 10
         on_failure: skip
       - id: computer-use
@@ -1007,7 +1007,7 @@ teardown:
 
 | 文件 | 变化 |
 |---|---|
-| `dsh.index.json` | 保留(包身份、版本、协议、依赖声明) |
+| `ds.index.json` | 保留(包身份、版本、协议、依赖声明) |
 | `plugins.json` | **被 `assembly.yaml` 取代** |
 | `mcp.json` | 保留,但也可在 `assembly.yaml` 中声明(需要顺序) |
 | `soul.md` / `models.json` / `patches.yaml` / `presets/` | 保留不变 |
@@ -1016,13 +1016,13 @@ teardown:
 
 | # | Yellow 现在调用 | 内核需要提供 |
 |---|---|---|
-| 1 | `dsh plugin add <pkg>` | `kernel.load_plugin(name)` |
+| 1 | 插件包安装命令 | `kernel.load_plugin(name)` |
 | 2 | `agentPreset.read` | `kernel.read_preset(id)` |
 | 3 | `agentPreset.select` | `kernel.apply_preset(session_id, id)` |
 | 4 | `session.create` | `kernel.sessions().create(opts)` |
 | 5 | `session.fork` | `kernel.sessions().fork(id)` |
-| 6 | `dsh-skill-filesystem` 的 `customSkillDirs` | `kernel.register_skill_dir(dir)` |
-| 7 | `dsh-mcp-client` 挂载行 | `kernel.add_mcp_server(spec)` |
+| 6 | 技能根目录配置 | `kernel.register_skill_dir(dir)` |
+| 7 | MCP 客户端挂载行 | `kernel.add_mcp_server(spec)` |
 | 8 | `cordis.patch.yml` 补丁合并 | `kernel.patch_composition(rows)` |
 | 9 | `settings.yaml` 的 `llm-pi-ai` 段 | `kernel.set_model_route(route)` |
 
@@ -1149,5 +1149,5 @@ ngu models                                 # 列出可用模型
 8. **工作区 git 快照服务**
 9. **动态加载层(Yellow)**:加载 / 卸载 / 热替换 + QuickJS 接入 + 子进程协议
 10. **可加载对象接入**:插件(搜索 → 压缩 → 手机远程 → 子代理 → computer use)、MCP、技能
-11. **整合包(`.dshpack`)分发与安装**
+11. **整合包(`.ngupack`)分发与安装**
 12. **UI 与远程**(复用现有隧道 / TUI)

@@ -813,7 +813,7 @@
     <!-- Browser-only picker for installing a pack: the native dialog has no
          door on the server, so the archive is uploaded and its server-side
          path handed to the same verify-then-install command. -->
-    <input type="file" id="install-input" accept=".dshpack" hidden>
+    <input type="file" id="install-input" accept=".ngupack" hidden>
     <textarea id="input" rows="1" placeholder="Ask the kernel something&hellip;  (Enter to send, Shift+Enter for a newline)"></textarea>
     <button id="send">Send</button>
   </div>
@@ -3336,7 +3336,7 @@ setApiKey.addEventListener("keydown", (event) => {
 
 document.getElementById("btn-install").addEventListener("click", () => {
   if (typeof onServer !== "undefined" && onServer) {
-    // No native dialog over HTTP: pick the .dshpack, upload it, install from
+    // No native dialog over HTTP: pick the .ngupack, upload it, install from
     // the path the server just wrote — the same steps the window's dialog
     // runs, with the browser's picker in front.
     document.getElementById("install-input").click();

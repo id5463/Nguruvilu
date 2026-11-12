@@ -583,20 +583,20 @@ stages:
   - name: foundation
     plugins:
       - id: fs-tools
-        source: "npm:@dshd/fs-tools@^1.2"
+        source: "npm:@acme/fs-tools@^1.2"
         order: 10
       - id: shell-tools
-        source: "npm:@dshd/shell-tools@^1.0"
+        source: "npm:@acme/shell-tools@^1.0"
         order: 20
   - name: services
     plugins:
       - id: compaction
-        source: "npm:@dshd/compaction@^0.5"
+        source: "npm:@acme/compaction@^0.5"
         order: 10
         config:
           threshold_tokens: 150000
       - id: mcp-client
-        source: "npm:@dshd/mcp-client@^1.0"
+        source: "npm:@acme/mcp-client@^1.0"
         order: 20
         after: [compaction]
     mcp:
@@ -614,11 +614,11 @@ stages:
   - name: extensions
     plugins:
       - id: search
-        source: "npm:@dshd/search@^2.0"
+        source: "npm:@acme/search@^2.0"
         order: 10
         on_failure: skip
       - id: windows-only
-        source: "npm:@dshd/win@^1.0"
+        source: "npm:@acme/win@^1.0"
         platform: [win32]
 teardown:
   reverse_stages: true

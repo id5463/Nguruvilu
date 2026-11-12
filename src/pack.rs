@@ -1,11 +1,11 @@
-//! Packs: `.dshpack`, the distribution format.
+//! Packs: `.ngupack`, the distribution format.
 //!
 //! A pack is a zip holding a **manifest of references** plus the small data
 //! files that cannot be fetched from anywhere — persona, model route, context
 //! policy, MCP servers, appearance, injection rules.
 //!
 //! ```text
-//! my-pack-1.0.0.dshpack
+//! my-pack-1.0.0.ngupack
 //! ├── dsh.index.json     the manifest: what to fetch, and what is inside
 //! ├── soul.md            persona
 //! ├── models.json        how to talk to the model
@@ -48,7 +48,29 @@ use serde::{Deserialize, Serialize};
 use crate::fetch::{Fetcher, Source};
 
 /// Manifest file name inside the archive.
-pub const MANIFEST_NAME: &str = "dsh.index.json";
+///
+/// Renamed from `dsh.index.json`: this kernel is not part of that family, and a
+/// format file is the one place a name travels to every pack anyone installs.
+/// [`LEGACY_MANIFEST_NAME`] is still read, so every already-installed directory
+/// and every archive built before the rename keeps working — nothing has to be
+/// migrated for a pack to remain loadable.
+pub const MANIFEST_NAME: &str = "ds.index.json";
+
+/// The manifest name packs written before the rename carry.
+///
+/// Read wherever [`MANIFEST_NAME`] is read, and reported by `pack` so a user can
+/// see which spelling a directory is using. Never written: a pack built now is
+/// `ds.index.json`, and [`migrate_manifest_name`] rewrites an old one in place.
+pub const LEGACY_MANIFEST_NAME: &str = "dsh.index.json";
+
+/// Archive extension this build writes.
+pub const ARCHIVE_EXT: &str = "ngupack";
+
+/// Archive extension packs written before the rename carry.
+pub const LEGACY_ARCHIVE_EXT: &str = "dshpack";
+
+/// Every archive extension [`crate::pack::open`] accepts, preferred first.
+pub const ARCHIVE_EXTS: &[&str] = &[ARCHIVE_EXT, LEGACY_ARCHIVE_EXT];
 
 /// Assembly file name the loader reads.
 pub const ASSEMBLY_NAME: &str = "assembly.yaml";
@@ -1140,8 +1162,47 @@ pub fn set_enabled(dir: &Path, enabled: bool) -> Result<bool> {
 /// whatever is actually wrong shows up when the thing it describes is used.
 /// Refusing here substitutes this program's judgement for the user's, and the
 /// user has the authority.
+/// The manifest file this directory actually has, if either name is present.
+///
+/// `ds.index.json` wins when a directory carries both: it is the name a rebuild
+/// writes, and a directory holding both spellings is one in the middle of a
+/// migration.
+pub fn manifest_path(dir: &Path) -> Option<PathBuf> {
+    let modern = dir.join(MANIFEST_NAME);
+    if modern.is_file() {
+        return Some(modern);
+    }
+    let legacy = dir.join(LEGACY_MANIFEST_NAME);
+    if legacy.is_file() {
+        return Some(legacy);
+    }
+    None
+}
+
+/// Rewrite a legacy manifest name to the current one, in place.
+///
+/// Returns whether anything changed. Idempotent, and a no-op for a directory
+/// that already carries the current name — so a caller may run it over every
+/// installed pack on each start without paying for it twice.
+pub fn migrate_manifest_name(dir: &Path) -> Result<bool> {
+    let legacy = dir.join(LEGACY_MANIFEST_NAME);
+    let modern = dir.join(MANIFEST_NAME);
+    if !legacy.is_file() || modern.exists() {
+        return Ok(false);
+    }
+    std::fs::rename(&legacy, &modern)
+        .with_context(|| format!("renaming {} to {}", legacy.display(), modern.display()))?;
+    Ok(true)
+}
 pub fn read_manifest(dir: &Path) -> Result<PackManifest> {
-    let path = dir.join(MANIFEST_NAME);
+    let path = manifest_path(dir).ok_or_else(|| {
+        anyhow!(
+            "{} has no manifest: a pack needs {} (or the older {})",
+            dir.display(),
+            MANIFEST_NAME,
+            LEGACY_MANIFEST_NAME
+        )
+    })?;
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {} (a pack needs one)", path.display()))?;
     let manifest: PackManifest = serde_json::from_str(&text)
@@ -1182,7 +1243,8 @@ pub fn inspect(dir: &Path) -> Result<PackContents> {
     let mut contents = PackContents::default();
     collect_files(dir, dir, &mut contents.files)?;
     contents.files.sort();
-    contents.has_manifest = dir.join(MANIFEST_NAME).is_file();
+    // Either spelling counts: a directory mid-migration is still a pack.
+    contents.has_manifest = manifest_path(dir).is_some();
     contents.has_assembly = dir.join(ASSEMBLY_NAME).is_file();
     Ok(contents)
 }
@@ -1209,9 +1271,23 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
 
 /// The files a pack would contain, excluding any archive.
 ///
+/// Whether a file name is a pack archive, in either the current or the older
+/// spelling.
+///
+/// Used to keep a leftover build out of the pack it is being built from, so it
+/// has to recognise both names: an archive from before the rename is just as
+/// wrong to embed as a fresh one.
+fn is_pack_archive_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    ARCHIVE_EXTS
+        .iter()
+        .any(|ext| lower.ends_with(&format!(".{ext}")))
+}
+
 /// The default output path sits beside the tree being packed, so a scan that
 /// does not exclude it counts the archive as a member of itself. Every
-/// `.dshpack` is excluded, not only the one being written: an archive left over
+/// `.ngupack` (and the older `.dshpack`) is excluded, not only the one being
+/// written: an archive left over
 /// from an earlier build is still an archive, and embedding one is always wrong
 /// — it ships a stale pack inside a fresh one, and the build after that embeds
 /// both.
@@ -1220,7 +1296,7 @@ pub fn packable_files(dir: &Path, out: &Path) -> Result<PackContents> {
     let mut contents = inspect(dir)?;
     contents
         .files
-        .retain(|relative| !relative.to_ascii_lowercase().ends_with(".dshpack"));
+        .retain(|relative| !is_pack_archive_name(relative));
     Ok(contents)
 }
 
@@ -2326,7 +2402,9 @@ pub fn installed(packs_dir: &Path) -> Result<Vec<InstalledPack>> {
             continue;
         }
         let path = entry.path();
-        if !path.join(MANIFEST_NAME).is_file() {
+        // A directory carrying either spelling is a pack; `read_manifest`
+        // prefers the current name when a migration left both behind.
+        if manifest_path(&path).is_none() {
             continue;
         }
         // A pack with a broken manifest is reported rather than skipped: a
@@ -2414,6 +2492,51 @@ pub fn describe(manifest: &PackManifest) -> BTreeMap<String, String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_pack_written_under_the_old_manifest_name_still_loads() {
+        // The rename is a format change, so the promise has to be: every pack
+        // that was installable yesterday is installable today. A directory with
+        // only the old name must read, and `migrate_manifest_name` must be what
+        // upgrades it rather than a hard failure.
+        let dir = scratch("legacy-manifest");
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join(LEGACY_MANIFEST_NAME);
+        std::fs::write(
+            &legacy,
+            r#"{"formatVersion":1,"game":"nguruvilu","name":"old","versionId":"1.0.0","license":"MIT","kernelVersion":"0.1.0","dependencies":{"nguruvilu":">=0.1.0"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(manifest_path(&dir).as_deref(), Some(legacy.as_path()));
+        let manifest = read_manifest(&dir).expect("an old-name pack still reads");
+        assert_eq!(manifest.name, "old");
+        assert!(inspect(&dir).unwrap().has_manifest);
+
+        assert!(migrate_manifest_name(&dir).unwrap(), "the rename happened");
+        assert!(dir.join(MANIFEST_NAME).is_file(), "now under the new name");
+        assert!(!legacy.exists(), "the old spelling is gone");
+        assert!(!migrate_manifest_name(&dir).unwrap(), "and it is idempotent");
+        assert_eq!(read_manifest(&dir).expect("still reads").name, "old");
+    }
+
+    #[test]
+    fn every_archive_spelling_is_recognised() {
+        // Both names must be embeddable-never and openable-always: an archive
+        // left over from a previous build is just as wrong to pack inside the
+        // next one, whichever extension it carries.
+        for name in [
+            "demo-1.0.0.ngupack",
+            "demo-1.0.0.dshpack",
+            "DEMO-1.0.0.NGUPACK",
+            "sub/dir/demo.ngupack",
+        ] {
+            assert!(is_pack_archive_name(name), "{name} is an archive");
+        }
+        for name in ["README.md", "assembly.yaml", "demo.zip", "ds.index.json"] {
+            assert!(!is_pack_archive_name(name), "{name} is not an archive");
+        }
+    }
     use super::*;
 
     fn scratch(tag: &str) -> PathBuf {
@@ -2604,7 +2727,7 @@ mod tests {
     fn a_manifest_pack_round_trips_through_the_archive() {
         let dir = scratch("round");
         sample(&dir, "demo", "1.0.0");
-        let archive = dir.join("demo-1.0.0.dshpack");
+        let archive = dir.join("demo-1.0.0.ngupack");
 
         let built = pack(&dir, &archive).unwrap();
         assert_eq!(built.name, "demo");
@@ -2625,7 +2748,7 @@ mod tests {
         std::fs::create_dir_all(dir.join(FILES_DIR)).unwrap();
         std::fs::write(dir.join(FILES_DIR).join("x.dll"), b"payload").unwrap();
 
-        let error = pack(&dir, &dir.join("out.dshpack")).expect_err("must refuse");
+        let error = pack(&dir, &dir.join("out.ngupack")).expect_err("must refuse");
         let text = format!("{error:#}");
         assert!(text.contains("--offline"), "{text}");
     }
@@ -2634,7 +2757,7 @@ mod tests {
     fn the_archive_is_not_a_member_of_itself() {
         let dir = scratch("self");
         sample(&dir, "demo", "1.0.0");
-        let archive = dir.join("demo-1.0.0.dshpack");
+        let archive = dir.join("demo-1.0.0.ngupack");
 
         pack(&dir, &archive).unwrap();
         let again = pack(&dir, &archive).unwrap();
@@ -2642,7 +2765,7 @@ mod tests {
 
         let report = verify(&archive).unwrap();
         assert!(
-            !report.contents.files.iter().any(|f| f.ends_with(".dshpack")),
+            !report.contents.files.iter().any(|f| f.ends_with(".ngupack")),
             "{:?}",
             report.contents.files
         );
@@ -2656,7 +2779,7 @@ mod tests {
         write_manifest(&dir, &manifest).unwrap();
         // soul.md deliberately not written.
 
-        let archive = dir.join("out.dshpack");
+        let archive = dir.join("out.ngupack");
         pack(&dir, &archive).unwrap();
         let report = verify(&archive).unwrap();
         assert!(
@@ -2694,7 +2817,7 @@ mod tests {
         // are lowered so the accounting is what is under test rather than 256 MiB
         // of zeros.
         let dir = scratch("bomb");
-        let archive = by_hand(&dir, "bomb.dshpack", |writer| {
+        let archive = by_hand(&dir, "bomb.ngupack", |writer| {
             writer.start_file("dsh.index.json", deflated()).unwrap();
             writer.write_all(b"{\"formatVersion\":1}").unwrap();
             // Two members of 4 KiB each; the second crosses the 6 KiB total.
@@ -2726,7 +2849,7 @@ mod tests {
         // almost nothing, so a few kilobytes of archive claim tens of megabytes
         // — and, continued, gigabytes.
         let dir = scratch("bomb-real");
-        let archive = by_hand(&dir, "bomb.dshpack", |writer| {
+        let archive = by_hand(&dir, "bomb.ngupack", |writer| {
             writer.start_file("dsh.index.json", deflated()).unwrap();
             writer.write_all(b"{\"formatVersion\":1}").unwrap();
             writer.start_file("payload", deflated()).unwrap();
@@ -2754,7 +2877,7 @@ mod tests {
     #[test]
     fn one_enormous_member_is_refused_by_the_per_entry_limit() {
         let dir = scratch("bomb-entry");
-        let archive = by_hand(&dir, "bomb.dshpack", |writer| {
+        let archive = by_hand(&dir, "bomb.ngupack", |writer| {
             writer.start_file("dsh.index.json", deflated()).unwrap();
             writer.write_all(b"{\"formatVersion\":1}").unwrap();
             writer.start_file("payload", deflated()).unwrap();
@@ -2772,7 +2895,7 @@ mod tests {
     #[test]
     fn an_archive_with_too_many_entries_is_refused_before_anything_is_written() {
         let dir = scratch("bomb-count");
-        let archive = by_hand(&dir, "bomb.dshpack", |writer| {
+        let archive = by_hand(&dir, "bomb.ngupack", |writer| {
             for index in 0..5 {
                 writer.start_file(format!("f{index}"), deflated()).unwrap();
                 writer.write_all(b"x").unwrap();
@@ -2800,7 +2923,7 @@ mod tests {
         // with two identical central entries reads back as one member), so the
         // guard is proved against the collision it can be handed.
         let dir = scratch("repeated");
-        let archive = by_hand(&dir, "members.dshpack", |writer| {
+        let archive = by_hand(&dir, "members.ngupack", |writer| {
             writer.start_file("dsh.index.json", deflated()).unwrap();
             writer.write_all(b"{\"formatVersion\":1}").unwrap();
             writer.start_file("a.md", deflated()).unwrap();
@@ -2829,7 +2952,7 @@ mod tests {
         #[cfg(windows)]
         {
             let dir = scratch("repeated-case");
-            let archive = by_hand(&dir, "members.dshpack", |writer| {
+            let archive = by_hand(&dir, "members.ngupack", |writer| {
                 writer.start_file("dsh.index.json", deflated()).unwrap();
                 writer.write_all(b"{\"formatVersion\":1}").unwrap();
                 writer.start_file("A.md", deflated()).unwrap();
@@ -2849,7 +2972,7 @@ mod tests {
         // Written out as a plain file, a symlink entry is a path the archive
         // does not name — and the format has no use for one.
         let dir = scratch("symlink");
-        let archive = by_hand(&dir, "link.dshpack", |writer| {
+        let archive = by_hand(&dir, "link.ngupack", |writer| {
             writer
                 .add_symlink("escape", "../../outside", zip::write::SimpleFileOptions::default())
                 .unwrap();
@@ -2868,7 +2991,7 @@ mod tests {
         manifest.dependencies.nguruvilu = ">=99.0.0".into();
         write_manifest(&dir, &manifest).unwrap();
 
-        let archive = dir.join("out.dshpack");
+        let archive = dir.join("out.ngupack");
         pack(&dir, &archive).unwrap();
         let report = verify(&archive).unwrap();
         assert!(!report.kernel_compatible);
@@ -2888,7 +3011,7 @@ mod tests {
         let mut manifest = PackManifest::new("demo", "1.0.0");
         manifest.dependencies.nguruvilu = ">=99.0.0".into();
         write_manifest(&dir, &manifest).unwrap();
-        let archive = dir.join("out.dshpack");
+        let archive = dir.join("out.ngupack");
         pack(&dir, &archive).unwrap();
 
         let placed = install(&archive, &dir.join("packs"))
@@ -2923,7 +3046,7 @@ mod tests {
         std::fs::create_dir_all(&embedded).unwrap();
         std::fs::write(embedded.join("SKILL.md"), "pdf skill\n").unwrap();
 
-        let archive = dir.join("offline.dshpack");
+        let archive = dir.join("offline.ngupack");
         {
             let contents = packable_files(&dir, &archive).unwrap();
             write_archive(&dir, &contents.files, &archive).unwrap();
@@ -2952,7 +3075,7 @@ mod tests {
         std::fs::create_dir_all(&embedded).unwrap();
         std::fs::write(embedded.join("SKILL.md"), "x").unwrap();
 
-        let archive = dir.join("demo.dshpack");
+        let archive = dir.join("demo.ngupack");
         {
             let contents = packable_files(&dir, &archive).unwrap();
             write_archive(&dir, &contents.files, &archive).unwrap();
@@ -2982,7 +3105,7 @@ mod tests {
         )
         .unwrap();
 
-        let archive = dir.join("look.dshpack");
+        let archive = dir.join("look.ngupack");
         pack(&dir, &archive).unwrap();
 
         let placed = install(&archive, &dir.join("packs")).await.unwrap();
@@ -3176,14 +3299,14 @@ mod tests {
         // embedding one ships a stale pack inside a fresh one.
         let dir = scratch("no-nesting");
         sample(&dir, "demo", "1.0.0");
-        std::fs::write(dir.join("stale-0.9.0.dshpack"), b"an old archive").unwrap();
+        std::fs::write(dir.join("stale-0.9.0.ngupack"), b"an old archive").unwrap();
 
-        let archive = dir.join("demo-1.0.0.dshpack");
+        let archive = dir.join("demo-1.0.0.ngupack");
         pack(&dir, &archive).unwrap();
 
         let report = verify(&archive).unwrap();
         assert!(
-            !report.contents.files.iter().any(|f| f.ends_with(".dshpack")),
+            !report.contents.files.iter().any(|f| f.ends_with(".ngupack")),
             "{:?}",
             report.contents.files
         );
@@ -3272,7 +3395,7 @@ mod tests {
         });
         write_manifest(&dir, &manifest).unwrap();
 
-        let archive = dir.join("out.dshpack");
+        let archive = dir.join("out.ngupack");
         pack(&dir, &archive).unwrap();
         let report = verify(&archive).unwrap();
         assert_eq!(report.manifest.name, "demo");
@@ -3330,7 +3453,7 @@ mod tests {
         });
         write_manifest(&dir, &manifest).unwrap();
 
-        let archive = dir.join("delegate-pack.dshpack");
+        let archive = dir.join("delegate-pack.ngupack");
         pack(&dir, &archive).unwrap();
         let placed = install(&archive, &dir.join("packs")).await.unwrap();
 
@@ -3558,7 +3681,7 @@ mod tests {
         )
         .unwrap();
 
-        let archive = dir.join("out.dshpack");
+        let archive = dir.join("out.ngupack");
         pack(&dir, &archive).unwrap();
         let placed = install(&archive, &packs).await.unwrap();
 
@@ -3633,7 +3756,7 @@ mod tests {
         )
         .unwrap();
 
-        let archive = dir.join("out.dshpack");
+        let archive = dir.join("out.ngupack");
         pack(&dir, &archive).unwrap();
         let error = install(&archive, &dir.join("packs"))
             .await

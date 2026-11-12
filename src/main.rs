@@ -237,11 +237,11 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
-    /// Build a `.dshpack` archive from a pack directory.
+    /// Build a `.ngupack` archive from a pack directory.
     Pack {
-        /// Pack directory (must contain dsh.index.json).
+        /// Pack directory (must contain ds.index.json, or the older dsh.index.json).
         dir: PathBuf,
-        /// Output archive path. Defaults to <name>-<version>.dshpack.
+        /// Output archive path. Defaults to <name>-<version>.ngupack.
         #[arg(short, long)]
         out: Option<PathBuf>,
         /// Fetch every reference and write its hash into the manifest.
@@ -256,9 +256,9 @@ enum Command {
         #[arg(long)]
         offline: bool,
     },
-    /// Install a `.dshpack` archive.
+    /// Install a `.ngupack` archive (the older `.dshpack` is accepted).
     Install {
-        /// What to install: a local `.dshpack` path, `github:owner/repo[@path][@ref]`,
+        /// What to install: a local `.ngupack` path, `github:owner/repo[@path][@ref]`,
         /// or an `https://` URL to an archive.
         file: PathBuf,
         /// Directory to install into.
@@ -302,7 +302,7 @@ enum Command {
         /// Where to write it. Defaults to ./ui.
         dir: Option<PathBuf>,
     },
-    /// Verify a `.dshpack` archive without installing it.
+    /// Verify a `.ngupack` archive without installing it.
     Verify {
         /// Archive to verify.
         file: PathBuf,
@@ -2657,7 +2657,12 @@ async fn pack_command(
     let mut manifest = nguruvilu::pack::read_manifest(dir)?;
     let archive = match out {
         Some(path) => path.clone(),
-        None => PathBuf::from(format!("{}-{}.dshpack", manifest.name, manifest.version_id)),
+        None => PathBuf::from(format!(
+            "{}-{}.{}",
+            manifest.name,
+            manifest.version_id,
+            nguruvilu::pack::ARCHIVE_EXT
+        )),
     };
 
     if pin {
@@ -2810,7 +2815,7 @@ async fn resolve_pack_source(spec: &str) -> Result<PathBuf> {
     pack_archive_in(&fetched.path)
 }
 
-/// The one `.dshpack` inside a fetched directory.
+/// The one pack archive inside a fetched directory.
 ///
 /// A pack's own directory contains one archive; a repository contains many,
 /// and guessing which was meant would install the wrong pack — so it lists
@@ -2826,13 +2831,23 @@ fn pack_archive_in(dir: &std::path::Path) -> Result<PathBuf> {
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
-            } else if path.extension().and_then(|ext| ext.to_str()) == Some("dshpack") {
+            } else if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| nguruvilu::pack::ARCHIVE_EXTS.contains(&ext.to_ascii_lowercase().as_str()))
+                .unwrap_or(false)
+            {
                 found.push(path);
             }
         }
     }
     match found.len() {
-        0 => Err(anyhow::anyhow!("no .dshpack archive under {}", dir.display())),
+        0 => Err(anyhow::anyhow!(
+            "no .{} (or .{}) archive under {}",
+            nguruvilu::pack::ARCHIVE_EXT,
+            nguruvilu::pack::LEGACY_ARCHIVE_EXT,
+            dir.display()
+        )),
         1 => Ok(found.pop().expect("exactly one match")),
         _ => {
             found.sort();
@@ -2939,7 +2954,7 @@ fn mcp_import_command(
     }
     println!();
     println!(
-        "next: ngu pack {dir} --out {name}-1.0.0.dshpack   then   ngu install <the archive>",
+        "next: ngu pack {dir} --out {name}-1.0.0.ngupack   then   ngu install <the archive>",
         dir = dir.display(),
         name = pack_name
     );
@@ -3138,8 +3153,8 @@ fn generated_pack_readme(
         }
     }
     out.push_str(&format!(
-        "\n## 用法\n\n```bash\nngu pack {name} --out {name}-1.0.0.dshpack\n\
-         ngu install {name}-1.0.0.dshpack\nngu packs\n```\n\n\
+        "\n## 用法\n\n```bash\nngu pack {name} --out {name}-1.0.0.ngupack\n\
+         ngu install {name}-1.0.0.ngupack\nngu packs\n```\n\n\
          装载后每个服务器的工具以 `mcp__<id>__*` 出现;卸载留文件,`--delete` 才删。\n\n\
          ## 许可\n\n本包清单声明 **{license}**(这是这个*包*的许可);各 MCP 服务器\n\
          本身的许可以其上游为准。\n",
@@ -4530,10 +4545,10 @@ mod tests {
         // The split decides whether the argument is downloaded or installed
         // from disk, so a path must never be reinterpreted as a spec.
         assert!(is_remote_spec("github:id5463/Nguruvilu@packs/browser-use@main"));
-        assert!(is_remote_spec("https://example.com/packs/demo-1.0.0.dshpack"));
-        assert!(is_remote_spec("http://example.com/demo-1.0.0.dshpack"));
-        assert!(!is_remote_spec(r"C:\packs\demo-1.0.0.dshpack"));
-        assert!(!is_remote_spec("packs/demo-1.0.0.dshpack"));
+        assert!(is_remote_spec("https://example.com/packs/demo-1.0.0.ngupack"));
+        assert!(is_remote_spec("http://example.com/demo-1.0.0.ngupack"));
+        assert!(!is_remote_spec(r"C:\packs\demo-1.0.0.ngupack"));
+        assert!(!is_remote_spec("packs/demo-1.0.0.ngupack"));
         assert!(!is_remote_spec("./github:looks-like-a-spec"));
     }
 
@@ -4549,13 +4564,13 @@ mod tests {
             "an empty directory yields nothing, by name"
         );
 
-        std::fs::write(root.join("sub/demo-1.0.0.dshpack"), b"one").unwrap();
+        std::fs::write(root.join("sub/demo-1.0.0.ngupack"), b"one").unwrap();
         let one = pack_archive_in(&root).unwrap();
-        assert!(one.ends_with("demo-1.0.0.dshpack"));
+        assert!(one.ends_with("demo-1.0.0.ngupack"));
 
         // A repository holds several packs: refuse and say which, rather than
         // guess and install the wrong one.
-        std::fs::write(root.join("other-2.0.0.dshpack"), b"two").unwrap();
+        std::fs::write(root.join("other-2.0.0.ngupack"), b"two").unwrap();
         let error = format!("{:#}", pack_archive_in(&root).expect_err("two archives"));
         assert!(error.contains("2 archives"), "{error}");
         assert!(error.contains("demo-1.0.0.dshpack"), "{error}");

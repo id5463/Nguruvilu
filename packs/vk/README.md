@@ -11,7 +11,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `dsh.index.json` | 清单:引用 `mcp.json` + 内联技能 `skills/vk` |
+| `ds.index.json` | 清单:引用 `mcp.json` + 内联技能 `skills/vk` |
 | `mcp.json` | 服务器 `vk-api`:stdio,`npx -y vk-mcp-server`,scope session |
 | `skills/vk/SKILL.md` | 使用与排查技能(按需加载,只占一行目录) |
 

@@ -182,11 +182,11 @@ ngu.state()                                 // 一次拿到完整状态
 
 ```
 clock/
-├── dsh.index.json
+├── ds.index.json
 └── index.html
 ```
 
-**`dsh.index.json`**
+**`ds.index.json`**
 
 ```json
 {

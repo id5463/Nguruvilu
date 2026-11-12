@@ -20,7 +20,7 @@
 ## 内容
 
 ```
-dsh.index.json      清单
+ds.index.json      清单
 soul.md             主代理的角色（几行，不复述规则）
 mcp.json            把 files/ticket-mcp.mjs 作为 stdio MCP 服务器带来
 files/ticket-mcp.mjs  票的状态机与参数生成（代码，Node，无依赖）

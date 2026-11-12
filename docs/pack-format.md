@@ -1,6 +1,6 @@
 # 整合包格式 (formatVersion 1)
 
-Nguruvilu 整合包(`.dshpack`)是**一份发行清单**,不是自带全部内容的压缩包。
+Nguruvilu 整合包(`.ngupack`)是**一份发行清单**,不是自带全部内容的压缩包。
 
 一个包声明两件事:
 
@@ -19,8 +19,8 @@ Nguruvilu 整合包(`.dshpack`)是**一份发行清单**,不是自带全部内�
 ## 包的形态
 
 ```
-my-pack-1.0.0.dshpack          ← zip
-├── dsh.index.json             ← 清单(引用 + 内容文件索引)
+my-pack-1.0.0.ngupack          ← zip
+├── ds.index.json             ← 清单(引用 + 内容文件索引)
 ├── soul.md                    ← 人设
 ├── models.json                ← 模型路由 / 输出 / 请求塑形
 ├── context.json               ← 上下文窗口 / 压缩 / 缓存策略
@@ -30,11 +30,11 @@ my-pack-1.0.0.dshpack          ← zip
 └── search.json                ← 搜索 provider 与 key 的环境变量名
 ```
 
-内容文件**全部可选**。一个只加一条注入规则的包,可以只有一个 `dsh.index.json` 和一个 `injections.json`。
+内容文件**全部可选**。一个只加一条注入规则的包,可以只有一个 `ds.index.json` 和一个 `injections.json`。
 
 ---
 
-## `dsh.index.json`
+## `ds.index.json`
 
 ### 身份与兼容
 
@@ -388,7 +388,7 @@ packs 目录:
 | `judge` | 判官 `judge` 工具 —— 内核自带客户端,由这个包启用(没 key 就没有工具;`NGU_JUDGE_*` 或面板三栏配置) |
 
 `starter` 是从五个旧预装包(chinese / ui / search / subagent / computer-use)**合并**
-来的:五份清单写进一份 `dsh.index.json`(plugins 数组放两个、ui/mcp/内容字段各管各的),
+来的:五份清单写进一份 `ds.index.json`(plugins 数组放两个、ui/mcp/内容字段各管各的),
 两份人设合成一个 `soul.md`。升级到已有旧五包的机器上时,启动逻辑按下面的顺序处理:
 
 1. 先放置 `starter` 与 `judge`;
@@ -421,11 +421,11 @@ packs 目录:
 `themes/` 目录:
 
 ```
-dsh.index.json
+ds.index.json
 look.json
 ```
 
-**`dsh.index.json`**
+**`ds.index.json`**
 
 ```json
 {
@@ -466,7 +466,7 @@ look.json
 现有那个**自带全部内容**的 zip 继续有效,作为**离线/内网**形态:
 
 ```
-ngu pack --offline <目录> -o out.dshpack    ← 把引用指向的东西也打进去
+ngu pack --offline <目录> -o out.ngupack    ← 把引用指向的东西也打进去
 ```
 
 两种形态的区别:

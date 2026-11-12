@@ -4,12 +4,6 @@
 
 **Nguruvilu 是一个独立的 agent 内核。** 命令行工具名 `ngu`。
 
-## 与 dshd 的关系
-
-**Nguruvilu 是 dshd 家族的内核,但作为项目完全独立。**
-
-两者是内核与发行版的关系:Nguruvilu 独立开发、独立发布、独立演进,不隶属于 dshd 品牌;dshd 家族(Red / Blue / White / Green / Brown / Pink / tan)是它的使用方之一。任何其他项目都可以基于 Nguruvilu 构建,不必与 dshd 产生关系。
-
 ## 架构层次
 
 ```
@@ -21,7 +15,7 @@
                       ↕ 扩展点
 ┌─ 动态加载层(Yellow)─────────────────────────┐
 │  职责:动态加载、卸载、热替换                  │
-│  分发格式:整合包(.dshpack)                   │
+│  分发格式:整合包(.ngupack)                   │
 └───────────────────────────────────────────────┘
                       ↕ 加载
 ┌─ 可加载对象(三者平级)────────────────────────┐
@@ -54,7 +48,7 @@
 |---|---|---|
 | **语言** | **Rust** | 单文件原生可执行(免解压、零依赖)、无 GC 停顿、真并行、启动毫秒级 |
 | **动态加载层** | Yellow(重构) | 加载插件 / MCP / 技能;整合包为分发格式 |
-| 插件运行时 | **QuickJS 嵌入 JS** + 子进程 | 热加载天然成立;现有 dshd JS 代码可直接搬为插件 |
+| 插件运行时 | **QuickJS 嵌入 JS** + 子进程 | 热加载天然成立;已有的 JS 能力可直接搬为插件 |
 | 压缩 | **纯插件** | 内核保持最小 |
 | 模型格式 | 仅 OpenAI 兼容 | 砍掉多 provider 适配 |
 | 会话存储 | **JSONL + trait 接口** | 追加写、崩溃安全、无原生依赖;预留后端替换 |
@@ -81,9 +75,8 @@ Rust 的选择有先例:OpenAI 的 **Codex CLI 已从 TypeScript 重写为 Rust*
 | 来源 | 协议 | 用途 |
 |---|---|---|
 | [Pi](https://github.com/earendil-works/pi)(本地 `I:\pi`) | MIT | agent 循环设计(775 行 loop)、4 工具设计(443 行)、压缩思路(777 行) |
-| [DSH](https://github.com/deepseek-ai/deepseek-harness)(本地 `I:\deepseek-harness`) | MIT | Cordis 隔离机制、epoch 热重载、effect 撤销、缓存策略、审批栈 |
 
-两者均为 MIT:可自由取用、修改、商用,保留版权与许可声明即可。**注意:它们都是 TypeScript,Rust 实现只能参考设计、重写代码,不能直接复制。**
+[Pi](https://github.com/earendil-works/pi) 为 MIT:可自由取用、修改、商用,保留版权与许可声明即可。**注意:它是 TypeScript,Rust 实现只能参考设计、重写代码,不能直接复制。**
 
 ## 目录
 
@@ -104,7 +97,7 @@ src/
   events.rs        事件总线(观察式订阅 / effect 退订 / 审计 JSONL 与 5MB 轮转)
   skills.rs        技能系统(目录扫描 / frontmatter 解析 / 目录注入 / 加载工具)
   mcp.rs           MCP 客户端(stdio + Streamable HTTP,JSON-RPC,并发安全)
-  pack.rs          整合包(.dshpack zip:打包 / 校验 / 安装 / 清单;Carried 与 Fetched 两种内容形态)
+  pack.rs          整合包(.ngupack zip:打包 / 校验 / 安装 / 清单;Carried 与 Fetched 两种内容形态)
   preinstall.rs    预装包(两个官方包:starter 五合一 + judge 嵌进二进制;已卸载不复活、已编辑不覆盖)
   dylib.rs         动态库插件(最小 C ABI + JSON API、ABI 校验、热更新)
   assembly.rs      装配清单(阶段 / 依赖 / order / 平台过滤 / 循环检测)
@@ -374,13 +367,13 @@ SyntaxError。后果极具迷惑性:
 - `node --check` 检测不出来,因为 node 里没有 `window.ipc` 这个预置属性
 
 改名即可(`ui/index.html` 里叫 `toShell`,并留有注释说明原因)。
-## 整合包(`.dshpack`):打包与读包
+## 整合包(`.ngupack`):打包与读包
 
 整合包是一个 **zip 归档**,装三样东西:身份清单、装配清单、以及装配引用的内容。
 
 ```
 my-pack/                        ← 包目录(打包的输入)
-  dsh.index.json                ← 身份:名称/版本/协议/内核版本/依赖
+  ds.index.json                 ← 身份:名称/版本/协议/内核版本/依赖
   assembly.yaml                 ← 装配:加载什么、什么顺序
   skills/pdf-tools/SKILL.md     ← 内容
   plugins/ngu_demo_plugin.dll
@@ -389,11 +382,12 @@ my-pack/                        ← 包目录(打包的输入)
 ### 打包
 
 ```bash
-ngu pack ./my-pack                              # → my-pack-<version>.dshpack
-ngu pack ./my-pack --out /tmp/custom.dshpack    # 指定输出路径
+ngu pack ./my-pack                              # → my-pack-<version>.ngupack
+ngu pack ./my-pack --out /tmp/custom.ngupack    # 指定输出路径
 ```
 
-包目录**必须**有 `dsh.index.json`。没有清单的归档无法被识别,宁可打不出来。
+包目录**必须**有 `ds.index.json`(旧的 `dsh.index.json` 仍被读取)。没有清单的归档无法被
+识别,宁可打不出来。
 
 打包时自动排除 `.git/`、`target/`、`node_modules/`,条目按名称排序(同样内容的两次打包可逐字节比较)。
 
@@ -403,15 +397,15 @@ ngu pack ./my-pack --out /tmp/custom.dshpack    # 指定输出路径
 
 ```bash
 # 1. 校验:清单是否合法、有没有装配清单、协议是否声明
-ngu verify my-pack-1.0.0.dshpack
-ngu verify my-pack-1.0.0.dshpack --json        # 机器可读
+ngu verify my-pack-1.0.0.ngupack
+ngu verify my-pack-1.0.0.ngupack --json        # 机器可读
 
 # 2. 用系统工具直接看(它就是标准 zip,不依赖 ngu)
-unzip -l my-pack-1.0.0.dshpack
+unzip -l my-pack-1.0.0.ngupack
 #   Windows: 右键 → 打开方式 → 资源管理器;或 Expand-Archive
 
 # 3. 安装后看它加载什么
-ngu install my-pack-1.0.0.dshpack
+ngu install my-pack-1.0.0.ngupack
 ngu packs
 ngu assembly <安装目录>/assembly.yaml           # 预览加载计划,不执行
 ngu apply    <安装目录>/assembly.yaml           # 真正加载
@@ -425,15 +419,15 @@ ngu apply    <安装目录>/assembly.yaml           # 真正加载
 
 ```bash
 # 1. 本地文件 —— 离线包,完全不联网
-ngu install my-pack-1.0.0.dshpack
-ngu install my-pack-1.0.0.dshpack --into /opt/packs
+ngu install my-pack-1.0.0.ngupack
+ngu install my-pack-1.0.0.ngupack --into /opt/packs
 
 # 2. 从 GitHub 下载(仓库里那条传统分发路径)
 ngu install github:owner/repo@packs/my-pack@v1.0.0     # 指到包目录(推荐,唯一归档)
 ngu install github:owner/repo@main                     # 指到仓库根:多个归档会列出来让你挑,不猜
 
 # 3. 直接给归档的 URL
-ngu install https://example.com/dist/my-pack-1.0.0.dshpack
+ngu install https://example.com/dist/my-pack-1.0.0.ngupack
 
 # 装完之后
 ngu packs                                        # 列出已安装
@@ -532,9 +526,9 @@ stages:
 - **卸载跟包走**:卸掉 `starter` 包 → 插件纤维卸下 → `delegate` 与 `search_web` 从工具表消失;你配的
   设置不删,装回来即恢复。界面上那一节(搜索三栏)也随包动态创建/移除
   (搜索的开关粒度另有面板 `off`,不必整包卸载)。
-- **不搞独占**:我们研究过 DSH 的 computer-use 注册表(一个会话只允许一个电脑操作
-  提供方),**刻意不做** —— 多种操控电脑的方式可以自由并存,同时驱动一台桌面时由使用者
-  自己协调。自由优先于互斥。
+- **不搞独占**:computer-use 注册表式的排他(一个会话只允许一个电脑操作提供方)**刻意
+  不做** —— 多种操控电脑的方式可以自由并存,同时驱动一台桌面时由使用者自己协调。自由
+  优先于互斥。
 - **彻底包化(dylib)是既定路线**:能力实现编成动态库随包分发,内核只剩装载器。
   `src/dylib.rs` 的最小 ABI、`ngu_demo_plugin.dll` 样例、`examples/demo-plugin/`
   都已就位;逐个能力迁移是下一步的事。
@@ -628,7 +622,7 @@ stages:
 | `skills` | 列出找到的技能(`--verbose` 连正文) |
 | `assembly` | 校验装配清单并打印加载计划(不执行) |
 | `apply` | 应用装配清单:加载插件 / MCP / 技能 |
-| `pack` | 从包目录打 `.dshpack`(`--out` 指定输出,`--pin` 钉引用,`--offline` 离线) |
+| `pack` | 从包目录打 `.ngupack`(`--out` 指定输出,`--pin` 钉引用,`--offline` 离线) |
 | **`install`** | **装包:本地文件 / `github:owner/repo[@path][@ref]` / `https://` 归档 URL**(`--into` 指定目录) |
 | **`mcp import`** | **把 Claude Code / Claude Desktop 的 `.mcp.json` 变成本地包**(stdio 直通并经严格读取器复核;http 等传输如实列出、不混进包里;`--name/--out/--license`) |
 | `packs` | 列出已安装(版本 / loaded / assembly) |
@@ -699,7 +693,7 @@ pwsh -File release.ps1
 | **MCP** | ✅ | stdio 与 Streamable HTTP 两种传输的 JSON-RPC 客户端,工具自动注册与命名空间隔离 |
 | **装配清单** | ✅ | 阶段 / 依赖拓扑 / order / 平台过滤 / 循环检测 |
 | **动态加载层** | ✅ | 插件·MCP·技能平级加载,台账去重,失败策略(abort/skip/retry) |
-| **整合包** | ✅ | .dshpack(zip):打包 / 校验 / 安装;身份与装配分离;路径逃逸防护 |
+| **整合包** | ✅ | .ngupack(zip):打包 / 校验 / 安装;身份与装配分离;路径逃逸防护 |
 | **包的加载与卸载** | ✅ | 按对话生效;卸载(留文件)与删除是两件事;对话内热加载 / 热卸载,回合结束生效,不重启 |
 | **预装包** | ✅ | **两个官方包**:`starter`(**五合一**:chinese+ui+search+subagent+computer-use 的人设/注入/界面文案/搜索默认值/界面副本/桌面驱动声明/两个插件)+ `judge`(判官);嵌在可执行文件里,首次运行自动放置;卸载过不复活,改过不覆盖。升级到五合一的机器上,旧五包**未改动才自动退役**(改动过的保留并每次提示) |
 | **桌面 / 浏览器能力包** | ✅ | 两条线:`starter` 的 `mcp.json`(桌面,**装包时按平台自动下载并校验 `cua-driver`,之后全离线**,冷装约 20s / 二跑 0.2s,实测 57 个桌面工具)与 `browser-use`(浏览器,需自装 `chrome-devtools-mcp@1.10.1`) |
@@ -750,10 +744,10 @@ pwsh -File release.ps1
 
 ## 包的许可
 
-所有包都必须是 MIT 许可。每个包的 `dsh.index.json` 中 `license` 字段须为 `"MIT"`,包内的每个插件、技能与组件也须声明 `"MIT"`。非 MIT 许可的包不属于本项目的分发范围,作者若要分发其他许可的包,请自行承担其许可义务。
+所有包都必须是 MIT 许可。每个包的 `ds.index.json` 中 `license` 字段须为 `"MIT"`,包内的每个插件、技能与组件也须声明 `"MIT"`。非 MIT 许可的包不属于本项目的分发范围,作者若要分发其他许可的包,请自行承担其许可义务。
 
 ## 许可
 
 MIT。见 [LICENSE](LICENSE)。
 
-取用参考项目([Pi](https://github.com/earendil-works/pi)、[DSH](https://github.com/deepseek-ai/deepseek-harness))同为 MIT:保留版权与许可声明即可自由使用、修改、商用 —— 但它们是 TypeScript,本项目只参考设计、不复制代码。
+参考项目 [Pi](https://github.com/earendil-works/pi) 同为 MIT:保留版权与许可声明即可自由使用、修改、商用 —— 但它是 TypeScript,本项目只参考设计、不复制代码。
