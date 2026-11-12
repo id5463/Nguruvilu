@@ -55,5 +55,6 @@
     "btn-fetch-models": "拉取列表",
     "send": "发送",
     "placeholder:input": "问内核点什么…(回车发送,Shift+回车换行)"
-  }
+  },
+  "css": "/* 这个包只改界面的一角，不携带整份 index.html。\n   以前要让侧栏更宽，只能把 150KB 的界面整份复制进包 —— 那样每改一个数字\n   都要跟着母版同步一遍。现在几行到这里就够了，tests/ui_sync.rs 也不用再\n   逼两份副本逐字节相同。 */\n:root {\n  --radius: 10px;\n}\n#sessions { padding: 14px 12px; }\nh2 { letter-spacing: .1em; }\n.sess { border-radius: 8px; }\n"
 }

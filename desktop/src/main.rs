@@ -2121,6 +2121,20 @@ async fn apply_pack(
 ///
 /// Asking the endpoint beats making a user type a model id from memory: a
 /// gateway can front dozens of models and its list changes without notice.
+/// The model ids this endpoint last reported.
+///
+/// `delegate` asks for these when it is registered, and `fetch_models` is what
+/// fills them in — the same catalog the picker shows. It is a process-wide cell
+/// rather than a field on `AppState` because the tool is registered once, before
+/// any session exists, and because the answer belongs to the endpoint rather
+/// than to a conversation.
+static KNOWN_MODELS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The last catalog seen, in registration order.
+fn known_models() -> Vec<String> {
+    KNOWN_MODELS.lock().expect("model cache").clone()
+}
+
 async fn fetch_models(
     state: Arc<Mutex<AppState>>,
     sink: Arc<dyn EventSink>,
@@ -2133,6 +2147,10 @@ async fn fetch_models(
     match client.list_models_detailed().await {
         Ok(models) => {
             eprintln!("[models] provider reported {} entries", models.len());
+            // Kept for `delegate`: the subtask model argument is only a choice
+            // if the ids are known before the tool is described.
+            *KNOWN_MODELS.lock().expect("model cache") =
+                models.iter().map(|model| model.id.clone()).collect();
             emit(
                 &sink,
                 json!({
@@ -2207,6 +2225,14 @@ fn remove_pack(target: &str) -> anyhow::Result<()> {
 pub(crate) fn resolve_active_ui(wanted: Option<&str>) -> Option<PathBuf> {
     let packs = nguruvilu::pack::installed(&nguruvilu::pack::default_packs_dir()).ok()?;
 
+    // Collect every pack that claims an interface instead of stopping at the
+    // first. The shell serves exactly one document, so two packs cannot be
+    // layered the way themes, labels, panels and stylesheets can — but the
+    // previous version returned on the first match and dropped the rest in
+    // silence. Installing a pack could therefore replace someone else's
+    // interface with nothing to explain it, which reads as "my pack stopped
+    // working".
+    let mut claims: Vec<(String, PathBuf)> = Vec::new();
     for pack in &packs {
         // An unloaded pack is out of every conversation, and that includes the
         // interface it brought: unloading it puts the built-in one back.
@@ -2233,9 +2259,38 @@ pub(crate) fn resolve_active_ui(wanted: Option<&str>) -> Option<PathBuf> {
             );
             continue;
         }
-        let directory = entry.parent().map(PathBuf::from)?;
-        eprintln!("[ui] serving interface '{}' from {}", ui.id, directory.display());
-        return Some(directory);
+        let Some(directory) = entry.parent().map(PathBuf::from) else {
+            continue;
+        };
+        claims.push((
+            format!("{} {} ({})", pack.manifest.name, pack.manifest.version_id, ui.id),
+            directory,
+        ));
+    }
+
+    // Sorted so both the report and the choice are the same on every run,
+    // whatever order the directory listing produced.
+    claims.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if claims.len() > 1 {
+        let names = claims
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "[ui] {} packs declare an interface and only one can be served: {}.              Serving '{}'. Unload the ones you are not using (packs panel →              Unload) — an unloaded pack's interface steps aside automatically.",
+            claims.len(),
+            names,
+            claims[0].0
+        );
+    }
+
+    // The first by name, so the window is usable rather than blank — but the
+    // conflict is on the record now instead of silent.
+    if let Some((name, directory)) = claims.first() {
+        eprintln!("[ui] serving interface of {name} from {}", directory.display());
+        return Some(directory.clone());
     }
 
     if wanted.is_some() {
@@ -2600,12 +2655,13 @@ pub(crate) fn set_active_ui(dir: PathBuf) {
 
 /// Send the panels, theme, and labels plugins contributed.
 fn emit_panels(state: &Arc<Mutex<AppState>>, sink: &Arc<dyn EventSink>) {
-    let (panels, theme, strings) = {
+    let (panels, theme, strings, css) = {
         let guard = state.lock().expect("state lock");
         (
             guard.kernel.ui_panels(),
             guard.kernel.resolved_theme(),
             guard.kernel.resolved_strings(),
+            guard.kernel.resolved_css(),
         )
     };
     sink.emit(json!({ "ev": "ui_panels", "panels": panels }));
@@ -2615,6 +2671,11 @@ fn emit_panels(state: &Arc<Mutex<AppState>>, sink: &Arc<dyn EventSink>) {
     // or the right palette with the previous pack's words.
     sink.emit(json!({ "ev": "theme", "tokens": theme.tokens, "name": theme.name }));
     sink.emit(json!({ "ev": "strings", "strings": strings }));
+    // Pack stylesheets travel last, after the theme and the labels, so the
+    // page has already applied the tokens those rules may build on. An empty
+    // string is sent rather than omitted: the page rewrites its pack sheet
+    // whole, which is what makes unloading a pack take its rules with it.
+    sink.emit(json!({ "ev": "ui_css", "css": css }));
 }
 
 /// Send one event to the page.

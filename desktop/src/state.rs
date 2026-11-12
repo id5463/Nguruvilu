@@ -273,6 +273,15 @@ impl nguruvilu::model::ModelAccess for DesktopModelAccess {
         prompt
     }
 
+    /// The endpoint's catalog, as last reported by `fetch_models`.
+    ///
+    /// Not fetched here: this is called while the tool is being described, and a
+    /// network round trip in that path would stall registration. Empty until the
+    /// shell has listed models once, which it does on connect.
+    fn available_models(&self) -> Vec<String> {
+        crate::known_models()
+    }
+
     fn context_policy(&self) -> Arc<dyn ContextPolicy> {
         Arc::clone(&self.policy.lock().expect("policy lock"))
     }
@@ -501,6 +510,9 @@ impl AppState {
         // Same for document reading (读不了就装包): `packs/documents` asks for
         // `builtin:documents` and `read` learns PDF/Office.
         nguruvilu::tools::documents::define(&mut kernel);
+        // Available to a pack, not loaded by the kernel: a conversation that
+        // wants to restart its own process asks for `builtin:restart`.
+        nguruvilu::tools::restart::define(&mut kernel);
         // Available to a pack, not loaded by the kernel: `packs/search` asks
         // for `builtin:search` and it appears — with a tool only while a key
         // is configured (see `search::configure`).
@@ -1425,6 +1437,29 @@ impl AppState {
     pub fn packs(&self) -> Result<Value> {
         let dir = nguruvilu::pack::default_packs_dir();
         let packs = nguruvilu::pack::installed(&dir)?;
+        // Which interface ids more than one loaded pack claims. Two packs
+        // declaring the same id cannot both be served — the shell serves one
+        // document — so this is the list the page needs to say so. Without it
+        // the loser was invisible: its UI simply never appeared, with nothing
+        // anywhere to explain why.
+        let mut ui_claims: std::collections::BTreeMap<&str, Vec<&str>> =
+            std::collections::BTreeMap::new();
+        for pack in &packs {
+            if !pack.enabled {
+                continue;
+            }
+            if let Some(ui) = &pack.manifest.ui {
+                ui_claims
+                    .entry(ui.id.as_str())
+                    .or_default()
+                    .push(pack.manifest.name.as_str());
+            }
+        }
+        let conflicting: Vec<&str> = ui_claims
+            .iter()
+            .filter(|(_, names)| names.len() > 1)
+            .map(|(id, _)| *id)
+            .collect();
         Ok(json!({
             "dir": dir.display().to_string(),
             "packs": packs.iter().map(|pack| json!({
@@ -1445,6 +1480,15 @@ impl AppState {
                 "path": pack.path.display().to_string(),
                 "assembly": pack.assembly.as_ref().map(|p| p.display().to_string()),
                 "loaded": pack.enabled,
+                // What interface this pack brings, and whether another loaded
+                // pack claims the same id — the page shows the clash instead
+                // of letting one pack's UI quietly fail to appear.
+                "ui": pack.manifest.ui.as_ref().map(|ui| json!({
+                    "id": ui.id,
+                    "title": ui.title,
+                    "conflict": conflicting.contains(&ui.id.as_str()),
+                    "claimedBy": ui_claims.get(ui.id.as_str()).cloned().unwrap_or_default(),
+                })),
             })).collect::<Vec<_>>(),
         }))
     }

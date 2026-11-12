@@ -135,6 +135,13 @@ pub struct Contributions {
     /// Text rather than colour: a pack that translates the shell says what each
     /// element reads, and the shell applies it without knowing any language.
     pub strings: std::collections::BTreeMap<String, String>,
+    /// Stylesheet rules this plugin contributes, appended after the interface's
+    /// own sheet.
+    ///
+    /// Text rather than a file: a pack says which rules it wants and the shell
+    /// appends them, so a small restyle never has to ship a whole page. See
+    /// `LookFile::css` for why this exists.
+    pub css: Vec<String>,
     /// Services this plugin provides, by name.
     pub services: Vec<(String, Arc<dyn Any + Send + Sync>)>,
     /// Tools this plugin registers.
@@ -197,6 +204,12 @@ impl Contributions {
     /// `apply` and the later entries win over the earlier ones.
     pub fn strings<I: IntoIterator<Item = (String, String)>>(mut self, map: I) -> Self {
         self.strings.extend(map);
+        self
+    }
+
+    /// Add a stylesheet fragment, appended after the interface's own sheet.
+    pub fn css(mut self, rules: impl Into<String>) -> Self {
+        self.css.push(rules.into());
         self
     }
 
@@ -500,6 +513,9 @@ pub struct Fiber {
     pub themes: Vec<crate::theme::Theme>,
     /// Interface labels this fiber contributes, by element id.
     pub strings: std::collections::BTreeMap<String, String>,
+    /// Stylesheet rules this fiber contributes, appended after the built-in
+    /// sheet. Kept on the fiber so they unload with it.
+    pub css: Vec<String>,
     /// Sessions that have asked for this instance.
     ///
     /// The reference count that makes session isolation real: an instance is
@@ -681,6 +697,7 @@ struct Staged {
     ui: Vec<crate::ui::UiPanel>,
     themes: Vec<crate::theme::Theme>,
     strings: std::collections::BTreeMap<String, String>,
+    css: Vec<String>,
     services: Vec<((String, RealmId), Arc<dyn Any + Send + Sync>)>,
     tools: Vec<ToolDef>,
     readers: Vec<crate::tools::readers::ReaderSpec>,
@@ -891,6 +908,37 @@ impl Kernel {
         merged
     }
 
+    /// The stylesheet rules every active plugin contributes, in load order.
+    ///
+    /// Returned as one string the shell appends to a single `<style>` element,
+    /// so unloading a pack removes exactly the rules that pack added — the
+    /// element is rewritten whole on every update rather than appended to. A
+    /// pack's rules therefore cannot outlive the pack, which is the same
+    /// guarantee `resolved_theme` gives its tokens.
+    pub fn resolved_css(&self) -> String {
+        let mut fibers: Vec<&Fiber> = self
+            .fibers
+            .values()
+            .filter(|fiber| fiber.state == FiberState::Active)
+            .collect();
+        // Load order, so a later pack can override an earlier one's selector
+        // without depending on a hash map's iteration order.
+        fibers.sort_by_key(|fiber| fiber.id);
+        let mut out = String::new();
+        for fiber in fibers {
+            for rules in &fiber.css {
+                if out.is_empty() {
+                    out.push_str("/* pack stylesheets */\n");
+                }
+                out.push_str(rules);
+                if !rules.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+        }
+        out
+    }
+
     /// Register a plugin definition without loading an instance.
     pub fn define(&mut self, plugin: Arc<dyn Plugin>) {
         self.plugins.insert(plugin.name().to_string(), plugin);
@@ -967,6 +1015,7 @@ impl Kernel {
                 ui: Vec::new(),
                 themes: Vec::new(),
                 strings: std::collections::BTreeMap::new(),
+                css: Vec::new(),
                 users: BTreeSet::new(),
                 effects: Vec::new(),
                 epoch: Epoch::Inactive,
@@ -1414,6 +1463,7 @@ impl Kernel {
             fiber.ui.clear();
             fiber.themes.clear();
             fiber.strings.clear();
+            fiber.css.clear();
         }
         self.version += 1;
     }
@@ -1556,6 +1606,7 @@ impl Kernel {
             ui,
             themes,
             strings,
+            css,
             services: provided,
             tools: provided_tools,
             readers,
@@ -1630,6 +1681,7 @@ impl Kernel {
             ui,
             themes,
             strings,
+            css,
             services: staged_services,
             tools: staged_tools,
             readers,
@@ -1651,6 +1703,7 @@ impl Kernel {
             ui,
             themes,
             strings,
+            css,
             services,
             tools,
             readers,
@@ -1697,6 +1750,7 @@ impl Kernel {
             target.ui = ui;
             target.themes = themes;
             target.strings = strings;
+            target.css = css;
             target.effects = effects;
             target.epoch = epoch;
             target.state = FiberState::Active;

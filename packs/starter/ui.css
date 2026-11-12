@@ -1,0 +1,575 @@
+  :root {
+    color-scheme: dark;
+    --bg: #14161a;
+    --panel: #171a1f;
+    --line: #262b33;
+    --text: #d8dee9;
+    --dim: #7c8798;
+    --accent: #6ea8fe;
+    --ok: #7ddc9a;
+    --bad: #ff8f8f;
+    --warn: #e8c98a;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  /* Touch keyboards shove the visual viewport; a fixed frame + dvh keeps
+     composer and status glued where the thumb expects them. */
+  html { overscroll-behavior: none; }
+  body {
+    margin: 0;
+    position: fixed; inset: 0; width: 100%; height: 100dvh;
+    display: grid;
+    /* 宽屏 1440 下，原来 200 / 1fr / 360 会让对话区只剩 880px，两侧松、
+       中间紧 —— 一眼看去重心是散的。侧栏改成可以收缩的 228 / 380 上限，
+       并把对话内容的可读宽度单独夹在 #stream 里，这样栏宽可以跟着窗口长，
+       文字行长却不会长到读不下去。 */
+    grid-template-columns: clamp(180px, 16vw, 228px) minmax(0, 1fr) clamp(300px, 26vw, 380px);
+    /* Four bottom items in DOM order: the plugin dock above the composer
+       (#slot-above-composer, spans all columns), the composer itself, and the
+       26px status strip. The template needs a row for each — with only three
+       rows the composer was auto-placed into the fixed 26px strip and grew down
+       over the dock, which is exactly what "面板被遮挡" looked like. */
+    grid-template-rows: minmax(0, 1fr) auto auto 26px;
+    font: 13.5px/1.6 ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    background: var(--bg);
+    color: var(--text);
+    overflow: hidden;
+  }
+  .panel {
+    background: var(--panel);
+    overflow: auto;
+    /* A light scrollbar bar on a dark panel is a scratch on the whole column. */
+    scrollbar-color: var(--dim) transparent;
+    scrollbar-width: thin;
+  }
+  #sessions { border-right: 1px solid var(--line); padding: 12px 10px; }
+  #details  { border-left: 1px solid var(--line); padding: 12px 12px; }
+
+  h2 {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .09em;
+    color: var(--dim); margin: 0 0 8px; font-weight: 600;
+  }
+  h2:not(:first-child) { margin-top: 22px; border-top: 1px solid var(--line); padding-top: 14px; }
+
+/* ---- packages ---- */
+  .pack {
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 7px 9px; margin-bottom: 6px; background: var(--panel);
+  }
+  .pack-head { display: flex; align-items: center; gap: 6px; }
+  .pack-name {
+    flex: 1; min-width: 0; font-size: 12px; color: var(--text);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .pack-meta { font-size: 10.5px; color: var(--dim); margin-top: 3px; }
+  .pack-desc { font-size: 12px; color: var(--text); margin-top: 4px; line-height: 1.45; }
+  .notice {
+    border-radius: 6px; padding: 7px 9px; margin-bottom: 8px;
+    font-size: 11.5px; line-height: 1.5;
+    background: color-mix(in srgb, var(--ok) 14%, var(--panel)); border: 1px solid color-mix(in srgb, var(--ok) 45%, var(--panel)); color: var(--ok);
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .notice.bad { background: color-mix(in srgb, var(--bad) 16%, var(--panel)); border-color: color-mix(in srgb, var(--bad) 50%, var(--panel)); color: var(--bad); }
+  .hint.tight { margin-top: 4px; }
+
+  /* Settings groups: one card per concern, so a column of twenty fields reads
+     as six decisions instead of a wall of inputs. */
+  .group {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--bg);
+    padding: 10px 10px 2px;
+    margin: 0 0 12px;
+  }
+  .group-title {
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    color: var(--dim);
+    font-weight: 600;
+    margin: 0 0 8px;
+  }
+  /* Long rationales collapse: fields first, essays one click away. */
+  .hint-more { margin: 0 0 8px; font-size: 10.5px; }
+  .hint-more > summary { color: var(--dim); cursor: pointer; }
+  .hint-more[open] > summary { margin-bottom: 4px; }
+  .hint-more .hint { margin-top: 0; }
+
+  /* ---- settings ---- */
+  .warn {
+    background: color-mix(in srgb, var(--warn) 16%, var(--panel)); border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--panel)); color: var(--warn);
+    border-radius: 6px; padding: 8px 10px; font-size: 11.5px;
+    margin-bottom: 10px; line-height: 1.5;
+  }
+  label.field { display: block; margin-bottom: 10px; }
+  label.field .cap { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; }
+  label.field input {
+    width: 100%; background: var(--panel); color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px 8px; font: inherit; font-size: 12px;
+  }
+  label.field input:focus, label.field select:focus { outline: none; border-color: var(--accent); }
+  label.field select {
+    width: 100%; background: var(--panel); color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px 8px; font: inherit; font-size: 12px;
+  }
+  .row { display: flex; gap: 6px; align-items: center; }
+  button.small {
+    padding: 6px 12px; cursor: pointer; font: inherit; font-size: 12px;
+    background: color-mix(in srgb, var(--accent) 40%, var(--panel)); color: var(--text);
+    border: 1px solid var(--accent); border-radius: 6px;
+  }
+  button.small:hover { background: color-mix(in srgb, var(--accent) 55%, var(--panel)); }
+  button.small.ghost { background: var(--panel); color: var(--dim); border-color: var(--line); }
+  button.small.ghost:hover { background: color-mix(in srgb, var(--accent) 22%, var(--panel)); }
+  button.tiny {
+    font: inherit; font-size: 9.5px; padding: 1px 6px; margin-left: 6px;
+    background: var(--panel); color: var(--dim); border: 1px solid var(--line);
+    border-radius: 4px; cursor: pointer; text-transform: none; letter-spacing: 0;
+  }
+  button.tiny:hover { background: color-mix(in srgb, var(--accent) 22%, var(--panel)); color: var(--text); }
+  /* A datalist only appears once you type, and WebView2 does not even
+     show its arrow — so the fetched catalog gets a list you can see. */
+  .picker {
+    max-height: 168px; overflow: auto; margin: -4px 0 8px;
+    border: 1px solid var(--line); border-radius: 6px; background: var(--panel);
+  }
+  .picker .item {
+    display: flex; justify-content: space-between; gap: 8px;
+    padding: 4px 8px; cursor: pointer; font-size: 11.5px;
+    font-family: var(--mono); color: var(--dim);
+  }
+  .picker .item:hover { background: color-mix(in srgb, var(--accent) 22%, var(--panel)); color: var(--text); }
+  .picker .item.current { background: color-mix(in srgb, var(--accent) 40%, var(--panel)); color: var(--text); }
+  /* Saved API profiles, one chip each; the active one is the accent pill. */
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 6px; }
+  .chip-wrap { display: inline-flex; align-items: stretch; }
+  button.chip { border-radius: 9px 0 0 9px; background: var(--panel); color: var(--dim); padding: 3px 10px; }
+  button.chip:hover { background: color-mix(in srgb, var(--accent) 22%, var(--panel)); color: var(--text); }
+  button.chip.current { background: color-mix(in srgb, var(--accent) 40%, var(--panel)); color: var(--text); }
+  button.chip-x { border-radius: 0 9px 9px 0; border-left: 1px solid var(--line); padding: 3px 7px; }
+  .row-inline { display: flex; gap: 6px; margin: 2px 0 6px; }
+  .row-inline input { flex: 1 1 auto; min-width: 0; background: var(--panel); color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+  .dim-line { color: var(--dim); font-size: 12px; }
+  .picker .owner { color: var(--dim); font-size: 10px; }
+  .hint { color: var(--dim); font-size: 10.5px; margin-top: 6px; overflow-wrap: break-word; line-height: 1.5; }
+  .saved { color: var(--ok); font-size: 10.5px; }
+  /* A failed save stays under the button until the next attempt: an error
+     that scrolls away in the transcript reads as "the click did nothing". */
+  .save-error {
+    color: var(--bad); font-size: 11px; margin-top: 6px;
+    white-space: pre-wrap; word-break: break-word;
+  }
+
+  /* ---- session list ---- */
+  .sess-group {
+    padding: 8px 8px 2px; color: var(--dim); font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.04em;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .sess-group button {
+    background: none; border: 0; color: var(--dim); cursor: pointer; font-size: 11px; padding: 0 4px;
+  }
+  .sess-group button:hover { color: var(--text); }
+  .sess {
+    display: flex; align-items: center; gap: 6px;
+    padding: 6px 8px; border-radius: 6px; cursor: default;
+    color: var(--dim); font-size: 12px;
+  }
+  .sess:hover { background: color-mix(in srgb, var(--accent) 16%, var(--panel)); }
+  .sess.active { background: color-mix(in srgb, var(--accent) 20%, var(--panel)); color: var(--text); }
+  .sess .title {
+    flex: 1; min-width: 0; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
+  .sess .n { color: var(--dim); font-size: 10px; font-variant-numeric: tabular-nums; }
+  .sess .run { color: var(--accent); font-size: 10px; }
+  .sess .del {
+    opacity: 0; color: var(--dim); border: none; background: none;
+    cursor: pointer; font-size: 14px; line-height: 1; padding: 0 2px;
+  }
+  .sess:hover .del { opacity: 1; }
+  .sess .del:hover { color: var(--bad); }
+  button.action {
+    width: 100%; margin-top: 8px; padding: 7px 8px; cursor: pointer;
+    background: var(--panel); color: var(--dim); border: 1px solid var(--line);
+    border-radius: 6px; font: inherit; font-size: 12px;
+  }
+  button.action:hover { background: color-mix(in srgb, var(--accent) 22%, var(--panel)); color: var(--text); }
+  /* Pinned under the heading: the list scrolls beneath it, so the button is
+     reachable whether the conversation list is 3 rows or 300. */
+  #new-session {
+    position: sticky; top: -12px; z-index: 3;
+    margin-top: 0; margin-bottom: 8px;
+    box-shadow: 0 2px 0 var(--panel), 0 4px 8px color-mix(in srgb, var(--bg) 55%, transparent);
+  }
+
+  /* ---- conversation ---- */
+  /* 对话区是这块界面唯一需要长读的地方，所以它的行长单独夹住：栏再宽，
+     一行也不超过约 82 个字符，多出来的空间变成左右留白而不是更长的行。 */
+  #stream { padding: 22px 26px; }
+  #stream > * { max-width: 78ch; margin-left: auto; margin-right: auto; }
+  .turn { margin-bottom: 18px; }
+  .who {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--dim); margin-bottom: 4px;
+  }
+  .body { white-space: pre-wrap; word-break: break-word; }
+  .user .body { color: var(--text); }
+  .assistant .body { color: var(--text); white-space: normal; overflow-wrap: break-word; }
+  /* ---- markdown, as the assistant's text is rendered ---- */
+  .assistant .body p { margin: 0 0 6px; }
+  .assistant .body p:last-child { margin-bottom: 0; }
+  .assistant .body h1 { font-size: 16px; margin: 10px 0 5px; }
+  .assistant .body h2 { font-size: 14.5px; margin: 9px 0 5px; }
+  .assistant .body h3 { font-size: 13.5px; margin: 8px 0 4px; }
+  .assistant .body h4, .assistant .body h5, .assistant .body h6 {
+    font-size: 13px; margin: 7px 0 4px;
+  }
+  .assistant .body ul, .assistant .body ol { margin: 4px 0 6px; padding-left: 20px; }
+  .assistant .body li { margin: 2px 0; }
+  .assistant .body blockquote {
+    border-left: 2px solid var(--line); margin: 6px 0;
+    padding: 2px 10px; color: var(--dim);
+  }
+  .assistant .body a { color: var(--accent); }
+  .assistant .body hr { border: none; border-top: 1px solid var(--line); margin: 8px 0; }
+  .assistant .body table {
+    border-collapse: collapse; margin: 6px 0; font-size: 12.5px;
+    white-space: normal;
+  }
+  .assistant .body th, .assistant .body td {
+    border: 1px solid var(--line); padding: 4px 9px; text-align: left;
+    vertical-align: top;
+  }
+  .assistant .body th {
+    background: var(--panel); color: var(--text); font-weight: 600;
+  }
+  .assistant .body pre.md-code {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    padding: 8px 10px; margin: 6px 0; overflow-x: auto;
+    font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
+    white-space: pre;
+  }
+  .assistant .body code { font-family: var(--mono); font-size: 11.5px; }
+  .assistant .body li > code, .assistant .body p > code {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 4px; padding: 0 4px;
+  }
+  .tool-call {
+    font-family: var(--mono); font-size: 11.5px; color: var(--accent);
+    background: var(--panel); border: 1px solid var(--line); border-left: 2px solid var(--accent);
+    border-radius: 5px; padding: 6px 9px; margin: 5px 0;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  .tool-result {
+    font-family: var(--mono); font-size: 11px; color: var(--dim);
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 5px; padding: 6px 9px; margin: 5px 0 8px;
+    max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+  }
+  .tool-result.bad { border-color: color-mix(in srgb, var(--bad) 50%, var(--panel)); color: var(--bad); }
+  .attached { margin: 6px 0 10px; }
+  .attached img {
+    max-width: 100%; max-height: 320px; border-radius: 6px;
+    border: 1px solid var(--line); display: block;
+  }
+  .attached .cap { font-size: 10px; color: var(--dim); margin-top: 3px; display: block; }
+  .err-entry {
+    background: color-mix(in srgb, var(--bad) 16%, var(--panel)); border: 1px solid color-mix(in srgb, var(--bad) 50%, var(--panel)); color: var(--bad);
+    border-radius: 6px; padding: 10px 12px; margin-bottom: 16px;
+    font-size: 12px; white-space: pre-wrap; word-break: break-word;
+  }
+  .err-entry .cap {
+    display: block; font-size: 10px; text-transform: uppercase;
+    letter-spacing: .08em; color: var(--bad); margin-bottom: 5px;
+  }
+  /* The seam left by folding the oldest messages out of the live view. */
+  .folded {
+    text-align: center; font-size: 11px; color: var(--dim);
+    border-top: 1px dashed var(--line); border-bottom: 1px dashed var(--line);
+    padding: 8px 0; margin-bottom: 16px;
+  }
+  /* Reasoning is the model thinking aloud. Shown collapsed by default
+     because it is often longer than the answer, and toggleable because
+     sometimes it is the most informative part. */
+  .reasoning {
+    border-left: 2px solid var(--line); margin: 4px 0 8px; padding: 4px 10px;
+    color: var(--dim); font-size: 11.5px; font-style: italic;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .reasoning.collapsed { max-height: 2.6em; overflow: hidden; }
+  .reasoning .toggle {
+    display: block; font-style: normal; font-size: 10px; color: var(--accent);
+    cursor: pointer; margin-bottom: 3px; user-select: none;
+  }
+  .empty { color: var(--dim); font-style: italic; }
+  .caret {
+    display: inline-block; width: 7px; height: 14px; margin-left: 2px;
+    background: var(--accent); vertical-align: text-bottom;
+    animation: blink 1s steps(2, start) infinite;
+  }
+  @keyframes blink { to { visibility: hidden; } }
+
+  /* ---- above-composer slot（包带来的任务面板） ----
+     这块以前一条 grid-column 都没有。桌面网格是三列（200px 会话栏 / 正文 /
+     360px 详情），自动排布就把它塞进了第一列：面板只有 200px 宽，看起来被
+     侧栏盖住、还被挤成一条。现在它和输入条一样横跨整行，内容在中间一个够读
+     的宽度里居中，既不再躲进侧栏，也不再左右顶到屏幕边。 */
+  #slot-above-composer {
+    grid-column: 1 / -1;
+    display: flex;
+    justify-content: center;
+    /* 底边留 0：输入条靠自己的 border-top 划界，压上去就把那条线抹掉了。 */
+    padding: 8px 12px 0;
+  }
+  /* 没有面板时整条槽消失。留着一个有 padding 的空 flex 盒，就是卸载任务包之后
+     输入框上方那条 8px 的空白——用户会读成「留了个空 UI」。:empty 只在真的没
+     子元素时成立，有面板时行为不变。 */
+  #slot-above-composer:empty {
+    display: none;
+  }
+  /* 只约束这一槽里的面板。同一个 .panel-fragment 也用在侧栏与详情栏，那里
+     空间本来就窄，写成全局 max-width 会把它们一起改掉。 */
+  #slot-above-composer > .panel-fragment {
+    width: 100%;
+    max-width: 880px;
+    margin: 0 auto;
+  }
+
+  /* ---- composer ---- */
+  #composer {
+    grid-column: 1 / -1;
+    border-top: 1px solid var(--line);
+    background: var(--panel);
+    padding: 10px 12px;
+    display: flex; gap: 8px; align-items: flex-end;
+  }
+  /* 宽屏时把输入条的内容收进一条居中带，和上面那块任务面板同宽（880px）。
+     以前输入框 flex:1 把整行吃满：框的左边缘贴到屏幕左边、发送键甩到最右边，
+     与居中的正文不在一条中轴上。窄屏（手机）保持原来的贴边。
+     用 padding 而不是新套一层容器：DOM 不变，就不动任何选择器与脚本。 */
+  @media (min-width: 861px) {
+    #composer {
+      padding-left: max(12px, calc((100% - 880px) / 2));
+      padding-right: max(12px, calc((100% - 880px) / 2));
+    }
+  }
+  #input {
+    flex: 1; resize: none; min-height: 38px; max-height: 160px;
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--line); border-radius: 7px;
+    padding: 9px 11px; font: inherit;
+  }
+  #input:focus { outline: none; border-color: var(--accent); }
+  #send {
+    padding: 9px 18px; cursor: pointer; font: inherit;
+    background: color-mix(in srgb, var(--accent) 40%, var(--panel)); color: var(--text);
+    border: 1px solid var(--accent); border-radius: 7px;
+  }
+  #send:hover { background: color-mix(in srgb, var(--accent) 55%, var(--panel)); }
+  #attach {
+    padding: 9px 11px; cursor: pointer; font: inherit;
+    background: color-mix(in srgb, var(--accent) 25%, var(--panel)); color: var(--text);
+    border: 1px solid var(--accent); border-radius: 7px;
+  }
+  #attach:hover { background: color-mix(in srgb, var(--accent) 45%, var(--panel)); }
+  #link-health { font-size: 10.5px; color: var(--text); opacity: .8; margin-left: 10px; }
+  #send:disabled { opacity: .45; cursor: default; }
+  #send.stop {
+    background: color-mix(in srgb, var(--bad) 26%, var(--panel));
+    border-color: var(--bad);
+  }
+  #send.stop:hover { background: color-mix(in srgb, var(--bad) 42%, var(--panel)); }
+
+  /* ---- status bar ---- */
+  #status {
+    grid-column: 1 / -1;
+    border-top: 1px solid var(--line);
+    background: var(--bg);
+    display: flex; align-items: center; gap: 14px;
+    padding: 0 12px; font-size: 10.5px; color: var(--dim);
+    font-variant-numeric: tabular-nums;
+  }
+  #status .dot { color: var(--ok); }
+  #status .dot.busy { color: var(--accent); }
+  #status .dot.unset { color: var(--warn); }
+
+  /* ---- details ---- */
+  .kv { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; padding: 2px 0; }
+  .kv .k { color: var(--dim); }
+  .kv .v { color: var(--dim); font-family: var(--mono); font-size: 11px;
+           max-width: 62%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chip {
+    display: inline-block; font-family: var(--mono); font-size: 10.5px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
+    padding: 1px 6px; margin: 2px 3px 2px 0; color: var(--dim);
+  }
+  .skill { font-size: 12px; padding: 4px 0; }
+  .skill .id { font-family: var(--mono); color: var(--accent); font-size: 11px; }
+  .skill .d { color: var(--dim); font-size: 11px; }
+
+  /* ---- touch screens ----
+     A finger is not a cursor: every target grows to the 44px floor the touch
+     platform guides put under a fingertip, hover-only affordances become
+     always visible, and small text that doubles as a button stops being small.
+     Applied only where the pointer is coarse, so the mouse-driven desktop
+     keeps its density. */
+  @media (pointer: coarse) {
+    body { font-size: 14px; }
+    .sess {
+      min-height: 44px; padding: 10px; font-size: 14px;
+      border-radius: 8px;
+    }
+    /* Opacity-on-hover never fires without a hover: on touch the delete
+       button must simply be there. */
+    .sess .del { opacity: 1; width: 44px; height: 44px; font-size: 20px; }
+    button.action { min-height: 44px; padding: 11px 10px; font-size: 14px; }
+    button.small { min-height: 44px; padding: 10px 16px; font-size: 14px; }
+    button.tiny { font-size: 12px; padding: 6px 10px; }
+    #send { min-height: 46px; padding: 12px 22px; font-size: 14px; }
+    #input { min-height: 46px; font-size: 14px; }
+    /* The reasoning label is the collapse control: give the finger room. */
+    .reasoning .toggle {
+      display: block; font-size: 13px; padding: 8px 0 4px;
+      margin-bottom: 4px; min-height: 32px;
+    }
+    .reasoning { padding: 6px 12px; }
+    /* <details> summaries are buttons too. */
+    .hint-more > summary { padding: 10px 2px; font-size: 13px; min-height: 40px; }
+    /* The show-thinking switch and everything else in the status strip. */
+    #status label { padding: 10px 8px; font-size: 13px; }
+    #status { min-height: 40px; }
+    .picker .item { padding: 11px 10px; font-size: 13px; }
+    label.field input, label.field select {
+      padding: 10px; font-size: 14px; min-height: 44px;
+    }
+    .kv { font-size: 13px; padding: 4px 0; }
+    .tool-call, .tool-result { font-size: 12.5px; }
+    /* Fat scrollbars: dragging a thin rail with a fingertip fails. */
+    .panel { scrollbar-width: auto; }
+    .panel::-webkit-scrollbar { width: 14px; height: 14px; }
+    .panel::-webkit-scrollbar-thumb {
+      background: var(--dim); border-radius: 7px;
+      border: 3px solid var(--panel);
+    }
+  }
+
+  /* Phone-only controls stay out of the desktop layout entirely. */
+  .phone-only { display: none !important; }
+  /* The drawer backdrop: shown only while the phone drawer is open, never
+     anywhere else (a plain div would otherwise take grid space). */
+  #drawer-backdrop { display: none; }
+
+  /* ---------- phones: one column, sessions in a sliding drawer ---------- */
+  @media (max-width: 860px) {
+    body {
+      /* minmax(0, 1fr), not `1fr`: an auto minimum would let the top bar's
+         nowrap title set the column's min-content — every row stretching
+         wider than the screen, with the composer's Send button pushed off
+         the right edge. The column is the viewport, period. */
+      grid-template-columns: minmax(0, 1fr);
+      /* top bar | conversation | composer | status */
+      grid-template-rows: auto minmax(0, 1fr) auto auto 40px;
+      font-size: 14px;
+    }
+    /* One row with the menu button and the conversation in front of the
+       thumb; the session list slides in over the conversation from here. */
+    #topbar.phone-only {
+      display: flex !important; align-items: center; gap: 10px;
+      grid-row: 1;
+      padding: 4px 10px calc(4px + env(safe-area-inset-top, 0px));
+      border-bottom: 1px solid var(--line); background: var(--bg);
+      min-height: 48px; box-sizing: border-box;
+    }
+    #drawer-toggle {
+      min-width: 44px; min-height: 44px; font-size: 18px; line-height: 1;
+      background: none; border: 1px solid var(--line); border-radius: 8px;
+      color: var(--text); cursor: pointer; touch-action: manipulation;
+    }
+    #topbar-title {
+      /* Fixed to the space the menu button leaves, whatever the title's
+         length: the box shrinks and the text ellipsizes inside it. */
+      flex: 1 1 auto; min-width: 0;
+      font-size: 13px; color: var(--dim);
+      overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+    }
+    /* The composer shrinks with the column instead of holding a min-content
+       width of its own (its placeholder is one long unwrapped line). */
+    #composer, #input { min-width: 0; }
+    /* The conversation list slides in from the left, over the conversation.
+       Vertical again inside: the drawer is full height, so a column of rows
+       reads the way a session list reads everywhere else. */
+    #sessions {
+      position: fixed; top: 0; left: 0; bottom: 0; z-index: 30;
+      width: min(86vw, 330px);
+      display: flex; flex-direction: column; align-items: stretch;
+      padding: calc(12px + env(safe-area-inset-top, 0px)) 10px 12px;
+      border-right: 1px solid var(--line); border-bottom: none;
+      overflow-y: auto; overflow-x: hidden;
+      transform: translateX(-104%);
+      transition: transform .22s ease;
+      height: auto; max-height: none;
+      background: var(--bg);
+    }
+    body.drawer-open #sessions {
+      transform: translateX(0);
+      box-shadow: 6px 0 24px rgba(0, 0, 0, .35);
+    }
+    body.drawer-open #drawer-backdrop {
+      display: block; position: fixed; inset: 0; z-index: 29;
+      background: rgba(0, 0, 0, .45);
+      -webkit-tap-highlight-color: transparent;
+    }
+    #new-session { position: sticky; top: 0; z-index: 3; white-space: nowrap; }
+    #session-list {
+      display: flex; flex-direction: column; gap: 6px;
+      flex: 1 1 auto; min-width: 0; min-height: 0;
+      overflow-x: hidden; overflow-y: auto;
+      touch-action: pan-y;
+    }
+    /* Explicit rows for the parts still in the grid: conversation, slot,
+       composer, status. Without them the sidebar's full height took row 1 and
+       the composer row shrank below its 61px content, covering the bottom of
+       the conversation. The drawer is fixed, so it owns no row. */
+    #stream { grid-row: 2; }
+    /* 手机是单列网格，跨列在这里没有意义；左右各留 8px，面板不再贴着屏幕
+       边。底边仍是 0：输入条照旧靠自己的 border-top 和这一行分界。 */
+    #slot-above-composer { grid-row: 3; grid-column: auto; padding: 4px 8px 0; }
+    #slot-above-composer > .panel-fragment { max-width: none; }
+    #composer { grid-row: 4; }
+    #status { grid-row: 5; max-height: 40px; overflow: hidden; }
+    #session-list .sess {
+      flex: 0 0 auto; white-space: nowrap; max-width: none; width: 100%;
+      border: 1px solid var(--line); border-radius: 8px;
+      padding: 10px 13px; min-height: 44px; overflow: hidden;
+      touch-action: manipulation;
+    }
+    #session-list .sess .del { display: none; }          /* delete from a phone row is an accident waiting to happen */
+    #session-list .sess.active { border-color: var(--accent); }
+    /* Settings stay reachable: a full-height sheet over the conversation,
+       opened from the status strip and closed from its own header. */
+    #details {
+      position: fixed; inset: 0; z-index: 20;
+      border-left: none; padding: 12px 14px calc(14px + env(safe-area-inset-bottom, 0px));
+      display: none;
+    }
+    #details.open { display: block; }
+    #toggle-settings.phone-only { display: inline-block !important; }
+    .sheet-head.phone-only { display: flex !important; }
+    .sheet-head {
+      align-items: center; justify-content: space-between;
+      margin-bottom: 8px;
+    }
+    .sheet-head .sheet-title {
+      font-size: 10px; text-transform: uppercase; letter-spacing: .09em;
+      color: var(--dim); font-weight: 600;
+    }
+    #composer { padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px)); }
+    #main, main { min-width: 0; }
+  }

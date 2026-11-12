@@ -972,6 +972,27 @@ pub struct LookFile {
     /// the no-gates rule applies to text as much as to anything else here.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub strings: BTreeMap<String, String>,
+
+    /// Stylesheet rules appended after the interface's own.
+    ///
+    /// The gap this fills: `themes` can only change custom properties the
+    /// interface already declared, and `panels` can only add fragments at a few
+    /// fixed slots. Anything else — spacing, a column width, the look of a
+    /// control — used to require shipping a complete copy of the 150 KB
+    /// interface, because the only other way in was to replace `index.html`
+    /// wholesale. That made every small change expensive twice over: the pack
+    /// had to carry the whole page, and `tests/ui_sync.rs` then required it to
+    /// stay byte-identical to the built-in.
+    ///
+    /// So this holds CSS text, appended after the built-in sheet, which is what
+    /// lets a pack restyle a corner of the interface in a dozen lines instead of
+    /// copying a megabyte of markup it does not care about.
+    ///
+    /// Rules here apply to the page the pack is loaded into, which is why the
+    /// same trust rule as `panels` applies: loading a pack already means
+    /// trusting it with the interface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub css: Option<String>,
 }
 
 /// `injections.json`: the injection engine's own serialised form.

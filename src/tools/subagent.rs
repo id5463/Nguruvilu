@@ -150,10 +150,33 @@ impl crate::plugin::Plugin for Delegate {
 /// description would say at any budget without rewriting a process global under
 /// the other tests' feet.
 pub(crate) fn description(budgets: crate::tools::Budgets) -> String {
+    description_with_models(budgets, &[])
+}
+
+/// What `delegate` says when the endpoint's catalog is known.
+///
+/// The model id is where a subtask most often failed: the argument was optional
+/// and undocumented, so the model either left it out (fine) or invented one (a
+/// 404 that looks like a broken tool). Naming the ids in the description turns a
+/// guess into a choice.
+pub(crate) fn description_with_models(budgets: crate::tools::Budgets, models: &[String]) -> String {
     let steps = budgets.subagent_max_steps;
     let minutes = (budgets.subagent_wall_ms / 60_000).max(1);
     let depth = budgets.subagent_max_depth;
-    format!(
+    // A handful of ids is worth inlining; a catalog of hundreds is not, and
+    // would crowd out the instructions that matter more.
+    let catalog = match models.len() {
+        0 => String::new(),
+        n if n <= 8 => format!(
+            " Models this endpoint offers: {}. Pick one that fits the work — a              cheaper or faster one is usually right for mechanical tasks.",
+            models.join(", ")
+        ),
+        n => format!(
+            " This endpoint offers {n} models; the first few are: {}.              Any id from that catalog works.",
+            models.iter().take(8).cloned().collect::<Vec<_>>().join(", ")
+        ),
+    };
+    let body = format!(
         "Run a self-contained subtask in a fresh agent with no memory of this \
          conversation, and get back only its answer. Use it to keep a large \
          side investigation out of this transcript. \
@@ -168,17 +191,22 @@ pub(crate) fn description(budgets: crate::tools::Budgets) -> String {
          It is silent while it runs: every step and tool \
          call is appended to its own transcript under {TRACE_DIR}/ in the \
          working directory, named in the result, so read that file to see what \
-         it is doing while it works."
-    )
+         it is doing while it works.{catalog}"
+    );
+    body
 }
 
 fn tool(access: Arc<dyn ModelAccess>) -> ToolDef {
     // The budgets the caller is told about are the ones in force: registration
     // runs after the host has published them, so this states real numbers.
     let budgets = super::budgets();
+    // Asked once at registration, not per call: the catalog belongs to the
+    // endpoint, and it is what turns the `model` argument from a guess into a
+    // choice.
+    let models = access.available_models();
     ToolDef::new(
         TOOL,
-        description(budgets),
+        description_with_models(budgets, &models),
         json!({
             "type": "object",
             "properties": {

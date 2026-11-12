@@ -26,6 +26,7 @@
 //! the entry document cannot be found at all.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -696,6 +697,170 @@ async fn handle(
         // rather than by who is asking. The download cap stays — that one keeps
         // a single request from occupying the link, which is capacity, not
         // permission.
+        Route::UploadChunk => {
+            // One slice of a parallel upload. Kept as small as the protocol
+            // allows: read the part, write it, say how many bytes landed.
+            let Some(upload_id) = query.get("upload") else {
+                respond(&mut stream, 400, "text/plain; charset=utf-8", b"missing upload id").await;
+                return;
+            };
+            let Some(workdir) = session_workdir_in(&state) else {
+                let reason = "this session has no working directory yet: open or create a \
+                              session first, then upload again";
+                respond(&mut stream, 409, "text/plain; charset=utf-8", reason.as_bytes()).await;
+                return;
+            };
+            let uploads = workdir.join("uploads");
+            let Some(directory) = part_dir(&uploads, upload_id) else {
+                respond(&mut stream, 400, "text/plain; charset=utf-8", b"bad upload id").await;
+                return;
+            };
+            let index = query.get("index").and_then(|v| v.parse::<u32>().ok());
+            let Some(index) = index else {
+                respond(&mut stream, 400, "text/plain; charset=utf-8", b"missing index").await;
+                return;
+            };
+            if request.body.is_empty() {
+                respond(&mut stream, 400, "text/plain; charset=utf-8", b"empty part").await;
+                return;
+            }
+            let part = directory.join(format!("{index:06}.part"));
+            let write = async {
+                tokio::fs::create_dir_all(&directory).await?;
+                tokio::fs::write(&part, &request.body).await
+            };
+            match write.await {
+                Ok(()) => {
+                    eprintln!(
+                        "[serve] chunk {index} of {upload_id} from {peer}: {} bytes",
+                        request.body.len()
+                    );
+                    let payload = json!({
+                        "ok": true,
+                        "index": index,
+                        "received": request.body.len(),
+                    });
+                    (200, "application/json", payload.to_string().into_bytes())
+                }
+                Err(error) => {
+                    eprintln!("[serve] chunk {index} of {upload_id}: cannot write: {error}");
+                    (500, "text/plain; charset=utf-8", format!("cannot store part: {error}").into_bytes())
+                }
+            }
+        }
+        Route::UploadComplete => {
+            let Some(upload_id) = query.get("upload") else {
+                respond(&mut stream, 400, "text/plain; charset=utf-8", b"missing upload id").await;
+                return;
+            };
+            let Some(workdir) = session_workdir_in(&state) else {
+                let reason = "this session has no working directory yet";
+                respond(&mut stream, 409, "text/plain; charset=utf-8", reason.as_bytes()).await;
+                return;
+            };
+            let uploads = workdir.join("uploads");
+            let Some(directory) = part_dir(&uploads, upload_id) else {
+                respond(&mut stream, 400, "text/plain; charset=utf-8", b"bad upload id").await;
+                return;
+            };
+            let name = sanitize_name(query.get("name").map(String::as_str).unwrap_or(""));
+
+            // Parts are joined in index order. A gap is reported rather than
+            // skipped: a file missing its middle is worse than a failed upload.
+            let mut parts: Vec<(u32, PathBuf)> = Vec::new();
+            match tokio::fs::read_dir(&directory).await {
+                Ok(mut entries) => {
+                    while let Ok(Some(entry)) = entries.next_entry().await {
+                        let file = entry.file_name().to_string_lossy().into_owned();
+                        if let Some(stem) = file.strip_suffix(".part") {
+                            if let Ok(index) = stem.parse::<u32>() {
+                                parts.push((index, entry.path()));
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[serve] complete {upload_id}: cannot read parts: {error}");
+                    respond(&mut stream, 404, "text/plain; charset=utf-8",
+                            b"no parts for this upload (it may have expired)").await;
+                    return;
+                }
+            }
+            parts.sort_by_key(|(index, _)| *index);
+            if parts.is_empty() {
+                respond(&mut stream, 404, "text/plain; charset=utf-8",
+                        b"no parts for this upload (it may have expired)").await;
+                return;
+            }
+            for (expected, (index, _)) in parts.iter().enumerate() {
+                if *index as usize != expected {
+                    let reason = format!(
+                        "missing part {expected} (had {index}); the upload did not finish"
+                    );
+                    eprintln!("[serve] complete {upload_id}: {reason}");
+                    respond(&mut stream, 409, "text/plain; charset=utf-8", reason.as_bytes()).await;
+                    return;
+                }
+            }
+
+            let joined: Vec<u8> = {
+                let mut all = Vec::new();
+                let mut failed = None;
+                for (_, path) in &parts {
+                    match tokio::fs::read(path).await {
+                        Ok(bytes) => all.extend_from_slice(&bytes),
+                        Err(error) => {
+                            failed = Some(error);
+                            break;
+                        }
+                    }
+                }
+                match failed {
+                    Some(error) => {
+                        eprintln!("[serve] complete {upload_id}: cannot read a part: {error}");
+                        let reason = format!("cannot read a part: {error}");
+                        respond(&mut stream, 500, "text/plain; charset=utf-8",
+                                reason.as_bytes()).await;
+                        return;
+                    }
+                    None => all,
+                }
+            };
+
+            if let Err(error) = tokio::fs::create_dir_all(&uploads).await {
+                let reason = format!("cannot create uploads: {error}");
+                respond(&mut stream, 500, "text/plain; charset=utf-8",
+                        reason.as_bytes()).await;
+                return;
+            }
+            let name = free_upload_name(&uploads, &name).await;
+            let file_path = uploads.join(&name);
+            match tokio::fs::write(&file_path, &joined).await {
+                Ok(()) => {
+                    let _ = tokio::fs::remove_dir_all(&directory).await;
+                    let _ = sweep_parts(&uploads.join(".ngu-upload")).await;
+                    eprintln!(
+                        "[serve] joined {} part(s), {} bytes → {}",
+                        parts.len(),
+                        joined.len(),
+                        file_path.display()
+                    );
+                    let payload = json!({
+                        "ok": true,
+                        "path": file_path.display().to_string(),
+                        "name": name,
+                        "size": joined.len(),
+                        "parts": parts.len(),
+                    });
+                    (200, "application/json", payload.to_string().into_bytes())
+                }
+                Err(error) => {
+                    eprintln!("[serve] complete {upload_id}: cannot write final: {error}");
+                    (500, "text/plain; charset=utf-8",
+                     format!("cannot write upload: {error}").into_bytes())
+                }
+            }
+        }
         Route::File => {
             let Some(raw_path) = query.get("path") else {
                 respond(&mut stream, 400, "text/plain; charset=utf-8", b"missing path").await;
@@ -877,6 +1042,36 @@ enum Route {
     Command,
     /// `POST /upload`: a file the page hands to the shell.
     Upload,
+    /// `POST /upload/chunk`: one slice of a file the page is sending in
+    /// parallel.
+    ///
+    /// Why this door exists, with the numbers that produced it. Every request
+    /// here is a fresh connection with a cold congestion window, and on a link
+    /// with 400 ms of round trip that window needs several round trips before it
+    /// is large enough to transfer anything useful. A single connection
+    /// therefore settles at a low rate that does not improve with file size —
+    /// measured against a real phone link, 8 MB went at 33 KB/s and took 244 s.
+    ///
+    /// Slicing lets N connections grow N windows at once. Same 8 MB, 32 slices:
+    /// 18.0 s, 444 KB/s, 13.6x. The gain scales with size (1 MB: 0.6x, worse;
+    /// 2 MB: 1.3x; 4 MB: 3.3x) because a larger file spends longer stuck in the
+    /// ramp — which is why the page only slices above a threshold.
+    ///
+    /// The protocol is deliberately small:
+    ///
+    /// * `POST /upload/chunk?upload=<id>&index=<n>&total=<n>&name=<file>` with
+    ///   the raw bytes as the body. The reply is `{ok, received, index}`.
+    /// * `POST /upload/complete?upload=<id>` joins the parts and answers with
+    ///   the same shape `/upload` does, so the page has one code path for the
+    ///   result.
+    ///
+    /// Parts live in `.ngu-upload/<id>/` inside the session's uploads directory
+    /// and are removed once joined. A rejected or abandoned upload leaves its
+    /// parts behind only until [`PART_TTL`] passes, so a phone that walks away
+    /// mid-upload cannot fill the disk.
+    UploadChunk,
+    /// `POST /upload/complete`: join the parts of one chunked upload.
+    UploadComplete,
     /// `GET /file?path=…`: a file the shell hands back.
     File,
     /// `GET /health`: whether the upstream the shell needs is reachable.
@@ -900,6 +1095,8 @@ fn route(method: &str, path: &str) -> Route {
         ("GET", "events") => Route::Events,
         ("POST", "cmd") => Route::Command,
         ("POST", "upload") => Route::Upload,
+        ("POST", "upload/chunk") => Route::UploadChunk,
+        ("POST", "upload/complete") => Route::UploadComplete,
         ("GET", "file") => Route::File,
         ("GET", "health") => Route::Health,
         // The wrong verb on a door that exists, and every other `POST`: one
@@ -1080,6 +1277,48 @@ fn free_name(mut taken: impl FnMut(&str) -> bool, name: &str) -> String {
     // keeping the name and letting the write replace the last candidate is
     // better than failing an upload the user asked for.
     suffixed(name, MAX_NAME_SUFFIX + 1)
+}
+
+/// How long an abandoned chunked upload's parts are kept.
+///
+/// A phone that starts eight parallel chunks and loses its link leaves parts on
+/// disk with nothing that will ever join them. Long enough for a retry from a
+/// fresh page, short enough that the disk is not a landfill.
+const PART_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// The directory holding one chunked upload's parts.
+///
+/// The id comes from the page and becomes a path, so it is filtered exactly like
+/// an upload file name: hex only, and a hard length cap. Anything else is a
+/// rejection rather than a sanitisation, because a caller that sends a path
+/// separator here is not making a mistake about a file name.
+fn part_dir(uploads: &Path, id: &str) -> Option<PathBuf> {
+    let ok = !id.is_empty()
+        && id.len() <= 64
+        && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-');
+    ok.then(|| uploads.join(".ngu-upload").join(id))
+}
+
+/// Drop part directories that outlived [`PART_TTL`].
+async fn sweep_parts(root: &Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(root).await else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|when| now.duration_since(when).ok())
+            .map(|age| age > PART_TTL)
+            .unwrap_or(false);
+        if old {
+            let _ = tokio::fs::remove_dir_all(entry.path()).await;
+        }
+    }
 }
 
 /// [`free_name`] against the live contents of `directory`.
@@ -2082,6 +2321,8 @@ mod routing_tests {
         assert_eq!(route("GET", "events"), Route::Events);
         assert_eq!(route("POST", "cmd"), Route::Command);
         assert_eq!(route("POST", "upload"), Route::Upload);
+        assert_eq!(route("POST", "upload/chunk"), Route::UploadChunk);
+        assert_eq!(route("POST", "upload/complete"), Route::UploadComplete);
         assert_eq!(route("GET", "file"), Route::File);
         assert_eq!(route("GET", "health"), Route::Health);
         assert_eq!(route("GET", "index.html"), Route::Ui);

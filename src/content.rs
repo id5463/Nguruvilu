@@ -388,7 +388,11 @@ fn install_appearance(
     pack_name: &str,
     look: LookFile,
 ) -> Result<()> {
-    if look.themes.is_empty() && look.panels.is_empty() && look.strings.is_empty() {
+    if look.themes.is_empty()
+        && look.panels.is_empty()
+        && look.strings.is_empty()
+        && look.css.as_deref().map_or(true, str::is_empty)
+    {
         return Ok(());
     }
 
@@ -442,6 +446,13 @@ fn install_appearance(
             // need to know which language they are in.
             if !self.look.strings.is_empty() {
                 contributions = contributions.strings(self.look.strings.clone());
+            }
+            // Rules after the interface's own, so a pack can restyle without
+            // replacing the page it restyles.
+            if let Some(rules) = self.look.css.as_deref() {
+                if !rules.trim().is_empty() {
+                    contributions = contributions.css(rules);
+                }
             }
             Ok(contributions)
         }

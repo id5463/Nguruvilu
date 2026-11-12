@@ -624,6 +624,26 @@ impl nguruvilu::model::ModelAccess for CliModelAccess {
         prompt
     }
 
+    /// The endpoint's catalog, for `delegate`.
+    ///
+    /// The CLI has no long-lived catalog to read, so this asks the endpoint and
+    /// gives up quietly on failure: a subtask without a model argument works
+    /// fine, and blocking registration on the network would make an offline
+    /// start impossible.
+    fn available_models(&self) -> Vec<String> {
+        let client = match self.client() {
+            Ok(client) => client,
+            Err(_) => return Vec::new(),
+        };
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return Vec::new();
+        };
+        runtime.block_on(async { client.list_models().await.unwrap_or_default() })
+    }
+
     fn context_policy(&self) -> Arc<dyn ContextPolicy> {
         Arc::clone(&self.policy.lock().expect("policy lock"))
     }
@@ -915,6 +935,9 @@ async fn run() -> Result<()> {
     // `builtin:documents` and `read` learns PDF/Office; without the pack,
     // `read` says so and names what is installed.
     nguruvilu::tools::documents::define(&mut kernel);
+    // Available to a pack, not loaded by the kernel: a conversation that
+    // wants to restart its own process asks for `builtin:restart`.
+    nguruvilu::tools::restart::define(&mut kernel);
     // Same split for search: the code is available, the pack's assembly is
     // what makes a conversation have it. The cell is the host's copy of the
     // settings — filled now, refilled after pack content lands, and again
