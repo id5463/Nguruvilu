@@ -1,14 +1,20 @@
   :root {
-    color-scheme: dark;
-    --bg: #14161a;
-    --panel: #171a1f;
-    --line: #262b33;
-    --text: #d8dee9;
-    --dim: #7c8798;
-    --accent: #6ea8fe;
-    --ok: #7ddc9a;
-    --bad: #ff8f8f;
-    --warn: #e8c98a;
+    /* 奶白底色。原来是纯黑（#14161a），深色底上所有次要文字都往灰里挤，
+       长时间读对话眼睛很累。奶白是暖白，不是纯白：纯白配深字对比过强，
+       大面积看反而刺眼。 */
+    color-scheme: light;
+    --bg: #faf7f2;        /* 页面底：奶白，带一点暖 */
+    --panel: #f3efe7;     /* 侧栏/设置：比底色略深，边界靠明度差而不是黑线 */
+    --card: #fffdfa;      /* 卡片/输入框：比底色更亮，浮起来 */
+    --line: #e0d9cc;      /* 分隔线：暖灰，不是黑 */
+    --line-strong: #cdc3b2;
+    --text: #2f2a24;      /* 正文：近黑但偏暖，纯黑在奶白上发脏 */
+    --dim: #8a8073;       /* 次要文字 */
+    --accent: #b4632a;    /* 主色：陶土橙，配奶白最稳，也不和状态色打架 */
+    --accent-soft: #f0e0d0;
+    --ok: #3f7d4e;
+    --bad: #b3402f;
+    --warn: #9a6b16;
     --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
   }
   * { box-sizing: border-box; }
@@ -41,8 +47,8 @@
   .panel {
     background: var(--panel);
     overflow: auto;
-    /* A light scrollbar bar on a dark panel is a scratch on the whole column. */
-    scrollbar-color: var(--dim) transparent;
+    /* 浅底上滚动条要淡，否则两条深色竖线会把整个界面切碎。 */
+    scrollbar-color: var(--line-strong) transparent;
     scrollbar-width: thin;
   }
   #sessions { border-right: 1px solid var(--line); padding: 12px 10px; }
@@ -56,8 +62,8 @@
 
 /* ---- packages ---- */
   .pack {
-    border: 1px solid var(--line); border-radius: 6px;
-    padding: 7px 9px; margin-bottom: 6px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 10px;
+    padding: 9px 11px; margin-bottom: 8px; background: var(--card);
   }
   .pack-head { display: flex; align-items: center; gap: 6px; }
   .pack-name {
@@ -79,10 +85,10 @@
      as six decisions instead of a wall of inputs. */
   .group {
     border: 1px solid var(--line);
-    border-radius: 8px;
-    background: var(--bg);
-    padding: 10px 10px 2px;
-    margin: 0 0 12px;
+    border-radius: 12px;
+    background: var(--card);
+    padding: 12px 12px 4px;
+    margin: 0 0 14px;
   }
   .group-title {
     font-size: 10.5px;
@@ -107,23 +113,26 @@
   label.field { display: block; margin-bottom: 10px; }
   label.field .cap { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; }
   label.field input {
-    width: 100%; background: var(--panel); color: var(--text);
-    border: 1px solid var(--line); border-radius: 6px;
-    padding: 6px 8px; font: inherit; font-size: 12px;
+    width: 100%; background: var(--card); color: var(--text);
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 7px 9px; font: inherit; font-size: 12px;
   }
-  label.field input:focus, label.field select:focus { outline: none; border-color: var(--accent); }
+  label.field input:focus, label.field select:focus {
+    outline: none; border-color: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+  }
   label.field select {
-    width: 100%; background: var(--panel); color: var(--text);
-    border: 1px solid var(--line); border-radius: 6px;
-    padding: 6px 8px; font: inherit; font-size: 12px;
+    width: 100%; background: var(--card); color: var(--text);
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 7px 9px; font: inherit; font-size: 12px;
   }
   .row { display: flex; gap: 6px; align-items: center; }
   button.small {
     padding: 6px 12px; cursor: pointer; font: inherit; font-size: 12px;
-    background: color-mix(in srgb, var(--accent) 40%, var(--panel)); color: var(--text);
-    border: 1px solid var(--accent); border-radius: 6px;
+    background: var(--card); color: var(--accent);
+    border: 1px solid var(--line-strong); border-radius: 8px;
   }
-  button.small:hover { background: color-mix(in srgb, var(--accent) 55%, var(--panel)); }
+  button.small:hover { background: var(--accent-soft); border-color: var(--accent); }
   button.small.ghost { background: var(--panel); color: var(--dim); border-color: var(--line); }
   button.small.ghost:hover { background: color-mix(in srgb, var(--accent) 22%, var(--panel)); }
   button.tiny {
@@ -178,8 +187,11 @@
   .sess-group button:hover { color: var(--text); }
   .sess {
     display: flex; align-items: center; gap: 6px;
-    padding: 6px 8px; border-radius: 6px; cursor: default;
+    padding: 7px 9px; border-radius: 8px; cursor: default;
     color: var(--dim); font-size: 12px;
+    /* 包通过挂接点往里加徽章时，行会变长；min-width:0 + 下面的省略号规则
+       保证标题让出空间，而不是把徽章和删除按钮挤到重叠。 */
+    min-width: 0;
   }
   .sess:hover { background: color-mix(in srgb, var(--accent) 16%, var(--panel)); }
   .sess.active { background: color-mix(in srgb, var(--accent) 20%, var(--panel)); color: var(--text); }
@@ -188,6 +200,8 @@
     text-overflow: ellipsis; white-space: nowrap;
   }
   .sess .n { color: var(--dim); font-size: 10px; font-variant-numeric: tabular-nums; }
+  /* 挂接点加的徽章：不收缩、不换行，标题负责让位。 */
+  .sess > span:not(.title) { flex: 0 0 auto; }
   .sess .run { color: var(--accent); font-size: 10px; }
   .sess .del {
     opacity: 0; color: var(--dim); border: none; background: none;
@@ -244,33 +258,35 @@
     white-space: normal;
   }
   .assistant .body th, .assistant .body td {
-    border: 1px solid var(--line); padding: 4px 9px; text-align: left;
+    border: 1px solid var(--line); padding: 6px 10px; text-align: left;
     vertical-align: top;
   }
   .assistant .body th {
-    background: var(--panel); color: var(--text); font-weight: 600;
+    background: var(--accent-soft); color: #7d4519; font-weight: 600;
   }
   .assistant .body pre.md-code {
-    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
-    padding: 8px 10px; margin: 6px 0; overflow-x: auto;
-    font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
+    background: #f6f2ea; border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px 12px; margin: 8px 0; overflow-x: auto;
+    font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
     white-space: pre;
   }
   .assistant .body code { font-family: var(--mono); font-size: 11.5px; }
   .assistant .body li > code, .assistant .body p > code {
-    background: var(--panel); border: 1px solid var(--line);
-    border-radius: 4px; padding: 0 4px;
+    background: var(--accent-soft); border: 1px solid #e6d3bf;
+    border-radius: 5px; padding: 1px 5px;
+    color: #7d4519;
   }
   .tool-call {
-    font-family: var(--mono); font-size: 11.5px; color: var(--accent);
-    background: var(--panel); border: 1px solid var(--line); border-left: 2px solid var(--accent);
-    border-radius: 5px; padding: 6px 9px; margin: 5px 0;
+    font-family: var(--mono); font-size: 11.5px; color: #7d4519;
+    background: var(--accent-soft); border: 1px solid #ecd9c4;
+    border-left: 3px solid var(--accent);
+    border-radius: 6px; padding: 7px 10px; margin: 6px 0;
     white-space: pre-wrap; word-break: break-all;
   }
   .tool-result {
-    font-family: var(--mono); font-size: 11px; color: var(--dim);
-    background: var(--panel); border: 1px solid var(--line);
-    border-radius: 5px; padding: 6px 9px; margin: 5px 0 8px;
+    font-family: var(--mono); font-size: 11px; color: #6b6257;
+    background: #f6f2ea; border: 1px solid var(--line);
+    border-radius: 6px; padding: 7px 10px; margin: 6px 0 9px;
     max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-word;
   }
   .tool-result.bad { border-color: color-mix(in srgb, var(--bad) 50%, var(--panel)); color: var(--bad); }
@@ -391,11 +407,20 @@
   #status {
     grid-column: 1 / -1;
     border-top: 1px solid var(--line);
-    background: var(--bg);
+    background: var(--panel);
     display: flex; align-items: center; gap: 14px;
     padding: 0 12px; font-size: 10.5px; color: var(--dim);
     font-variant-numeric: tabular-nums;
+    /* 内容挤不下时滚动，而不是叠到相邻格子里去 —— 手机上那一行元素太多，
+       原来是直接溢出，看起来就是"重叠"。 */
+    overflow-x: auto;
+    overflow-y: hidden;
+    white-space: nowrap;
+    scrollbar-width: none;
   }
+  #status::-webkit-scrollbar { display: none; }
+  /* 每个直接子元素都不许被压扁：flex 的默认 shrink 会把文字挤成一坨。 */
+  #status > * { flex: 0 0 auto; }
   #status .dot { color: var(--ok); }
   #status .dot.busy { color: var(--accent); }
   #status .dot.unset { color: var(--warn); }

@@ -1262,28 +1262,88 @@ function applyPackCss(css) {
 /// The script runs in this document, so it can reach the DOM it is handed. It is
 /// *not* given `toShell` and cannot read the token: what a hook may do is
 /// decorate, and the boundary is that it was never handed the means to do more.
-const ranHooks = new Set();
+// Each pack's hook bundle, keyed by the script text so it can be undone.
+//
+// `bundles` holds what is currently live: one entry per hook script that has
+// run, with the points it registered and the functions it registered there.
+// `applyPackHooks` diffs against it — new scripts run, missing scripts are
+// unwound. Without the unwind, unloading a pack left its badges on screen
+// forever: the shell stopped sending them, but the page had no record of what
+// to remove, so nothing ever did.
+// The last session list the shell sent. Kept so a hook change can rebuild the
+// rows from state instead of trying to un-decorate them one node at a time.
+let lastSessions = [];
+
+const bundles = new Map();   // script -> { keys: Set<string>, unsubs: fn[] }
+const ranHooks = new Set();  // "point script", for a fast skip
+
 function applyPackHooks(hooks) {
-  if (!hooks || typeof hooks !== "object") return;
-  // Point names are the keys; the script is the value. Sorted so two packs on
-  // one point run in a stable order.
-  for (const point of Object.keys(hooks).sort()) {
-    const script = hooks[point];
-    if (typeof script !== "string" || !script.trim()) continue;
-    // The identity of "already run" is the script text itself: editing a pack's
-    // hook file changes it, and a changed script should run again.
-    const key = point + " " + script;
-    if (ranHooks.has(key)) continue;
-    ranHooks.add(key);
-    try {
-      // `ngu.hook` is what the script uses; it is passed in explicitly rather
-      // than relied on from `window`, so the script cannot mistake the page for
-      // its own scope.
-      new Function("ngu", script)(window.ngu);
-    } catch (error) {
-      notice("挂接脚本 " + point + " 执行失败: " + error.message, true);
+  const wanted = new Map();   // script -> [point, ...]
+  if (hooks && typeof hooks === "object") {
+    for (const point of Object.keys(hooks)) {
+      const script = hooks[point];
+      if (typeof script !== "string" || !script.trim()) continue;
+      if (!wanted.has(script)) wanted.set(script, []);
+      wanted.get(script).push(point);
     }
   }
+
+  // 1. Unwind scripts that are no longer offered. This is the half that was
+  //    missing: a pack that is unloaded, or whose hook file is edited, has to
+  //    take its registrations with it.
+  for (const [script, bundle] of [...bundles]) {
+    if (wanted.has(script)) continue;
+    for (const off of bundle.unsubs) {
+      try { off(); } catch (error) { /* one bad unsubscribe must not stop the rest */ }
+    }
+    for (const key of bundle.keys) ranHooks.delete(key);
+    bundles.delete(script);
+  }
+
+  // 2. Run scripts that are new, remembering how to undo each registration.
+  for (const [script, points] of wanted) {
+    const keys = points.map((point) => point + " " + script);
+    if (keys.every((key) => ranHooks.has(key))) {
+      // Already live; make sure the bundle still lists every point it covers.
+      const bundle = bundles.get(script);
+      if (bundle) for (const key of keys) bundle.keys.add(key);
+      continue;
+    }
+    const unsubs = [];
+    try {
+      // The script gets a `ngu` whose `hook` records an unsubscribe, so the
+      // page can undo exactly what this script registered and nothing else.
+      const scoped = {
+        hook: (point, fn) => {
+          const off = window.ngu.hook(point, fn);
+          unsubs.push(off);
+          return off;
+        },
+      };
+      new Function("ngu", script)(scoped);
+      for (const key of keys) ranHooks.add(key);
+      bundles.set(script, { keys: new Set(keys), unsubs });
+    } catch (error) {
+      // A script that throws part-way still unsubscribes what it managed to
+      // register, so a broken pack leaves nothing behind.
+      for (const off of unsubs) {
+        try { off(); } catch (e) { /* ignore */ }
+      }
+      notice("挂接脚本执行失败: " + error.message, true);
+    }
+  }
+
+  // 3. What a hook drew has to go with it. An unsubscribe stops future calls
+  //    but leaves the nodes already in the DOM, so the two hosts are emptied and
+  //    the session list is rebuilt from state — which re-runs the handlers that
+  //    are *still* registered and draws only those.
+  const chipHost = document.getElementById("hook-status-bar");
+  if (chipHost) chipHost.replaceChildren();
+  // Rebuild the rows rather than surgically removing badges: the page does not
+  // know which nodes a hook added, and a rebuild is the one path that is
+  // correct for any decoration a pack invents.
+  renderSessions(lastSessions);
+  ngu.send({ cmd: "status" });
 }
 
 function applyTheme(event) {
@@ -2765,6 +2825,7 @@ onAny((name, event) => {
         break;
       }
       case "sessions":
+        lastSessions = event.list || [];
         renderSessions(event.list);
         break;
       case "transcript":

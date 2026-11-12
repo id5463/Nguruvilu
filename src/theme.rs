@@ -28,15 +28,19 @@ use serde::{Deserialize, Serialize};
 /// cannot. The list is short on purpose — each entry is a promise that changing
 /// it looks right.
 pub const TOKENS: &[(&str, &str)] = &[
-    ("--bg", "#14161a"),
-    ("--panel", "#171a1f"),
-    ("--line", "#262b33"),
-    ("--text", "#d8dee9"),
-    ("--dim", "#7c8798"),
-    ("--accent", "#6ea8fe"),
-    ("--ok", "#7ddc9a"),
-    ("--bad", "#ff8f8f"),
-    ("--warn", "#e8c98a"),
+    // 奶白（warm cream）。原来是纯黑底配蓝灰字：深色底上所有次要文字都往
+    // 灰里挤，长对话读着眼睛累。奶白不是纯白 —— 纯白配深字的对比过强，
+    // 大面积看反而刺眼；带一点暖的米白才耐看。
+    ("--bg", "#faf7f2"),
+    ("--panel", "#f3efe7"),
+    ("--line", "#e0d9cc"),
+    ("--text", "#2f2a24"),
+    ("--dim", "#8a8073"),
+    // 陶土橙做主色：配奶白最稳，也不和红/绿两个状态色打架。
+    ("--accent", "#b4632a"),
+    ("--ok", "#3f7d4e"),
+    ("--bad", "#b3402f"),
+    ("--warn", "#9a6b16"),
     ("--mono", "ui-monospace, \"Cascadia Mono\", Consolas, monospace"),
 ];
 
@@ -293,7 +297,7 @@ mod tests {
         assert!(registry.is_empty());
         let resolved = registry.resolve();
         assert_eq!(resolved.name, "builtin");
-        assert_eq!(resolved.tokens["--bg"], "#14161a");
+        assert_eq!(resolved.tokens["--bg"], "#faf7f2");
     }
 
     #[test]
