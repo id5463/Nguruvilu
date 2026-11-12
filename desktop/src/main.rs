@@ -26,7 +26,7 @@ use std::io::BufRead;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 #[cfg(windows)]
@@ -360,8 +360,8 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
         let startup_prompt = startup_prompt.clone();
         // Decided before the window exists: the page is loaded once, so an
         // interface cannot be swapped in afterwards without a reload.
-        if let Some(directory) = resolve_active_ui(ui_id.as_deref()) {
-            set_active_ui(directory);
+        if let Some(stack) = crate::resolve_ui_stack(ui_id.as_deref()) {
+            set_active_ui(stack);
         }
 
         let ui_port = serve_interface_on_loopback(Arc::clone(&state))?;
@@ -2222,20 +2222,33 @@ fn remove_pack(target: &str) -> anyhow::Result<()> {
 /// `wanted` names one by id; without it, the first installed pack that declares
 /// an interface wins. The built-in is what a machine with no such pack gets,
 /// which is why nothing has to be configured for the program to work.
-pub(crate) fn resolve_active_ui(wanted: Option<&str>) -> Option<PathBuf> {
+/// Every interface directory that should be looked in, highest priority first.
+///
+/// The order is what makes packs overlay instead of exclude: the pack that
+/// declares a `ui` and owns the document comes first, and every other loaded
+/// pack that carries a `ui` directory comes after it. A URL path is answered by
+/// the first directory that actually has it, so a second pack can add a file
+/// or replace one without touching the page.
+///
+/// `wanted` names an interface id, the way the built-in one is chosen; absent
+/// means "whatever pack claims one".
+pub(crate) fn resolve_ui_stack(wanted: Option<&str>) -> Option<Vec<PathBuf>> {
     let packs = nguruvilu::pack::installed(&nguruvilu::pack::default_packs_dir()).ok()?;
 
-    // Collect every pack that claims an interface instead of stopping at the
-    // first. The shell serves exactly one document, so two packs cannot be
-    // layered the way themes, labels, panels and stylesheets can — but the
-    // previous version returned on the first match and dropped the rest in
-    // silence. Installing a pack could therefore replace someone else's
-    // interface with nothing to explain it, which reads as "my pack stopped
-    // working".
-    let mut claims: Vec<(String, PathBuf)> = Vec::new();
+    // The base first: a pack whose `ui.entry` is the document itself.
+    let mut base: Option<(String, PathBuf)> = None;
+    // Everyone else's directory, in load order, as overlay layers.
+    let mut layers: Vec<(String, PathBuf)> = Vec::new();
+
+    // Two passes, because `base` has to win regardless of the directory
+    // listing's order: a pack that says `base: true` owns the document, and a
+    // pack that says nothing is only an overlay. Without this an overlay whose
+    // name sorts earlier became the base and served its placeholder as the page
+    // — the document vanished and every other pack's files came back empty.
+    for want_base in [true, false] {
     for pack in &packs {
         // An unloaded pack is out of every conversation, and that includes the
-        // interface it brought: unloading it puts the built-in one back.
+        // interface it brought.
         if !pack.enabled {
             continue;
         }
@@ -2247,8 +2260,6 @@ pub(crate) fn resolve_active_ui(wanted: Option<&str>) -> Option<PathBuf> {
                 continue;
             }
         }
-        // `entry` is relative to the installed pack, so its parent is the
-        // directory the assets live in.
         let entry = pack.path.join(&ui.entry);
         if !entry.is_file() {
             eprintln!(
@@ -2262,44 +2273,52 @@ pub(crate) fn resolve_active_ui(wanted: Option<&str>) -> Option<PathBuf> {
         let Some(directory) = entry.parent().map(PathBuf::from) else {
             continue;
         };
-        claims.push((
-            format!("{} {} ({})", pack.manifest.name, pack.manifest.version_id, ui.id),
-            directory,
-        ));
+        if ui.base != want_base {
+            continue;
+        }
+        let label = format!("{} {}", pack.manifest.name, pack.manifest.version_id);
+        match &base {
+            None => base = Some((label, directory)),
+            Some((base_label, _)) => {
+                // Two packs both claiming the base: the first by name keeps it
+                // and the other becomes an overlay, so the choice is the same
+                // on every run and the loser is still served its own files.
+                if ui.base {
+                    eprintln!(
+                        "[ui] {} also declares itself the base interface; {base_label} keeps it",
+                        label
+                    );
+                }
+                layers.push((label, directory));
+            }
+        }
+    }
     }
 
-    // Sorted so both the report and the choice are the same on every run,
-    // whatever order the directory listing produced.
-    claims.sort_by(|a, b| a.0.cmp(&b.0));
+    let (base_label, base_dir) = base?;
+    let mut stack = Vec::with_capacity(1 + layers.len());
+    stack.push(base_dir);
 
-    if claims.len() > 1 {
-        let names = claims
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
+    if !layers.is_empty() {
+        layers.sort_by(|a, b| a.0.cmp(&b.0));
         eprintln!(
-            "[ui] {} packs declare an interface and only one can be served: {}.              Serving '{}'. Unload the ones you are not using (packs panel →              Unload) — an unloaded pack's interface steps aside automatically.",
-            claims.len(),
-            names,
-            claims[0].0
+            "[ui] serving '{}' from {}, overlaid by: {}",
+            base_label,
+            stack[0].display(),
+            layers
+                .iter()
+                .map(|(name, dir)| format!("{name} ({})", dir.display()))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
+        for (_, dir) in layers {
+            stack.push(dir);
+        }
+    } else {
+        eprintln!("[ui] serving '{}' from {}", base_label, stack[0].display());
     }
 
-    // The first by name, so the window is usable rather than blank — but the
-    // conflict is on the record now instead of silent.
-    if let Some((name, directory)) = claims.first() {
-        eprintln!("[ui] serving interface of {name} from {}", directory.display());
-        return Some(directory.clone());
-    }
-
-    if wanted.is_some() {
-        eprintln!(
-            "[ui] no installed pack declares interface '{}'; using the built-in one",
-            wanted.unwrap_or_default()
-        );
-    }
-    None
+    Some(stack)
 }
 
 /// Where the served interface lives.
@@ -2309,7 +2328,7 @@ pub(crate) fn resolve_active_ui(wanted: Option<&str>) -> Option<PathBuf> {
 /// for the life of the window, and it must answer without knowing about state
 /// locks — a handler that blocks on the state mutex while the UI thread holds
 /// it would deadlock the window.
-static ACTIVE_UI: OnceLock<PathBuf> = OnceLock::new();
+static ACTIVE_UI: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
 
 /// Serve a path from the active interface directory, or the built-in page.
 ///
@@ -2572,44 +2591,75 @@ fn respond_loopback(
 pub(crate) fn serve_ui(path: &str) -> (Vec<u8>, &'static str) {
     let builtin = || (UI_HTML.as_bytes().to_vec(), "text/html; charset=utf-8");
 
-    let Some(root) = ACTIVE_UI.get() else {
+    let Some(stack) = ACTIVE_UI.get() else {
         return builtin();
     };
 
     // A path from a URL is untrusted input that becomes a filesystem path.
     // Refusing anything but a plain relative descent is what keeps `..` from
-    // reaching outside the interface directory.
+    // reaching outside an interface directory.
     let requested = if path.is_empty() || path == "/" { "index.html" } else { path };
-    // `safe_relative` is the only thing allowed to decide what a URL path may
-    // name: decoded, backslash-unified, and refusing any segment that is `.`,
-    // `..`, a drive letter or stream, or a Windows device. `canonicalize`
-    // settles symlinks, and `starts_with` is the last word - the resolved file
-    // has to still be inside the interface directory, whatever the join
-    // produced. Anything that fails falls back to the index, which is inside.
-    let Ok(root) = root.canonicalize() else {
-        return builtin();
-    };
-    let candidate = match crate::serve::safe_relative(requested) {
-        Some(relative) => match root.join(relative).canonicalize() {
-            Ok(resolved) if resolved.starts_with(&root) => resolved,
-            _ => root.join("index.html"),
-        },
-        None => root.join("index.html"),
+    let Some(relative) = crate::serve::safe_relative(requested) else {
+        return stack
+            .first()
+            .map(|root| read_interface_file(root, "index.html"))
+            .unwrap_or_else(builtin);
     };
 
-    let file = if candidate.is_file() {
-        candidate
-    } else {
-        root.join("index.html")
-    };
-
-    match std::fs::read(&file) {
-        Ok(bytes) => (bytes, mime_for(&file)),
-        Err(error) => {
-            eprintln!("[ui] cannot read {}: {error}", file.display());
-            builtin()
+    // Walk the stack in order and serve the first hit. That is the whole of the
+    // overlay: a pack lower in the stack can add a file the base does not have,
+    // or replace one it does, without either pack knowing about the other.
+    for (depth, root) in stack.iter().enumerate() {
+        if let Some(found) = resolve_inside(root, &relative) {
+            if let Ok(bytes) = std::fs::read(&found) {
+                if depth > 0 {
+                    eprintln!(
+                        "[ui] '{}' served from overlay {}",
+                        relative.display(),
+                        root.display()
+                    );
+                }
+                return (bytes, mime_for(&found));
+            }
         }
     }
+
+    // Nothing in the stack has it: fall back to the base's index.html, so a
+    // stale link still lands on the page instead of a blank response.
+    stack
+        .first()
+        .map(|root| read_interface_file(root, "index.html"))
+        .unwrap_or_else(builtin)
+}
+
+/// Read `name` out of one interface directory, falling back to the built-in
+/// page.
+fn read_interface_file(root: &Path, name: &str) -> (Vec<u8>, &'static str) {
+    match resolve_inside(root, Path::new(name)) {
+        Some(found) => match std::fs::read(&found) {
+            Ok(bytes) => (bytes, mime_for(&found)),
+            Err(error) => {
+                eprintln!("[ui] cannot read {}: {error}", found.display());
+                (UI_HTML.as_bytes().to_vec(), "text/html; charset=utf-8")
+            }
+        },
+        None => (UI_HTML.as_bytes().to_vec(), "text/html; charset=utf-8"),
+    }
+}
+
+/// Resolve a relative path inside one interface root, or `None` if it escapes
+/// or does not exist.
+///
+/// `canonicalize` settles symlinks, and `starts_with` is the last word — the
+/// resolved file has to still be inside the interface directory, whatever the
+/// join produced.
+fn resolve_inside(root: &Path, relative: &Path) -> Option<PathBuf> {
+    let root = root.canonicalize().ok()?;
+    let candidate = root.join(relative).canonicalize().ok()?;
+    if !candidate.starts_with(&root) || !candidate.is_file() {
+        return None;
+    }
+    Some(candidate)
 }
 
 /// A content type for the extensions an interface actually uses.
@@ -2643,12 +2693,24 @@ pub(crate) fn mime_for(path: &Path) -> &'static str {
     }
 }
 
-/// Point the window at an interface directory.
-pub(crate) fn set_active_ui(dir: PathBuf) {
-    // First writer wins: the interface is chosen once, at startup, and a second
-    // call would silently serve a different directory than the page was loaded
-    // from.
-    if ACTIVE_UI.set(dir).is_ok() {
+/// Point the window at the interface stack.
+///
+/// A stack, not a directory, because interfaces overlay the way resource packs
+/// do: the base pack supplies the page, and another pack may supply just one
+/// file — a stylesheet, a fragment, a replacement icon — without having to
+/// ship a copy of the whole document. Lookups walk the stack from the front and
+/// the first directory that has the file wins.
+///
+/// This is the mechanism the Patchouli ecosystem uses for the same problem: an
+/// add-on does not fork the book, it takes over the "where does this JSON come
+/// from" decision and checks the resource pack first. Here the equivalent
+/// decision is "which directory does this URL path come from", and stacking is
+/// what lets several packs answer it at once instead of one pack excluding the
+/// rest.
+pub(crate) fn set_active_ui(stack: Vec<PathBuf>) {
+    // First writer wins: the stack is decided once, at startup, and a second
+    // call would silently serve different files than the page was loaded from.
+    if ACTIVE_UI.set(stack).is_ok() {
         // nothing to do; the handler reads it on the next request
     }
 }

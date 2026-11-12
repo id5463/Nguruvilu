@@ -6,15 +6,30 @@
   "versionId": "1.0.0",
   "license": "MIT",
   "kernelVersion": "0.1.0",
-  "dependencies": { "nguruvilu": ">=0.1.0" },
+  "dependencies": {
+    "nguruvilu": ">=0.1.0"
+  },
   "soul": "soul.md",
   "injections": "injections.json",
   "look": "look.json",
   "search": "search.json",
-  "ui": { "id": "ui", "title": "内置界面(可改的起点)", "entry": "index.html" },
+  "ui": {
+    "id": "ui",
+    "title": "内置界面(可改的起点)",
+    "entry": "index.html",
+    "base": true
+  },
   "mcp": "mcp.json",
   "plugins": [
-    { "id": "delegate", "source": "builtin:delegate", "license": "MIT" },
-    { "id": "search", "source": "builtin:search", "license": "MIT" }
+    {
+      "id": "delegate",
+      "source": "builtin:delegate",
+      "license": "MIT"
+    },
+    {
+      "id": "search",
+      "source": "builtin:search",
+      "license": "MIT"
+    }
   ]
 }

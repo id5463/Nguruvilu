@@ -224,6 +224,21 @@ pub struct UiDecl {
     /// The entry file within the interface directory.
     #[serde(default = "default_entry")]
     pub entry: String,
+    /// This pack owns the document, rather than overlaying its files.
+    ///
+    /// The page is one document, so exactly one pack can supply `index.html` —
+    /// that is the closest analogue to Patchouli's rule that a resource pack
+    /// may override a book's contents but "not include book.json". Everything
+    /// else a pack brings (stylesheets, fragments, images) is an overlay: a
+    /// lookup walks the stack and the first directory with the file wins, so
+    /// several packs extend one interface at once instead of one excluding the
+    /// rest.
+    ///
+    /// Defaults to false: a pack that says nothing is an overlay, because that
+    /// is the safe answer — an overlay cannot break the page it does not own.
+    /// The pack that ships the interface declares `base: true`.
+    #[serde(default)]
+    pub base: bool,
     /// Where the interface comes from, when it is fetched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
@@ -243,6 +258,7 @@ impl UiDecl {
             id: id.into(),
             title: String::new(),
             entry: default_entry(),
+            base: false,
             source: None,
             sha256: None,
         }

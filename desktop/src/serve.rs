@@ -37,7 +37,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::sink::EventSink;
 use crate::state::AppState;
-use crate::{resolve_active_ui, serve_ui, set_active_ui};
+use crate::{serve_ui, set_active_ui};
 
 /// Longest download `/file` will serve, in bytes.
 ///
@@ -171,8 +171,8 @@ pub fn serve(
         // Decided before the first request, for the same reason the window
         // decides before it loads: the page is one document, and which
         // interface it is cannot change under a running session.
-        if let Some(directory) = resolve_active_ui(ui_id.as_deref()) {
-            set_active_ui(directory);
+        if let Some(stack) = crate::resolve_ui_stack(ui_id.as_deref()) {
+            set_active_ui(stack);
         }
 
         let (bus, _) = broadcast::channel::<String>(256);
