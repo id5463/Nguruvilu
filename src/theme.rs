@@ -31,11 +31,11 @@ pub const TOKENS: &[(&str, &str)] = &[
     // 奶白（warm cream）。原来是纯黑底配蓝灰字：深色底上所有次要文字都往
     // 灰里挤，长对话读着眼睛累。奶白不是纯白 —— 纯白配深字的对比过强，
     // 大面积看反而刺眼；带一点暖的米白才耐看。
-    ("--bg", "#faf7f2"),
-    ("--panel", "#f3efe7"),
-    ("--line", "#e0d9cc"),
-    ("--text", "#2f2a24"),
-    ("--dim", "#8a8073"),
+    ("--bg", "#f2ede3"),
+    ("--panel", "#e9e3d7"),
+    ("--line", "#d5cbb9"),
+    ("--text", "#3a2e24"),
+    ("--dim", "#7d7264"),
     // 陶土橙做主色：配奶白最稳，也不和红/绿两个状态色打架。
     ("--accent", "#b4632a"),
     ("--ok", "#3f7d4e"),
@@ -297,7 +297,7 @@ mod tests {
         assert!(registry.is_empty());
         let resolved = registry.resolve();
         assert_eq!(resolved.name, "builtin");
-        assert_eq!(resolved.tokens["--bg"], "#faf7f2");
+        assert_eq!(resolved.tokens["--bg"], "#f2ede3");
     }
 
     #[test]

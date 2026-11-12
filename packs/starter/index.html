@@ -265,13 +265,16 @@
          面板插槽（上面那个）每次重画都会 replaceChildren，
          所以把挂接点的内容放进那里，它会被一起清掉。 -->
     <span id="hook-status-bar"></span>
-    <label style="margin-left:auto; cursor:pointer; display:flex; gap:4px; align-items:center;">
+    <!-- 样式从内联挪到 .status-toggle：内联的 display:flex 会盖掉 CSS 里
+         手机上想用的 display:none，三个开关在 390px 的屏幕上就挤着模型名
+         和消息数，一起把状态栏撑到需要横向滚动。 -->
+    <label class="status-toggle status-toggle-first">
       <input type="checkbox" id="show-reasoning"> <span id="cap-reasoning">thinking</span>
     </label>
-    <label style="cursor:pointer; display:flex; gap:4px; align-items:center;">
+    <label class="status-toggle">
       <input type="checkbox" id="show-tool-output"> <span>tool output</span>
     </label>
-    <label style="cursor:pointer; display:flex; gap:4px; align-items:center;">
+    <label class="status-toggle">
       <input type="checkbox" id="show-images"> <span>images</span>
     </label>
   </div>

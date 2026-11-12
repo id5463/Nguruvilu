@@ -1508,22 +1508,27 @@ pub(crate) fn watch_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>)
             let removed: Vec<String> = last.difference(&now).cloned().collect();
             last = now;
 
-            for name in removed {
-                eprintln!("[pack] {name} disappeared from the enabled set; unloading");
+            // The fingerprint is `name@version` so a version change counts as a
+            // change, but the kernel matches on the bare name — passing
+            // "hook-demo@1.0.0" as `name` made every unload a no-op, silently.
+            for entry in removed {
+                let name = pack_name_of(&entry);
+                eprintln!("[pack] {entry} disappeared from the enabled set; unloading");
                 crate::push_pack_action(
                     &state,
                     nguruvilu::tools::pack::Pending::Unload {
-                        name: name.clone(),
+                        name: name.to_string(),
                         session: None,
                     },
                 );
             }
-            for name in added {
-                eprintln!("[pack] {name} appeared in the enabled set; loading");
+            for entry in added {
+                let name = pack_name_of(&entry);
+                eprintln!("[pack] {entry} appeared in the enabled set; loading");
                 crate::push_pack_action(
                     &state,
                     nguruvilu::tools::pack::Pending::Load {
-                        name: name.clone(),
+                        name: name.to_string(),
                         session: None,
                     },
                 );
@@ -1546,6 +1551,11 @@ pub(crate) fn push_pack_action(
 ) {
     let guard = state.lock().expect("state lock");
     guard.pending.push(action);
+}
+
+/// The bare pack name from a `name@version` fingerprint.
+fn pack_name_of(fingerprint: &str) -> &str {
+    fingerprint.split('@').next().unwrap_or(fingerprint)
 }
 
 /// `name@version` for every enabled pack, as a set.

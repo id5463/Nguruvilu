@@ -738,6 +738,27 @@ pub fn unload_pack(
             .push(format!("nothing in the ledger came from '{label}'"));
     }
 
+    // The pack's appearance is not in the ledger — `content::apply` loads it as
+    // a built-in plugin named `pack:<name>`, which is provenance the ledger
+    // never records. Unloading it here is what makes a pack that was copied
+    // into the directory by hand (no install, so no ledger entry) still lose
+    // its stylesheet, labels and hooks: without this the interface kept them
+    // forever, because the ledger loop above had nothing to iterate over.
+    //
+    // Done last so the ledger's own unloads keep their order in the report.
+    let appearance = format!("pack:{name}");
+    let appearance_fibers: Vec<u64> = kernel
+        .fibers()
+        .iter()
+        .filter(|fiber| fiber.plugin == appearance)
+        .map(|fiber| fiber.id)
+        .collect();
+    for id in appearance_fibers {
+        if kernel.unload(id).is_ok() {
+            report.plugins.push(appearance.clone());
+        }
+    }
+
     ledger.save(ledger_path)?;
     Ok(report)
 }
