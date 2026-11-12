@@ -185,6 +185,22 @@ pub fn serve(
         // missing feature. `ready` still asks; the flag makes it a no-op.
         crate::load_packs_once(Arc::clone(&state), Arc::clone(&sink)).await;
 
+        // Follow the pack directory while the server runs.
+        //
+        // `ngu uninstall` on the command line only writes a marker file next to
+        // the pack; it cannot reach into a running process. Without this loop,
+        // "I uninstalled it but its interface is still there" was literally
+        // true: the process kept serving what it loaded at startup, and only a
+        // restart noticed. The panel's own Unload button always hot-reloaded,
+        // because it pushes a pending action through the kernel — so the two
+        // ways of unloading a pack behaved differently, with nothing on screen
+        // to say so.
+        //
+        // Polling rather than inotify: the directory is small, the interval is
+        // a second, and a watcher would need a crate and platform-specific
+        // handling for a change that happens a handful of times a day.
+        crate::watch_packs(Arc::clone(&state), Arc::clone(&sink));
+
         // Outbound remote control, same as the window: the process dials the
         // relay and every command still passes the allow-list in `remote`.
         {

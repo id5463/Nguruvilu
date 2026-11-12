@@ -18,6 +18,11 @@
     --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
   }
   * { box-sizing: border-box; }
+  /* 一条总规则：界面里没有任何东西可以比它所在的格子更宽。
+     没有这一条时，一个长 token（URL、代码、徽章）就能把整列撑开，
+     在手机上表现为"内容跑到屏幕外面"或"两栏压在一起"。 */
+  .panel, #stream, #status, #composer, #details, #sessions { min-width: 0; }
+  .panel *, #stream * { min-width: 0; }
   html, body { height: 100%; }
   /* Touch keyboards shove the visual viewport; a fixed frame + dvh keeps
      composer and status glued where the thumb expects them. */
@@ -53,6 +58,8 @@
   }
   #sessions { border-right: 1px solid var(--line); padding: 12px 10px; }
   #details  { border-left: 1px solid var(--line); padding: 12px 12px; }
+  /* 设置栏的可读宽度也夹住：超宽屏幕上拉满 380px 已经够，再宽只是空。 */
+  #details > * { max-width: 420px; }
 
   h2 {
     font-size: 10px; text-transform: uppercase; letter-spacing: .09em;
@@ -64,6 +71,9 @@
   .pack {
     border: 1px solid var(--line); border-radius: 10px;
     padding: 9px 11px; margin-bottom: 8px; background: var(--card);
+    /* 包描述可能很长；不许它把侧栏撑出横向滚动条。 */
+    overflow-wrap: anywhere;
+    max-width: 100%;
   }
   .pack-head { display: flex; align-items: center; gap: 6px; }
   .pack-name {
@@ -226,8 +236,18 @@
   /* ---- conversation ---- */
   /* 对话区是这块界面唯一需要长读的地方，所以它的行长单独夹住：栏再宽，
      一行也不超过约 82 个字符，多出来的空间变成左右留白而不是更长的行。 */
-  #stream { padding: 22px 26px; }
+  #stream {
+    padding: 22px 26px;
+    /* 对话区是唯一会长到无穷的地方：给它一个上限，超出就在自己里面滚，
+       而不是把整个 grid 撑高、把输入框顶出屏幕。 */
+    max-height: 100%;
+    overflow-y: auto;
+    overflow-x: hidden;
+    /* 长 URL / 长代码串必须能在词内断开，否则单元格内容宽度会撑爆整行。 */
+    overflow-wrap: anywhere;
+  }
   #stream > * { max-width: 78ch; margin-left: auto; margin-right: auto; }
+  #stream img, #stream table, #stream pre { max-width: 100%; }
   .turn { margin-bottom: 18px; }
   .who {
     font-size: 10px; text-transform: uppercase; letter-spacing: .08em;
@@ -524,6 +544,20 @@
       font-size: 13px; color: var(--dim);
       overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
     }
+    #topbar-settings {
+      flex: 0 0 auto;
+      min-width: 44px; min-height: 44px; font-size: 17px; line-height: 1;
+      background: none; border: 1px solid var(--line); border-radius: 8px;
+      color: var(--text); cursor: pointer; touch-action: manipulation;
+    }
+    /* 手机上状态栏只留最关键的三样：状态点、模型、消息数。
+       其余（链路、计时、三个复选框）藏起来 —— 它们在 390px 里既读不清，
+       又互相挤压，界面看起来就是"重叠"。 */
+    #status { gap: 10px; padding: 0 10px; }
+    #status #link-health,
+    #status #timing { display: none; }
+    #status label { display: none; }
+    #status #stats { margin-left: auto; }
     /* The composer shrinks with the column instead of holding a min-content
        width of its own (its placeholder is one long unwrapped line). */
     #composer, #input { min-width: 0; }
@@ -568,7 +602,14 @@
     #slot-above-composer { grid-row: 3; grid-column: auto; padding: 4px 8px 0; }
     #slot-above-composer > .panel-fragment { max-width: none; }
     #composer { grid-row: 4; }
-    #status { grid-row: 5; max-height: 40px; overflow: hidden; }
+    #status {
+      grid-row: 5;
+      /* 一条固定的带子，内容超出就横向滚，绝不换行叠到别的格子上。 */
+      max-height: 40px; min-height: 40px;
+      overflow-x: auto; overflow-y: hidden;
+      flex-wrap: nowrap; white-space: nowrap;
+    }
+    #status > * { flex: 0 0 auto; max-width: 40vw; overflow: hidden; text-overflow: ellipsis; }
     #session-list .sess {
       flex: 0 0 auto; white-space: nowrap; max-width: none; width: 100%;
       border: 1px solid var(--line); border-radius: 8px;

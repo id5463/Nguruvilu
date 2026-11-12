@@ -1481,6 +1481,93 @@ async fn dispatch_path(
 }
 
 /// Push the installed-pack list to the page.
+/// Follow the pack directory and reconcile what the kernel has loaded.
+///
+/// The panel's Unload button pushes a pending action through the kernel and
+/// hot-reloads in the same breath. The command line cannot: `ngu uninstall`
+/// only writes a marker next to the pack, in a different process. So the two
+/// ways of unloading a pack used to disagree — the button took effect
+/// immediately, the command needed a restart, and the screen said nothing
+/// either way.
+///
+/// This closes that gap by watching the same thing both paths change: which
+/// packs are enabled. When the set differs from what was last reconciled, the
+/// difference is pushed through the kernel exactly as the button would.
+pub(crate) fn watch_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
+    tokio::spawn(async move {
+        let mut last = enabled_fingerprint();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let now = enabled_fingerprint();
+            if now == last {
+                continue;
+            }
+            // Work out what changed, so the kernel is told "load this" and
+            // "unload that" rather than being rebuilt wholesale.
+            let added: Vec<String> = now.difference(&last).cloned().collect();
+            let removed: Vec<String> = last.difference(&now).cloned().collect();
+            last = now;
+
+            for name in removed {
+                eprintln!("[pack] {name} disappeared from the enabled set; unloading");
+                crate::push_pack_action(
+                    &state,
+                    nguruvilu::tools::pack::Pending::Unload {
+                        name: name.clone(),
+                        session: None,
+                    },
+                );
+            }
+            for name in added {
+                eprintln!("[pack] {name} appeared in the enabled set; loading");
+                crate::push_pack_action(
+                    &state,
+                    nguruvilu::tools::pack::Pending::Load {
+                        name: name.clone(),
+                        session: None,
+                    },
+                );
+            }
+            crate::drain_packs(Arc::clone(&state), Arc::clone(&sink)).await;
+            emit_panels(&state, &sink);
+            refresh_packs(&state, &sink);
+        }
+    });
+}
+
+/// Record one pack action for the kernel to apply at the next safe point.
+///
+/// The same queue the panel's Unload button fills, factored out so the file
+/// watcher and the button cannot drift apart: there is one way a pack change
+/// reaches the kernel, whatever asked for it.
+pub(crate) fn push_pack_action(
+    state: &Arc<Mutex<AppState>>,
+    action: nguruvilu::tools::pack::Pending,
+) {
+    let guard = state.lock().expect("state lock");
+    guard.pending.push(action);
+}
+
+/// `name@version` for every enabled pack, as a set.
+///
+/// A pack appears and disappears by name; the version is included so that
+/// reinstalling a different version is a change like any other.
+fn enabled_fingerprint() -> std::collections::BTreeSet<String> {
+    match nguruvilu::pack::installed(&nguruvilu::pack::default_packs_dir()) {
+        Ok(packs) => packs
+            .iter()
+            .filter(|pack| pack.enabled)
+            .map(|pack| format!("{}@{}", pack.manifest.name, pack.manifest.version_id))
+            .collect(),
+        // A listing that failed is not an empty pack set: returning empty here
+        // would unload everything on a transient I/O error.
+        Err(error) => {
+            eprintln!("[pack] cannot list packs while watching: {error:#}");
+            std::collections::BTreeSet::new()
+        }
+    }
+}
+
 fn refresh_packs(state: &Arc<Mutex<AppState>>, sink: &Arc<dyn EventSink>) {
     match state.lock().expect("state lock").packs() {
         Ok(list) => emit(sink, json!({ "ev": "packs", "list": list })),

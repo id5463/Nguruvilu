@@ -12,6 +12,10 @@
   <header id="topbar" class="phone-only">
     <button id="drawer-toggle" type="button" aria-label="Sessions" aria-controls="sessions" aria-expanded="false">&#9776;</button>
     <span id="topbar-title">Nguruvilu</span>
+    <!-- 设置放在顶栏而不是状态栏：状态栏在 390px 宽的手机上已经塞满，
+         原来的设置按钮被挤到看不见的地方，等于没有。顶栏只有一行，
+         高度固定，按钮放在这里永远点得到。 -->
+    <button id="topbar-settings" type="button" aria-label="Settings" aria-controls="details" aria-expanded="false">&#9881;</button>
   </header>
   <!-- Phone only: taps anywhere outside the open drawer close it. -->
   <div id="drawer-backdrop"></div>
@@ -261,7 +265,6 @@
          面板插槽（上面那个）每次重画都会 replaceChildren，
          所以把挂接点的内容放进那里，它会被一起清掉。 -->
     <span id="hook-status-bar"></span>
-    <button class="tiny phone-only" id="toggle-settings" type="button" aria-controls="details" aria-expanded="false">Settings</button>
     <label style="margin-left:auto; cursor:pointer; display:flex; gap:4px; align-items:center;">
       <input type="checkbox" id="show-reasoning"> <span id="cap-reasoning">thinking</span>
     </label>
@@ -3102,10 +3105,16 @@ function saveSettings() {
 
 document.getElementById("save-settings").addEventListener("click", saveSettings);
 
-// Phone: settings are a sheet over the conversation, opened from the status strip.
+// Phone: settings are a sheet over the conversation, opened from the top bar.
+//
+// It used to live in the status strip, which on a 390px screen is already
+// carrying the model name, link health, message count, timing and three
+// checkboxes. The button was the first thing to be squeezed out, so settings
+// were unreachable on a phone — the one place they were the only way in. The
+// top bar has a fixed height and one spare slot, which is why they live there.
 (() => {
   const details = document.getElementById("details");
-  const toggle = document.getElementById("toggle-settings");
+  const toggle = document.getElementById("topbar-settings");
   const setOpen = (open) => {
     details.classList.toggle("open", open);
     toggle.setAttribute("aria-expanded", String(open));
