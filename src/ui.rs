@@ -33,7 +33,14 @@ use serde::{Deserialize, Serialize};
 pub const BUILTIN_HTML: &str = include_str!("../desktop/ui/index.html");
 
 /// A place on screen a plugin may fill.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Where a panel goes.
+///
+/// Named places first, then anywhere: `Slot::At` names a real element id and a
+/// position relative to it, which is what lets a pack put a button next to the
+/// Send button instead of in one of six fixed spots. The named variants stay
+/// because they are the common case and they survive a page restructure; an
+/// anchored one is exactly as stable as the id it names.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum UiSlot {
     /// Top of the left column, above the session list.
@@ -48,7 +55,51 @@ pub enum UiSlot {
     StatusBar,
     /// Above the composer, spanning the conversation column.
     AboveComposer,
+    /// A real element id and a position relative to it.
+    ///
+    /// Written in a manifest as `"at": {"id": "composer", "place": "before"}`.
+    /// `place` is one of `before`, `after`, `prepend`, `append`. An id the page
+    /// does not have is reported and skipped — a panel that quietly lands
+    /// nowhere is worse than one that says so.
+    At {
+        /// The DOM id to anchor to.
+        id: String,
+        /// Where, relative to it.
+        place: UiPlacement,
+    },
 }
+
+/// Where an anchored panel sits relative to its id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UiPlacement {
+    /// As a sibling immediately before the element.
+    Before,
+    /// As a sibling immediately after the element.
+    After,
+    /// As the first child.
+    Prepend,
+    /// As the last child.
+    Append,
+}
+
+/// A stable sort key for a slot.
+///
+/// The old code cast the enum to `u8`, which a variant carrying data cannot do.
+/// An anchored slot sorts last and carries its anchor's name into the key, so
+/// two panels on the same id keep a deterministic order.
+fn slot_rank(slot: &UiSlot) -> (u8, &str) {
+    match slot {
+        UiSlot::SidebarTop => (0, ""),
+        UiSlot::SidebarBottom => (1, ""),
+        UiSlot::DetailsTop => (2, ""),
+        UiSlot::DetailsBottom => (3, ""),
+        UiSlot::StatusBar => (4, ""),
+        UiSlot::AboveComposer => (5, ""),
+        UiSlot::At { id, .. } => (6, id.as_str()),
+    }
+}
+
 
 impl UiSlot {
     /// Every slot, so the shell can create a container for each.
@@ -72,6 +123,9 @@ impl UiSlot {
             UiSlot::DetailsBottom => "slot-details-bottom",
             UiSlot::StatusBar => "slot-status-bar",
             UiSlot::AboveComposer => "slot-above-composer",
+            // An anchored panel has no pre-made container: the page creates its
+            // host at insertion time, next to the element the panel named.
+            UiSlot::At { .. } => "",
         }
     }
 
@@ -84,6 +138,7 @@ impl UiSlot {
             UiSlot::DetailsBottom => "details-bottom",
             UiSlot::StatusBar => "status-bar",
             UiSlot::AboveComposer => "above-composer",
+            UiSlot::At { .. } => "at",
         }
     }
 }
@@ -182,8 +237,8 @@ impl UiRegistry {
     pub fn panels(&self) -> Vec<&UiPanel> {
         let mut panels: Vec<&UiPanel> = self.panels.iter().collect();
         panels.sort_by(|a, b| {
-            (a.slot as u8)
-                .cmp(&(b.slot as u8))
+            slot_rank(&a.slot)
+                .cmp(&slot_rank(&b.slot))
                 .then_with(|| b.order.cmp(&a.order))
                 .then_with(|| a.id.cmp(&b.id))
         });

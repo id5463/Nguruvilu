@@ -1635,6 +1635,40 @@ function postToPanels(event) {
 /// be a second rendering path to keep correct. Each panel is now its own
 /// sandboxed document (see above), so a rebuild costs one iframe load per panel
 /// and its script runs inside that document, once, with its own fragment there.
+/// The host element for one panel's slot, or null when its anchor is gone.
+///
+/// Fixed slots have a container the page ships. An anchored panel gets a host
+/// created on the spot, inserted relative to the element it named, and removed
+/// again on the next render (the whole set is rebuilt), so a pack that
+/// disappears takes its host with it.
+function containerFor(slot) {
+  if (typeof slot === "string") {
+    return document.getElementById("slot-" + slot);
+  }
+  const at = slot && slot.at;
+  if (!at || typeof at.id !== "string") return null;
+  const anchor = document.getElementById(at.id);
+  if (!anchor) {
+    // Named an element that is not there: report it once rather than dropping
+    // the panel in silence, which looks exactly like the pack not loading.
+    notice("面板锚点不存在: #" + at.id, true);
+    return null;
+  }
+  const host = document.createElement("div");
+  host.className = "panel-fragment anchored";
+  host.dataset.anchor = at.id;
+  switch (at.place) {
+    case "before": anchor.parentElement.insertBefore(host, anchor); break;
+    case "append": anchor.append(host); break;
+    case "prepend": anchor.prepend(host); break;
+    case "after":
+    default:
+      anchor.after(host);
+      break;
+  }
+  return host;
+}
+
 function renderSlots(panels) {
   panelFrames = new Map();
   for (const slot of ["sidebar-top", "sidebar-bottom", "details-top", "details-bottom", "status-bar", "above-composer"]) {
@@ -1643,7 +1677,12 @@ function renderSlots(panels) {
   }
 
   for (const panel of panels || []) {
-    const container = document.getElementById("slot-" + panel.slot);
+    // A panel either names one of the fixed slots or an anchor: `slot` is a
+    // string for the fixed ones, and an object `{ at: { id, place } }` when the
+    // pack wants a specific element. The object form is what lets a pack put a
+    // button beside the Send button without the page growing a new slot for
+    // every place a pack might want.
+    const container = containerFor(panel.slot);
     if (!container) continue;
 
     const box = el("div", "panel-fragment");
