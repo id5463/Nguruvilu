@@ -243,18 +243,6 @@
   </aside>
 
   <div id="slot-above-composer"></div>
-  <!-- 上传进度条。放在输入框上方而不是设置面板的提示栏里：那个提示栏只有
-       打开设置才看得见，传大文件时人是盯着输入框的，进度写在别处等于没有。 -->
-  <div id="upload-bar" hidden>
-    <div class="upload-row">
-      <span class="upload-name" id="upload-name"></span>
-      <span class="upload-pct" id="upload-pct"></span>
-      <button type="button" class="upload-cancel" id="upload-cancel" title="取消上传">×</button>
-    </div>
-    <div class="upload-track"><div class="upload-fill" id="upload-fill"></div></div>
-    <div class="upload-bytes" id="upload-bytes"></div>
-  </div>
-
   <div id="composer">
     <button id="attach" title="上传文件给内核" hidden>&#128206;</button>
     <input type="file" id="attach-input" multiple hidden>
@@ -493,7 +481,7 @@ if (onServer) {
       return sendChunk(
         "/upload?name=" + encodeURIComponent(file.name),
         file,
-        (loaded, total) => progressLine(label, loaded, total)
+        (loaded, total) => reportUpload(label, loaded, total, false)
       );
     }
 
@@ -505,7 +493,7 @@ if (onServer) {
     const sent = new Array(total).fill(0);
     const report = () => {
       const done = sent.reduce((a, b) => a + b, 0);
-      progressLine(label, done, file.size);
+      reportUpload(label, done, file.size, false);
     };
 
     let next = 0;
@@ -534,42 +522,44 @@ if (onServer) {
     await Promise.all(
       Array.from({ length: Math.min(UPLOAD_PARALLEL, total) }, () => worker())
     );
-    progressLine(label, file.size, file.size);
+    reportUpload(label, file.size, file.size, false);
     return sendChunk(
       "/upload/complete?upload=" + id + "&name=" + encodeURIComponent(file.name),
       new Blob([])
     );
   }
 
-  // The upload bar: name, percent, a filled track, and bytes.
+  // Upload progress goes out as an event, not into a element this file owns.
   //
-  // This used to be one line in the settings panel's notice strip, which is only
-  // visible with settings open — so a large upload looked like nothing was
-  // happening at all. An upload is the one operation where the person is
-  // waiting and watching, so it gets its own bar above the composer.
-  let uploadCancelled = false;
-  const uploadBar = () => document.getElementById("upload-bar");
-
-  function showUpload(label, loaded, total) {
-    const bar = uploadBar();
-    if (!bar) return;
-    bar.hidden = false;
+  // The first version put a bar above the composer in the page itself, which
+  // meant editing this 3 400-line document for a feature a pack can implement:
+  // the interface already has `above-composer`, `panels` and `css`, and a pack
+  // can make that slot a floating overlay with three lines of CSS. A control
+  // that only matters while a transfer is running has no business occupying a
+  // grid row of the base page.
+  function reportUpload(label, loaded, total, done) {
     const percent = total ? Math.min(100, Math.floor((loaded * 100) / total)) : 0;
-    document.getElementById("upload-name").textContent = label;
-    document.getElementById("upload-pct").textContent = percent + "%";
-    document.getElementById("upload-fill").style.width = percent + "%";
-    document.getElementById("upload-bytes").textContent =
-      formatBytes(loaded) + " / " + formatBytes(total);
+    const progress = { label, loaded, total, percent, done: !!done };
+    // Panels get their own message, not a DOM node: the upload control is a
+    // pack's business, and a pack cannot read this document's state directly.
+    for (const [panelId, entry] of panelFrames) {
+      postToPanel(entry.frame, panelId, { ev: "upload-progress", progress });
+    }
+    for (const handler of uploadHandlers.slice()) {
+      try {
+        handler(progress);
+      } catch (error) {
+        notice("上传进度处理出错: " + error.message, true);
+      }
+    }
   }
-
-  function hideUpload() {
-    const bar = uploadBar();
-    if (bar) bar.hidden = true;
-  }
-
-  // Kept as the name the upload pipeline already calls.
-  function progressLine(label, loaded, total) {
-    showUpload(label, loaded, total);
+  const uploadHandlers = [];
+  function onUploadProgress(handler) {
+    if (typeof handler === "function") uploadHandlers.push(handler);
+    return () => {
+      const at = uploadHandlers.indexOf(handler);
+      if (at >= 0) uploadHandlers.splice(at, 1);
+    };
   }
 
   function formatBytes(bytes) {
@@ -601,7 +591,7 @@ if (onServer) {
     }
     // The bar comes down once the batch is over, whatever the outcome: leaving a
     // finished bar on screen makes the next upload's start look like a stall.
-    hideUpload();
+    reportUpload("", 0, 0, true);
     if (uploaded.length > 0) {
       const lines = uploaded.map((result) => "已上传: " + result.path);
       field.value = (field.value ? field.value + "\n" : "") + lines.join("\n");
