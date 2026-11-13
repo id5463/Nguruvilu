@@ -68,6 +68,22 @@ pub trait ModelAccess: Send + Sync {
         self.system_prompt()
     }
 
+
+    /// Model ids the route's endpoint offers, for a caller that must choose one.
+    ///
+    /// `delegate` used to describe its `model` argument as "optional, defaults to
+    /// the session's" and nothing more: the model had to *guess* an id, and a
+    /// guess that the endpoint does not know fails the subtask with a 404 that
+    /// reads like a broken tool. The list is the difference between choosing and
+    /// guessing.
+    ///
+    /// Defaults to empty, because an implementor that has no catalog to offer
+    /// must still compile — and because "I do not know" is honest here, while a
+    /// made-up list is not.
+    fn available_models(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// The context policy in force, so a subagent compacts like its parent.
     fn context_policy(&self) -> Arc<dyn ContextPolicy>;
 }

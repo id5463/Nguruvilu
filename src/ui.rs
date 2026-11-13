@@ -33,7 +33,14 @@ use serde::{Deserialize, Serialize};
 pub const BUILTIN_HTML: &str = include_str!("../desktop/ui/index.html");
 
 /// A place on screen a plugin may fill.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Where a panel goes.
+///
+/// Named places first, then anywhere: `Slot::At` names a real element id and a
+/// position relative to it, which is what lets a pack put a button next to the
+/// Send button instead of in one of six fixed spots. The named variants stay
+/// because they are the common case and they survive a page restructure; an
+/// anchored one is exactly as stable as the id it names.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum UiSlot {
     /// Top of the left column, above the session list.
@@ -48,7 +55,66 @@ pub enum UiSlot {
     StatusBar,
     /// Above the composer, spanning the conversation column.
     AboveComposer,
+    /// Any element on the page, named by a selector.
+    ///
+    /// Written in a manifest as `"at": {"select": "#composer .row", "place":
+    /// "before"}`. `select` is any CSS selector, not just an id: the page has a
+    /// handful of ids and hundreds of class-named elements, so an id-only
+    /// anchor could only ever reach a few fixed spots — which is the limit this
+    /// replaces.
+    ///
+    /// Any selector is accepted. A pack already runs what it likes: loading one
+    /// can start an MCP server, which is an arbitrary process that can read
+    /// `settings.json` and everything else. Refusing a selector would restrict a
+    /// capability the pack does not need restricted while changing nothing about
+    /// what it can reach — and it would silently break a legitimate panel.
+    ///
+    /// `all: true` places one host per match instead of only the first, which is
+    /// what makes "beside every turn" possible.
+    At {
+        /// A CSS selector for the anchor element(s).
+        #[serde(rename = "select", alias = "id")]
+        select: String,
+        /// Where, relative to each match.
+        place: UiPlacement,
+        /// Whether to anchor to every match or only the first.
+        #[serde(default)]
+        all: bool,
+    },
 }
+
+/// Where an anchored panel sits relative to its id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UiPlacement {
+    /// As a sibling immediately before the element.
+    Before,
+    /// As a sibling immediately after the element.
+    After,
+    /// As the first child.
+    Prepend,
+    /// As the last child.
+    Append,
+}
+
+
+/// A stable sort key for a slot.
+///
+/// The old code cast the enum to `u8`, which a variant carrying data cannot do.
+/// An anchored slot sorts last and carries its anchor's name into the key, so
+/// two panels on the same id keep a deterministic order.
+fn slot_rank(slot: &UiSlot) -> (u8, &str) {
+    match slot {
+        UiSlot::SidebarTop => (0, ""),
+        UiSlot::SidebarBottom => (1, ""),
+        UiSlot::DetailsTop => (2, ""),
+        UiSlot::DetailsBottom => (3, ""),
+        UiSlot::StatusBar => (4, ""),
+        UiSlot::AboveComposer => (5, ""),
+        UiSlot::At { select, .. } => (6, select.as_str()),
+    }
+}
+
 
 impl UiSlot {
     /// Every slot, so the shell can create a container for each.
@@ -72,6 +138,9 @@ impl UiSlot {
             UiSlot::DetailsBottom => "slot-details-bottom",
             UiSlot::StatusBar => "slot-status-bar",
             UiSlot::AboveComposer => "slot-above-composer",
+            // An anchored panel has no pre-made container: the page creates its
+            // host at insertion time, next to the element the panel named.
+            UiSlot::At { .. } => "",
         }
     }
 
@@ -84,16 +153,49 @@ impl UiSlot {
             UiSlot::DetailsBottom => "details-bottom",
             UiSlot::StatusBar => "status-bar",
             UiSlot::AboveComposer => "above-composer",
+            UiSlot::At { .. } => "at",
         }
     }
+}
+
+/// The panel kind used when a pack does not name one.
+fn default_kind() -> String {
+    "html".to_string()
 }
 
 /// A fragment of interface contributed by a plugin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiPanel {
-    /// Unique id. A second panel with the same id replaces the first, so a
-    /// reload does not stack duplicates.
+    /// Unique id. A second panel with the same id **in the same namespace**
+    /// replaces the first, so a reload does not stack duplicates.
+    ///
+    /// Ids are scoped: `stats/row` from one pack and `stats/row` from another
+    /// are two panels, not one overwriting the other. Before namespaces, two
+    /// packs that happened to pick the same id silently clobbered each other —
+    /// which is exactly the "my pack's panel vanished" report that has no
+    /// visible cause.
     pub id: String,
+    /// Which pack's space this id lives in.
+    ///
+    /// Empty means "unscoped", which keeps every panel written before
+    /// namespaces existed working unchanged. A pack that wants to sit beside
+    /// another pack's panels in one group gives the same namespace and a
+    /// different id; a pack that wants to replace its own panel keeps the same
+    /// pair.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub namespace: String,
+    /// What kind of panel this is.
+    ///
+    /// `html` (the default) renders the fragment in a sandboxed frame. Any
+    /// other name must be registered by a pack through `look.json`'s `types`
+    /// table, which is how a pack defines a *new* kind of panel instead of only
+    /// filling a slot — the `pageTypes` registry Patchouli uses for the same
+    /// reason.
+    ///
+    /// An unknown type is reported rather than rendered as raw HTML: silently
+    /// falling back would make a typo look like a styling problem.
+    #[serde(default = "default_kind", rename = "type")]
+    pub kind: String,
     /// Where it goes.
     pub slot: UiSlot,
     /// Optional heading rendered above the fragment.
@@ -115,6 +217,8 @@ impl UiPanel {
     pub fn new(id: impl Into<String>, slot: UiSlot, html: impl Into<String>) -> Self {
         Self {
             id: id.into(),
+            namespace: String::new(),
+            kind: default_kind(),
             slot,
             title: None,
             html: html.into(),
@@ -158,9 +262,18 @@ impl UiRegistry {
         Self::default()
     }
 
-    /// Add or replace a panel by id.
+    /// Add or replace a panel by (namespace, id).
+    ///
+    /// The pair is the identity, not the id alone: two packs may both call
+    /// their panel `stats`, and the second one should appear beside the first
+    /// rather than erase it. A pack replacing its *own* panel keeps the same
+    /// pair, so a reload still updates in place.
     pub fn add(&mut self, panel: UiPanel) {
-        match self.panels.iter_mut().find(|p| p.id == panel.id) {
+        match self
+            .panels
+            .iter_mut()
+            .find(|p| p.id == panel.id && p.namespace == panel.namespace)
+        {
             Some(existing) => *existing = panel,
             None => self.panels.push(panel),
         }
@@ -178,12 +291,18 @@ impl UiRegistry {
         self.panels.retain(|panel| panel.id != id);
     }
 
+    /// Remove by the full identity, leaving same-named panels elsewhere alone.
+    pub fn remove_scoped(&mut self, namespace: &str, id: &str) {
+        self.panels
+            .retain(|panel| !(panel.id == id && panel.namespace == namespace));
+    }
+
     /// Every panel, ordered for rendering: by slot, then by order, then by id.
     pub fn panels(&self) -> Vec<&UiPanel> {
         let mut panels: Vec<&UiPanel> = self.panels.iter().collect();
         panels.sort_by(|a, b| {
-            (a.slot as u8)
-                .cmp(&(b.slot as u8))
+            slot_rank(&a.slot)
+                .cmp(&slot_rank(&b.slot))
                 .then_with(|| b.order.cmp(&a.order))
                 .then_with(|| a.id.cmp(&b.id))
         });

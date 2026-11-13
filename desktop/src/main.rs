@@ -26,7 +26,7 @@ use std::io::BufRead;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 #[cfg(windows)]
@@ -360,8 +360,8 @@ fn windowed(startup_prompt: Option<String>, ui_id: Option<String>) -> anyhow::Re
         let startup_prompt = startup_prompt.clone();
         // Decided before the window exists: the page is loaded once, so an
         // interface cannot be swapped in afterwards without a reload.
-        if let Some(directory) = resolve_active_ui(ui_id.as_deref()) {
-            set_active_ui(directory);
+        if let Some(stack) = crate::resolve_ui_stack(ui_id.as_deref()) {
+            set_active_ui(stack);
         }
 
         let ui_port = serve_interface_on_loopback(Arc::clone(&state))?;
@@ -1481,6 +1481,103 @@ async fn dispatch_path(
 }
 
 /// Push the installed-pack list to the page.
+/// Follow the pack directory and reconcile what the kernel has loaded.
+///
+/// The panel's Unload button pushes a pending action through the kernel and
+/// hot-reloads in the same breath. The command line cannot: `ngu uninstall`
+/// only writes a marker next to the pack, in a different process. So the two
+/// ways of unloading a pack used to disagree — the button took effect
+/// immediately, the command needed a restart, and the screen said nothing
+/// either way.
+///
+/// This closes that gap by watching the same thing both paths change: which
+/// packs are enabled. When the set differs from what was last reconciled, the
+/// difference is pushed through the kernel exactly as the button would.
+pub(crate) fn watch_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
+    tokio::spawn(async move {
+        let mut last = enabled_fingerprint();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let now = enabled_fingerprint();
+            if now == last {
+                continue;
+            }
+            // Work out what changed, so the kernel is told "load this" and
+            // "unload that" rather than being rebuilt wholesale.
+            let added: Vec<String> = now.difference(&last).cloned().collect();
+            let removed: Vec<String> = last.difference(&now).cloned().collect();
+            last = now;
+
+            // The fingerprint is `name@version` so a version change counts as a
+            // change, but the kernel matches on the bare name — passing
+            // "hook-demo@1.0.0" as `name` made every unload a no-op, silently.
+            for entry in removed {
+                let name = pack_name_of(&entry);
+                eprintln!("[pack] {entry} disappeared from the enabled set; unloading");
+                crate::push_pack_action(
+                    &state,
+                    nguruvilu::tools::pack::Pending::Unload {
+                        name: name.to_string(),
+                        session: None,
+                    },
+                );
+            }
+            for entry in added {
+                let name = pack_name_of(&entry);
+                eprintln!("[pack] {entry} appeared in the enabled set; loading");
+                crate::push_pack_action(
+                    &state,
+                    nguruvilu::tools::pack::Pending::Load {
+                        name: name.to_string(),
+                        session: None,
+                    },
+                );
+            }
+            crate::drain_packs(Arc::clone(&state), Arc::clone(&sink)).await;
+            emit_panels(&state, &sink);
+            refresh_packs(&state, &sink);
+        }
+    });
+}
+
+/// Record one pack action for the kernel to apply at the next safe point.
+///
+/// The same queue the panel's Unload button fills, factored out so the file
+/// watcher and the button cannot drift apart: there is one way a pack change
+/// reaches the kernel, whatever asked for it.
+pub(crate) fn push_pack_action(
+    state: &Arc<Mutex<AppState>>,
+    action: nguruvilu::tools::pack::Pending,
+) {
+    let guard = state.lock().expect("state lock");
+    guard.pending.push(action);
+}
+
+/// The bare pack name from a `name@version` fingerprint.
+fn pack_name_of(fingerprint: &str) -> &str {
+    fingerprint.split('@').next().unwrap_or(fingerprint)
+}
+
+/// `name@version` for every enabled pack, as a set.
+///
+/// A pack appears and disappears by name; the version is included so that
+/// reinstalling a different version is a change like any other.
+fn enabled_fingerprint() -> std::collections::BTreeSet<String> {
+    match nguruvilu::pack::installed(&nguruvilu::pack::default_packs_dir()) {
+        Ok(packs) => packs
+            .iter()
+            .filter(|pack| pack.enabled)
+            .map(|pack| format!("{}@{}", pack.manifest.name, pack.manifest.version_id))
+            .collect(),
+        // A listing that failed is not an empty pack set: returning empty here
+        // would unload everything on a transient I/O error.
+        Err(error) => {
+            eprintln!("[pack] cannot list packs while watching: {error:#}");
+            std::collections::BTreeSet::new()
+        }
+    }
+}
+
 fn refresh_packs(state: &Arc<Mutex<AppState>>, sink: &Arc<dyn EventSink>) {
     match state.lock().expect("state lock").packs() {
         Ok(list) => emit(sink, json!({ "ev": "packs", "list": list })),
@@ -2121,6 +2218,20 @@ async fn apply_pack(
 ///
 /// Asking the endpoint beats making a user type a model id from memory: a
 /// gateway can front dozens of models and its list changes without notice.
+/// The model ids this endpoint last reported.
+///
+/// `delegate` asks for these when it is registered, and `fetch_models` is what
+/// fills them in — the same catalog the picker shows. It is a process-wide cell
+/// rather than a field on `AppState` because the tool is registered once, before
+/// any session exists, and because the answer belongs to the endpoint rather
+/// than to a conversation.
+static KNOWN_MODELS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The last catalog seen, in registration order.
+fn known_models() -> Vec<String> {
+    KNOWN_MODELS.lock().expect("model cache").clone()
+}
+
 async fn fetch_models(
     state: Arc<Mutex<AppState>>,
     sink: Arc<dyn EventSink>,
@@ -2133,6 +2244,10 @@ async fn fetch_models(
     match client.list_models_detailed().await {
         Ok(models) => {
             eprintln!("[models] provider reported {} entries", models.len());
+            // Kept for `delegate`: the subtask model argument is only a choice
+            // if the ids are known before the tool is described.
+            *KNOWN_MODELS.lock().expect("model cache") =
+                models.iter().map(|model| model.id.clone()).collect();
             emit(
                 &sink,
                 json!({
@@ -2204,12 +2319,33 @@ fn remove_pack(target: &str) -> anyhow::Result<()> {
 /// `wanted` names one by id; without it, the first installed pack that declares
 /// an interface wins. The built-in is what a machine with no such pack gets,
 /// which is why nothing has to be configured for the program to work.
-pub(crate) fn resolve_active_ui(wanted: Option<&str>) -> Option<PathBuf> {
+/// Every interface directory that should be looked in, highest priority first.
+///
+/// The order is what makes packs overlay instead of exclude: the pack that
+/// declares a `ui` and owns the document comes first, and every other loaded
+/// pack that carries a `ui` directory comes after it. A URL path is answered by
+/// the first directory that actually has it, so a second pack can add a file
+/// or replace one without touching the page.
+///
+/// `wanted` names an interface id, the way the built-in one is chosen; absent
+/// means "whatever pack claims one".
+pub(crate) fn resolve_ui_stack(wanted: Option<&str>) -> Option<Vec<PathBuf>> {
     let packs = nguruvilu::pack::installed(&nguruvilu::pack::default_packs_dir()).ok()?;
 
+    // The base first: a pack whose `ui.entry` is the document itself.
+    let mut base: Option<(String, PathBuf, bool)> = None;
+    // Everyone else's directory, with its order key, as overlay layers.
+    let mut layers: Vec<(String, PathBuf, i32)> = Vec::new();
+
+    // Two passes, because `base` has to win regardless of the directory
+    // listing's order: a pack that says `base: true` owns the document, and a
+    // pack that says nothing is only an overlay. Without this an overlay whose
+    // name sorts earlier became the base and served its placeholder as the page
+    // — the document vanished and every other pack's files came back empty.
+    for want_base in [true, false] {
     for pack in &packs {
         // An unloaded pack is out of every conversation, and that includes the
-        // interface it brought: unloading it puts the built-in one back.
+        // interface it brought.
         if !pack.enabled {
             continue;
         }
@@ -2221,8 +2357,6 @@ pub(crate) fn resolve_active_ui(wanted: Option<&str>) -> Option<PathBuf> {
                 continue;
             }
         }
-        // `entry` is relative to the installed pack, so its parent is the
-        // directory the assets live in.
         let entry = pack.path.join(&ui.entry);
         if !entry.is_file() {
             eprintln!(
@@ -2233,28 +2367,72 @@ pub(crate) fn resolve_active_ui(wanted: Option<&str>) -> Option<PathBuf> {
             );
             continue;
         }
-        let directory = entry.parent().map(PathBuf::from)?;
-        eprintln!("[ui] serving interface '{}' from {}", ui.id, directory.display());
-        return Some(directory);
+        let Some(directory) = entry.parent().map(PathBuf::from) else {
+            continue;
+        };
+        if ui.base != want_base {
+            continue;
+        }
+        let label = format!("{} {}", pack.manifest.name, pack.manifest.version_id);
+        match &base {
+            None => base = Some((label, directory, ui.overlays)),
+            Some((base_label, _, _)) => {
+                // Two packs both claiming the base: the first by name keeps it
+                // and the other becomes an overlay, so the choice is the same
+                // on every run and the loser is still served its own files.
+                if ui.base {
+                    eprintln!(
+                        "[ui] {} also declares itself the base interface; {base_label} keeps it",
+                        label
+                    );
+                }
+                layers.push((label, directory, ui.overlay_order));
+            }
+        }
+    }
     }
 
-    if wanted.is_some() {
+    let (base_label, base_dir, base_accepts_overlays) = base?;
+    // A base that refuses overlays is served exactly as shipped — the analogue
+    // of `use_resource_pack: false` in a Patchouli book.
+    if !base_accepts_overlays && !layers.is_empty() {
         eprintln!(
-            "[ui] no installed pack declares interface '{}'; using the built-in one",
-            wanted.unwrap_or_default()
+            "[ui] {} declares overlays off; {} overlay(s) will not be used",
+            base_label,
+            layers.len()
         );
+        layers.clear();
     }
-    None
-}
+    // Overlays first, base last: that is the resource-pack order, and getting
+    // it backwards made an overlay unable to replace a file the base already
+    // had — the walk stopped at the base and the overlay's own copy was never
+    // consulted. A pack that supplies `ui.css` means "use mine", not "use both".
+    layers.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
 
-/// Where the served interface lives.
-///
-/// Set once when a pack declares one. A global rather than a parameter because
-/// the custom-protocol handler is a plain closure that the webview builder owns
-/// for the life of the window, and it must answer without knowing about state
-/// locks — a handler that blocks on the state mutex while the UI thread holds
-/// it would deadlock the window.
-static ACTIVE_UI: OnceLock<PathBuf> = OnceLock::new();
+    let mut stack = Vec::with_capacity(1 + layers.len());
+    for (_, dir, _) in &layers {
+        stack.push(dir.clone());
+    }
+    let base_index = stack.len();
+    stack.push(base_dir);
+
+    if !layers.is_empty() {
+        eprintln!(
+            "[ui] serving '{}' from {}, overlaid by: {}",
+            base_label,
+            stack[base_index].display(),
+            layers
+                .iter()
+                .map(|(name, dir, order)| format!("{name}@{order} ({})", dir.display()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    } else {
+        eprintln!("[ui] serving '{}' from {}", base_label, stack[base_index].display());
+    }
+
+    Some(stack)
+}
 
 /// Serve a path from the active interface directory, or the built-in page.
 ///
@@ -2514,47 +2692,153 @@ fn respond_loopback(
     let _ = stream.flush();
 }
 
+/// Where interface content comes from.
+///
+/// Shaped after Patchouli's `BookContentLoader`, and for the same reason: the
+/// shell should not hard-code "read this file from this directory". Patchouli
+/// ships three loaders — one reads straight from the resource manager, one
+/// serves a preloaded map, one reads a directory on disk — and an add-on can
+/// take over that decision without forking the book. Here the equivalent
+/// decision is "which bytes answer this URL path", and making it a trait is
+/// what lets a pack supply its own answer instead of fighting over one page.
+///
+/// Implementations return `None` for "not mine", never an error: the walk
+/// continues to the next source, which is what makes several packs stack.
+pub(crate) trait ContentSource: Send + Sync {
+    /// A short name for the log, so an overlay answering a request is visible.
+    fn label(&self) -> String;
+
+    /// The bytes and content type for `relative`, or `None` if this source
+    /// does not have it.
+    fn find(&self, relative: &Path) -> Option<(Vec<u8>, &'static str)>;
+}
+
+/// One interface directory on disk: a base pack, or an overlay pack.
+pub(crate) struct DirSource {
+    /// What to call it in the log.
+    pub label: String,
+    /// The directory URL paths resolve inside.
+    pub root: PathBuf,
+}
+
+impl ContentSource for DirSource {
+    fn label(&self) -> String {
+        self.label.clone()
+    }
+
+    fn find(&self, relative: &Path) -> Option<(Vec<u8>, &'static str)> {
+        let found = resolve_inside(&self.root, relative)?;
+        let bytes = std::fs::read(&found).ok()?;
+        let mime = mime_for(&found);
+        Some((bytes, mime))
+    }
+}
+
+/// Every source for the served interface, in priority order.
+///
+/// Set once when the interface is chosen. A global rather than a parameter
+/// because the custom-protocol handler is a plain closure the webview builder
+/// owns for the life of the window, and it must answer without knowing about
+/// state locks — a handler that blocks on the state mutex while the UI thread
+/// holds it would deadlock the window.
+static ACTIVE_SOURCES: std::sync::OnceLock<Vec<Box<dyn ContentSource>>> =
+    std::sync::OnceLock::new();
+
+/// Point the shell at the interface sources.
+pub(crate) fn set_active_ui(stack: Vec<PathBuf>) {
+    // First writer wins: the stack is decided once, at startup, and a second
+    // call would silently serve different files than the page was loaded from.
+    let sources: Vec<Box<dyn ContentSource>> = stack
+        .into_iter()
+        .map(|root| {
+            let label = root.display().to_string();
+            Box::new(DirSource { label, root }) as Box<dyn ContentSource>
+        })
+        .collect();
+    let count = sources.len();
+    match ACTIVE_SOURCES.set(sources) {
+        Ok(()) => eprintln!("[ui] {count} content source(s) installed"),
+        Err(_) => eprintln!(
+            "[ui] content sources already set; this call (with {count}) is ignored"
+        ),
+    }
+}
+
 pub(crate) fn serve_ui(path: &str) -> (Vec<u8>, &'static str) {
     let builtin = || (UI_HTML.as_bytes().to_vec(), "text/html; charset=utf-8");
 
-    let Some(root) = ACTIVE_UI.get() else {
+    let Some(sources) = ACTIVE_SOURCES.get() else {
         return builtin();
     };
 
     // A path from a URL is untrusted input that becomes a filesystem path.
     // Refusing anything but a plain relative descent is what keeps `..` from
-    // reaching outside the interface directory.
+    // reaching outside an interface directory.
     let requested = if path.is_empty() || path == "/" { "index.html" } else { path };
-    // `safe_relative` is the only thing allowed to decide what a URL path may
-    // name: decoded, backslash-unified, and refusing any segment that is `.`,
-    // `..`, a drive letter or stream, or a Windows device. `canonicalize`
-    // settles symlinks, and `starts_with` is the last word - the resolved file
-    // has to still be inside the interface directory, whatever the join
-    // produced. Anything that fails falls back to the index, which is inside.
-    let Ok(root) = root.canonicalize() else {
-        return builtin();
-    };
-    let candidate = match crate::serve::safe_relative(requested) {
-        Some(relative) => match root.join(relative).canonicalize() {
-            Ok(resolved) if resolved.starts_with(&root) => resolved,
-            _ => root.join("index.html"),
-        },
-        None => root.join("index.html"),
+    let Some(relative) = crate::serve::safe_relative(requested) else {
+        return sources
+            .first()
+            .and_then(|source| source.find(Path::new("index.html")))
+            .unwrap_or_else(builtin);
     };
 
-    let file = if candidate.is_file() {
-        candidate
-    } else {
-        root.join("index.html")
-    };
+    // `index.html` is the one path an overlay may not take: it is the document
+    // itself, and the pack that owns it is the base. This is the same line
+    // Patchouli draws — a resource pack may override a book's contents but "not
+    // book.json" — and it is what stops an overlay that ships a placeholder
+    // page from replacing the whole interface with it.
+    if relative.as_os_str() == "index.html" {
+        return sources
+            .last()
+            .and_then(|source| source.find(&relative))
+            .or_else(|| {
+                sources
+                    .first()
+                    .and_then(|source| source.find(Path::new("index.html")))
+            })
+            .unwrap_or_else(builtin);
+    }
 
-    match std::fs::read(&file) {
-        Ok(bytes) => (bytes, mime_for(&file)),
-        Err(error) => {
-            eprintln!("[ui] cannot read {}: {error}", file.display());
-            builtin()
+    // Ask each source in turn and serve the first that answers. That is the
+    // whole of the overlay: an overlay can add a file the base does not have,
+    // or replace one it does, without either pack knowing about the other.
+    for (depth, source) in sources.iter().enumerate() {
+        if let Some((bytes, mime)) = source.find(&relative) {
+            // Anything but the base answering is an overlay answering, which
+            // is worth one line when it happens: it explains why a file differs
+            // from the copy in the base pack.
+            if depth + 1 < sources.len() {
+                eprintln!(
+                    "[ui] '{}' served from overlay {}",
+                    relative.display(),
+                    source.label()
+                );
+            }
+            return (bytes, mime);
         }
     }
+
+    // Nothing has it: fall back to the first source's index.html, so a stale
+    // link still lands on the page instead of a blank response.
+    sources
+        .first()
+        .and_then(|source| source.find(Path::new("index.html")))
+        .unwrap_or_else(builtin)
+}
+
+/// Resolve a relative path inside one interface root, or `None` if it escapes
+/// or does not exist.
+///
+/// `canonicalize` settles symlinks, and `starts_with` is the last word — the
+/// resolved file has to still be inside the interface directory, whatever the
+/// join produced.
+fn resolve_inside(root: &Path, relative: &Path) -> Option<PathBuf> {
+    let root = root.canonicalize().ok()?;
+    let candidate = root.join(relative).canonicalize().ok()?;
+    if !candidate.starts_with(&root) || !candidate.is_file() {
+        return None;
+    }
+    Some(candidate)
 }
 
 /// A content type for the extensions an interface actually uses.
@@ -2588,24 +2872,17 @@ pub(crate) fn mime_for(path: &Path) -> &'static str {
     }
 }
 
-/// Point the window at an interface directory.
-pub(crate) fn set_active_ui(dir: PathBuf) {
-    // First writer wins: the interface is chosen once, at startup, and a second
-    // call would silently serve a different directory than the page was loaded
-    // from.
-    if ACTIVE_UI.set(dir).is_ok() {
-        // nothing to do; the handler reads it on the next request
-    }
-}
-
 /// Send the panels, theme, and labels plugins contributed.
 fn emit_panels(state: &Arc<Mutex<AppState>>, sink: &Arc<dyn EventSink>) {
-    let (panels, theme, strings) = {
+    let (panels, theme, strings, css, hooks, panel_types) = {
         let guard = state.lock().expect("state lock");
         (
             guard.kernel.ui_panels(),
             guard.kernel.resolved_theme(),
             guard.kernel.resolved_strings(),
+            guard.kernel.resolved_css(),
+            guard.kernel.resolved_hooks(),
+            guard.kernel.resolved_panel_types(),
         )
     };
     sink.emit(json!({ "ev": "ui_panels", "panels": panels }));
@@ -2615,6 +2892,19 @@ fn emit_panels(state: &Arc<Mutex<AppState>>, sink: &Arc<dyn EventSink>) {
     // or the right palette with the previous pack's words.
     sink.emit(json!({ "ev": "theme", "tokens": theme.tokens, "name": theme.name }));
     sink.emit(json!({ "ev": "strings", "strings": strings }));
+    // Pack stylesheets travel last, after the theme and the labels, so the
+    // page has already applied the tokens those rules may build on. An empty
+    // string is sent rather than omitted: the page rewrites its pack sheet
+    // whole, which is what makes unloading a pack take its rules with it.
+    sink.emit(json!({ "ev": "ui_css", "css": css }));
+    // Scripts for named interface points. Sent even when empty so unloading a
+    // pack removes the code it hung: the page evaluates only what it is given,
+    // once per change.
+    sink.emit(json!({ "ev": "ui_hooks", "hooks": hooks }));
+    // Panel kinds: name -> renderer. Sent with the panels because a panel of an
+    // unknown type cannot be drawn, and the two arriving separately means one
+    // render happens against a type table that has not landed yet.
+    sink.emit(json!({ "ev": "ui_types", "types": panel_types }));
 }
 
 /// Send one event to the page.

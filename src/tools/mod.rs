@@ -16,11 +16,14 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
-pub mod base;pub mod documents;
+pub mod base;
+pub mod documents;
 pub mod judge;
 pub mod jobs;
 pub mod longhorizon;
-pub mod pack;pub mod readers;
+pub mod pack;
+pub mod readers;
+pub mod restart;
 pub mod search;
 pub mod spill;
 pub mod subagent;

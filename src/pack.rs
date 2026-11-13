@@ -224,12 +224,48 @@ pub struct UiDecl {
     /// The entry file within the interface directory.
     #[serde(default = "default_entry")]
     pub entry: String,
+    /// This pack owns the document, rather than overlaying its files.
+    ///
+    /// The page is one document, so exactly one pack can supply `index.html` —
+    /// that is the closest analogue to Patchouli's rule that a resource pack
+    /// may override a book's contents but "not include book.json". Everything
+    /// else a pack brings (stylesheets, fragments, images) is an overlay: a
+    /// lookup walks the stack and the first directory with the file wins, so
+    /// several packs extend one interface at once instead of one excluding the
+    /// rest.
+    ///
+    /// Defaults to false: a pack that says nothing is an overlay, because that
+    /// is the safe answer — an overlay cannot break the page it does not own.
+    /// The pack that ships the interface declares `base: true`.
+    #[serde(default)]
+    pub base: bool,
+    /// Where this pack sits among the overlays. Higher wins.
+    ///
+    /// Overlays are ordered, not merged by name: a pack that wants its
+    /// stylesheet to land after another's has to be able to say so, the same
+    /// way Patchouli's `sortnum` orders entries inside a category. Ties fall
+    /// back to the pack name so two runs never resolve differently.
+    #[serde(default)]
+    pub overlay_order: i32,
+    /// Whether this interface accepts overlays from other packs at all.
+    ///
+    /// The analogue of `use_resource_pack: true` in a Patchouli `book.json`.
+    /// Defaults to true for an overlay (it is only supplying files, so it has
+    /// nothing to protect) and is what the base pack can switch off when it
+    /// wants its page served exactly as shipped.
+    #[serde(default = "default_true")]
+    pub overlays: bool,
     /// Where the interface comes from, when it is fetched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     /// sha256 of the fetched directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+}
+
+/// Serde default for fields that are on unless a manifest turns them off.
+fn default_true() -> bool {
+    true
 }
 
 fn default_entry() -> String {
@@ -243,6 +279,9 @@ impl UiDecl {
             id: id.into(),
             title: String::new(),
             entry: default_entry(),
+            base: false,
+            overlay_order: 0,
+            overlays: true,
             source: None,
             sha256: None,
         }
@@ -972,6 +1011,80 @@ pub struct LookFile {
     /// the no-gates rule applies to text as much as to anything else here.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub strings: BTreeMap<String, String>,
+
+    /// Stylesheet rules appended after the interface's own.
+    ///
+    /// The gap this fills: `themes` can only change custom properties the
+    /// interface already declared, and `panels` can only add fragments at a few
+    /// fixed slots. Anything else — spacing, a column width, the look of a
+    /// control — used to require shipping a complete copy of the 150 KB
+    /// interface, because the only other way in was to replace `index.html`
+    /// wholesale. That made every small change expensive twice over: the pack
+    /// had to carry the whole page, and `tests/ui_sync.rs` then required it to
+    /// stay byte-identical to the built-in.
+    ///
+    /// So this holds CSS text, appended after the built-in sheet, which is what
+    /// lets a pack restyle a corner of the interface in a dozen lines instead of
+    /// copying a megabyte of markup it does not care about.
+    ///
+    /// Rules here apply to the page the pack is loaded into, which is why the
+    /// same trust rule as `panels` applies: loading a pack already means
+    /// trusting it with the interface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub css: Option<String>,
+
+    /// Named points this pack hangs code on, and the script that does it.
+    ///
+    /// The shape Patchouli add-ons use: the host names a point
+    /// (`session.row.end`), the add-on supplies the code that runs there. Here
+    /// the point names are the page's own — see `runHook` in the interface —
+    /// and the scripts are evaluated in the page after it has loaded, in the
+    /// order the packs resolved.
+    ///
+    /// This is what lets a pack extend a rendering step instead of replacing
+    /// the document, which was the only option before: one badge in the session
+    /// list used to cost a copy of the whole 3 000-line page.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hooks: BTreeMap<String, String>,
+
+    /// Panel kinds this pack defines.
+    ///
+    /// The registry Patchouli keeps as `pageTypes`: a pack that wants a *new
+    /// kind of panel* — a chart, a diff view, a colour picker — registers a
+    /// name here, and every panel that declares `"type": "<name>"` is handed to
+    /// this renderer instead of the built-in HTML one.
+    ///
+    /// A type is data, not code from the kernel's point of view: the pack
+    /// supplies a renderer script and an optional fixture (default `html`), and
+    /// the page runs it inside the same sandbox a normal panel gets. That keeps
+    /// the boundary where it already was — a panel has never been able to reach
+    /// the shell, and defining a type does not change that.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub types: BTreeMap<String, PanelType>,
+}
+
+/// One pack-defined panel kind.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PanelType {
+    /// Which built-in shape this type is drawn with. Only `html` exists today:
+    /// a type decides how the fragment is produced, not how it is hosted.
+    #[serde(default = "default_renderer")]
+    pub renderer: String,
+    /// A script that runs once per panel of this type.
+    ///
+    /// It receives `(host, data)` — `host` is the panel's own element inside
+    /// the sandboxed frame, `data` is whatever the panel's `html` field holds,
+    /// parsed as JSON when it looks like JSON. The script fills `host`; the
+    /// page does not interpret what it draws.
+    pub script: String,
+    /// Shown in the pack panel, for a human choosing what to install.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+fn default_renderer() -> String {
+    "html".to_string()
 }
 
 /// `injections.json`: the injection engine's own serialised form.

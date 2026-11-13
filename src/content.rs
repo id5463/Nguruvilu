@@ -252,8 +252,40 @@ pub fn apply(
         let path = dir.join(file.path());
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
-        let look: LookFile = serde_json::from_str(&text)
+        let mut look: LookFile = serde_json::from_str(&text)
             .with_context(|| format!("{} is not a valid look file", path.display()))?;
+
+        // `hooks` holds file names, not script text: a hook is code, and code
+        // in a JSON string is unreadable and uneditable. Read each one relative
+        // to the pack, the same way `look` itself is resolved — a name that is
+        // not there is an error, because a pack whose hook silently vanished is
+        // worse than one that refuses to load.
+        for (point, file) in look.hooks.clone() {
+            let script_path = dir.join(&file);
+            match std::fs::read_to_string(&script_path) {
+                Ok(script) => {
+                    look.hooks.insert(point, script);
+                }
+                Err(error) => {
+                    anyhow::bail!(
+                        "pack '{}': hook '{}' names {}, which cannot be read: {error}",
+                        manifest.name,
+                        point,
+                        script_path.display()
+                    );
+                }
+            }
+        }
+
+        eprintln!(
+            "[look] {}: {} theme(s), {} panel(s), {} label(s), css={}, {} hook point(s)",
+            manifest.name,
+            look.themes.len(),
+            look.panels.len(),
+            look.strings.len(),
+            look.css.as_deref().map(str::len).unwrap_or(0),
+            look.hooks.len(),
+        );
         install_appearance(kernel, &manifest.name, look)?;
     }
 
@@ -388,7 +420,13 @@ fn install_appearance(
     pack_name: &str,
     look: LookFile,
 ) -> Result<()> {
-    if look.themes.is_empty() && look.panels.is_empty() && look.strings.is_empty() {
+    if look.themes.is_empty()
+        && look.panels.is_empty()
+        && look.strings.is_empty()
+        && look.css.as_deref().map_or(true, str::is_empty)
+        && look.hooks.is_empty()
+        && look.types.is_empty()
+    {
         return Ok(());
     }
 
@@ -442,6 +480,23 @@ fn install_appearance(
             // need to know which language they are in.
             if !self.look.strings.is_empty() {
                 contributions = contributions.strings(self.look.strings.clone());
+            }
+            // Rules after the interface's own, so a pack can restyle without
+            // replacing the page it restyles.
+            if let Some(rules) = self.look.css.as_deref() {
+                if !rules.trim().is_empty() {
+                    contributions = contributions.css(rules);
+                }
+            }
+            // Scripts on named points: the pack extends a rendering step
+            // instead of replacing the page.
+            if !self.look.hooks.is_empty() {
+                contributions = contributions.hooks(self.look.hooks.clone());
+            }
+            // Panel kinds: the pack defines a name, panels elsewhere ask for it
+            // by name instead of shipping their own renderer each time.
+            if !self.look.types.is_empty() {
+                contributions = contributions.panel_types(self.look.types.clone());
             }
             Ok(contributions)
         }

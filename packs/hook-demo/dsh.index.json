@@ -1,0 +1,13 @@
+{
+  "formatVersion": 1,
+  "game": "nguruvilu",
+  "name": "hook-demo",
+  "description": "挂接点示例：给会话行加徽章，给状态栏加回合计数，不复制界面",
+  "versionId": "1.0.0",
+  "license": "MIT",
+  "kernelVersion": "0.1.0",
+  "dependencies": {
+    "nguruvilu": ">=0.1.0"
+  },
+  "look": "look.json"
+}
