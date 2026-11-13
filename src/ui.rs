@@ -55,17 +55,31 @@ pub enum UiSlot {
     StatusBar,
     /// Above the composer, spanning the conversation column.
     AboveComposer,
-    /// A real element id and a position relative to it.
+    /// Any element on the page, named by a selector.
     ///
-    /// Written in a manifest as `"at": {"id": "composer", "place": "before"}`.
-    /// `place` is one of `before`, `after`, `prepend`, `append`. An id the page
-    /// does not have is reported and skipped — a panel that quietly lands
-    /// nowhere is worse than one that says so.
+    /// Written in a manifest as `"at": {"select": "#composer .row", "place":
+    /// "before"}`. `select` is any CSS selector, not just an id: the page has a
+    /// handful of ids and hundreds of class-named elements, so an id-only
+    /// anchor could only ever reach a few fixed spots — which is the limit this
+    /// replaces.
+    ///
+    /// Any selector is accepted. A pack already runs what it likes: loading one
+    /// can start an MCP server, which is an arbitrary process that can read
+    /// `settings.json` and everything else. Refusing a selector would restrict a
+    /// capability the pack does not need restricted while changing nothing about
+    /// what it can reach — and it would silently break a legitimate panel.
+    ///
+    /// `all: true` places one host per match instead of only the first, which is
+    /// what makes "beside every turn" possible.
     At {
-        /// The DOM id to anchor to.
-        id: String,
-        /// Where, relative to it.
+        /// A CSS selector for the anchor element(s).
+        #[serde(rename = "select", alias = "id")]
+        select: String,
+        /// Where, relative to each match.
         place: UiPlacement,
+        /// Whether to anchor to every match or only the first.
+        #[serde(default)]
+        all: bool,
     },
 }
 
@@ -83,6 +97,7 @@ pub enum UiPlacement {
     Append,
 }
 
+
 /// A stable sort key for a slot.
 ///
 /// The old code cast the enum to `u8`, which a variant carrying data cannot do.
@@ -96,7 +111,7 @@ fn slot_rank(slot: &UiSlot) -> (u8, &str) {
         UiSlot::DetailsBottom => (3, ""),
         UiSlot::StatusBar => (4, ""),
         UiSlot::AboveComposer => (5, ""),
-        UiSlot::At { id, .. } => (6, id.as_str()),
+        UiSlot::At { select, .. } => (6, select.as_str()),
     }
 }
 

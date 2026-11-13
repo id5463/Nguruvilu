@@ -10,12 +10,12 @@
       "id": "hook-demo-buttons",
       "slot": {
         "at": {
-          "id": "send",
+          "select": "#composer",
           "place": "before"
         }
       },
       "html": "<button id=\"demo-count\" class=\"demo-btn\">会话数</button>",
-      "script": "document.getElementById('demo-count').addEventListener('click', () => {\n  const n = document.querySelectorAll('.sess').length;\n  const turns = document.querySelectorAll('#stream .turn').length;\n  const out = document.createElement('span');\n  out.textContent = n + '/' + turns;\n  document.getElementById('demo-count').replaceWith(out);\n});\n",
+      "script": "document.getElementById('demo-count').addEventListener('click', () => {\n  const n = document.querySelectorAll('.sess').length;\n  const t = document.querySelectorAll('#stream .turn').length;\n  const out = document.createElement('span');\n  out.textContent = n + '/' + t;\n  document.getElementById('demo-count').replaceWith(out);\n});\n",
       "order": 10
     },
     {
@@ -26,6 +26,19 @@
       "type": "chart",
       "html": "[252, 1095, 2, 282, 0, 0, 2191, 189]",
       "order": 5
+    },
+    {
+      "id": "turn-mark",
+      "namespace": "hook-demo",
+      "slot": {
+        "at": {
+          "select": "#stream .turn",
+          "place": "before",
+          "all": true
+        }
+      },
+      "html": "<span class=\"turn-mark\">▸</span>",
+      "order": 1
     }
   ],
   "types": {

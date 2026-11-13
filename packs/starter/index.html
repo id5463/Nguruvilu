@@ -1688,47 +1688,66 @@ function postToPanels(event) {
 /// be a second rendering path to keep correct. Each panel is now its own
 /// sandboxed document (see above), so a rebuild costs one iframe load per panel
 /// and its script runs inside that document, once, with its own fragment there.
-/// The host element for one panel's slot, or null when its anchor is gone.
+/// Every host element for one panel's slot; empty when its anchor is gone.
 ///
-/// Fixed slots have a container the page ships. An anchored panel gets a host
-/// created on the spot, inserted relative to the element it named, and removed
-/// again on the next render (the whole set is rebuilt), so a pack that
-/// disappears takes its host with it.
-function containerFor(slot) {
+/// Fixed slots have the container the page ships. An anchored panel names a CSS
+/// selector and gets a host created at insertion time, next to every match when
+/// the panel asked for `all`. Hosts are rebuilt on each render (the sweep at the
+/// top of `renderSlots` removes the previous set), so a pack that disappears
+/// takes its hosts with it.
+///
+function hostsFor(slot) {
   if (typeof slot === "string") {
-    return document.getElementById("slot-" + slot);
+    const one = document.getElementById("slot-" + slot);
+    return one ? [one] : [];
   }
   const at = slot && slot.at;
-  if (!at || typeof at.id !== "string") return null;
-  const anchor = document.getElementById(at.id);
-  if (!anchor) {
-    // Named an element that is not there: report it once rather than dropping
+  if (!at) return [];
+  const selector = at.select || at.id;
+  if (typeof selector !== "string" || !selector.trim()) {
+    notice("面板锚点为空", true);
+    return [];
+  }
+  // Any selector. A pack can already start an MCP server, so a selector is not
+  // a capability worth gating; a refused one would only break a real panel.
+  let matches;
+  try {
+    matches = [...document.querySelectorAll(selector)];
+  } catch (error) {
+    notice("面板锚点选择器无效: " + selector, true);
+    return [];
+  }
+  if (!at.all) matches = matches.slice(0, 1);
+  if (matches.length === 0) {
+    // Named something that is not there: report it once rather than dropping
     // the panel in silence, which looks exactly like the pack not loading.
-    notice("面板锚点不存在: #" + at.id, true);
-    return null;
+    notice("面板锚点不存在: " + selector, true);
+    return [];
   }
-  const host = document.createElement("div");
-  host.className = "panel-fragment anchored";
-  host.dataset.anchor = at.id;
-  switch (at.place) {
-    case "before": anchor.parentElement.insertBefore(host, anchor); break;
-    case "append": anchor.append(host); break;
-    case "prepend": anchor.prepend(host); break;
-    case "after":
-    default:
-      anchor.after(host);
-      break;
+  const hosts = [];
+  for (const anchor of matches) {
+    const host = document.createElement("div");
+    host.className = "panel-fragment anchored";
+    host.dataset.anchor = selector;
+    switch (at.place) {
+      case "before": anchor.parentElement.insertBefore(host, anchor); break;
+      case "append": anchor.append(host); break;
+      case "prepend": anchor.prepend(host); break;
+      case "after":
+      default:
+        anchor.after(host);
+        break;
+    }
+    hosts.push(host);
   }
-  return host;
+  return hosts;
 }
 
 /// Panel kinds packs have defined, by name. `html` is built in.
 ///
 /// The registry Patchouli keeps as `pageTypes`: a pack registers a name, panels
 /// elsewhere ask for it by name, and the page hands the panel to that renderer
-/// instead of drawing its fragment itself. Kept here rather than passed into
-/// `renderSlots` so a type table that arrives after a panel list still applies
-/// on the next render.
+/// instead of drawing its fragment itself.
 let panelTypes = {};
 
 /// Take a type table from the shell. Replaces wholesale, like the stylesheet,
@@ -1757,9 +1776,11 @@ function renderSlots(panels) {
     // pack wants a specific element. The object form is what lets a pack put a
     // button beside the Send button without the page growing a new slot for
     // every place a pack might want.
-    const container = containerFor(panel.slot);
-    if (!container) continue;
-
+    const hosts = hostsFor(panel.slot);
+    if (hosts.length === 0) continue;
+    // One panel may land in several places (`all: true`). Each host gets its
+    // own copy of the fragment, because a DOM node lives in one tree.
+    for (const container of hosts) {
     const box = el("div", "panel-fragment");
     box.dataset.panelId = panel.id;
     if (panel.title) box.append(el("h2", null, panel.title));
@@ -1808,6 +1829,7 @@ function renderSlots(panels) {
       panelFrames.set(panel.id, { frame: frame });
     }
     container.append(box);
+    }
   }
 }
 
