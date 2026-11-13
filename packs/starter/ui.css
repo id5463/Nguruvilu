@@ -41,7 +41,8 @@
        26px status strip. The template needs a row for each — with only three
        rows the composer was auto-placed into the fixed 26px strip and grew down
        over the dock, which is exactly what "面板被遮挡" looked like. */
-    grid-template-rows: minmax(0, 1fr) auto auto 26px;
+    /* 多出的一行是上传进度条：它和 above-composer 槽位一样横跨全宽。 */
+    grid-template-rows: minmax(0, 1fr) auto auto auto 26px;
     font: 13.5px/1.6 ui-sans-serif, system-ui, "Segoe UI", sans-serif;
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
@@ -492,6 +493,49 @@
   .skill .id { font-family: var(--mono); color: var(--accent); font-size: 11px; }
   .skill .d { color: var(--dim); font-size: 11px; }
 
+  /* ---- upload bar ---- */
+  /* Sits above the composer. An upload is the one operation where a person is
+     waiting and watching, so it gets its own progress element rather than a line
+     in a panel they may never have opened. */
+  #upload-bar {
+    grid-column: 1 / -1;
+    background: var(--card);
+    border-top: 1px solid var(--line);
+    padding: 8px 14px 9px;
+    font-size: 11.5px; color: var(--text);
+  }
+  #upload-bar[hidden] { display: none; }
+  .upload-row {
+    display: flex; align-items: center; gap: 10px;
+    margin-bottom: 6px; min-width: 0;
+  }
+  .upload-name {
+    flex: 1 1 auto; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-family: var(--mono); font-size: 11px;
+  }
+  .upload-pct {
+    flex: 0 0 auto; font-variant-numeric: tabular-nums;
+    color: var(--accent); font-weight: 600; min-width: 4ch; text-align: right;
+  }
+  .upload-cancel {
+    flex: 0 0 auto; border: 0; background: none; cursor: pointer;
+    color: var(--dim); font-size: 16px; line-height: 1; padding: 0 2px;
+  }
+  .upload-cancel:hover { color: var(--bad); }
+  .upload-track {
+    height: 5px; border-radius: 3px; background: var(--panel);
+    border: 1px solid var(--line); overflow: hidden;
+  }
+  .upload-fill {
+    height: 100%; width: 0%; background: var(--accent);
+    transition: width .18s ease-out;
+  }
+  .upload-bytes {
+    margin-top: 4px; font-size: 10.5px; color: var(--dim);
+    font-variant-numeric: tabular-nums;
+  }
+
   /* ---- touch screens ----
      A finger is not a cursor: every target grows to the 44px floor the touch
      platform guides put under a fingertip, hover-only affordances become
@@ -553,7 +597,7 @@
          the right edge. The column is the viewport, period. */
       grid-template-columns: minmax(0, 1fr);
       /* top bar | conversation | composer | status */
-      grid-template-rows: auto minmax(0, 1fr) auto auto 40px;
+      grid-template-rows: auto minmax(0, 1fr) auto auto auto 40px;
       font-size: 14px;
     }
     /* One row with the menu button and the conversation in front of the

@@ -243,6 +243,18 @@
   </aside>
 
   <div id="slot-above-composer"></div>
+  <!-- 上传进度条。放在输入框上方而不是设置面板的提示栏里：那个提示栏只有
+       打开设置才看得见，传大文件时人是盯着输入框的，进度写在别处等于没有。 -->
+  <div id="upload-bar" hidden>
+    <div class="upload-row">
+      <span class="upload-name" id="upload-name"></span>
+      <span class="upload-pct" id="upload-pct"></span>
+      <button type="button" class="upload-cancel" id="upload-cancel" title="取消上传">×</button>
+    </div>
+    <div class="upload-track"><div class="upload-fill" id="upload-fill"></div></div>
+    <div class="upload-bytes" id="upload-bytes"></div>
+  </div>
+
   <div id="composer">
     <button id="attach" title="上传文件给内核" hidden>&#128206;</button>
     <input type="file" id="attach-input" multiple hidden>
@@ -250,7 +262,7 @@
          door on the server, so the archive is uploaded and its server-side
          path handed to the same verify-then-install command. -->
     <input type="file" id="install-input" accept=".ngupack" hidden>
-    <textarea id="input" rows="1" placeholder="Ask the kernel something&hellip;  (Enter to send, Shift+Enter for a newline)"></textarea>
+    <textarea id="input" rows="1" placeholder="Ask the kernel something&hellip;"></textarea>
     <button id="send">Send</button>
   </div>
 
@@ -529,14 +541,35 @@ if (onServer) {
     );
   }
 
-  // One line in the notice bar: "上传 name  45%  2.1/4.7 MB".
+  // The upload bar: name, percent, a filled track, and bytes.
+  //
+  // This used to be one line in the settings panel's notice strip, which is only
+  // visible with settings open — so a large upload looked like nothing was
+  // happening at all. An upload is the one operation where the person is
+  // waiting and watching, so it gets its own bar above the composer.
+  let uploadCancelled = false;
+  const uploadBar = () => document.getElementById("upload-bar");
+
+  function showUpload(label, loaded, total) {
+    const bar = uploadBar();
+    if (!bar) return;
+    bar.hidden = false;
+    const percent = total ? Math.min(100, Math.floor((loaded * 100) / total)) : 0;
+    document.getElementById("upload-name").textContent = label;
+    document.getElementById("upload-pct").textContent = percent + "%";
+    document.getElementById("upload-fill").style.width = percent + "%";
+    document.getElementById("upload-bytes").textContent =
+      formatBytes(loaded) + " / " + formatBytes(total);
+  }
+
+  function hideUpload() {
+    const bar = uploadBar();
+    if (bar) bar.hidden = true;
+  }
+
+  // Kept as the name the upload pipeline already calls.
   function progressLine(label, loaded, total) {
-    const percent = total ? Math.floor((loaded * 100) / total) : 0;
-    notice(
-      "上传 " + label + "  " + percent + "%  " +
-        formatBytes(loaded) + " / " + formatBytes(total),
-      false
-    );
+    showUpload(label, loaded, total);
   }
 
   function formatBytes(bytes) {
@@ -553,7 +586,12 @@ if (onServer) {
     // Files stay sequential even though their parts run in parallel: the
     // composer must receive paths in the order they were picked, and running
     // two files at once would halve the slices each one gets.
+    uploadCancelled = false;
     for (const file of files) {
+      if (uploadCancelled) {
+        failed.push(file.name + ": 已取消");
+        break;
+      }
       try {
         const result = await uploadOne(file, file.name);
         uploaded.push(result);
@@ -561,6 +599,9 @@ if (onServer) {
         failed.push(file.name + ": " + error.message);
       }
     }
+    // The bar comes down once the batch is over, whatever the outcome: leaving a
+    // finished bar on screen makes the next upload's start look like a stall.
+    hideUpload();
     if (uploaded.length > 0) {
       const lines = uploaded.map((result) => "已上传: " + result.path);
       field.value = (field.value ? field.value + "\n" : "") + lines.join("\n");
@@ -573,6 +614,19 @@ if (onServer) {
     }
     for (const failure of failed) {
       notice("上传失败 — " + failure, true);
+    }
+  }
+
+  // Cancel stops the batch at the next file boundary. A slice already in flight
+  // is not aborted — the sender would have to cancel the XHR, and the parts it
+  // already wrote are harmless (the join never runs, and the sweep expires them).
+  {
+    const cancel = document.getElementById("upload-cancel");
+    if (cancel) {
+      cancel.addEventListener("click", () => {
+        uploadCancelled = true;
+        notice("已请求取消上传", false);
+      });
     }
   }
 
@@ -691,6 +745,19 @@ const usageLine = document.getElementById("usage-line");
 const input = document.getElementById("input");
 const send = document.getElementById("send");
 /// Placeholder restored when no turn is running (packs may replace it later).
+// The same placeholder everywhere is either too long for a phone or too terse
+// for a desktop. The long form wraps onto a second line inside a one-row
+// textarea, and the second line is simply cut off — which is what the phone
+// screenshot showed. So: short on touch, explanatory with a keyboard.
+const PLACEHOLDER_DESKTOP =
+  "Ask the kernel something…  (Enter to send, Shift+Enter for a newline)";
+const PLACEHOLDER_TOUCH = "Ask the kernel something…";
+// Width rather than pointer type: a narrow window on a desktop has the same
+// problem as a phone, and headless browsers report no coarse pointer at all, so
+// the pointer media query alone left narrow layouts with the long placeholder.
+if (window.innerWidth >= 860 && !matchMedia("(pointer: coarse)").matches) {
+  input.placeholder = PLACEHOLDER_DESKTOP;
+}
 const IDLE_PLACEHOLDER = input.placeholder;
 
 const setBaseUrl = document.getElementById("set-base-url");
@@ -2811,7 +2878,9 @@ function setBusy(value) {
   send.classList.toggle("stop", value);
   send.title = value ? "Stop the running turn" : "Send (Enter)";
   input.placeholder = value
-    ? "Running — Enter sends this as steering for the next step; ■ Stop ends the turn"
+    ? (window.innerWidth >= 860
+        ? "Running — Enter sends this as steering for the next step; ■ Stop ends the turn"
+        : "Running — ■ Stop ends the turn")
     : IDLE_PLACEHOLDER;
   if (!value) {
     document.getElementById("dot").className = "dot";
