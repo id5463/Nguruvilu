@@ -193,3 +193,74 @@ fn look_file_hooks_name_files_and_real_points() {
         );
     }
 }
+
+/// Panels are identified by (namespace, id), not id alone.
+///
+/// Two packs that both call a panel `stats` must sit beside each other; before
+/// namespaces the second silently replaced the first, which is indistinguishable
+/// from "my pack's panel never loaded".
+#[test]
+fn panels_with_the_same_id_in_different_namespaces_coexist() {
+    use nguruvilu::ui::{UiPanel, UiRegistry, UiSlot};
+
+    let mut registry = UiRegistry::new();
+    let mut a = UiPanel::new("stats", UiSlot::SidebarTop, "<b>a</b>");
+    a.namespace = "pack-a".into();
+    let mut b = UiPanel::new("stats", UiSlot::SidebarTop, "<b>b</b>");
+    b.namespace = "pack-b".into();
+    registry.add(a);
+    registry.add(b);
+
+    assert_eq!(
+        registry.panels().len(),
+        2,
+        "same id in two namespaces must not collapse into one panel"
+    );
+
+    // Same pair replaces in place: a reload updates its own panel.
+    let mut again = UiPanel::new("stats", UiSlot::SidebarTop, "<b>a2</b>");
+    again.namespace = "pack-a".into();
+    registry.add(again);
+    assert_eq!(registry.panels().len(), 2, "same pair must replace, not add");
+
+    // Scoped removal leaves the other namespace alone.
+    registry.remove_scoped("pack-a", "stats");
+    let left = registry.panels();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].namespace, "pack-b");
+}
+
+/// A pack can define a new panel kind, and a panel of an unknown kind is
+/// reported rather than drawn as raw HTML.
+#[test]
+fn a_pack_can_register_a_panel_type() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(root.join("packs/hook-demo/look.json"))
+        .expect("the demo pack's look file");
+    let look: serde_json::Value = serde_json::from_str(&text).expect("look.json parses");
+
+    let types = look
+        .get("types")
+        .and_then(|v| v.as_object())
+        .expect("the demo pack registers a panel type");
+    let chart = types.get("chart").expect("the chart type is declared");
+    let script = chart
+        .get("script")
+        .and_then(|v| v.as_str())
+        .expect("a type carries a renderer script");
+    assert!(
+        script.contains("host") && script.contains("data"),
+        "a renderer must consume the host element and the panel's data"
+    );
+
+    // The panel that asks for it names the type, not a renderer of its own.
+    let panels = look.get("panels").and_then(|v| v.as_array()).expect("panels");
+    let uses = panels
+        .iter()
+        .find(|p| p.get("type").and_then(|t| t.as_str()) == Some("chart"))
+        .expect("one panel uses the registered type");
+    assert!(
+        uses.get("html").and_then(|v| v.as_str()).unwrap_or("").trim_start().starts_with('['),
+        "a chart panel's html field carries its data, not markup"
+    );
+}

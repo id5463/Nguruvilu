@@ -147,6 +147,8 @@ pub struct Contributions {
     /// Keyed by point name, holding the script text; the page evaluates it once
     /// after load. Empty for a plugin that only restyles. See `LookFile::hooks`.
     pub hooks: std::collections::BTreeMap<String, String>,
+    /// Panel kinds this plugin defines, by name. See `LookFile::types`.
+    pub panel_types: std::collections::BTreeMap<String, crate::pack::PanelType>,
     /// Services this plugin provides, by name.
     pub services: Vec<(String, Arc<dyn Any + Send + Sync>)>,
     /// Tools this plugin registers.
@@ -215,6 +217,15 @@ impl Contributions {
     /// Add a stylesheet fragment, appended after the interface's own sheet.
     pub fn css(mut self, rules: impl Into<String>) -> Self {
         self.css.push(rules.into());
+        self
+    }
+
+    /// Define panel kinds other panels can ask for by name.
+    pub fn panel_types(
+        mut self,
+        map: std::collections::BTreeMap<String, crate::pack::PanelType>,
+    ) -> Self {
+        self.panel_types.extend(map);
         self
     }
 
@@ -533,6 +544,8 @@ pub struct Fiber {
     /// Interface points this fiber hangs code on. Kept here for the same
     /// reason: unloading the pack must take its hooks with it.
     pub hooks: std::collections::BTreeMap<String, String>,
+    /// Panel kinds this fiber defines, unloaded with it.
+    pub panel_types: std::collections::BTreeMap<String, crate::pack::PanelType>,
     /// Sessions that have asked for this instance.
     ///
     /// The reference count that makes session isolation real: an instance is
@@ -716,6 +729,7 @@ struct Staged {
     strings: std::collections::BTreeMap<String, String>,
     css: Vec<String>,
     hooks: std::collections::BTreeMap<String, String>,
+    panel_types: std::collections::BTreeMap<String, crate::pack::PanelType>,
     services: Vec<((String, RealmId), Arc<dyn Any + Send + Sync>)>,
     tools: Vec<ToolDef>,
     readers: Vec<crate::tools::readers::ReaderSpec>,
@@ -990,6 +1004,26 @@ impl Kernel {
         merged
     }
 
+    /// The panel kinds every active plugin defines, merged.
+    ///
+    /// A name defined twice keeps the later fiber's version — the pack loaded
+    /// after another is the more specific choice, the same rule labels follow.
+    pub fn resolved_panel_types(
+        &self,
+    ) -> std::collections::BTreeMap<String, crate::pack::PanelType> {
+        let mut fibers: Vec<&Fiber> = self
+            .fibers
+            .values()
+            .filter(|fiber| fiber.state == FiberState::Active)
+            .collect();
+        fibers.sort_by_key(|fiber| fiber.id);
+        let mut merged = std::collections::BTreeMap::new();
+        for fiber in fibers {
+            merged.extend(fiber.panel_types.clone());
+        }
+        merged
+    }
+
     /// Register a plugin definition without loading an instance.
     pub fn define(&mut self, plugin: Arc<dyn Plugin>) {
         self.plugins.insert(plugin.name().to_string(), plugin);
@@ -1068,6 +1102,7 @@ impl Kernel {
                 strings: std::collections::BTreeMap::new(),
                 css: Vec::new(),
                 hooks: std::collections::BTreeMap::new(),
+                panel_types: std::collections::BTreeMap::new(),
                 users: BTreeSet::new(),
                 effects: Vec::new(),
                 epoch: Epoch::Inactive,
@@ -1517,6 +1552,7 @@ impl Kernel {
             fiber.strings.clear();
             fiber.css.clear();
             fiber.hooks.clear();
+            fiber.panel_types.clear();
         }
         self.version += 1;
     }
@@ -1661,6 +1697,7 @@ impl Kernel {
             strings,
             css,
             hooks,
+            panel_types,
             services: provided,
             tools: provided_tools,
             readers,
@@ -1737,6 +1774,7 @@ impl Kernel {
             strings,
             css,
             hooks,
+            panel_types,
             services: staged_services,
             tools: staged_tools,
             readers,
@@ -1760,6 +1798,7 @@ impl Kernel {
             strings,
             css,
             hooks,
+            panel_types,
             services,
             tools,
             readers,
@@ -1808,6 +1847,7 @@ impl Kernel {
             target.strings = strings;
             target.css = css;
             target.hooks = hooks;
+            target.panel_types = panel_types;
             target.effects = effects;
             target.epoch = epoch;
             target.state = FiberState::Active;

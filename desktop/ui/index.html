@@ -1421,7 +1421,18 @@ function applyStrings(strings) {
 //
 // 它能做的只剩一件事：发命令。而那条路要经过宿主 —— 面板 postMessage 到父窗口，
 // 父窗口核对「消息来自哪一帧」与「panelId 在白名单里」，才转成 toShell。
-const PANEL_CSP = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'";
+// A panel document's policy.
+//
+// `unsafe-eval` is here for one reason: a pack-defined panel type is delivered
+// as a string and has to become a function inside the frame (`new Function`).
+// The alternative would be a blob URL or a separate script file, and neither
+// buys anything — this document is already a sandboxed, opaque-origin frame with
+// `default-src 'none'`, so the code that runs in it can reach nothing but the
+// frame. Denying eval would only make a registered type impossible to render
+// while changing no boundary that matters.
+const PANEL_CSP =
+  "default-src 'none'; style-src 'unsafe-inline'; " +
+  "script-src 'unsafe-inline' 'unsafe-eval'";
 
 // iframe 是独立文档，继承不到本页的样式变量：给一套跟随系统深浅色的最小样式，
 // 免得面板渲染成白底 Times。
@@ -1542,6 +1553,48 @@ function panelSdk(panelId) {
 ///
 /// 面板的 HTML 与脚本都到这块文档为止，进不了主文档。收尾的脚本标签不能以字面量
 /// 写在外层脚本里（外层那块 script 会就此闭合），所以标签是拼出来的。
+/// A panel type's renderer, wired into the panel document.
+///
+/// The pack's script runs inside the same sandboxed frame a normal panel gets —
+/// defining a type does not widen what a pack may touch. It receives the frame's
+/// own body and the panel's data, and fills the body; nothing else changes.
+function typeDocument(custom, panel, panelId) {
+  const open = "<scr" + "ipt>";
+  const close = "</scr" + "ipt>";
+  const data = (() => {
+    const raw = panel.html;
+    if (typeof raw !== "string" || !raw.trim()) return "null";
+    try {
+      return JSON.stringify(JSON.parse(raw));
+    } catch (error) {
+      // Not JSON: hand it over as a string. A type that wants markup can still
+      // read it; one that wanted JSON will say so in its own error.
+      return JSON.stringify(raw);
+    }
+  })();
+  const head =
+    '<!doctype html><html><head><meta charset="utf-8">' +
+    '<meta http-equiv="Content-Security-Policy" content="' + PANEL_CSP + '">' +
+    "<style>" + PANEL_BASE_CSS + "</style></head><body>" +
+    (panel.html || "") + "</body></html>";
+  const sdk = open + "\n" + panelSdk(panelId) + "\n" + close;
+  const runner = [
+    open,
+    "(function () {",
+    "  var data = " + data + ";",
+    "  var host = document.body;",
+    "  try {",
+    "    var fn = new Function('host', 'data', 'ngu', " + JSON.stringify(custom.script) + ");",
+    "    fn(host, data, window.ngu);",
+    "  } catch (error) {",
+    "    host.textContent = 'panel type failed: ' + error.message;",
+    "  }",
+    "})();",
+    close,
+  ].join("\n");
+  return head.replace("</body></html>", sdk + runner + "</body></html>");
+}
+
 function panelDocument(panel, panelId) {
   const open = "<scr" + "ipt>";
   const close = "</scr" + "ipt>";
@@ -1669,11 +1722,33 @@ function containerFor(slot) {
   return host;
 }
 
+/// Panel kinds packs have defined, by name. `html` is built in.
+///
+/// The registry Patchouli keeps as `pageTypes`: a pack registers a name, panels
+/// elsewhere ask for it by name, and the page hands the panel to that renderer
+/// instead of drawing its fragment itself. Kept here rather than passed into
+/// `renderSlots` so a type table that arrives after a panel list still applies
+/// on the next render.
+let panelTypes = {};
+
+/// Take a type table from the shell. Replaces wholesale, like the stylesheet,
+/// so unloading a pack removes the kinds it defined.
+function applyPackTypes(types) {
+  panelTypes = (types && typeof types === "object") ? types : {};
+}
+
 function renderSlots(panels) {
   panelFrames = new Map();
   for (const slot of ["sidebar-top", "sidebar-bottom", "details-top", "details-bottom", "status-bar", "above-composer"]) {
     const container = document.getElementById("slot-" + slot);
     if (container) container.replaceChildren();
+  }
+  // Anchored panels get a host created at insertion time, so the loop above
+  // cannot know about them. Without this sweep every render stacked another
+  // copy beside the anchor: three updates meant three Send-side buttons, and
+  // nothing ever removed the old two.
+  for (const stale of document.querySelectorAll(".panel-fragment.anchored")) {
+    stale.remove();
   }
 
   for (const panel of panels || []) {
@@ -1689,7 +1764,20 @@ function renderSlots(panels) {
     box.dataset.panelId = panel.id;
     if (panel.title) box.append(el("h2", null, panel.title));
 
-    if (panel.html || panel.script) {
+    // A panel of a registered kind is handed to that type's renderer; a panel
+    // naming an unregistered kind is reported instead of drawn as raw HTML,
+    // because a silent fallback turns a typo into a "my panel looks wrong" bug.
+    const kind = panel.type || "html";
+    const custom = kind !== "html" ? panelTypes[kind] : null;
+    if (kind !== "html" && !custom) {
+      const miss = el("div", "warn");
+      miss.textContent = "未知面板类型 '" + kind + "'，该类型没有包注册";
+      box.append(miss);
+      container.append(box);
+      continue;
+    }
+
+    if (panel.html || panel.script || custom) {
       // 面板直接运行，不再弹“同意”。一次模态确认要用户在页面能用之前先点掉；
       // 拒绝过一次还会把面板永久关黑，看起来就像功能坏了。装这个包本来就是
       // 这个人的决定，沙箱 iframe 是真正的执行边界，保留；弹窗只是摩擦。
@@ -1704,7 +1792,12 @@ function renderSlots(panels) {
       frame.style.background = "transparent";
       frame.style.display = "block";
       // srcdoc 用属性赋值，不拼 innerHTML：面板的 HTML 到这块文档为止。
-      frame.setAttribute("srcdoc", panelDocument(panel, panel.id));
+      frame.setAttribute(
+        "srcdoc",
+        custom
+          ? typeDocument(custom, panel, panel.id)
+          : panelDocument(panel, panel.id)
+      );
       // 帧是每次重画时新建的，它不知道页面此前发生过什么：不补这一下，面板就要
       // 一直空到下一个不相干的工具调用，任务列表在打开时根本不会出现。加载完先
       // 喂一次缓存的状态 —— 只这一条，别的一概不编。
@@ -2825,6 +2918,9 @@ onAny((name, event) => {
         break;
       case "ui_hooks":
         applyPackHooks(event.hooks);
+        break;
+      case "ui_types":
+        applyPackTypes(event.types);
         break;
       case "models":
         renderModels(event.list);

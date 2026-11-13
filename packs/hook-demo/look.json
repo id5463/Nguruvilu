@@ -17,6 +17,21 @@
       "html": "<button id=\"demo-count\" class=\"demo-btn\">会话数</button>",
       "script": "document.getElementById('demo-count').addEventListener('click', () => {\n  const n = document.querySelectorAll('.sess').length;\n  const turns = document.querySelectorAll('#stream .turn').length;\n  const out = document.createElement('span');\n  out.textContent = n + '/' + turns;\n  document.getElementById('demo-count').replaceWith(out);\n});\n",
       "order": 10
+    },
+    {
+      "id": "activity",
+      "namespace": "hook-demo",
+      "slot": "sidebar-top",
+      "title": "会话消息数",
+      "type": "chart",
+      "html": "[252, 1095, 2, 282, 0, 0, 2191, 189]",
+      "order": 5
     }
-  ]
+  ],
+  "types": {
+    "chart": {
+      "script": "// 自定义面板类型 \"chart\"。\n// 包定义了\"什么是一种图表面板\"，别的面板只要写 \"type\": \"chart\" 就能用，\n// 不用每次都带一份自己的渲染代码。这与 Patchouli 的 pageTypes 注册表同形。\nconst canvas = document.createElement(\"canvas\");\ncanvas.width = Math.min(host.clientWidth || 260, 320);\ncanvas.height = 120;\ncanvas.style.width = \"100%\";\nhost.replaceChildren(canvas);\n\nconst ctx = canvas.getContext(\"2d\");\nif (!ctx) {\n  host.textContent = \"no canvas\";\n  return;\n}\nconst values = Array.isArray(data) ? data : [];\nif (values.length === 0) {\n  host.textContent = \"no data\";\n  return;\n}\nconst max = Math.max(...values.map((v) => Number(v) || 0), 1);\nconst gap = 6;\nconst barW = (canvas.width - gap * (values.length + 1)) / values.length;\nconst style = getComputedStyle(document.documentElement);\nconst accent = style.getPropertyValue(\"--accent\").trim() || \"#b4632a\";\nconst dim = style.getPropertyValue(\"--dim\").trim() || \"#7d7264\";\n\nctx.font = \"10px system-ui\";\nvalues.forEach((v, i) => {\n  const n = Number(v) || 0;\n  const h = Math.max(2, Math.round((n / max) * (canvas.height - 24)));\n  const x = gap + i * (barW + gap);\n  const y = canvas.height - h - 14;\n  ctx.fillStyle = accent;\n  ctx.fillRect(x, y, barW, h);\n  ctx.fillStyle = dim;\n  ctx.fillText(String(n), x, canvas.height - 3);\n});\n",
+      "description": "柱状图：data 是一个数字数组"
+    }
+  }
 }

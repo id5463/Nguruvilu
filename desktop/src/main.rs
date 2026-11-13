@@ -2874,7 +2874,7 @@ pub(crate) fn mime_for(path: &Path) -> &'static str {
 
 /// Send the panels, theme, and labels plugins contributed.
 fn emit_panels(state: &Arc<Mutex<AppState>>, sink: &Arc<dyn EventSink>) {
-    let (panels, theme, strings, css, hooks) = {
+    let (panels, theme, strings, css, hooks, panel_types) = {
         let guard = state.lock().expect("state lock");
         (
             guard.kernel.ui_panels(),
@@ -2882,6 +2882,7 @@ fn emit_panels(state: &Arc<Mutex<AppState>>, sink: &Arc<dyn EventSink>) {
             guard.kernel.resolved_strings(),
             guard.kernel.resolved_css(),
             guard.kernel.resolved_hooks(),
+            guard.kernel.resolved_panel_types(),
         )
     };
     sink.emit(json!({ "ev": "ui_panels", "panels": panels }));
@@ -2900,6 +2901,10 @@ fn emit_panels(state: &Arc<Mutex<AppState>>, sink: &Arc<dyn EventSink>) {
     // pack removes the code it hung: the page evaluates only what it is given,
     // once per change.
     sink.emit(json!({ "ev": "ui_hooks", "hooks": hooks }));
+    // Panel kinds: name -> renderer. Sent with the panels because a panel of an
+    // unknown type cannot be drawn, and the two arriving separately means one
+    // render happens against a type table that has not landed yet.
+    sink.emit(json!({ "ev": "ui_types", "types": panel_types }));
 }
 
 /// Send one event to the page.

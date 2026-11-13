@@ -143,12 +143,44 @@ impl UiSlot {
     }
 }
 
+/// The panel kind used when a pack does not name one.
+fn default_kind() -> String {
+    "html".to_string()
+}
+
 /// A fragment of interface contributed by a plugin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiPanel {
-    /// Unique id. A second panel with the same id replaces the first, so a
-    /// reload does not stack duplicates.
+    /// Unique id. A second panel with the same id **in the same namespace**
+    /// replaces the first, so a reload does not stack duplicates.
+    ///
+    /// Ids are scoped: `stats/row` from one pack and `stats/row` from another
+    /// are two panels, not one overwriting the other. Before namespaces, two
+    /// packs that happened to pick the same id silently clobbered each other —
+    /// which is exactly the "my pack's panel vanished" report that has no
+    /// visible cause.
     pub id: String,
+    /// Which pack's space this id lives in.
+    ///
+    /// Empty means "unscoped", which keeps every panel written before
+    /// namespaces existed working unchanged. A pack that wants to sit beside
+    /// another pack's panels in one group gives the same namespace and a
+    /// different id; a pack that wants to replace its own panel keeps the same
+    /// pair.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub namespace: String,
+    /// What kind of panel this is.
+    ///
+    /// `html` (the default) renders the fragment in a sandboxed frame. Any
+    /// other name must be registered by a pack through `look.json`'s `types`
+    /// table, which is how a pack defines a *new* kind of panel instead of only
+    /// filling a slot — the `pageTypes` registry Patchouli uses for the same
+    /// reason.
+    ///
+    /// An unknown type is reported rather than rendered as raw HTML: silently
+    /// falling back would make a typo look like a styling problem.
+    #[serde(default = "default_kind", rename = "type")]
+    pub kind: String,
     /// Where it goes.
     pub slot: UiSlot,
     /// Optional heading rendered above the fragment.
@@ -170,6 +202,8 @@ impl UiPanel {
     pub fn new(id: impl Into<String>, slot: UiSlot, html: impl Into<String>) -> Self {
         Self {
             id: id.into(),
+            namespace: String::new(),
+            kind: default_kind(),
             slot,
             title: None,
             html: html.into(),
@@ -213,9 +247,18 @@ impl UiRegistry {
         Self::default()
     }
 
-    /// Add or replace a panel by id.
+    /// Add or replace a panel by (namespace, id).
+    ///
+    /// The pair is the identity, not the id alone: two packs may both call
+    /// their panel `stats`, and the second one should appear beside the first
+    /// rather than erase it. A pack replacing its *own* panel keeps the same
+    /// pair, so a reload still updates in place.
     pub fn add(&mut self, panel: UiPanel) {
-        match self.panels.iter_mut().find(|p| p.id == panel.id) {
+        match self
+            .panels
+            .iter_mut()
+            .find(|p| p.id == panel.id && p.namespace == panel.namespace)
+        {
             Some(existing) => *existing = panel,
             None => self.panels.push(panel),
         }
@@ -231,6 +274,12 @@ impl UiRegistry {
     /// Remove a panel by id.
     pub fn remove(&mut self, id: &str) {
         self.panels.retain(|panel| panel.id != id);
+    }
+
+    /// Remove by the full identity, leaving same-named panels elsewhere alone.
+    pub fn remove_scoped(&mut self, namespace: &str, id: &str) {
+        self.panels
+            .retain(|panel| !(panel.id == id && panel.namespace == namespace));
     }
 
     /// Every panel, ordered for rendering: by slot, then by order, then by id.

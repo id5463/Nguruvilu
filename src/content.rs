@@ -425,6 +425,7 @@ fn install_appearance(
         && look.strings.is_empty()
         && look.css.as_deref().map_or(true, str::is_empty)
         && look.hooks.is_empty()
+        && look.types.is_empty()
     {
         return Ok(());
     }
@@ -491,6 +492,11 @@ fn install_appearance(
             // instead of replacing the page.
             if !self.look.hooks.is_empty() {
                 contributions = contributions.hooks(self.look.hooks.clone());
+            }
+            // Panel kinds: the pack defines a name, panels elsewhere ask for it
+            // by name instead of shipping their own renderer each time.
+            if !self.look.types.is_empty() {
+                contributions = contributions.panel_types(self.look.types.clone());
             }
             Ok(contributions)
         }

@@ -1046,6 +1046,45 @@ pub struct LookFile {
     /// list used to cost a copy of the whole 3 000-line page.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub hooks: BTreeMap<String, String>,
+
+    /// Panel kinds this pack defines.
+    ///
+    /// The registry Patchouli keeps as `pageTypes`: a pack that wants a *new
+    /// kind of panel* — a chart, a diff view, a colour picker — registers a
+    /// name here, and every panel that declares `"type": "<name>"` is handed to
+    /// this renderer instead of the built-in HTML one.
+    ///
+    /// A type is data, not code from the kernel's point of view: the pack
+    /// supplies a renderer script and an optional fixture (default `html`), and
+    /// the page runs it inside the same sandbox a normal panel gets. That keeps
+    /// the boundary where it already was — a panel has never been able to reach
+    /// the shell, and defining a type does not change that.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub types: BTreeMap<String, PanelType>,
+}
+
+/// One pack-defined panel kind.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PanelType {
+    /// Which built-in shape this type is drawn with. Only `html` exists today:
+    /// a type decides how the fragment is produced, not how it is hosted.
+    #[serde(default = "default_renderer")]
+    pub renderer: String,
+    /// A script that runs once per panel of this type.
+    ///
+    /// It receives `(host, data)` — `host` is the panel's own element inside
+    /// the sandboxed frame, `data` is whatever the panel's `html` field holds,
+    /// parsed as JSON when it looks like JSON. The script fills `host`; the
+    /// page does not interpret what it draws.
+    pub script: String,
+    /// Shown in the pack panel, for a human choosing what to install.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+fn default_renderer() -> String {
+    "html".to_string()
 }
 
 /// `injections.json`: the injection engine's own serialised form.
