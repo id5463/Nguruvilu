@@ -649,6 +649,40 @@ pub trait Plugin: Send + Sync {
     /// than in a JSON blob, and a plugin that wants to count calls does not
     /// have to parse anything.
     fn after_tool_call(&self, _ctx: &TurnContext, _call: &ToolCallView, _ok: bool) {}
+
+    /// Change one piece of data as it passes through the loop.
+    ///
+    /// One method for every seam instead of one method per seam. A seam that
+    /// needs its own method means the kernel grows a method each time someone
+    /// wants to touch something new; a seam that is a `Slot` variant means the
+    /// plugin says which data it cares about and does not care how many kinds
+    /// exist. Adding a kind is a variant here plus one call site, not a new
+    /// trait method that every plugin has to keep implementing.
+    ///
+    /// The default returns the value untouched, so a plugin that does not care
+    /// pays one match.
+    fn intercept(&self, _ctx: &TurnContext, slot: Slot) -> Slot {
+        slot
+    }
+}
+
+/// One piece of data on its way through the loop.
+///
+/// The variants are the seams that exist today. They are data, not callbacks:
+/// a plugin can rewrite text, filter a list or answer a question, and the
+/// kernel keeps deciding what to do with the answer.
+pub enum Slot {
+    /// The text about to be added to the system prompt.
+    Prompt(String),
+    /// The model's reply, once it has finished.
+    Reply(String),
+    /// Tool names available for this turn.
+    Tools(Vec<String>),
+    /// A command name the kernel does not recognise.
+    ///
+    /// `Some(_)` means a plugin answered it and the loop should stop looking;
+    /// `None` means nobody claimed it and the kernel reports "unknown command".
+    Command { name: String, body: String, out: Option<String> },
 }
 
 /// What a plugin is told about the turn it is being asked about.
@@ -2827,5 +2861,17 @@ impl crate::agent::PluginHooks for KernelHooks {
         let ctx = self.turn_context(input, model);
         let call = ToolCallView { name: name.to_string(), arguments: String::new() };
         self.with(|kernel| kernel.note_tool_call(&ctx, &call, ok));
+    }
+
+    fn intercept(&self, input: &str, model: &str, slot: crate::plugin::Slot) -> crate::plugin::Slot {
+        let ctx = self.turn_context(input, model);
+        self.with(|kernel| {
+            let mut current = slot;
+            for plugin in kernel.active_plugins() {
+                current = plugin.intercept(&ctx, current);
+            }
+            current
+        })
+        .unwrap_or_else(|| crate::plugin::Slot::Reply(String::new()))
     }
 }

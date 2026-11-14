@@ -1487,9 +1487,18 @@ function applyStrings(strings) {
 // `default-src 'none'`, so the code that runs in it can reach nothing but the
 // frame. Denying eval would only make a registered type impossible to render
 // while changing no boundary that matters.
+// A panel document's policy.
+//
+// Wide open on purpose. The previous policy forbade every external resource,
+// which meant a panel could not embed a page, load an image, or pull a script —
+// three things a pack legitimately wants (a browser view, a chart library, a
+// WebAssembly emulator). The iframe is still a frame, but what it may load is
+// now the pack author's decision: installing a pack already trusts it with the
+// machine, and a CSP that blocks its UI while its code runs unrestricted is a
+// boundary that only inconveniences the honest.
 const PANEL_CSP =
-  "default-src 'none'; style-src 'unsafe-inline'; " +
-  "script-src 'unsafe-inline' 'unsafe-eval'";
+  "default-src * data: blob: filesystem: 'unsafe-inline' 'unsafe-eval' " +
+  "wasm-unsafe-eval";
 
 // iframe 是独立文档，继承不到本页的样式变量：给一套跟随系统深浅色的最小样式，
 // 免得面板渲染成白底 Times。
@@ -1862,7 +1871,16 @@ function renderSlots(panels) {
       const frame = document.createElement("iframe");
       // 只给 allow-scripts。多给 allow-same-origin 就等于什么都没做：同源沙箱里
       // 的脚本可以把自己的 sandbox 属性摘掉。
-      frame.setAttribute("sandbox", "allow-scripts");
+      // `allow-same-origin` lets a panel reach this document — its elements, its
+      // storage, the token in its closure — which is what makes a panel able to
+      // put a slash menu on the composer or add a tab strip. That is a real
+      // power and it is granted deliberately: a pack that runs in this shell can
+      // already start a process on this machine, so withholding the DOM bought
+      // no safety and blocked every interaction feature.
+      frame.setAttribute(
+        "sandbox",
+        "allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads"
+      );
       frame.setAttribute("title", panel.title || ("panel " + panel.id));
       frame.style.width = "100%";
       frame.style.height = "120px";

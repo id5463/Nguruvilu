@@ -22,10 +22,32 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-/// Commands the cloud may run. Read-only status and turn-starting commands only.
-/// Destructive commands (delete, settings writes, pack uninstall, shell exit)
-/// stay local-only on purpose.
-pub const ALLOWED_COMMANDS: &[&str] = &["ready", "status", "new_session", "open_session", "prompt", "cancel"];
+/// Commands the cloud may run when nobody says otherwise.
+///
+/// The short list is the default because a relay is a door into this machine,
+/// and a door that opens everything by default is a door nobody meant to
+/// install. `NGU_REMOTE_ALLOW` widens it without recompiling: the user who
+/// wants the server to drive this desktop says so once, in the environment,
+/// where the decision is visible and reversible.
+pub const DEFAULT_ALLOWED_COMMANDS: &[&str] =
+    &["ready", "status", "new_session", "open_session", "prompt", "cancel"];
+
+/// Commands the cloud may run, from `NGU_REMOTE_ALLOW` or the default.
+///
+/// Comma- or space-separated. An empty or unreadable value falls back to the
+/// default rather than to "everything" or "nothing": neither guess is one the
+/// user asked for.
+pub fn allowed_commands() -> Vec<String> {
+    match std::env::var("NGU_REMOTE_ALLOW") {
+        Ok(raw) if !raw.trim().is_empty() => raw
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => DEFAULT_ALLOWED_COMMANDS.iter().map(|s| s.to_string()).collect(),
+    }
+}
 
 /// Largest command body the relay may hand this machine, in bytes.
 ///
@@ -61,7 +83,7 @@ pub const FAST_FAILURE: Duration = Duration::from_secs(5);
 pub const JITTER: f64 = 0.3;
 
 /// Whether a remote command body may run. Rejects anything that is not one
-/// JSON object with a `cmd` field from [`ALLOWED_COMMANDS`].
+/// JSON object with a `cmd` field from [`allowed_commands`].
 ///
 /// This is the name-only half of the gate: [`admit`] adds the local `prompt`
 /// switch, the body limit and the rate window on top of it.
@@ -72,7 +94,7 @@ pub fn is_allowed(body: &str) -> bool {
     value
         .get("cmd")
         .and_then(|c| c.as_str())
-        .is_some_and(|cmd| ALLOWED_COMMANDS.contains(&cmd))
+        .is_some_and(|cmd| allowed_commands().iter().any(|allowed| allowed == cmd))
 }
 
 /// Configuration for the outbound relay link. Both values come from the
@@ -214,7 +236,7 @@ pub enum Admission {
     RateLimited,
     /// `prompt` with the local switch off.
     PromptDisabled,
-    /// Not one JSON object with a `cmd` from [`ALLOWED_COMMANDS`].
+    /// Not one JSON object with a `cmd` from [`allowed_commands`].
     NotAllowed,
 }
 

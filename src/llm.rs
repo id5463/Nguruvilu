@@ -1717,12 +1717,27 @@ pub(crate) fn proxy_rules(configured: &str) -> Result<Option<reqwest::Proxy>> {
 
     Ok(Some(reqwest::Proxy::custom(move |target| {
         let host = target.host_str().unwrap_or_default();
-        if bypasses_proxy(excluded.as_deref(), host) {
+        // A loopback address never goes through a proxy. Routing the machine's
+        // own request to its own service through a proxy lands at whatever that
+        // proxy thinks the address means — and for `127.0.0.1` that is the
+        // proxy's own loopback, not this machine's. Nobody sets NO_PROXY to
+        // exclude localhost for this reason: it is not a policy, it is the only
+        // answer that works.
+        if is_loopback(host) || bypasses_proxy(excluded.as_deref(), host) {
             None
         } else {
             Some(upstream.clone())
         }
     })))
+}
+
+/// Whether `host` names this machine.
+///
+/// Only the literal forms: a hostname that resolves to loopback ("mybox.local")
+/// cannot be told apart from one that does not without a DNS lookup, and this
+/// runs on every request.
+fn is_loopback(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
 }
 
 /// Whether `NO_PROXY`'s list excludes `host`.

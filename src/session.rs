@@ -1860,3 +1860,97 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 }
+
+// ---------------------------------------------------------------- the service
+//
+// A plugin that wants to start its own conversation — a subagent with a real
+// id, a background worker, a second view — needs somewhere to put it. The store
+// is that somewhere, and it used to be reachable only from the shell.
+//
+// Registered as a service rather than passed around: the kernel already hands
+// services to plugins through `PluginCtx`, and a store is exactly the shape
+// that fits — one shared object, many readers, no ownership question.
+
+/// Name the store answers to in the service table.
+pub const SERVICE: &str = "sessions";
+
+/// The store as a plugin sees it.
+///
+/// A trait object rather than the concrete `JsonlStore` because the host owns
+/// the path and may swap the backend; a plugin only ever needs these four
+/// operations.
+pub trait SessionService: std::any::Any + Send + Sync {
+    /// Write a new session.
+    fn create(&self, session: &Session) -> Result<()>;
+    /// Append messages to an existing session.
+    fn append(&self, id: &str, messages: &[Message]) -> Result<()>;
+    /// Read one session back.
+    fn load(&self, id: &str) -> Result<Option<Session>>;
+    /// Every session id the store holds, newest first as the store defines it.
+    fn ids(&self) -> Result<Vec<String>>;
+}
+
+/// Adapts a [`SessionStore`] to the plugin-facing [`SessionService`].
+///
+/// A wrapper rather than an impl on `JsonlStore` directly: the two traits share
+/// method names (`create`, `append`, `load`), and implementing both on one type
+/// makes every existing `store.create(...)` call ambiguous. A newtype keeps the
+/// old calls meaning what they meant and gives the service a name of its own.
+pub struct StoreHandle<S: SessionStore> {
+    inner: std::sync::Arc<S>,
+}
+
+impl<S: SessionStore + 'static> StoreHandle<S> {
+    /// Wrap a store for the service table.
+    pub fn new(inner: std::sync::Arc<S>) -> Self {
+        Self { inner }
+    }
+}
+
+impl<S: SessionStore + 'static> SessionService for StoreHandle<S> {
+    fn create(&self, session: &Session) -> Result<()> {
+        self.inner.create(session)
+    }
+    fn append(&self, id: &str, messages: &[Message]) -> Result<()> {
+        self.inner.append(id, messages)
+    }
+    fn load(&self, id: &str) -> Result<Option<Session>> {
+        self.inner.load(id)
+    }
+    fn ids(&self) -> Result<Vec<String>> {
+        Ok(self.inner.list()?.into_iter().map(|s| s.id).collect())
+    }
+}
+
+/// The plugin that puts the store in the service table.
+struct StoreService {
+    store: std::sync::Arc<dyn SessionService>,
+}
+
+impl StoreService {
+    const NAME: &str = "builtin:sessions";
+}
+
+impl crate::plugin::Plugin for StoreService {
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn provide(&self) -> Vec<String> {
+        vec![SERVICE.to_string()]
+    }
+
+    fn apply(&self, _ctx: &crate::plugin::PluginCtx) -> Result<crate::plugin::Contributions> {
+        let handle: std::sync::Arc<dyn std::any::Any + Send + Sync> = self.store.clone() as _;
+        Ok(crate::plugin::Contributions::new().service(SERVICE, handle))
+    }
+}
+
+/// Register the session store so plugins can reach it.
+pub fn install_store(
+    kernel: &mut crate::plugin::Kernel,
+    store: std::sync::Arc<dyn SessionService>,
+) -> Result<u64> {
+    kernel.define(std::sync::Arc::new(StoreService { store }));
+    kernel.load(StoreService::NAME, crate::plugin::RealmMap::new(), serde_json::Value::Null)
+}

@@ -381,6 +381,16 @@ impl TurnConfig for SharedConfig {
             policy: Arc::clone(&self.policy.lock().expect("policy lock")),
             injection: Arc::clone(&self.injection.lock().expect("injection lock")),
             cache_policy: snapshot.cache_policy,
+            // The kernel, when one has been wired in: this is what lets a pack
+            // touch a reply or the tool table. `None` before startup finishes,
+            // and then the turn runs with no plugin participation.
+            plugin_hooks: self
+                .kernel
+                .lock()
+                .expect("kernel handle")
+                .as_ref()
+                .and_then(|weak| weak.upgrade())
+                .map(|kernel| nguruvilu::plugin::Kernel::hook_view(&kernel)),
         }
     }
 }
@@ -632,6 +642,28 @@ impl AppState {
         }
 
         config.set_session_scope(store.root(), &session.id, session.cwd.clone());
+
+        // The store goes into the service table before it moves into `Self`, so
+        // a pack can start its own conversation — a subagent with an id a human
+        // can switch to, rather than one that vanishes when it finishes.
+        {
+            // A second handle on the same root, not a copy of the data: the
+            // store is a path plus a few conventions, and two instances over one
+            // directory are the same store.
+            match JsonlStore::open(store.root()) {
+                Ok(second) => {
+                    use nguruvilu::session::{SessionService, StoreHandle};
+                    let handle: std::sync::Arc<dyn SessionService> =
+                        std::sync::Arc::new(StoreHandle::new(std::sync::Arc::new(second)));
+                    if let Err(error) = nguruvilu::session::install_store(&mut kernel, handle) {
+                        eprintln!("[sessions] cannot offer the store to packs: {error:#}");
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[sessions] cannot reopen the store for packs: {error:#}");
+                }
+            }
+        }
 
         // Before any pack folds: boot loads the packs after this point, so the
         // snapshot is exactly the user's own state a recompute returns to.

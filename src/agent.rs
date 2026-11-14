@@ -119,6 +119,8 @@ pub trait PluginHooks: Send + Sync {
     fn refuse_call(&self, input: &str, model: &str, name: &str, arguments: &str) -> Option<String>;
     /// News that a call finished.
     fn note_call(&self, input: &str, model: &str, name: &str, ok: bool);
+    /// Pass one piece of data through every plugin that wants it.
+    fn intercept(&self, input: &str, model: &str, slot: crate::plugin::Slot) -> crate::plugin::Slot;
 }
 
 /// Supplies turn settings.
@@ -608,7 +610,22 @@ impl Agent {
         let mut snapshot_tools = (*settings.tools).clone();
         if let Some(hooks) = &settings.plugin_hooks {
             let all = snapshot_tools.names();
-            if let Some(keep) = hooks.filter_tools(prompt, &settings.model, all.clone()) {
+            // The old per-seam method, kept because it answers the common case
+            // in one call; a plugin that returns `None` here can still narrow
+            // the table through `intercept(Slot::Tools)`.
+            let filtered = hooks
+                .filter_tools(prompt, &settings.model, all.clone())
+                .or_else(|| {
+                    match hooks.intercept(
+                        prompt,
+                        &settings.model,
+                        crate::plugin::Slot::Tools(all.clone()),
+                    ) {
+                        crate::plugin::Slot::Tools(names) => Some(names),
+                        _ => None,
+                    }
+                });
+            if let Some(keep) = filtered {
                 let keep: std::collections::HashSet<String> = keep.into_iter().collect();
                 for name in all {
                     if !keep.contains(&name) {
@@ -892,7 +909,28 @@ impl Agent {
                     .map(|(i, c)| (i, c.clone()))
                     .collect();
                 let mut tool_calls: Vec<ToolCall> = llm::assemble_calls(&indexed);
-                let text = out.text;
+                // The reply passes through the plugins before anything else
+                // sees it. Deliberately not during streaming: buffering deltas
+                // to catch a word split across two of them would add latency to
+                // every answer, and the user would rather see the correction at
+                // the end than wait for certainty on each character.
+                let text = {
+                    let original = out.text;
+                    match &settings.plugin_hooks {
+                        Some(hooks) => {
+                            let slot = hooks.intercept(
+                                prompt,
+                                &settings.model,
+                                crate::plugin::Slot::Reply(original.clone()),
+                            );
+                            match slot {
+                                crate::plugin::Slot::Reply(replaced) => replaced,
+                                _ => original,
+                            }
+                        }
+                        None => original,
+                    }
+                };
 
                 // Stopped between the answer and its tool calls: the calls never
                 // ran, so they are dropped rather than left unanswered — a tool
