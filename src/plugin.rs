@@ -602,6 +602,79 @@ pub trait Plugin: Send + Sync {
 
     /// Produce contributions. Called only when every dependency is present.
     fn apply(&self, ctx: &PluginCtx) -> Result<Contributions>;
+
+    // ---- what a plugin may do while the agent runs ----
+    //
+    // These are methods, not a registry of named points. The difference
+    // matters: a registry means the kernel publishes a fixed list of moments
+    // and a plugin hopes one matches; a method means the kernel asks every
+    // plugin the question it already knows how to ask. Adding a moment is
+    // adding a method here — the plugin says what it can do by implementing
+    // it, and there is no name to misspell and no table to look up.
+
+    /// Text to append to this turn's system prompt.
+    ///
+    /// Called once per turn, after the base prompt and the skill catalog are
+    /// assembled, with the user's message in hand. Returning nothing is the
+    /// common case; returning text is how a retriever says "you will probably
+    /// need these skills" without the kernel knowing what a retriever is.
+    fn build_prompt(&self, _ctx: &TurnContext) -> Option<String> {
+        None
+    }
+
+    /// Which of these tool names survive for one request.
+    ///
+    /// Runs after the registry is snapshotted and before the body is built, so
+    /// a server advertising fifty-five primitives can be cut to the six a task
+    /// needs. Names rather than definitions: the registry owns the handlers, and
+    /// handing them out to be rebuilt invites a plugin to drop one by accident.
+    /// `None` leaves the table whole, and nothing is unregistered either way —
+    /// the next turn starts from the full set again.
+    fn filter_tools(&self, _ctx: &TurnContext, _names: Vec<String>) -> Option<Vec<String>> {
+        None
+    }
+
+    /// A last word before a tool call runs.
+    ///
+    /// Returning `Some(reason)` refuses the call and hands the reason back to
+    /// the model as the tool result. This is advice with teeth the other
+    /// directions do not have: it is the only place a plugin can say no.
+    fn before_tool_call(&self, _ctx: &TurnContext, _call: &ToolCallView) -> Option<String> {
+        None
+    }
+
+    /// News after a tool call returned.
+    ///
+    /// Observational, like the event bus, but typed: the output is here rather
+    /// than in a JSON blob, and a plugin that wants to count calls does not
+    /// have to parse anything.
+    fn after_tool_call(&self, _ctx: &TurnContext, _call: &ToolCallView, _ok: bool) {}
+}
+
+/// What a plugin is told about the turn it is being asked about.
+///
+/// Passed by reference and read-only: a plugin answers a question, it does not
+/// own the turn. Everything here is a snapshot for this one call.
+pub struct TurnContext {
+    /// The conversation this turn belongs to.
+    pub session: String,
+    /// The user's message that started it.
+    pub input: String,
+    /// The model in force, so a plugin can answer differently per route.
+    pub model: String,
+    /// Skill ids with their one-line descriptions.
+    ///
+    /// Here rather than behind a service lookup because every prompt-side
+    /// question starts by looking at what skills exist.
+    pub skills: Vec<(String, String)>,
+}
+
+/// One tool call, as a plugin sees it.
+pub struct ToolCallView {
+    /// Tool name.
+    pub name: String,
+    /// Raw JSON arguments.
+    pub arguments: String,
 }
 
 /// A permission decision.
@@ -851,6 +924,83 @@ impl Kernel {
     /// Names of defined plugins.
     pub fn plugin_names(&self) -> Vec<String> {
         self.plugins.keys().cloned().collect()
+    }
+
+    /// Ask every active plugin for prompt text, in load order.
+    ///
+    /// No registry and no point names: the kernel asks the question it knows
+    /// how to ask, and a plugin answers by having implemented the method. A
+    /// plugin that does not care returns `None` for free.
+    pub fn prompt_additions(&self, ctx: &TurnContext) -> Vec<String> {
+        let mut out = Vec::new();
+        for plugin in self.active_plugins() {
+            if let Some(text) = plugin.build_prompt(ctx) {
+                if !text.trim().is_empty() {
+                    out.push(text);
+                }
+            }
+        }
+        out
+    }
+
+    /// Run the tool-name list past every active plugin, in load order.
+    ///
+    /// Each filter sees the previous one's output, so two packs can narrow the
+    /// same table without either knowing about the other. The result is for one
+    /// request only — nothing is unregistered, so the next turn starts whole.
+    pub fn filter_tools(&self, ctx: &TurnContext, mut names: Vec<String>) -> Vec<String> {
+        for plugin in self.active_plugins() {
+            if let Some(narrowed) = plugin.filter_tools(ctx, names.clone()) {
+                names = narrowed;
+            }
+        }
+        names
+    }
+
+    /// The first refusal for a tool call, if any plugin has one.
+    ///
+    /// First rather than all: a refusal is an answer to the model, and two
+    /// answers to one call would need a format the tool result does not have.
+    /// Load order decides, which is also the order the panel lists packs in.
+    pub fn refuse_tool_call(&self, ctx: &TurnContext, call: &ToolCallView) -> Option<String> {
+        self.active_plugins()
+            .into_iter()
+            .find_map(|plugin| plugin.before_tool_call(ctx, call))
+    }
+
+    /// Tell every active plugin that a tool call finished.
+    pub fn note_tool_call(&self, ctx: &TurnContext, call: &ToolCallView, ok: bool) {
+        for plugin in self.active_plugins() {
+            plugin.after_tool_call(ctx, call, ok);
+        }
+    }
+
+    /// A [`crate::agent::PluginHooks`] view over this kernel.
+    ///
+    /// The loop asks through this rather than holding the kernel: a turn can
+    /// run for minutes, and pinning the kernel for its duration would block
+    /// every reload. The view upgrades a weak handle per call, so a kernel that
+    /// is gone simply answers nothing.
+    pub fn hook_view(kernel: &Arc<std::sync::Mutex<Self>>) -> Arc<dyn crate::agent::PluginHooks> {
+        Arc::new(KernelHooks { kernel: Arc::downgrade(kernel) })
+    }
+
+    /// The plugins behind active fibers, in fiber order.
+    ///
+    /// Fiber order rather than name order: it is load order, which is the order
+    /// a user sees in the pack panel and the order a later pack's override is
+    /// expected to win in.
+    fn active_plugins(&self) -> Vec<Arc<dyn Plugin>> {
+        let mut fibers: Vec<&Fiber> = self
+            .fibers
+            .values()
+            .filter(|fiber| fiber.state == FiberState::Active)
+            .collect();
+        fibers.sort_by_key(|fiber| fiber.id);
+        fibers
+            .into_iter()
+            .filter_map(|fiber| self.plugins.get(&fiber.plugin).cloned())
+            .collect()
     }
 
     /// A realm-scoped service view.
@@ -2615,5 +2765,67 @@ mod tests {
             configs.iter().all(|config| config.contains("42")),
             "configuration survived the automatic reload: {configs:?}"
         );
+    }
+}
+
+/// [`crate::agent::PluginHooks`] implemented over a live kernel.
+struct KernelHooks {
+    kernel: std::sync::Weak<std::sync::Mutex<Kernel>>,
+}
+
+impl KernelHooks {
+    /// Run `f` against the kernel if it is still alive.
+    fn with<R>(&self, f: impl FnOnce(&Kernel) -> R) -> Option<R> {
+        let strong = self.kernel.upgrade()?;
+        let guard = strong.lock().ok()?;
+        Some(f(&guard))
+    }
+
+    fn turn_context(&self, input: &str, model: &str) -> TurnContext {
+        TurnContext {
+            session: String::new(),
+            input: input.to_string(),
+            model: model.to_string(),
+            skills: Vec::new(),
+        }
+    }
+}
+
+impl crate::agent::PluginHooks for KernelHooks {
+    fn prompt_additions(&self, input: &str, model: &str) -> Vec<String> {
+        let ctx = self.turn_context(input, model);
+        self.with(|kernel| kernel.prompt_additions(&ctx)).unwrap_or_default()
+    }
+
+    fn filter_tools(
+        &self,
+        input: &str,
+        model: &str,
+        names: Vec<String>,
+    ) -> Option<Vec<String>> {
+        let ctx = self.turn_context(input, model);
+        let mut keep: Option<Vec<String>> = None;
+        self.with(|kernel| {
+            let mut current = names;
+            for plugin in kernel.active_plugins() {
+                if let Some(next) = plugin.filter_tools(&ctx, current.clone()) {
+                    current = next;
+                }
+            }
+            keep = Some(current);
+        })?;
+        keep
+    }
+
+    fn refuse_call(&self, input: &str, model: &str, name: &str, arguments: &str) -> Option<String> {
+        let ctx = self.turn_context(input, model);
+        let call = ToolCallView { name: name.to_string(), arguments: arguments.to_string() };
+        self.with(|kernel| kernel.refuse_tool_call(&ctx, &call)).flatten()
+    }
+
+    fn note_call(&self, input: &str, model: &str, name: &str, ok: bool) {
+        let ctx = self.turn_context(input, model);
+        let call = ToolCallView { name: name.to_string(), arguments: String::new() };
+        self.with(|kernel| kernel.note_tool_call(&ctx, &call, ok));
     }
 }

@@ -91,6 +91,34 @@ pub struct TurnSettings {
     pub injection: Arc<crate::context::InjectionEngine>,
     /// Cache policy, which decides whether a prefix injection is allowed.
     pub cache_policy: crate::hotreload::CachePolicy,
+    /// Ask the loaded plugins what they want done for this turn.
+    ///
+    /// A trait object rather than a kernel reference: the loop must not hold
+    /// the kernel while a turn runs, and a test can substitute one with no
+    /// kernel at all. `None` means "no plugins", which is the headless case.
+    pub plugin_hooks: Option<Arc<dyn PluginHooks>>,
+}
+
+/// What the agent loop asks plugins, without knowing anything about them.
+///
+/// Three questions: what to add to the prompt, what to drop from the tool
+/// table, and whether to refuse a call. The kernel answers them; the loop only
+/// relays. This is the seam that means a new capability does not need a new
+/// field on any struct — the plugin implements a method and the loop already
+/// asks.
+pub trait PluginHooks: Send + Sync {
+    /// Extra prompt text for this turn, in load order.
+    fn prompt_additions(&self, input: &str, model: &str) -> Vec<String>;
+    /// Which of these tool names survive for this turn.
+    ///
+    /// Names rather than definitions: the registry owns the handlers, and
+    /// handing them out to be rebuilt invites a plugin to drop one by accident.
+    /// Returning `None` keeps the table whole.
+    fn filter_tools(&self, input: &str, model: &str, names: Vec<String>) -> Option<Vec<String>>;
+    /// The first refusal for one call, if any.
+    fn refuse_call(&self, input: &str, model: &str, name: &str, arguments: &str) -> Option<String>;
+    /// News that a call finished.
+    fn note_call(&self, input: &str, model: &str, name: &str, ok: bool);
 }
 
 /// Supplies turn settings.
@@ -155,6 +183,10 @@ impl TurnConfig for StaticConfig {
             policy: Arc::clone(&self.policy),
             injection: Arc::clone(&self.injection),
             cache_policy: self.cache_policy,
+            // A static config carries no kernel, so nothing is asked. Tests and
+            // embeddings get the loop without plugins, which is the point of
+            // the static shape.
+            plugin_hooks: None,
         }
     }
 }
@@ -571,7 +603,21 @@ impl Agent {
         // halfway through its work. Copying the table is cheap — every handler
         // is an `Arc` — and the copy is what keeps the code it names alive
         // until this turn returns.
-        let tools = Arc::new((*settings.tools).clone());
+        // The plugin seam narrows the table for this turn. Skipped entirely
+        // when no plugin is loaded, so the common case pays nothing.
+        let mut snapshot_tools = (*settings.tools).clone();
+        if let Some(hooks) = &settings.plugin_hooks {
+            let all = snapshot_tools.names();
+            if let Some(keep) = hooks.filter_tools(prompt, &settings.model, all.clone()) {
+                let keep: std::collections::HashSet<String> = keep.into_iter().collect();
+                for name in all {
+                    if !keep.contains(&name) {
+                        snapshot_tools.unregister(&name);
+                    }
+                }
+            }
+        }
+        let tools = Arc::new(snapshot_tools);
 
         // The session identity is frozen the same way, and for a sharper
         // reason: the desktop pins "the current session" onto one shared tool
@@ -1382,9 +1428,28 @@ impl Agent {
         //
         // Joined with a blank line, the bytes of each fragment stay verbatim, so a
         // pack's rule text is still exactly what its author wrote.
+        let mut added: Vec<String> = Vec::new();
         let mut head: Vec<&str> = Vec::new();
         if !settings.system_prompt.is_empty() {
             head.push(&settings.system_prompt);
+        }
+        // What the plugins want added, requested here rather than baked into
+        // `system_prompt`: only this point knows the user's message, which is
+        // the whole input of a retriever.
+        if let Some(hooks) = &settings.plugin_hooks {
+            // The newest user message is this turn's input; the loop has already
+            // pushed it by the time a request is built, so reading it back off
+            // the history is exact rather than a remembered copy.
+            let input = self
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == crate::message::Role::User)
+                .map(|m| m.text())
+                .unwrap_or_default();
+            for text in hooks.prompt_additions(&input, &settings.model) {
+                added.push(text);
+            }
         }
         // A prefix fragment is a standing rule: it belongs above the history,
         // and under CacheFirst the engine has already moved it elsewhere rather
@@ -1749,6 +1814,7 @@ mod tests {
                     policy: Arc::new(window::DefaultContextPolicy::default()),
                     injection: Arc::new(crate::context::InjectionEngine::new()),
                     cache_policy: crate::hotreload::CachePolicy::default(),
+                    plugin_hooks: None,
                 }
             }
         }

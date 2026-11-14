@@ -319,6 +319,13 @@ pub struct SharedConfig {
     /// board whose mission tools this turn cannot reach — worse than naming no
     /// mission at all — so both are written by one setter.
     pub mission_scope: Mutex<Option<(PathBuf, String)>>,
+    /// The live kernel, for asking plugins what they want to add.
+    ///
+    /// A weak handle rather than the kernel itself: the kernel owns the tools
+    /// and the fibers, and holding it strongly here would keep it alive when
+    /// the app is shutting down. `None` means the turn runs without asking
+    /// plugins anything, which is what a headless test wants.
+    pub kernel: Arc<Mutex<Option<std::sync::Weak<Mutex<nguruvilu::plugin::Kernel>>>>>,
 }
 
 impl SharedConfig {
@@ -572,6 +579,9 @@ impl AppState {
             // prompt names a mission from the first turn, not from the first
             // switch.
             mission_scope: Mutex::new(None),
+            // Wired after the kernel exists; a turn that runs before then
+            // simply gets no plugin additions.
+            kernel: Arc::new(Mutex::new(None)),
         });
 
         let store = JsonlStore::open(sessions_root())?;

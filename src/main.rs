@@ -684,6 +684,10 @@ impl TurnConfig for CliConfig {
             policy: Arc::clone(&self.policy.lock().expect("policy lock")),
             injection: Arc::clone(&self.injection.lock().expect("injection lock")),
             cache_policy: snapshot.cache_policy,
+            // The command-line path already assembled its prompt above; the
+            // plugin seam exists for the desktop shell, which has a kernel to
+            // ask.
+            plugin_hooks: None,
         }
     }
 }
