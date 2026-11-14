@@ -332,6 +332,111 @@ fn effort_already_refused(base_url: &str, effort: &str) -> bool {
 }
 
 /// Record a refusal for the rest of the process.
+// ---------------------------------------------------------------- capabilities
+//
+// Whether a route accepts a given shape is not something the OpenAI format
+// answers: providers that claim compatibility disagree about optional fields,
+// and the disagreement arrives as a 400 on the whole request rather than a note
+// about one field. This file uses both ways of knowing:
+//
+//   * A static table for what was measured by hand (`MODEL_CAPS`).
+//   * Runtime refusal for everything else (`TOOL_IMAGE_REFUSED`), the same
+//     pattern `REFUSED_EFFORTS` already follows.
+//
+// The table wins when it has an opinion, because it was measured deliberately;
+// the runtime memory fills the rest, so a route nobody tested still works after
+// one wasted round trip instead of never working at all.
+
+/// One measured capability of a model.
+///
+/// `None` means "not measured", which is not the same as `false` ("measured, and
+/// it does not work"). A model missing from the table is unknown, not broken.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModelCaps {
+    /// The model reads images at all. `Some(false)` means the provider accepts
+    /// the request and drops the picture silently — DeepSeek's flash routes do
+    /// exactly that, which is worse than a rejection because nothing fails.
+    pub vision: Option<bool>,
+    /// A `role: "tool"` message may carry an `image_url` part. DeepSeek's docs
+    /// say yes ("for image input"); the OpenAI wire format says no, because a
+    /// tool message's content is a string. Measured per route.
+    pub image_in_tool_result: Option<bool>,
+}
+
+/// Capabilities measured by hand, matched by model substring.
+///
+/// Substring rather than exact id: a route is usually a family
+/// (`deepseek/deepseek-v4.1-flash`, `-fast`, `-ultrafast`), and the measured
+/// behaviour has been the family's rather than the variant's.
+const MODEL_CAPS: &[(&str, ModelCaps)] = &[
+    // Measured: accepts the request, reports `image_tokens: 0`, answers nothing.
+    // Format-legal, useless.
+    (
+        "deepseek-v4.1-flash",
+        ModelCaps { vision: Some(false), image_in_tool_result: Some(true) },
+    ),
+    (
+        "deepseek-v4-flash-vision-exp",
+        ModelCaps { vision: Some(false), image_in_tool_result: Some(true) },
+    ),
+    // Measured: read a 40x40 red square correctly.
+    ("mimo-v2.6-flash", ModelCaps { vision: Some(true), image_in_tool_result: Some(true) }),
+    ("minimax-m3", ModelCaps { vision: Some(true), image_in_tool_result: Some(true) }),
+];
+
+/// What is known about a model, static table first.
+pub fn model_caps(model: &str) -> ModelCaps {
+    let lower = model.to_ascii_lowercase();
+    for (needle, caps) in MODEL_CAPS {
+        if lower.contains(&needle.to_ascii_lowercase()) {
+            return *caps;
+        }
+    }
+    ModelCaps::default()
+}
+
+/// Routes that rejected an image inside a tool result.
+static TOOL_IMAGE_REFUSED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
+
+fn route_key(base_url: &str, model: &str) -> String {
+    format!(
+        "{}\u{1}{}",
+        base_url.trim().trim_end_matches('/').to_ascii_lowercase(),
+        model.trim()
+    )
+}
+
+fn remember_tool_image_refused(base_url: &str, model: &str) {
+    let key = route_key(base_url, model);
+    let mut table = TOOL_IMAGE_REFUSED.lock().expect("tool image table");
+    table
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(key);
+}
+
+/// Whether this route may carry an image inside a tool result.
+///
+/// The static table answers when it has an opinion; otherwise a route that has
+/// not refused before gets the benefit of the doubt, because DeepSeek's shape
+/// keeps the transcript clean and every other route falls back after one 400.
+pub fn tool_image_allowed(base_url: &str, model: &str) -> bool {
+    if let Some(measured) = model_caps(model).image_in_tool_result {
+        return measured;
+    }
+    let key = route_key(base_url, model);
+    let table = TOOL_IMAGE_REFUSED.lock().expect("tool image table");
+    !table.as_ref().map(|set| set.contains(&key)).unwrap_or(false)
+}
+
+/// Whether this model reads images, when that has been measured.
+///
+/// `None` means unknown, and callers should try rather than refuse: guessing
+/// against a capable model costs more than one wasted request.
+pub fn model_reads_images(model: &str) -> Option<bool> {
+    model_caps(model).vision
+}
+
 fn remember_refused_effort(base_url: &str, effort: &str) {
     let key = refused_key(base_url, effort);
     let mut table = REFUSED_EFFORTS.lock().expect("refused table");
@@ -497,7 +602,18 @@ impl LlmClient {
             .get("reasoning_effort")
             .and_then(Value::as_str)
             .map(str::to_string);
-        match (self.dispatch(body).await, refused_word) {
+        match (self.dispatch(body.clone()).await, refused_word) {
+            // An image inside a tool result is the second shape a provider may
+            // refuse. The fallback is the same idea: remember the refusal on
+            // this route and ask again with the shape every provider accepts
+            // (the image travels as a user message instead).
+            (Err(error), _) if self.endpoint_refused_tool_image(&error) => {
+                remember_tool_image_refused(&self.config.base_url, &self.config.model);
+                eprintln!(
+                    "[llm] this route rejects images inside tool results;                      sending them as user messages from now on"
+                );
+                self.dispatch(self.build_body(messages, tools)).await
+            }
             (Err(error), Some(word)) if self.endpoint_refused_effort(&error) => {
                 // The endpoint names `reasoning_effort` in its rejection, so the
                 // field is the problem and not the turn. Ask once more without
@@ -532,6 +648,25 @@ impl LlmClient {
     /// Narrow on purpose: a 400 that names `reasoning_effort` says the word is
     /// wrong, while any other 400 is about the request as a whole and must
     /// reach the caller unchanged.
+    /// Whether this failure is the endpoint rejecting an image in a tool result.
+    ///
+    /// Narrow like `endpoint_refused_effort`: the rejection has to name the
+    /// field we added, otherwise a 400 about something else would silently cost
+    /// this route its images for good.
+    fn endpoint_refused_tool_image(&self, error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<RequestError>()
+                .map(|failure| {
+                    failure.status == Some(400)
+                        && (failure.message.contains("image_url")
+                            || failure.message.contains("tool")
+                            || failure.message.contains("content"))
+                })
+                .unwrap_or(false)
+        })
+    }
+
     fn endpoint_refused_effort(&self, error: &anyhow::Error) -> bool {
         error.chain().any(|cause| {
             cause
@@ -882,7 +1017,11 @@ impl LlmClient {
         true
     }
     fn build_body(&self, messages: &[Message], tools: &[Value]) -> Value {
-        let wire: Vec<Value> = messages.iter().map(to_wire).collect();
+        let tool_images = tool_image_allowed(&self.config.base_url, &self.config.model);
+        let wire: Vec<Value> = messages
+            .iter()
+            .map(|m| to_wire_with(m, tool_images))
+            .collect();
         let mut body = json!({
             "model": self.config.model,
             "messages": wire,
@@ -1307,6 +1446,16 @@ async fn handle_line(
 
 /// Convert one neutral message to the OpenAI wire shape.
 pub fn to_wire(message: &Message) -> Value {
+    to_wire_with(message, false)
+}
+
+/// Convert one message, choosing whether a tool result may carry images.
+///
+/// `tool_images` comes from [`tool_image_allowed`]. When false, the tool message
+/// keeps its text and any images it carried are dropped here — the caller is
+/// responsible for re-attaching them as a user message, which is what the agent
+/// loop already does for every attachment.
+pub fn to_wire_with(message: &Message, tool_images: bool) -> Value {
     let mut obj = json!({ "role": message.role.as_wire() });
 
     match message.role {
@@ -1329,7 +1478,27 @@ pub fn to_wire(message: &Message) -> Value {
             obj["tool_calls"] = json!(calls);
         }
         crate::message::Role::Tool => {
-            obj["content"] = json!(message.text());
+            // DeepSeek's docs allow an image part here ("for image input"),
+            // while the OpenAI format allows only a string. Which one applies is
+            // per route, so it is decided by the capability table and, when that
+            // has no opinion, by whether the route refused before.
+            if tool_images && !message.images.is_empty() {
+                let mut parts: Vec<Value> = Vec::with_capacity(message.images.len() + 1);
+                let text = message.text();
+                if !text.is_empty() {
+                    parts.push(json!({ "type": "text", "text": text }));
+                }
+                for image in &message.images {
+                    let mut url = json!({ "url": image.url });
+                    if let Some(detail) = &image.detail {
+                        url["detail"] = json!(detail);
+                    }
+                    parts.push(json!({ "type": "image_url", "image_url": url }));
+                }
+                obj["content"] = json!(parts);
+            } else {
+                obj["content"] = json!(message.text());
+            }
             if let Some(id) = &message.tool_call_id {
                 obj["tool_call_id"] = json!(id);
             }

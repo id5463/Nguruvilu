@@ -845,3 +845,51 @@ async fn executing_a_tool_emits_start_and_end_with_the_verdict() {
     assert_eq!(seen[3].1, Some(false), "broken: ok=false");
     assert_eq!(seen[3].2, "broken");
 }
+
+/// An image inside a tool result travels according to the measured table.
+///
+/// The two shapes are not cosmetic. A tool message whose content is an array is
+/// a DeepSeek extension; the OpenAI format allows only a string there, so a
+/// route that does not accept it answers 400 and the whole turn is lost. The
+/// table says which shape each measured route wants, and an unmeasured route
+/// is given the benefit of the doubt (it falls back once, then remembers).
+#[test]
+fn tool_result_images_follow_the_measured_capability_table() {
+    use nguruvilu::llm::{model_caps, to_wire_with};
+
+    // Measured: DeepSeek flash accepts the array shape (though it drops the
+    // picture); the vision-capable routes accept it and read it.
+    for route in [
+        "deepseek/deepseek-v4.1-flash",
+        "xiaomi/mimo-v2.6-flash",
+        "MiniMaxAI/MiniMax-M3",
+    ] {
+        assert_eq!(
+            model_caps(route).image_in_tool_result,
+            Some(true),
+            "{route} was measured as accepting an image inside a tool result"
+        );
+    }
+
+    // A route nobody measured has no opinion, which the caller reads as "try".
+    assert_eq!(model_caps("some/unknown-model").image_in_tool_result, None);
+
+    // And the wire shape follows the flag.
+    let mut result = nguruvilu::message::Message::tool_result("c1", "read", "x.png is an image");
+    result.images.push(nguruvilu::message::ImageAttachment::url(
+        "data:image/png;base64,AAAA",
+    ));
+
+    let with_images = to_wire_with(&result, true);
+    assert!(
+        with_images["content"].is_array(),
+        "the capable shape puts text and image parts in one array"
+    );
+    assert_eq!(with_images["content"][1]["type"], "image_url");
+
+    let without = to_wire_with(&result, false);
+    assert_eq!(
+        without["content"], "x.png is an image",
+        "the plain shape keeps a string and drops the picture, which the caller re-attaches"
+    );
+}

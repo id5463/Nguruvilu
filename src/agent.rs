@@ -992,6 +992,12 @@ impl Agent {
                 // the only place the format allows them.
                 let mut attached: Vec<(String, crate::message::ImageAttachment)> = Vec::new();
 
+                // Decided once for the batch: whether this route can carry an
+                // image inside the tool result itself, from the measured table.
+                let tool_images_ok = crate::llm::model_caps(&settings.model)
+                    .image_in_tool_result
+                    .unwrap_or(true);
+
                 for (position, call) in tool_calls.iter().enumerate() {
                     let result = match results[position].take() {
                         Some((_, result)) => result,
@@ -1010,23 +1016,40 @@ impl Agent {
                         None => Err(anyhow::anyhow!("tool panicked: {}", call.name)),
                     };
                     outcome.tool_calls += 1;
+                    let mut images_for_this_call: Vec<crate::message::ImageAttachment> =
+                        Vec::new();
                     let (ok, body) = match result {
                         Ok(output) => {
                             for image in output.images {
-                                attached.push((call.name.clone(), image));
+                                if tool_images_ok {
+                                    images_for_this_call.push(image);
+                                } else {
+                                    attached.push((call.name.clone(), image));
+                                }
                             }
                             (true, output.text)
                         }
                         Err(error) => (false, format!("error: {}", summarize_tool_error(&error))),
                     };
                     self.observer.on_tool_end(&call.name, ok, &body);
-                    let message = Message::tool_result(call.id.clone(), call.name.clone(), body);
+                    let mut message =
+                        Message::tool_result(call.id.clone(), call.name.clone(), body);
+                    // Images stay on the tool result when the route can carry
+                    // them; otherwise they are collected below and re-attached
+                    // as a user message, the shape every provider accepts.
+                    if tool_images_ok {
+                        message.images = images_for_this_call;
+                    }
                     self.messages.push(message.clone());
                     outcome.new_messages.push(message);
                     self.observer.on_message(self.messages.last().expect("just pushed"));
                 }
 
-                if !attached.is_empty() {
+                // When the route accepts images inside a tool result, they are
+                // already on the message that carried them and this extra user
+                // turn is pure noise: a second "user said something" the model
+                // never had, costing a turn of history per picture.
+                if !attached.is_empty() && !tool_images_ok {
                     let mut text = String::from("Image(s) produced by the tool call above:");
                     for (tool, image) in &attached {
                         text.push_str(&format!(
