@@ -1086,50 +1086,6 @@ pub(crate) async fn dispatch(
             }
         }
 
-        // Edit one field of the skill-judge settings. The panel sends
-        // `{key: "jev.model", value: "..."}`, dotted so a single setter covers
-        // every mode without a command per field.
-        "set_skill_config" => {
-            let key = command.get("key").and_then(|v| v.as_str()).unwrap_or("");
-            let value = command.get("value").and_then(|v| v.as_str()).unwrap_or("");
-            match state
-                .lock()
-                .expect("state lock")
-                .set_skill_config(key, value)
-            {
-                Ok(()) => {
-                    emit(&sink, json!({ "ev": "skill_config", "key": key }));
-                    let status = state.lock().expect("state lock").describe();
-                    emit(&sink, json!({ "ev": "status", "status": status }));
-                }
-                Err(error) => emit(
-                    &sink,
-                    json!({ "ev": "error", "message": format!("保存技能设置失败：{error:#}") }),
-                ),
-            }
-        }
-
-        // Ask the configured decision model one real question, so "is it
-        // configured right" is answered by the provider instead of by a guess
-        // about whether the fields look filled in.
-        "test_skill_judge" => {
-            // The config is copied out and the lock released before the await:
-            // holding a std `MutexGuard` across one makes this whole dispatch
-            // future non-`Send`, which the relay lane requires.
-            let config = state
-                .lock()
-                .expect("state lock")
-                .skill_judge_config();
-            let result = crate::state::test_skill_judge(&config).await;
-            match result {
-                Ok(detail) => emit(&sink, json!({ "ev": "skill_test", "ok": true, "detail": detail })),
-                Err(error) => emit(
-                    &sink,
-                    json!({ "ev": "skill_test", "ok": false, "error": format!("{error:#}") }),
-                ),
-            }
-        }
-
         "apply_pack" => {
             let path = command.get("path").and_then(|v| v.as_str()).unwrap_or("");
             if path.is_empty() {

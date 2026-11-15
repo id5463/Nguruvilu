@@ -97,15 +97,6 @@ pub struct TurnSettings {
     /// the kernel while a turn runs, and a test can substitute one with no
     /// kernel at all. `None` means "no plugins", which is the headless case.
     pub plugin_hooks: Option<Arc<dyn PluginHooks>>,
-    /// The skill catalog for this turn, already narrowed by whichever mode is
-    /// configured.
-    ///
-    /// Computed before the loop starts rather than inside `build_request`,
-    /// because deciding can mean asking a model and `build_request` is
-    /// synchronous. Placing it here also makes the catalog part of the frozen
-    /// turn: a mode switch mid-turn cannot change what the model was told it
-    /// had, which is the same rule the tool table follows.
-    pub skill_catalog: Option<String>,
 }
 
 /// What the agent loop asks plugins, without knowing anything about them.
@@ -129,7 +120,7 @@ pub trait PluginHooks: Send + Sync {
     /// News that a call finished.
     fn note_call(&self, input: &str, model: &str, name: &str, ok: bool);
     /// Pass one piece of data through every plugin that wants it.
-    fn intercept(&self, input: &str, model: &str, slot: crate::plugin::Slot) -> crate::plugin::Slot;
+    fn intercept(&self, input: &str, model: &str, seam: crate::plugin::Seam) -> crate::plugin::Seam;
 }
 
 /// Supplies turn settings.
@@ -198,7 +189,6 @@ impl TurnConfig for StaticConfig {
             // embeddings get the loop without plugins, which is the point of
             // the static shape.
             plugin_hooks: None,
-            skill_catalog: None,
         }
     }
 }
@@ -249,9 +239,130 @@ pub struct AgentOutcome {
     pub retries: u32,
 }
 
+/// Everything a turn's loop works on, handed over wholesale.
+///
+/// The fields are public on purpose. This is the price of a replaceable loop:
+/// a pack that writes its own has to see the conversation, the tools, the
+/// client, the cancel signal and the budget, because a loop that cannot see
+/// those cannot run a step. Keeping them private and passing a curated view
+/// would mean the view, not the loop, decides what is possible — which is the
+/// shape this file just spent its history growing out of.
+///
+/// What is *not* here is as deliberate: no kernel handle, no plugin registry.
+/// A loop asks the tool registry for a call and the client for a step; anything
+/// more would make the loop depend on the machinery that chose it.
+pub struct LoopState {
+    /// The conversation, including anything appended by this turn so far.
+    pub messages: Vec<Message>,
+    /// The model client.
+    pub client: LlmClient,
+    /// The tools this turn may call.
+    pub tools: Arc<ToolRegistry>,
+    /// The turn's frozen settings.
+    pub settings: TurnSettings,
+    /// Streaming callbacks, so a custom loop still paints the transcript.
+    pub observer: Arc<dyn AgentObserver>,
+    /// What a summary is written by.
+    pub summarizer: Arc<dyn Summarizer>,
+    /// The session this turn belongs to, for tool attribution.
+    pub identity: Option<crate::tools::ToolIdentity>,
+    /// A stop request from the host.
+    pub cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Messages the host wants delivered mid-turn.
+    pub inbox: Option<Arc<std::sync::Mutex<VecDeque<String>>>>,
+    /// Step cap for this turn.
+    pub max_steps: usize,
+    /// Whether this turn is somebody's subtask.
+    pub subtask: bool,
+    /// What a stop reports as the error.
+    pub stop_reason: String,
+    /// Injection engine override, for tests and embedding.
+    pub injection_override: Option<Arc<crate::context::InjectionEngine>>,
+    /// The user's message that started this turn.
+    ///
+    /// Carried rather than read back off `messages`: a loop decides where the
+    /// turn's history begins, and the first message of the turn is not
+    /// necessarily the last user message once a loop has appended its own.
+    pub start_prompt: String,
+}
+
+/// The loop a turn runs on.
+///
+/// One method, and the whole turn's state goes in and comes out. The default is
+/// [`Agent`]'s own loop, which is what every existing caller gets; a pack that
+/// wants a different shape — a tree search, a vote across routes, a loop that
+/// stops only when a person says so — supplies its own and is not second-class:
+/// nothing in the kernel asks whether the loop is "the real one".
+///
+/// Being replaceable does not mean being replaced. A build that never installs
+/// another loop runs exactly the code it ran before.
+pub trait AgentLoop: Send + Sync {
+    /// Run one turn to its end.
+    ///
+    /// `state` is owned, not borrowed: a loop that spawns work with the
+    /// conversation in hand cannot do that through a borrow that must outlive
+    /// the spawn. Whatever the loop changes is left in `state` when it returns,
+    /// and the caller reads it back out.
+    fn run<'a>(
+        &'a self,
+        state: LoopState,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (LoopState, Result<AgentOutcome>)> + Send + 'a>>;
+}
+
 /// How many times one answer may be continued after hitting the provider's
 /// output ceiling, before the loop stops extending it.
 const MAX_CONTINUATIONS: usize = 3;
+
+/// The loop every build has, wrapped so it can be chosen like any other.
+///
+/// It does not reimplement anything: it builds an [`Agent`] from the state,
+/// runs the same `run` the kernel always had, and hands the conversation back.
+/// That is deliberate — a "built-in loop" that had drifted from the one every
+/// caller gets would mean two behaviours to keep correct, and the point of the
+/// trait is that replacing the loop is ordinary, not that the default is
+/// special.
+pub struct BuiltinLoop;
+
+impl AgentLoop for BuiltinLoop {
+    fn run<'a>(
+        &'a self,
+        mut state: LoopState,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = (LoopState, Result<AgentOutcome>)> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut agent = Agent::new(
+                state.client.clone(),
+                Arc::new(StaticStateConfig { settings: state.settings.clone() }),
+                std::mem::take(&mut state.messages),
+            );
+            agent.max_steps = state.max_steps;
+            agent.observer = Arc::clone(&state.observer);
+            agent.summarizer = Arc::clone(&state.summarizer);
+            agent.identity = state.identity.clone();
+            agent.cancel = state.cancel.clone();
+            agent.inbox = state.inbox.clone();
+            agent.subtask = state.subtask;
+            agent.stop_reason = state.stop_reason.clone();
+            agent.injection_override = state.injection_override.clone();
+            let prompt = state.start_prompt.clone();
+            let result = agent.run(&prompt).await;
+            state.messages = std::mem::take(&mut agent.messages);
+            (state, result)
+        })
+    }
+}
+
+/// A turn's settings held still, for a loop that has already been given them.
+struct StaticStateConfig {
+    settings: TurnSettings,
+}
+
+impl TurnConfig for StaticStateConfig {
+    fn settings(&self) -> TurnSettings {
+        self.settings.clone()
+    }
+}
 
 /// What a stopped turn reports as its error.
 const STOPPED: &str = "stopped by the user";
@@ -422,6 +533,12 @@ pub struct Agent {
     /// as the reason its subtask did not finish, and "stopped by the user" sends
     /// it looking for a user who did no such thing.
     stop_reason: String,
+    /// The loop this agent runs on, when it is not the built-in one.
+    ///
+    /// `None` means [`Agent`]'s own loop, which is what every caller had before
+    /// this field existed. A replaced loop is handed the state wholesale; see
+    /// [`AgentLoop`] for why that is the shape rather than a curated view.
+    replaced_loop: Option<Arc<dyn AgentLoop>>,
 }
 
 impl Agent {
@@ -440,6 +557,7 @@ impl Agent {
             identity: None,
             subtask: false,
             stop_reason: STOPPED.to_string(),
+            replaced_loop: None,
         }
     }
 
@@ -517,6 +635,51 @@ impl Agent {
     pub fn as_subtask(mut self) -> Self {
         self.subtask = true;
         self
+    }
+
+    /// Run this agent's turns on a different loop.
+    ///
+    /// Nothing here decides whether the loop is trustworthy: a host that
+    /// installs one has already decided that, the same way loading a pack is the
+    /// decision to trust the pack. The default is the built-in loop, and a build
+    /// that never calls this runs exactly the code it always ran.
+    pub fn with_loop(mut self, loop_impl: Arc<dyn AgentLoop>) -> Self {
+        self.replaced_loop = Some(loop_impl);
+        self
+    }
+
+    /// Hand this turn's state to a replaced loop.
+    ///
+    /// The conversation moves rather than being copied: a loop is free to append
+    /// thousands of messages and copying them out and back would double the peak
+    /// memory of every turn for a feature most builds never use.
+    fn take_state(&mut self, prompt: &str) -> LoopState {
+        let settings = self.config.settings();
+        LoopState {
+            messages: std::mem::take(&mut self.messages),
+            client: self.client.clone(),
+            tools: Arc::clone(&settings.tools),
+            settings,
+            observer: Arc::clone(&self.observer),
+            summarizer: Arc::clone(&self.summarizer),
+            identity: self.identity.clone(),
+            cancel: self.cancel.clone(),
+            inbox: self.inbox.clone(),
+            max_steps: self.max_steps,
+            subtask: self.subtask,
+            stop_reason: self.stop_reason.clone(),
+            injection_override: self.injection_override.clone(),
+            start_prompt: prompt.to_string(),
+        }
+    }
+
+    /// Take the conversation back from a replaced loop.
+    ///
+    /// Only the conversation comes back. A loop that changed the tool table or
+    /// the settings changed them for its own turn; the next turn reads those
+    /// from the configuration source like every turn did.
+    fn give_back(&mut self, state: LoopState) {
+        self.messages = state.messages;
     }
 
     /// Deliver host-queued user messages at step boundaries.
@@ -598,6 +761,17 @@ impl Agent {
     /// or when the user stops it. The shell never decides that such a mission is
     /// finished; it only refuses to walk away from it.
     pub async fn run(&mut self, prompt: &str) -> Result<AgentOutcome> {
+        // A replaced loop takes the whole turn, including committing the user's
+        // message: it owns the conversation while it runs, and splitting that
+        // between the caller and the loop would make the two disagree about
+        // where the turn's history begins.
+        if let Some(loop_impl) = self.replaced_loop.clone() {
+            let state = self.take_state(prompt);
+            let (state, result) = loop_impl.run(state).await;
+            self.give_back(state);
+            return result;
+        }
+
         let user_message = Message::user(prompt);
         self.messages.push(user_message.clone());
         // The prompt is committed before anything is attempted: asking the
@@ -606,6 +780,21 @@ impl Agent {
 
         // Frozen for the whole turn: a reload landing now is next turn's news.
         let settings = self.config.settings();
+
+        // The turn is announced before anything else happens, so a plugin that
+        // wants to seed the conversation does it once and at the top. Emitted
+        // rather than returned: a listener here may inject, and nothing about
+        // startup depends on its answer.
+        if let Some(hooks) = &settings.plugin_hooks {
+            hooks.intercept(
+                prompt,
+                &settings.model,
+                crate::plugin::Seam {
+                    name: "session-start".into(),
+                    body: serde_json::json!({ "input": prompt }),
+                },
+            );
+        }
 
         // The tool table is frozen with them, for a reason of its own: the
         // desktop releases a conversation's plugins when that conversation is
@@ -626,14 +815,12 @@ impl Agent {
             let filtered = hooks
                 .filter_tools(prompt, &settings.model, all.clone())
                 .or_else(|| {
-                    match hooks.intercept(
+                    let seam = hooks.intercept(
                         prompt,
                         &settings.model,
-                        crate::plugin::Slot::Tools(all.clone()),
-                    ) {
-                        crate::plugin::Slot::Tools(names) => Some(names),
-                        _ => None,
-                    }
+                        crate::plugin::Seam::names("tools", all.clone()),
+                    );
+                    seam.as_names()
                 });
             if let Some(keep) = filtered {
                 let keep: std::collections::HashSet<String> = keep.into_iter().collect();
@@ -727,6 +914,30 @@ impl Agent {
 
             for _ in 0..batch_size {
                 step += 1;
+                // The step is announced before its request is assembled, so a
+                // plugin can see which step this is and what the history holds.
+                // The answer is read: a listener may add text to the request,
+                // which is the one thing a per-step point is for.
+                let step_note = match &settings.plugin_hooks {
+                    Some(hooks) => {
+                        let seam = hooks.intercept(
+                            prompt,
+                            &settings.model,
+                            crate::plugin::Seam {
+                                name: "pre-step".into(),
+                                body: serde_json::json!({
+                                    "step": step,
+                                    "messages": self.messages.len(),
+                                }),
+                            },
+                        );
+                        seam.body
+                            .get("prompt")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    }
+                    None => None,
+                };
                 // A stop between steps ends the turn here: everything committed
                 // so far is already in the history and is reported with it.
                 if self.stop_requested() {
@@ -788,7 +999,7 @@ impl Agent {
                     }
                 }
 
-                let (request, injection) = self.build_request(&settings);
+                let (request, injection) = self.build_request(&settings, step_note.as_deref());
                 if !injection.is_empty() {
                     self.observer.on_injection(&injection);
                     let mut texts = injection.prefix.clone();
@@ -928,15 +1139,12 @@ impl Agent {
                     let original = out.text;
                     match &settings.plugin_hooks {
                         Some(hooks) => {
-                            let slot = hooks.intercept(
+                            let seam = hooks.intercept(
                                 prompt,
                                 &settings.model,
-                                crate::plugin::Slot::Reply(original.clone()),
+                                crate::plugin::Seam::text("reply", original.clone()),
                             );
-                            match slot {
-                                crate::plugin::Slot::Reply(replaced) => replaced,
-                                _ => original,
-                            }
+                            seam.as_text().map(str::to_string).unwrap_or(original)
                         }
                         None => original,
                     }
@@ -1010,9 +1218,46 @@ impl Agent {
                 // starting a whole set of tools anyway spends side effects nobody
                 // will read. The calls are answered below regardless, so the
                 // history stays complete either way.
+                // Refusals decided before spawning, folded in below so the batch
+                // keeps one shape.
+                let mut results_early: Vec<(usize, ToolCall, Result<crate::tools::ToolOutput>)> =
+                    Vec::new();
                 let mut stopped = self.stop_requested();
                 if !stopped {
                     for (position, call) in tool_calls.iter().enumerate() {
+                        // Asked before the call runs, once per call. A refusal is
+                        // handed back as the tool result, which is the only way to
+                        // tell the model why — the call already exists in the
+                        // history and dropping it would leave a request no
+                        // provider accepts.
+                        let refusal = settings.plugin_hooks.as_ref().and_then(|hooks| {
+                            let seam = hooks.intercept(
+                                prompt,
+                                &settings.model,
+                                crate::plugin::Seam {
+                                    name: "pre-tool".into(),
+                                    body: serde_json::json!({
+                                        "name": call.name,
+                                        "arguments": call.arguments,
+                                    }),
+                                },
+                            );
+                            seam.body
+                                .get("refuse")
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|reason| !reason.is_empty())
+                                .map(str::to_string)
+                        });
+                        if let Some(reason) = refusal {
+                            self.observer.on_tool_start(&call.name, &call.arguments);
+                            results_early.push((
+                                position,
+                                call.clone(),
+                                Err(anyhow::anyhow!(reason)),
+                            ));
+                            continue;
+                        }
+
                         let registry = Arc::clone(&tools);
                         let call = call.clone();
                         let identity = identity.clone();
@@ -1028,6 +1273,11 @@ impl Agent {
 
                 let mut results: Vec<Option<(ToolCall, Result<crate::tools::ToolOutput>)>> =
                     (0..tool_calls.len()).map(|_| None).collect();
+                for (position, call, result) in results_early {
+                    if let Some(slot) = results.get_mut(position) {
+                        *slot = Some((call, result));
+                    }
+                }
                 // Collecting is cancellable: a bash call that runs for minutes
                 // must not outlive the user's decision to stop watching it.
                 let mut stop = self.cancel.clone();
@@ -1093,6 +1343,23 @@ impl Agent {
                     .unwrap_or(true);
 
                 for (position, call) in tool_calls.iter().enumerate() {
+                    // Told after each call returns, before its result is shaped
+                    // into the history. Observe-only: the answer is not read, so a
+                    // listener can count, log or learn without being able to change
+                    // what the model sees.
+                    if let Some(hooks) = &settings.plugin_hooks {
+                        hooks.intercept(
+                            prompt,
+                            &settings.model,
+                            crate::plugin::Seam {
+                                name: "post-tool".into(),
+                                body: serde_json::json!({
+                                    "name": call.name,
+                                    "ok": results[position].as_ref().map(|(_, r)| r.is_ok()),
+                                }),
+                            },
+                        );
+                    }
                     let result = match results[position].take() {
                         Some((_, result)) => result,
                         // Killed mid-call: the call still gets an answer, because
@@ -1176,6 +1443,40 @@ impl Agent {
             // finished it, and that status — never a step count — is what makes a
             // turn endable.
             let mission = self.running_mission();
+
+            // The batch boundary is where a turn would end, so it is the point
+            // worth asking about. A listener that answers `continue` keeps the
+            // loop going — that is the one way a plugin can extend a turn, and it
+            // is why this is asked before any `return` below.
+            let asked_to_continue = match &settings.plugin_hooks {
+                Some(hooks) => {
+                    let seam = hooks.intercept(
+                        prompt,
+                        &settings.model,
+                        crate::plugin::Seam {
+                            name: "turn-stopping".into(),
+                            body: serde_json::json!({
+                                "step": step,
+                                "answered": answered,
+                                "budget_spent": step >= step_budget,
+                            }),
+                        },
+                    );
+                    seam.body
+                        .get("continue")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                }
+                None => false,
+            };
+            if asked_to_continue && step < step_budget.saturating_mul(4) {
+                // Bounded: a listener that always says continue must not be able
+                // to run the loop forever. Four times the normal allowance is
+                // enough room for the case this exists for — a plugin that needs
+                // one more round trip — and finite for a plugin that is wrong.
+                renewals += 1;
+                continue 'batches;
+            }
 
             match mission {
                 // No mission: exactly what this loop did before, unchanged. An
@@ -1445,7 +1746,11 @@ impl Agent {
     /// Injected fragments never enter `self.messages`. They are recomputed for
     /// every request, so a fragment that stops matching simply stops appearing,
     /// and the recorded conversation stays exactly what was said.
-    fn build_request(&self, settings: &TurnSettings) -> (Vec<Message>, crate::context::Injection) {
+    fn build_request(
+        &self,
+        settings: &TurnSettings,
+        step_note: Option<&str>,
+    ) -> (Vec<Message>, crate::context::Injection) {
         let window = settings.policy.window(&settings.model);
         let engine = self.injection_override.as_ref().unwrap_or(&settings.injection);
         let injection = engine.inject(&self.messages, window.tokens, settings.cache_policy);
@@ -1477,16 +1782,50 @@ impl Agent {
         // Joined with a blank line, the bytes of each fragment stay verbatim, so a
         // pack's rule text is still exactly what its author wrote.
         let mut added: Vec<String> = Vec::new();
-        let mut head: Vec<&str> = Vec::new();
-        if !settings.system_prompt.is_empty() {
-            head.push(&settings.system_prompt);
+        let mut head: Vec<String> = Vec::new();
+        // The system prompt goes through the plugins before it is sent.
+        //
+        // `Slot::Prompt` was declared with this exact comment — "the text about
+        // to be added to the system prompt" — and never created anywhere, so a
+        // plugin could rewrite a finished reply but not the standing text the
+        // model reads first. What that cost: anything that has to say something
+        // in the prompt had to change `TurnSettings` instead, and a field on
+        // `TurnSettings` is a field every front end has to fill.
+        //
+        // Only this block is offered. A plugin rewriting the conversation would
+        // be rewriting the record of what the user said, which the session file
+        // keeps verbatim on purpose.
+        let system_prompt = match &settings.plugin_hooks {
+            Some(hooks) => {
+                let input = self
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == crate::message::Role::User)
+                    .map(|m| m.text())
+                    .unwrap_or_default();
+                let seam = hooks.intercept(
+                    &input,
+                    &settings.model,
+                    crate::plugin::Seam::text("prompt", settings.system_prompt.clone()),
+                );
+                seam.as_text()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| settings.system_prompt.clone())
+            }
+            None => settings.system_prompt.clone(),
+        };
+        if !system_prompt.is_empty() {
+            head.push(system_prompt);
         }
-        // The skill catalog: already narrowed for this turn, so this only joins
-        // it. It sits above the history like any standing rule, because it is
-        // one — what the model may load is the same fact at step one and step
-        // nine, and putting it in `added` would repeat it in every request body.
-        if let Some(catalog) = &settings.skill_catalog {
-            head.push(catalog);
+        // What the `pre-step` listener asked to add for this step alone. Appended
+        // after the standing prompt so it cannot change the cached prefix, and
+        // bounded because a plugin that returns a novel every step would spend
+        // the window it was trying to help with.
+        if let Some(note) = step_note {
+            if !note.trim().is_empty() {
+                added.push(note.chars().take(4096).collect());
+            }
         }
         // What the plugins want added, requested here rather than baked into
         // `system_prompt`: only this point knows the user's message, which is
@@ -1510,7 +1849,7 @@ impl Agent {
         // and under CacheFirst the engine has already moved it elsewhere rather
         // than dropping it.
         for text in &injection.prefix {
-            head.push(text.as_str());
+            head.push(text.clone());
         }
         if !head.is_empty() {
             request.push(Message::system(head.join("\n\n")));
@@ -1607,7 +1946,7 @@ mod tests {
         let mut agent = Agent::new(client, Arc::clone(&config), vec![Message::user("问题")]);
         agent.set_injection(Arc::new(engine));
 
-        let (request, _) = agent.build_request(&config.settings());
+        let (request, _) = agent.build_request(&config.settings(), None);
         let leading = request
             .iter()
             .take_while(|m| m.role == crate::message::Role::System)
@@ -1643,7 +1982,7 @@ mod tests {
             .expect("client builds");
         let agent = Agent::new(client, Arc::clone(&config), vec![Message::user("hi")]);
 
-        let request = agent.build_request(&config.settings()).0;
+        let request = agent.build_request(&config.settings(), None).0;
         assert_eq!(request.len(), 2);
         assert_eq!(request[0].role, crate::message::Role::System);
         assert_eq!(request[0].text(), "SYS");
@@ -1654,7 +1993,7 @@ mod tests {
 
         // An empty prompt contributes no message at all.
         let bare: Arc<dyn TurnConfig> = Arc::new(StaticConfig::new("", Arc::clone(&tools), "m"));
-        assert_eq!(agent.build_request(&bare.settings()).0.len(), 1);
+        assert_eq!(agent.build_request(&bare.settings(), None).0.len(), 1);
     }
 
     /// The whole point of thinning, end to end: what leaves this process is
@@ -1688,7 +2027,7 @@ mod tests {
             history,
         );
 
-        let request = agent.build_request(&config.settings()).0;
+        let request = agent.build_request(&config.settings(), None).0;
 
         // Twelve results, the newest eight exact: the older four say they were
         // thinned instead of shipping twenty thousand characters each.
@@ -1741,7 +2080,7 @@ mod tests {
         let mut agent = Agent::new(client, Arc::clone(&config), vec![Message::user("hi")]);
         agent.set_injection(Arc::new(engine));
 
-        let (request, injection) = agent.build_request(&config.settings());
+        let (request, injection) = agent.build_request(&config.settings(), None);
         assert_eq!(injection.activated, vec!["rule"]);
         // The rule is above the history — and inside the same leading block as
         // the persona, because a strict gateway refuses a second `system`
@@ -1775,7 +2114,7 @@ mod tests {
         let mut agent = Agent::new(client, Arc::clone(&config), vec![Message::user("hi")]);
         agent.set_injection(Arc::new(engine));
 
-        let (request, _) = agent.build_request(&config.settings());
+        let (request, _) = agent.build_request(&config.settings(), None);
         assert_eq!(request.len(), 3);
         assert_eq!(request.last().unwrap().text(), "remember the deadline");
     }
@@ -1809,7 +2148,7 @@ mod tests {
         );
         agent.set_injection(Arc::new(engine));
 
-        let (request, _) = agent.build_request(&config.settings());
+        let (request, _) = agent.build_request(&config.settings(), None);
 
         // Find the assistant call and assert the very next message is its result.
         let call_index = request
@@ -1841,7 +2180,7 @@ mod tests {
         );
         agent.set_injection(Arc::new(engine));
 
-        let (request, _) = agent.build_request(&config.settings());
+        let (request, _) = agent.build_request(&config.settings(), None);
         // system, first, injected (depth 1 = before the newest), second.
         assert_eq!(request.len(), 4);
         assert_eq!(request[1].text(), "first");
@@ -3065,5 +3404,71 @@ mod tests {
             "no request is made for a turn already asked to stop"
         );
         drop(stop);
+    }
+
+    /// A loop that answers without asking the model, so the test can tell
+    /// whether the replaced loop ran at all.
+    struct ScriptedLoop {
+        answer: String,
+    }
+
+    impl AgentLoop for ScriptedLoop {
+        fn run<'a>(
+            &'a self,
+            mut state: LoopState,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = (LoopState, Result<AgentOutcome>)> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                let message = Message::assistant(&self.answer);
+                state.messages.push(message.clone());
+                let outcome = AgentOutcome {
+                    text: self.answer.clone(),
+                    new_messages: vec![message],
+                    steps: 0,
+                    tool_calls: 0,
+                    usage: TokenUsage::default(),
+                    timing: TurnTiming::default(),
+                    config_version: 0,
+                    injections: Vec::new(),
+                    compactions: Vec::new(),
+                    error: None,
+                    retries: 0,
+                };
+                (state, Ok(outcome))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_replaced_loop_runs_instead_of_the_built_in_one() {
+        // The point of the trait: a host that installs a loop gets that loop,
+        // and the kernel does not quietly run its own anyway. No provider is
+        // started here — a built-in loop would fail reaching one, so a passing
+        // answer is proof the replaced loop handled the turn.
+        let tools = Arc::new(ToolRegistry::with_base_tools().unwrap());
+        let config: Arc<dyn TurnConfig> = Arc::new(StaticConfig::new("SYS", tools, "m"));
+        let client = LlmClient::new(crate::llm::LlmConfig::new("http://127.0.0.1:1", "k", "m")).unwrap();
+        let mut agent = Agent::new(client, config, Vec::new())
+            .with_loop(Arc::new(ScriptedLoop { answer: "from the replaced loop".into() }));
+
+        let outcome = agent.run("hello").await.expect("the scripted loop answers");
+
+        assert_eq!(outcome.text, "from the replaced loop");
+        // The conversation the loop built is the one the agent keeps: a turn
+        // that ran on a replaced loop must not lose its history.
+        assert_eq!(agent.messages.len(), 1);
+        assert_eq!(agent.messages[0].text(), "from the replaced loop");
+    }
+
+    #[tokio::test]
+    async fn the_built_in_loop_still_runs_when_none_is_installed() {
+        // The default is not special-cased away: without `with_loop`, the agent
+        // asks the provider exactly as it always did.
+        let (base, hits) = provider(vec![sse_answer("plain answer", "stop")]).await;
+        let mut agent = agent_against(base);
+        let outcome = agent.run("hello").await.expect("the built-in loop answers");
+        assert_eq!(outcome.text, "plain answer");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

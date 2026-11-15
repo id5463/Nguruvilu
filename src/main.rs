@@ -688,10 +688,6 @@ impl TurnConfig for CliConfig {
             // plugin seam exists for the desktop shell, which has a kernel to
             // ask.
             plugin_hooks: None,
-            // The catalog is already in `system_prompt` above. This path decides
-            // synchronously, so nothing here could ask a model; the modes that
-            // need one belong to the desktop, which can await.
-            skill_catalog: None,
         }
     }
 }

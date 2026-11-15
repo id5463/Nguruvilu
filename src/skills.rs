@@ -29,8 +29,6 @@ use serde_json::json;
 
 use crate::tools::{ConflictPolicy, ToolDef, ToolFuture, ToolRegistry};
 
-/// Which skills a turn's catalog shows, and the four mechanisms for deciding.
-pub mod judge;
 
 /// One skill discovered on disk.
 #[derive(Debug, Clone)]
@@ -89,17 +87,23 @@ impl Skill {
 /// overlapping skills all loaded and their instructions fighting, and a
 /// subagent handed the reading task so the main agent never saw the rules it
 /// was meant to follow.
-pub const CATALOG_RULES: &str = "\
-### 使用规则
-- 触发：用户点名（`$名字` 或直接说出名字），或任务明显匹配上面的描述 → 本轮必须用该技能。\
-提到多个就全用。技能不跨轮继承，除非本轮重新提到。
-- 用法（渐进披露）：决定使用后，主代理必须先完整读完它的 `SKILL.md` 再动手。\
-正文里引用了别的文件，就用同样的方式读那个文件。读取分页时跟 `next_cursor` 到结尾。
-- 多个适用时，取能覆盖请求的最小集合，并说明你将按什么顺序使用。
-- 声明：用一句话说明你在用哪个技能、为什么用。跳过明显该用的技能要说明原因。
-- 上下文纪律：只读 `SKILL.md` 直接链接到的文件。不要加载无关的参考、脚本或资产。
-- 不许把读技能指令的工作委派给子代理：读、总结、解释都必须由主代理自己完成。\
-子代理可以做被选中技能允许的任务工作，但不能替主代理理解规则。";
+pub const CATALOG_RULES: &str = r###"- Discovery: The list above is the skills available in this session (name + description + short path). Skill bodies live on disk at the absolute paths listed above.
+- Trigger rules: If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description shown above, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.
+- Missing/blocked: If a named skill isn't in the list or the path can't be read, say so briefly and continue with the best fallback.
+- How to use a skill (progressive disclosure):
+  1) After deciding to use a skill, the main agent must expand the listed short `path` with the matching alias from `### Skill roots`, then open and read its `SKILL.md` completely before taking task actions. If a read is truncated or paginated, continue until EOF.
+  2) When `SKILL.md` references relative paths (e.g., `scripts/foo.py`), resolve them relative to the directory containing that expanded `SKILL.md` first, and only consider other paths if needed.
+  3) If `SKILL.md` points to extra folders such as `references/`, use its routing instructions to identify the files required for the task. The main agent must read each required instruction or reference file itself before acting on it. Do not delegate reading, summarizing, or interpreting skill instructions to a subagent. Subagents may still perform task work when the selected skill allows it.
+  4) If `scripts/` exist, prefer running or patching them instead of retyping large code blocks.
+  5) If `assets/` or templates exist, reuse them instead of recreating from scratch.
+- Coordination and sequencing:
+  - If multiple skills apply, choose the minimal set that covers the request and state the order you'll use them.
+  - Announce which skill(s) you're using and why (one short line). If you skip an obvious skill, say why.
+- Context hygiene:
+  - Progressive disclosure applies to selecting relevant files, not partially reading a selected instruction file. Do not load unrelated references, scripts, or assets.
+  - Avoid deep reference-chasing: prefer opening only files directly linked from `SKILL.md` unless you're blocked.
+  - When variants exist (frameworks, providers, domains), pick only the relevant reference file(s) and note that choice.
+- Safety and fallback: If a skill can't be applied cleanly (missing files, unclear instructions), state the issue, pick the next-best approach, and continue."###;
 
 /// Outcome of a scan.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

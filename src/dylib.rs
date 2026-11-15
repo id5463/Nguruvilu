@@ -81,9 +81,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::{anyhow, Context, Result};
 use libloading::Library;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
-use crate::plugin::{Contributions, Plugin, PluginCtx};
+use crate::plugin::{Contributions, Plugin, PluginCtx, TurnContext};
 use crate::tools::{ToolDef, ToolFuture};
 
 /// ABI revision. A plugin whose `ngu_describe` does not report this value is
@@ -98,6 +98,22 @@ pub const SYM_INIT: &[u8] = b"ngu_init\0";
 pub const SYM_CALL: &[u8] = b"ngu_call\0";
 /// Required exported symbol: frees a string returned by `ngu_call`.
 pub const SYM_FREE: &[u8] = b"ngu_free_string\0";
+/// Optional exported symbol: called once per turn, asked what to add to the prompt.
+///
+/// The argument is one JSON object: `{"input": "<this turn's user message>",
+/// "session": "<id>", "cwd": "<working directory>", "model": "<model>"}`. The
+/// return is one JSON object: `{"prompt": "<text to append>"}`, or `{}` for
+/// nothing.
+///
+/// This is the seam a pack uses to say something to the model **before** the
+/// model speaks. A tool cannot do that — a tool answers when the model calls
+/// it, which is after the prompt is already fixed — and that is the whole
+/// reason this symbol exists rather than another tool.
+///
+/// Deliberately not named after any one use: a pack that adds a deadline, a
+/// style rule, or a list of skills returns the same shape.
+pub const SYM_TURN: &[u8] = b"ngu_turn\0";
+
 /// Optional exported symbol: called when the plugin is torn down.
 pub const SYM_SHUTDOWN: &[u8] = b"ngu_shutdown\0";
 /// Optional exported symbol: the ABI revision as a plain `u32`.
@@ -349,6 +365,19 @@ unsafe impl Send for DynamicPlugin {}
 unsafe impl Sync for DynamicPlugin {}
 
 impl DynamicPlugin {
+    /// Ask the plugin one question, when it answers questions at all.
+    ///
+    /// `None` means "this plugin does not answer that": it was never started,
+    /// or the call failed. Every caller turns that into the default, so a
+    /// broken plugin costs its own opinion and not the turn.
+    fn ask(&self, question: &str, args: Value) -> Option<Value> {
+        if !self.is_started() {
+            return None;
+        }
+        let text = call_plugin(self.call, self.free, &self.meta.name, question, args).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
     /// Load a shared library and read its metadata.
     ///
     /// # Safety
@@ -666,8 +695,36 @@ impl Plugin for DynamicPlugin {
         }
         Ok(contributions)
     }
-}
 
+    // ---- the loop's questions ----
+    //
+    // Answering is forwarding to `ngu_call` with the seam name as the tool
+    // name and one JSON object as the arguments. That is why there is one
+    // method here and not eight: the loop asks about names, and the set of
+    // names is open, so a plugin answers whichever ones it recognises and
+    // ignores the rest by echoing the body unchanged.
+    //
+    // A plugin that never answers gets its own body back, which leaves the
+    // loop's data untouched. Nothing is required of a plugin that only wanted
+    // to register a tool.
+
+    fn intercept(&self, ctx: &TurnContext, seam: crate::plugin::Seam) -> crate::plugin::Seam {
+        let answer = match self.ask(&format!("seam.{}", seam.name), json!({
+            "session": ctx.session,
+            "input": ctx.input,
+            "model": ctx.model,
+            "seam": seam.name,
+            "body": seam.body,
+        })) {
+            Some(answer) => answer,
+            None => return seam,
+        };
+        match answer.get("body") {
+            Some(body) => crate::plugin::Seam { name: seam.name, body: body.clone() },
+            None => seam,
+        }
+    }
+}
 impl DynamicPlugin {
     /// Wrap one registered tool spec as a kernel tool.
     fn tool_def(&self, spec: ToolSpec) -> Result<ToolDef> {
