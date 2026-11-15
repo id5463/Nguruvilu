@@ -3,7 +3,7 @@
   "game": "nguruvilu",
   "name": "skill-router",
   "description": "技能路由：三个检索器（词法 BM25 / 字符 n-gram / JeV 判断）并存可切换，按需挑出相关技能，而不是把全部技能塞进提示词。遵循 Agent Skills 规范（agentskills.io/specification）。",
-  "versionId": "1.0.0",
+  "versionId": "1.0.1",
   "license": "MIT",
   "kernelVersion": "0.1.0",
   "dependencies": {

@@ -36,7 +36,7 @@ var TREE = [
 var current = 'full';
 var skills = [];
 var openPath = [];
-var btn = null, menuHost = null, noteEl = null;
+var btn = null, menuHost = null, noteEl = null, catalogBlock = null, catalogOpen = false;
 
 function el(tag, cls, text) {
   var n = document.createElement(tag);
@@ -71,8 +71,35 @@ function runAction(action) {
       note(r && r.ok ? ('正常 ' + (r.detail || '')) : ('失败：' + ((r && r.error) || '未知')));
     }).catch(function (e) { note('失败：' + e); });
   } else if (action === 'list') {
-    note(skills.length ? (skills.length + ' 个：' + skills.join(', ')) : '没有技能');
+    // status.skills is a list of {id, description} objects, not strings. Joining
+    // it directly prints "[object Object]" — the reason this row looked like it
+    // did nothing. The catalog is drawn as its own block under the menu instead
+    // of going into the one-line note, because a list of skills squeezed into a
+    // status line is unreadable past two entries.
+    showCatalog(!catalogOpen);
   }
+}
+
+// The catalog block: every skill with the one-line description the model reads.
+function showCatalog(open) {
+  catalogOpen = open;
+  if (!catalogBlock) return;
+  catalogBlock.replaceChildren();
+  if (!open) { catalogBlock.hidden = true; reportHeight(); return; }
+  catalogBlock.hidden = false;
+  if (!skills.length) {
+    catalogBlock.appendChild(el('div', 'sr-empty', '没有技能'));
+    reportHeight();
+    return;
+  }
+  for (var i = 0; i < skills.length; i += 1) {
+    var s = skills[i];
+    var row = el('div', 'sr-skill');
+    row.appendChild(el('span', 'sr-skill-id', s.id || String(s)));
+    if (s.description) row.appendChild(el('span', 'sr-skill-desc', s.description));
+    catalogBlock.appendChild(row);
+  }
+  reportHeight();
 }
 
 function renderMenu() {
@@ -183,6 +210,9 @@ function build() {
   root.appendChild(btn);
   root.appendChild(noteEl);
   root.appendChild(menuHost);
+  catalogBlock = el('div', 'sr-catalog');
+  catalogBlock.hidden = true;
+  root.appendChild(catalogBlock);
   document.body.appendChild(root);
   document.addEventListener('click', function (e) {
     if (!root.contains(e.target)) closeMenu();
@@ -209,7 +239,14 @@ style.textContent = [
   '.sr-hint{color:#9a8d7c;font-size:10px;}',
   '.sr-arrow{color:#bcaa92;font-size:10px;}',
   '.sr-sep{height:1px;background:#eee5d6;margin:4px 6px;}',
-  '.sr-input{border:1px solid #ddd2bf;border-radius:5px;background:#fff;font:inherit;padding:2px 6px;width:200px;color:#3a2e24;}'
+  '.sr-input{border:1px solid #ddd2bf;border-radius:5px;background:#fff;font:inherit;padding:2px 6px;width:200px;color:#3a2e24;}',
+  '.sr-catalog{margin-top:6px;border:1px solid #e2d8c6;border-radius:8px;background:#fffdf8;max-height:320px;overflow:auto;}',
+  '.sr-catalog[hidden]{display:none;}',
+  '.sr-skill{display:flex;gap:8px;padding:6px 10px;border-bottom:1px solid #f1eade;align-items:baseline;}',
+  '.sr-skill:last-child{border-bottom:0;}',
+  '.sr-skill-id{font-weight:600;flex:0 0 auto;white-space:nowrap;}',
+  '.sr-skill-desc{color:#7d7264;font-size:11px;line-height:1.35;}',
+  '.sr-empty{padding:10px;color:#9a8d7c;text-align:center;}'
 ].join('');
 document.head.appendChild(style);
 
