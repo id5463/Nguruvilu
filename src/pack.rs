@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! my-pack-1.0.0.ngupack
-//! ├── dsh.index.json     the manifest: what to fetch, and what is inside
+//! ├── ngu.index.json     the manifest: what to fetch, and what is inside
 //! ├── soul.md            persona
 //! ├── models.json        how to talk to the model
 //! ├── context.json       how much to remember
@@ -49,18 +49,25 @@ use crate::fetch::{Fetcher, Source};
 
 /// Manifest file name inside the archive.
 ///
-/// Renamed from `dsh.index.json`: this kernel is not part of that family, and a
-/// format file is the one place a name travels to every pack anyone installs.
-/// [`LEGACY_MANIFEST_NAME`] is still read, so every already-installed directory
-/// and every archive built before the rename keeps working — nothing has to be
-/// migrated for a pack to remain loadable.
-pub const MANIFEST_NAME: &str = "ds.index.json";
+/// The name carries the project, deliberately. A format file is the one place a
+/// name travels to every pack on every machine, so a name borrowed from another
+/// project is a name that makes people ask which project they are running —
+/// which is exactly what happened: this file was `dsh.index.json`, then a
+/// half-finished rename left `ds.index.json`, and neither says Nguruvilu.
+///
+/// [`LEGACY_MANIFEST_NAME`] is still read so an installed directory keeps
+/// loading, and [`migrate_manifest_name`] rewrites it on sight.
+pub const MANIFEST_NAME: &str = "ngu.index.json";
 
-/// The manifest name packs written before the rename carry.
+/// Manifest names packs written before this one carry, newest first.
 ///
 /// Read wherever [`MANIFEST_NAME`] is read, and reported by `pack` so a user can
-/// see which spelling a directory is using. Never written: a pack built now is
-/// `ds.index.json`, and [`migrate_manifest_name`] rewrites an old one in place.
+/// see which spelling a directory uses. Never written: a pack built now is
+/// `ngu.index.json`, and [`migrate_manifest_name`] rewrites an old one in place.
+pub const LEGACY_MANIFEST_NAMES: &[&str] = &["ds.index.json", "dsh.index.json"];
+
+/// The oldest spelling, kept as its own constant because it is the one a large
+/// number of packs already on disk wear.
 pub const LEGACY_MANIFEST_NAME: &str = "dsh.index.json";
 
 /// Archive extension this build writes.
@@ -1267,7 +1274,7 @@ pub fn set_enabled(dir: &Path, enabled: bool) -> Result<bool> {
     Ok(was)
 }
 
-/// Read `dsh.index.json` from a pack directory.
+/// Read `ngu.index.json` from a pack directory.
 ///
 /// Reads, and does not judge. A manifest is a declaration by the person who
 /// wrote it, and this kernel is a tool rather than a gatekeeper: a pack whose
@@ -1285,9 +1292,11 @@ pub fn manifest_path(dir: &Path) -> Option<PathBuf> {
     if modern.is_file() {
         return Some(modern);
     }
-    let legacy = dir.join(LEGACY_MANIFEST_NAME);
-    if legacy.is_file() {
-        return Some(legacy);
+    for name in LEGACY_MANIFEST_NAMES {
+        let legacy = dir.join(name);
+        if legacy.is_file() {
+            return Some(legacy);
+        }
     }
     None
 }
@@ -1297,15 +1306,26 @@ pub fn manifest_path(dir: &Path) -> Option<PathBuf> {
 /// Returns whether anything changed. Idempotent, and a no-op for a directory
 /// that already carries the current name — so a caller may run it over every
 /// installed pack on each start without paying for it twice.
+///
+/// Callers should actually call it. It existed for a while and nothing did, so
+/// every pack on every machine kept the old spelling and the rename was a
+/// constant in a test rather than a thing that happened.
 pub fn migrate_manifest_name(dir: &Path) -> Result<bool> {
-    let legacy = dir.join(LEGACY_MANIFEST_NAME);
     let modern = dir.join(MANIFEST_NAME);
-    if !legacy.is_file() || modern.exists() {
+    if modern.exists() {
         return Ok(false);
     }
-    std::fs::rename(&legacy, &modern)
-        .with_context(|| format!("renaming {} to {}", legacy.display(), modern.display()))?;
-    Ok(true)
+    for name in LEGACY_MANIFEST_NAMES {
+        let legacy = dir.join(name);
+        if !legacy.is_file() {
+            continue;
+        }
+        std::fs::rename(&legacy, &modern).with_context(|| {
+            format!("renaming {} to {}", legacy.display(), modern.display())
+        })?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 pub fn read_manifest(dir: &Path) -> Result<PackManifest> {
     let path = manifest_path(dir).ok_or_else(|| {
@@ -1313,7 +1333,7 @@ pub fn read_manifest(dir: &Path) -> Result<PackManifest> {
             "{} has no manifest: a pack needs {} (or the older {})",
             dir.display(),
             MANIFEST_NAME,
-            LEGACY_MANIFEST_NAME
+            LEGACY_MANIFEST_NAMES.join(" / ")
         )
     })?;
     let text = std::fs::read_to_string(&path)
@@ -2515,9 +2535,38 @@ pub fn installed(packs_dir: &Path) -> Result<Vec<InstalledPack>> {
             continue;
         }
         let path = entry.path();
+        // Rename an old manifest spelling in place, now, on sight. Doing it
+        // here rather than in a startup pass means every path that lists packs
+        // migrates them — the shell, `pack list`, a test — so no caller has to
+        // remember. A failure to rename is not fatal: the pack still reads under
+        // its old name, and the next listing tries again.
+        match migrate_manifest_name(&path) {
+            Ok(true) => eprintln!(
+                "[pack] {} 的清单已改名为 {MANIFEST_NAME}",
+                path.display()
+            ),
+            Ok(false) => {}
+            Err(error) => eprintln!(
+                "[pack] {} 的清单改名失败（仍可读取）：{error:#}",
+                path.display()
+            ),
+        }
         // A directory carrying either spelling is a pack; `read_manifest`
         // prefers the current name when a migration left both behind.
+        //
+        // No manifest at all is not "not a pack" — it is usually a pack that
+        // lost one. The difference matters because this is exactly the shape a
+        // half-placed or hand-copied pack takes: a directory full of files,
+        // no manifest, and therefore no entry in any list. It used to be
+        // skipped without a word, so the only symptom was an absence, and an
+        // absence explains nothing. Named here so the log says which directory
+        // and what name it was wearing.
         if manifest_path(&path).is_none() {
+            eprintln!(
+                "[pack] {} 不是一个完整的包：目录里没有 {}（有文件但没有清单）",
+                path.display(),
+                MANIFEST_NAME
+            );
             continue;
         }
         // A pack with a broken manifest is reported rather than skipped: a

@@ -121,8 +121,8 @@ pub fn register_with(
     registry.register(
         ToolDef::new(
             "pack",
-            "Build, inspect, install, load, and unload `.dshpack` archives. A pack is a zip \
-             holding `dsh.index.json` (identity: name, version, license) plus a few small \
+            "Build, inspect, install, load, and unload `.ngupack` archives (the older `.dshpack` spelling is read). A pack is a zip \
+             holding `ngu.index.json` (identity: name, version, license) plus a few small \
              document files, and nothing else — everything it needs is referenced from the \
              manifest. Actions: \
              `build` an archive from a directory, `verify` an archive without installing it, \
@@ -130,7 +130,7 @@ pub fn register_with(
              `load` an installed pack into this conversation (files are kept, and an unloaded \
              pack comes back), `unload` an installed pack out of this conversation (its tools \
              stop being callable; the files stay), `apply` an installed pack's assembly. \
-             Building needs the directory to already contain `dsh.index.json` — write that \
+             Building needs the directory to already contain `ngu.index.json` — write that \
              file first.",
             json!({
                 "type": "object",

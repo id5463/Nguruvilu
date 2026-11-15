@@ -37,12 +37,12 @@ pub const SHIPPED: &[(&str, &str, &[u8])] = &[
     (
         "starter",
         "1.0.0",
-        include_bytes!("../packs/starter/starter-1.0.0.dshpack"),
+        include_bytes!("../packs/starter/starter-1.0.0.ngupack"),
     ),
     (
         "judge",
         "1.0.0",
-        include_bytes!("../packs/judge/judge-1.0.0.dshpack"),
+        include_bytes!("../packs/judge/judge-1.0.0.ngupack"),
     ),
 ];
 
@@ -121,6 +121,8 @@ pub async fn seed_with_record(dir: &Path, record_path: &Path) -> Result<Vec<Stri
 
     let mut record = read_record(record_path);
     let mut placed = Vec::new();
+    // Human-facing sentences, kept apart from the log lines above.
+    let mut notes: Vec<String> = Vec::new();
     let mut dirty = false;
 
     // Read once: placement adds directories, but every shipped pack is looked
@@ -202,16 +204,62 @@ pub async fn seed_with_record(dir: &Path, record_path: &Path) -> Result<Vec<Stri
             // the bytes we placed?"), never a statement about where the archive
             // came from. A local pack is not a signed artifact and this record
             // is not a root of trust; proving provenance is a design decision
-            // this file does not make. A mismatch means the contents are no
-            // longer ours to overwrite, so the update is reported and the pack
-            // on disk is kept — silently skipping it is how a user ends up with
-            // an old pack and no idea why.
-            if !untouched(&pack.path, &recorded_files)? {
+            // this file does not make.
+            //
+            // What a mismatch *means* is the part that used to be wrong. There
+            // are two different situations and one response cannot serve both:
+            //
+            //   an edited file   — the user changed something on purpose, so
+            //                      overwriting it would throw their work away;
+            //   a missing or
+            //   unreadable file  — the pack is broken. It cannot be loaded, so
+            //                      "keep it as it is" means keeping something
+            //                      that does not work, silently, forever.
+            //
+            // So a damaged pack is repaired and an edited one is kept. Before
+            // this, both took the same branch and both ended up in a log line
+            // nobody reads — which is how a machine sat there with a pack
+            // directory full of files, a UI that showed nothing, and no way to
+            // tell that anything had been decided at all.
+            let current = hashes_of(&pack.path)?;
+            let damage = damage_of(&current, &recorded_files);
+            if std::env::var("NGU_DEBUG_SEED").is_ok() {
+                eprintln!("[dbg] {name} damage={damage:?}");
+                eprintln!("[dbg]   current keys={:?}", current.keys().collect::<Vec<_>>());
+                eprintln!("[dbg]   recorded keys={:?}", recorded_files.keys().collect::<Vec<_>>());
+                eprintln!("[dbg]   untouched={:?}", untouched(&pack.path, &recorded_files));
+            }
+            if damage.is_empty() {
+                // Compare the way  does: a driver log or a build
+                // cache is the machine writing in the pack directory, not the
+                // user editing the pack. Comparing raw maps here made those
+                // files read as an edit, which pins the pack to its old version
+                // for good — the exact failure  exists to stop.
+                if without_noise(current.clone()) != without_noise(recorded_files.clone()) {
+                    placed.push(format!(
+                        "{name}@{recorded_version} kept: its files changed since it was placed, \
+                         so the shipped {version} was not installed"
+                    ));
+                    note(&mut notes, &format!(
+                        "{name} {recorded_version} 保持原样：安装后文件被改动过，\
+                         所以没有安装随程序带的 {version}。"
+                    ));
+                    return Ok(());
+                }
+            } else {
+                // A recorded file that is gone (or no longer readable) is not an
+                // edit: nobody improves a pack by deleting its manifest. Repair
+                // it, and say so, because a pack that changes underneath a user
+                // without a word is the same defect in the other direction.
                 placed.push(format!(
-                    "{name}@{recorded_version} kept: its files changed since it was placed, \
-                     so the shipped {version} was not installed"
+                    "{name}@{recorded_version} repaired: {}",
+                    damage.join(", ")
                 ));
-                return Ok(());
+                note(&mut notes, &format!(
+                    "{name} {recorded_version} 已修复残缺：{}。\
+                     这些是随程序带的文件，缺失或损坏，已按原样补回。",
+                    damage.join("、")
+                ));
             }
             match replace(dir, name, version, bytes, &pack.path).await {
                 Ok((path, warning)) => {
@@ -325,9 +373,17 @@ pub async fn seed_with_record(dir: &Path, record_path: &Path) -> Result<Vec<Stri
         let prefix = format!("{name}-");
         for entry in entries.flatten() {
             let path = entry.path();
+            // Any spelling of the manifest means this directory is a real pack,
+            // not debris. Asking only about the oldest spelling was enough
+            // while that was the only name written, and became a deleter the
+            // moment a manifest was renamed: `ui-1.0.0` with a migrated
+            // manifest stopped answering this question, was read as "the
+            // remains of an earlier attempt", and the user's pack was removed.
+            //
+            // This is why the check asks `manifest_path` rather than a literal.
             if !path.is_dir()
                 || !entry.file_name().to_string_lossy().starts_with(&prefix)
-                || path.join("dsh.index.json").exists()
+                || crate::pack::manifest_path(&path).is_some()
             {
                 continue;
             }
@@ -356,6 +412,8 @@ pub async fn seed_with_record(dir: &Path, record_path: &Path) -> Result<Vec<Stri
     if dirty {
         write_record(record_path, &record)?;
     }
+    // The notes go last: they explain decisions the log lines only name.
+    placed.extend(notes);
     Ok(placed)
 }
 
@@ -637,7 +695,128 @@ async fn replace(
 /// content references and fetches, not a file inventory, so the files this
 /// program wrote are the only trustworthy statement of what it put there.
 fn untouched(dir: &Path, recorded: &BTreeMap<String, String>) -> Result<bool> {
-    Ok(without_noise(hashes_of(dir)?) == without_noise(recorded.clone()))
+    let current = without_noise(hashes_of(dir)?);
+    let recorded = without_noise(recorded.clone());
+    if current == recorded {
+        return Ok(true);
+    }
+    // A manifest renamed in place keeps its bytes, so the file sets differ by
+    // exactly one moved key while the content is unchanged. Compare with the
+    // manifest spellings folded together: the point of this test is "did the
+    // user edit anything", and a rename this program performed is not an edit.
+    Ok(fold_manifest_names(&current) == fold_manifest_names(&recorded))
+}
+
+/// The file map with every manifest spelling replaced by the current name.
+///
+/// Two spellings of one manifest in the same pack is not a state this program
+/// creates, so folding them together cannot hide a real difference.
+fn fold_manifest_names(
+    files: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (name, hash) in files {
+        let folded = if is_manifest(name)
+            && (name.rsplit('/').next().unwrap_or(name) != crate::pack::MANIFEST_NAME)
+            && manifest_siblings(name).iter().any(|_| true)
+        {
+            let prefix = {
+                let base = name.rsplit('/').next().unwrap_or(name);
+                name.strip_suffix(base).unwrap_or("").to_string()
+            };
+            format!("{prefix}{}", crate::pack::MANIFEST_NAME)
+        } else {
+            name.clone()
+        };
+        out.insert(folded, hash.clone());
+    }
+    out
+}
+
+/// Which recorded files are missing or now hold different bytes *and* are the
+/// kind of file a pack cannot work without.
+///
+/// The distinction this draws is the whole point: an edit is a choice, a
+/// deletion is damage. Nobody improves a pack by removing its `ngu.index.json`
+/// or its `assembly.yaml` — without either one the pack does not load, so
+/// "keep it exactly as it is" produces a directory full of files that no list
+/// shows and no conversation gets.
+///
+/// Only manifest-shaped files count. A missing `README.md` is not damage; a
+/// missing manifest is. The list is deliberately short and content-based
+/// (a manifest is a name the pack format defines) rather than a guess about
+/// which file the user "probably" meant.
+fn damage_of(
+    current: &BTreeMap<String, String>,
+    recorded: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut damaged = Vec::new();
+    for (name, recorded_hash) in recorded {
+        if !is_manifest(name) {
+            continue;
+        }
+        match current.get(name) {
+            None => {
+                // A manifest that moved to another spelling of the same name is
+                // not damage — that is the rename, and the bytes are unchanged.
+                // Without this test every start reports a repair for a pack that
+                // was simply migrated, which trains the reader to ignore the
+                // report that exists to be acted on.
+                let moved = manifest_siblings(name)
+                    .into_iter()
+                    .any(|other| current.get(&other) == Some(recorded_hash));
+                if !moved {
+                    damaged.push(format!("{name} 缺失"));
+                }
+            }
+            Some(now) if Some(now) != recorded.get(name) => {
+                damaged.push(format!("{name} 与记录不符"))
+            }
+            Some(_) => {}
+        }
+    }
+    damaged
+}
+
+/// The other spellings a manifest name could have been recorded under.
+fn manifest_siblings(name: &str) -> Vec<String> {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    let prefix = name.strip_suffix(base).unwrap_or("");
+    let mut out = Vec::new();
+    let mut all: Vec<&str> = vec![crate::pack::MANIFEST_NAME];
+    all.extend(crate::pack::LEGACY_MANIFEST_NAMES.iter().copied());
+    if all.contains(&base) {
+        for spelling in all {
+            if spelling != base {
+                out.push(format!("{prefix}{spelling}"));
+            }
+        }
+    }
+    out
+}
+
+/// Files a pack cannot be understood without.
+///
+/// Every spelling of the manifest counts on both sides of the comparison: a
+/// rename makes the recorded name disappear from disk, and reading that as
+/// damage would report a repair on every start for a pack that is perfectly
+/// fine. `is_manifest` is asked about a *recorded* name here, so the answer has
+/// to include the name it was recorded under, not only the current one.
+fn is_manifest(relative: &str) -> bool {
+    let name = relative.rsplit('/').next().unwrap_or(relative);
+    name == crate::pack::MANIFEST_NAME
+        || crate::pack::LEGACY_MANIFEST_NAMES.contains(&name)
+        || matches!(name, "assembly.yaml" | "look.json" | "mcp.json")
+}
+
+/// Add a line to the human-facing side of the report.
+///
+/// `placed` is the log line, English, one per pack; this is the sentence a
+/// notice shows. Kept separate because the two are read in different places by
+/// different readers, and a single string that tries to serve both reads badly
+/// in one of them.
+fn note(notes: &mut Vec<String>, line: &str) {
+    notes.push(line.to_string());
 }
 
 /// The same file set with machine droppings removed, on both sides.
@@ -673,7 +852,7 @@ async fn place(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
     // Unique per call: two hosts (or two tests) may place at the same moment,
     // and a shared path would have one writing over the other's archive.
     let temp = std::env::temp_dir().join(format!(
-        "ngu-shipped-{name}-{}.dshpack",
+        "ngu-shipped-{name}-{}.ngupack",
         uuid::Uuid::new_v4().simple()
     ));
     std::fs::write(&temp, bytes).with_context(|| format!("writing {}", temp.display()))?;
@@ -744,7 +923,7 @@ mod tests {
         for (name, version, bytes) in SHIPPED {
             assert!(!bytes.is_empty(), "{name} ships nothing");
             let temp = std::env::temp_dir().join(format!(
-                "ngu-shipped-check-{}-{}.dshpack",
+                "ngu-shipped-check-{}-{}.ngupack",
                 name,
                 uuid::Uuid::new_v4().simple()
             ));
@@ -923,7 +1102,10 @@ mod tests {
         let make = |dir: &Path, name: &str, version: &str, file: &str, bytes: &str| {
             let pack = dir.join(format!("{name}-{version}"));
             std::fs::create_dir_all(&pack).unwrap();
-            std::fs::write(pack.join("dsh.index.json"), manifest(name, version)).unwrap();
+            // The name the program writes now. A test that builds a pack with
+            // the old spelling would be testing the migration in a fixture that
+            // is supposed to stand for a normal, freshly placed pack.
+            std::fs::write(pack.join(crate::pack::MANIFEST_NAME), manifest(name, version)).unwrap();
             std::fs::write(pack.join(file), bytes).unwrap();
             pack
         };

@@ -153,7 +153,7 @@ mod tests {
             "version: 1\nstages:\n  - name: s\n    skills: []\n",
         )
         .unwrap();
-        let out = dir.join(format!("{name}-{version}.dshpack"));
+        let out = dir.join(format!("{name}-{version}.{}", crate::pack::ARCHIVE_EXT));
         crate::pack::pack(&pack, &out).unwrap();
         out
     }
@@ -236,15 +236,20 @@ mod tests {
     fn the_manifest_filename_is_stable() {
         // A format file name travels to every pack anyone installs, so this
         // assertion is deliberate: changing it is a migration, not a rename.
-        assert_eq!(MANIFEST_NAME, "ds.index.json");
+        //
+        // It has now had two names: `dsh.index.json` (borrowed from another
+        // project) and `ds.index.json` (a half-finished rename that still did
+        // not say Nguruvilu). This is the one that does.
+        assert_eq!(MANIFEST_NAME, "ngu.index.json");
         assert_eq!(ASSEMBLY_NAME, "assembly.yaml");
     }
 
     #[test]
     fn both_manifest_spellings_are_recognised() {
-        // The old name is still read, so a pack installed before the rename
+        // Every old name is still read, so a pack installed before the rename
         // keeps loading; only the written name moved.
         assert_eq!(crate::pack::LEGACY_MANIFEST_NAME, "dsh.index.json");
-        assert_ne!(MANIFEST_NAME, crate::pack::LEGACY_MANIFEST_NAME);
+        assert!(crate::pack::LEGACY_MANIFEST_NAMES.contains(&"ds.index.json"));
+        assert!(!crate::pack::LEGACY_MANIFEST_NAMES.contains(&MANIFEST_NAME));
     }
 }
