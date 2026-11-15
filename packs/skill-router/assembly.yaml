@@ -1,0 +1,15 @@
+version: 1
+name: skill-router
+defaults:
+  scope: session
+  on_failure: skip
+stages:
+- name: pack
+  mcp:
+  - id: skill-router
+    source: stdio:node bin/skill-router.mjs
+    scope: session
+    transport: stdio
+    command: node
+    args:
+    - bin/skill-router.mjs

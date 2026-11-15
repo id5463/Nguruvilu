@@ -1,0 +1,13 @@
+{
+  "servers": [
+    {
+      "id": "skill-router",
+      "transport": "stdio",
+      "command": "node",
+      "args": [
+        "bin/skill-router.mjs"
+      ],
+      "scope": "session"
+    }
+  ]
+}
