@@ -1,6 +1,9 @@
 ---
 name: moodle
-description: 操作 Herzen 大学 Moodle(moodle.herzen.spb.ru)—— 自动采集全部课程的作业清单(增量 diff)、读作业详情、下载附件、提交文件。当用户提到 Moodle、作业、задание、提交、дедлайн、课程作业时使用。
+description: >-
+  Operate Herzen University Moodle (moodle.herzen.spb.ru): collect the assignment list for every
+  course with an incremental diff, read assignment details, download attachments, and submit files.
+  Use when the user mentions Moodle, homework, assignments, submission, deadline, or coursework.
 ---
 
 # Moodle 采集与提交(moodle-herzen MCP)

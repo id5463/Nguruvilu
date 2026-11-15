@@ -1,0 +1,11 @@
+version: 1
+name: judge
+defaults:
+  scope: session
+  on_failure: skip
+stages:
+- name: pack
+  plugins:
+  - id: judge
+    source: builtin:judge
+    scope: global

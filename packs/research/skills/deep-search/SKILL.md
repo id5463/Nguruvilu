@@ -1,8 +1,10 @@
 ---
 name: deep-search
-description: >
-  深度搜索协议:多轮闭环(检索式→搜→读全文→抽主张→找缺口→改写→再搜),
-  预算用尽才综合,每条结论回链原文;本地文献库优先,web 补缺。
+description: >-
+  Deep search protocol: a multi-round closed loop (formulate query, search, read the full text,
+  extract claims, find the gap, rewrite, search again), synthesising only when the budget runs out,
+  with every conclusion linking back to the original passage. Local literature first, the web fills
+  the gaps. Use for research questions that one search cannot answer.
 ---
 
 # deep-search —— 深度搜索协议

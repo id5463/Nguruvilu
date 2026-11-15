@@ -1,10 +1,11 @@
 ---
 name: mission-protocol
-description: >
-  长程任务协议:任务不是一段对话,是磁盘上的状态。目标/完成判据/下一步写进
-  mission,日志只追加,细节靠 recall 按行检索而不是重读历史;每到一个里程碑
-  打检查点;代理之间用信箱通信。上下文会被压缩、进程会重启,任务不跟着丢。
-  给超过上下文窗口几十上百倍、跨天跨周的任务用。
+description: >-
+  Long-horizon task protocol: a task is state on disk, not a conversation. Write the goal, the
+  done-criterion, and the next step into a mission; append to the log only; retrieve details with
+  recall by line instead of re-reading history; checkpoint at every milestone; talk between agents
+  through mailboxes. Context gets compacted and processes restart, but the task survives. Use when the
+  work spans dozens of times the context window, or days to weeks.
 ---
 
 # mission-protocol —— 长程任务协议

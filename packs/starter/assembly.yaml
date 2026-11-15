@@ -1,0 +1,14 @@
+version: 1
+name: starter
+defaults:
+  scope: session
+  on_failure: skip
+stages:
+- name: pack
+  plugins:
+  - id: delegate
+    source: builtin:delegate
+    scope: global
+  - id: search
+    source: builtin:search
+    scope: global

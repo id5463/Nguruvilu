@@ -1,10 +1,13 @@
 ---
 name: ticket-protocol
-description: >
-  主代理操作协议：目标冻成票（tickets/<id>/ticket.json），任务书写进 brief.md，
-  worker 是内核后台作业里起的 ngu 子进程（结束用 notify 叫醒你），完成判定是
-  worker 自己写的 report.json。派活、回话、追加预算、关闭都由 ticket_* 工具出参数，
-  进程与叫醒归内核作业。一条对话只管自己开出的票；状态从盘上事实推，不靠记忆。
+description: >-
+  Main-agent operating protocol: freeze the goal into a ticket (tickets/<id>/ticket.json), write the
+  task brief into brief.md, and let the worker be an ngu child process started by the kernel job
+  system, woken by notify when it ends; completion is the report.json the worker writes itself.
+  Dispatch, reply, grant more budget, and close are argument generators on ticket_* tools; the process
+  and the wake-up belong to the kernel job system. One conversation owns only the tickets it opened;
+  state is derived from facts on disk, never from memory. Use when delegating work that outlives this
+  turn.
 ---
 
 # ticket-protocol —— 主代理怎么干活

@@ -1,9 +1,10 @@
 ---
 name: ticket-review
-description: >
-  审查 = 跟 worker 说话，叫它自己把交付复查一遍。不是一套检查表，也不是由你重做。
-  你问三件事：改了什么、凭什么说做完了、还差什么；它答，你判断值不值得交给主人。
-  它答不上来就再问一次、追加预算重开一轮、或者关掉这张票。
+description: >-
+  Review by talking to the worker: ask it to re-examine its own delivery. It is not a checklist and it
+  is not you redoing the work. Ask three things: what changed, why is it done, what is still missing.
+  The worker answers, you decide whether it is worth handing to the user. If it cannot answer, ask
+  again, grant a new round, or close the ticket. Use after a ticket reports delivered.
 ---
 
 # ticket-review —— 审查就是对话

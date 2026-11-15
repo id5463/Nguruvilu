@@ -1468,34 +1468,16 @@ function applyStrings(strings) {
   }
 }
 
-// ---- pack 面板的沙箱 ------------------------------------------------
+// ---- pack 面板 ------------------------------------------------------
 //
-// 面板是包里带来的 HTML 加脚本，而包常常是远端下载物。这段代码过去直接进主文档、
-// 用 new Function 运行 —— 与本页同源、与本页同一个 token，于是「画个界面」就
-// 等于「拿到这台机器的 shell」。现在它被关进一个 srcdoc iframe：sandbox 只给
-// allow-scripts，不给 allow-same-origin，那是个不透明来源的孤岛 —— 拿不到主
-// 文档、cookie、localStorage，也读不到本页的 token。
+// 面板是包里带来的 HTML 加脚本，跑在一个 srcdoc iframe 里。给它
+// allow-same-origin：它要能操作主文档 —— 斜杠菜单挂到输入框上、标签条插进标题栏 ——
+// 而那是同源才做得到的事。拿掉它的 CSP 限制：面板要能嵌一个网页、拉一张图、
+// 引一个图表库，这些都需要外部资源。
 //
-// 它能做的只剩一件事：发命令。而那条路要经过宿主 —— 面板 postMessage 到父窗口，
-// 父窗口核对「消息来自哪一帧」与「panelId 在白名单里」，才转成 toShell。
-// A panel document's policy.
-//
-// `unsafe-eval` is here for one reason: a pack-defined panel type is delivered
-// as a string and has to become a function inside the frame (`new Function`).
-// The alternative would be a blob URL or a separate script file, and neither
-// buys anything — this document is already a sandboxed, opaque-origin frame with
-// `default-src 'none'`, so the code that runs in it can reach nothing but the
-// frame. Denying eval would only make a registered type impossible to render
-// while changing no boundary that matters.
-// A panel document's policy.
-//
-// Wide open on purpose. The previous policy forbade every external resource,
-// which meant a panel could not embed a page, load an image, or pull a script —
-// three things a pack legitimately wants (a browser view, a chart library, a
-// WebAssembly emulator). The iframe is still a frame, but what it may load is
-// now the pack author's decision: installing a pack already trusts it with the
-// machine, and a CSP that blocks its UI while its code runs unrestricted is a
-// boundary that only inconveniences the honest.
+// 这不是放松警惕，是承认一件事——装一个包本来就等于允许它在这台机器上起进程。
+// 一边让它的代码不受限地跑，一边用一个只拦 UI、不拦代码的边界挡住它的界面，
+// 挡住的是功能，不是风险。
 const PANEL_CSP =
   "default-src * data: blob: filesystem: 'unsafe-inline' 'unsafe-eval' " +
   "wasm-unsafe-eval";
@@ -1669,7 +1651,18 @@ function panelDocument(panel, panelId) {
     '<meta http-equiv="Content-Security-Policy" content="' + PANEL_CSP + '">' +
     "<style>" + PANEL_BASE_CSS + "</style></head><body>";
   const sdk = open + "\n" + panelSdk(panelId) + "\n" + close;
-  const script = panel.script ? "\n" + open + "\n" + panel.script + "\n" + close : "";
+  // A plain panel script used to be dropped into the frame as-is, so it ran in
+  // the frame global scope and `host` did not exist. A custom type script is
+  // called with `(host, data, ngu)`. Two conventions, one on each side of a line
+  // no author could see, and the failure mode was a pack that worked when tested
+  // under one and died with "host is not defined" under the other. Same
+  // convention now: a script runs with `host` bound to the frame body, whether it
+  // came from a panel or from a type.
+  const script = panel.script
+    ? "\n" + open + "\n" + "(function (host, data, ngu) {\n" +
+      panel.script +
+      "\n" + "})(document.body, null, window.ngu);\n" + close
+    : "";
   return head + (panel.html || "") + sdk + script + "</body></html>";
 }
 
@@ -1705,7 +1698,7 @@ window.addEventListener("message", (event) => {
       // "此刻没有东西可显示"的面板都会在输入框上方留一条空白带——一条永远
       // 空着的横条不是留白，是把输入框往下推。
       const empty = Math.round(height) <= 0;
-      frame.style.height = empty ? "0px" : Math.min(Math.max(Math.round(height), 40), 480) + "px";
+      frame.style.height = empty ? "0px" : Math.min(Math.max(Math.round(height), 40), 900) + "px";
       if (frame.parentElement) frame.parentElement.style.display = empty ? "none" : "";
     }
     return;
@@ -2517,10 +2510,29 @@ function renderPacks(list) {
   // The judge section follows its own pack (starter does not carry the judge).
   ensureJudgeSection(packs.some((pack) => pack.name === "judge" && pack.loaded !== false));
 
-  if (packs.length === 0) {
+  // Directories that are not readable packs, listed before the real ones.
+  //
+  // A pack the kernel cannot read is missing from `packs` entirely, so the only
+  // symptom used to be that it was not in the list — which reads exactly like
+  // "never installed". Naming it here, with the reason, is the difference
+  // between a mystery and a next step. Drawn even when `packs` is empty: that is
+  // precisely when it matters most.
+  for (const broken of (list && list.broken) || []) {
+    const box = el("div", "pack broken");
+    const head = el("div", "pack-head");
+    head.append(el("span", "pack-name", broken.name));
+    box.append(head);
+    const why = el("div", "warn");
+    why.textContent = broken.reason + " · " + broken.files + " 个文件 · " + broken.path;
+    box.append(why);
+    packList.append(box);
+  }
+
+  if (packs.length === 0 && !((list && list.broken) || []).length) {
     packList.append(el("div", "empty", "No packs installed. Use Install to add one."));
     return;
   }
+  if (packs.length === 0) return;
 
   for (const pack of packs) {
     const box = el("div", "pack");

@@ -1,6 +1,8 @@
 ---
 name: vk
-description: 操作俄罗斯社交平台 VK(VKontakte)——读公开主页/墙/帖子/照片,配合社群 token 可发帖发消息;当用户提到 VK、ВКонтакте、vk.com 或要对接 VK API 时使用
+description: >-
+  Operate VK (VKontakte): read public pages, walls, posts and photos; post and message with a
+  community token. Use when the user mentions VK, VKontakte, vk.com, or wants to call the VK API.
 ---
 
 # VK(VKontakte)接入

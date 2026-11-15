@@ -1,8 +1,10 @@
 ---
 name: draft-critique
-description: >
-  写作与批评分开:用 delegate 派独立批评者挑错,批评必须落到证据与修法;
-  多候选时生成→批评→排名,同一把尺子出比较表。
+description: >-
+  Separate writing from criticism: dispatch an independent critic with delegate, and make the
+  criticism land on evidence and a fix. With several candidates, generate, critique, then rank with
+  one ruler to produce a comparison table. Use when the output will be judged, or when the user asks
+  for a review.
 ---
 
 # draft-critique —— 生成、批评、排名

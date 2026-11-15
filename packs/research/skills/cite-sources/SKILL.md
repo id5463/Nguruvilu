@@ -1,8 +1,10 @@
 ---
 name: cite-sources
-description: >
-  交付物里每条主张都带得上来的出处:找源、核对三查、按格式标注,
-  查不到的如实标注,绝不编造。
+description: >-
+  Every claim in the deliverable carries a source that can be traced back: find the source, verify it
+  three ways, mark it in the required format, and label what cannot be found as missing rather than
+  inventing it. Use when writing anything that will be checked, or when the user asks for citations or
+  references.
 ---
 
 # cite-sources —— 带引用的交付

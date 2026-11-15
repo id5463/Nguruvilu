@@ -1,6 +1,9 @@
 ---
 name: vpn
-description: 管理本机 mihomo(Clash Meta)代理节点——查当前走哪个节点、测每个节点的真实延迟、切换节点。当用户问"现在走哪个节点/哪个节点快/换一个节点/VPN 能用吗/代理通不通"时使用。
+description: >-
+  Manage the local mihomo (Clash Meta) proxy: show the active node, measure the real latency of every
+  node, and switch nodes. Use when the user asks which node is in use, which node is fastest, wants a
+  different node, or asks whether the proxy is working.
 ---
 
 # VPN 节点管理（vpn MCP）
