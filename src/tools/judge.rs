@@ -207,6 +207,49 @@ fn tool(settings: JudgeSettings) -> Result<ToolDef> {
 }
 
 /// One evaluate call.
+/// One evaluate call, answered as the provider's JSON.
+///
+/// Split out from [`run`] because the tool formats the answer for a model to
+/// read while the skill judge needs the numbers themselves: `answers.<id>.noul`
+/// is a probability, and a caller that has to parse that back out of prose is
+/// one formatting change away from silently reading nothing.
+pub async fn evaluate(settings: &JudgeSettings, state: Value, questions: Value) -> Result<Value> {
+    let body = json!({
+        "model": settings.model,
+        "state": state,
+        "questions": questions,
+    });
+
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(concat!("nguruvilu/", env!("CARGO_PKG_VERSION")));
+    if let Ok(proxy) = std::env::var("NGU_PROXY") {
+        if !proxy.trim().is_empty() {
+            builder = builder.proxy(reqwest::Proxy::all(proxy.trim())?);
+        }
+    } else {
+        builder = builder.no_proxy();
+    }
+    let client = builder.build().context("building the judge client")?;
+
+    let response = client
+        .post(settings.url())
+        .header("Authorization", format!("Bearer {}", settings.api_key.trim()))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("reaching the judge at {}", settings.endpoint))?;
+
+    let status = response.status();
+    let text = body_text(response, "the judge").await?;
+    if !status.is_success() {
+        return Err(anyhow!("judge returned {status}: {}", snippet_of(&text)));
+    }
+    serde_json::from_str(&text)
+        .with_context(|| format!("judge returned a non-JSON body: {}", snippet_of(&text)))
+}
+
 async fn run(settings: &JudgeSettings, args: Value) -> Result<ToolOutput> {
     let state = match args.get("state") {
         None => None,

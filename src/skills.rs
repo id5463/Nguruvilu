@@ -29,6 +29,9 @@ use serde_json::json;
 
 use crate::tools::{ConflictPolicy, ToolDef, ToolFuture, ToolRegistry};
 
+/// Which skills a turn's catalog shows, and the four mechanisms for deciding.
+pub mod judge;
+
 /// One skill discovered on disk.
 #[derive(Debug, Clone)]
 pub struct Skill {
@@ -46,18 +49,57 @@ pub struct Skill {
     pub body: String,
     /// Root this skill was found under.
     pub source: PathBuf,
+    /// Words or phrases that should make this skill apply, from frontmatter
+    /// `triggers:`.
+    ///
+    /// Separate from the description because they are read by different
+    /// readers: the model reads the description and judges, and the `regex`
+    /// mode reads these and matches. A description written for a human ("检查
+    /// Moodle 作业") makes a poor matcher, and a matcher list makes a poor
+    /// description. Splitting them lets an author write each well.
+    ///
+    /// Accepts either a comma-separated string or a YAML list, since both are
+    /// what people write.
+    pub triggers: Vec<String>,
 }
 
 impl Skill {
     /// The catalog line for this skill.
+    ///
+    /// The `SKILL.md` path is part of the line, not an extra: a model that is
+    /// told only a name and a description can decide a skill applies but has no
+    /// way to read it, so the catalog and the body live in two separate worlds.
+    /// Naming the file closes that gap with the one `read` it already knows how
+    /// to make. It also survives a front end that has no `skill` tool.
     fn catalog_line(&self) -> String {
+        let where_ = self.path.display();
         if self.description.is_empty() {
-            format!("- {}", self.id)
+            format!("- {} ({})", self.id, where_)
         } else {
-            format!("- {}: {}", self.id, self.description)
+            format!("- {}: {} ({})", self.id, self.description, where_)
         }
     }
 }
+
+/// What the model is told to do with the catalog.
+///
+/// These are not a style preference. Each one is a failure this catalog had in
+/// a real session: a skill the user named by name being ignored, a model
+/// answering from what a skill's *name* suggested instead of reading it, three
+/// overlapping skills all loaded and their instructions fighting, and a
+/// subagent handed the reading task so the main agent never saw the rules it
+/// was meant to follow.
+pub const CATALOG_RULES: &str = "\
+### 使用规则
+- 触发：用户点名（`$名字` 或直接说出名字），或任务明显匹配上面的描述 → 本轮必须用该技能。\
+提到多个就全用。技能不跨轮继承，除非本轮重新提到。
+- 用法（渐进披露）：决定使用后，主代理必须先完整读完它的 `SKILL.md` 再动手。\
+正文里引用了别的文件，就用同样的方式读那个文件。读取分页时跟 `next_cursor` 到结尾。
+- 多个适用时，取能覆盖请求的最小集合，并说明你将按什么顺序使用。
+- 声明：用一句话说明你在用哪个技能、为什么用。跳过明显该用的技能要说明原因。
+- 上下文纪律：只读 `SKILL.md` 直接链接到的文件。不要加载无关的参考、脚本或资产。
+- 不许把读技能指令的工作委派给子代理：读、总结、解释都必须由主代理自己完成。\
+子代理可以做被选中技能允许的任务工作，但不能替主代理理解规则。";
 
 /// Outcome of a scan.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -292,7 +334,7 @@ impl SkillRegistry {
 
     /// The catalog block injected into the prompt, or `None` when empty.
     pub fn catalog(&self) -> Option<String> {
-        self.catalog_with_tools(&[])
+        self.catalog_with_tools(&[], None)
     }
 
     /// The catalog, plus which tools each skill's MCP server actually provides.
@@ -309,16 +351,29 @@ impl SkillRegistry {
     /// `mcp__moodle`, which is how the MCP host namespaces them. Listing them
     /// beside the skill is the whole fix: the model now reads "here is the
     /// skill, and here are the exact tools it governs".
-    pub fn catalog_with_tools(&self, tools: &[String]) -> Option<String> {
+    pub fn catalog_with_tools(
+        &self,
+        tools: &[String],
+        keep: Option<&std::collections::HashSet<String>>,
+    ) -> Option<String> {
         if self.skills.is_empty() {
             return None;
         }
         let mut out = String::from(
-            "Available skills. Load one with the `skill` tool when it applies. \
-             A skill that owns MCP tools lists them; use those tools directly \
-             rather than re-implementing the service with `bash`.\n",
+            "## 技能\n\
+             技能是一份写在 `SKILL.md` 里的指令。下面是本会话可用的技能。\n\
+             一个技能名下的 MCP 工具直接用它，不要用 `bash` 重新实现服务。\n\n\
+             ### 可用技能\n",
         );
         for skill in self.skills.values() {
+            // A mode may narrow this turn's catalog. `None` means no narrowing,
+            // which is the old behaviour and stays the default so nothing that
+            // does not opt in changes shape.
+            if let Some(keep) = keep {
+                if !keep.contains(&skill.id) {
+                    continue;
+                }
+            }
             out.push_str(&skill.catalog_line());
             let owned: Vec<&String> = tools
                 .iter()
@@ -362,6 +417,21 @@ fn parse_skill(manifest: &Path, dir: &Path, root: &Path) -> Result<Skill> {
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
 
+    // `triggers:` may be a comma-separated string or a YAML list. The flat
+    // frontmatter reader only sees `key: value`, so a list arrives as
+    // "- one\n- two" in the value; both forms are split here rather than in
+    // the matcher, so every reader agrees on what the words are.
+    let triggers = fields
+        .get("triggers")
+        .map(|raw| {
+            raw.split(['\n', ','])
+                .map(|t| t.trim().trim_start_matches('-').trim().trim_matches('"').trim_matches('\''))
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
     Ok(Skill {
         name: id.clone(),
         id,
@@ -370,6 +440,7 @@ fn parse_skill(manifest: &Path, dir: &Path, root: &Path) -> Result<Skill> {
         dir: dir.to_path_buf(),
         body: body.trim().to_string(),
         source: root.to_path_buf(),
+        triggers,
     })
 }
 
@@ -693,7 +764,7 @@ mod tests {
             "mcp__moodle-herzen__moodle_submit".to_string(),
             "mcp__other__unrelated".to_string(),
         ];
-        let catalog = registry.catalog_with_tools(&tools).expect("catalog");
+        let catalog = registry.catalog_with_tools(&tools, None).expect("catalog");
         assert!(
             catalog.contains("mcp__moodle-herzen__moodle_status"),
             "the skill must name its own tools: {catalog}"
@@ -713,7 +784,7 @@ mod tests {
         // Without a tool table the catalog still renders: an embedder that has
         // not built one yet must not lose its skills.
         assert!(registry
-            .catalog_with_tools(&[])
+            .catalog_with_tools(&[], None)
             .expect("catalog")
             .contains("moodle: Herzen Moodle homework."));
     }

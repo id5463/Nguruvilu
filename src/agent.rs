@@ -97,6 +97,15 @@ pub struct TurnSettings {
     /// the kernel while a turn runs, and a test can substitute one with no
     /// kernel at all. `None` means "no plugins", which is the headless case.
     pub plugin_hooks: Option<Arc<dyn PluginHooks>>,
+    /// The skill catalog for this turn, already narrowed by whichever mode is
+    /// configured.
+    ///
+    /// Computed before the loop starts rather than inside `build_request`,
+    /// because deciding can mean asking a model and `build_request` is
+    /// synchronous. Placing it here also makes the catalog part of the frozen
+    /// turn: a mode switch mid-turn cannot change what the model was told it
+    /// had, which is the same rule the tool table follows.
+    pub skill_catalog: Option<String>,
 }
 
 /// What the agent loop asks plugins, without knowing anything about them.
@@ -189,6 +198,7 @@ impl TurnConfig for StaticConfig {
             // embeddings get the loop without plugins, which is the point of
             // the static shape.
             plugin_hooks: None,
+            skill_catalog: None,
         }
     }
 }
@@ -1470,6 +1480,13 @@ impl Agent {
         let mut head: Vec<&str> = Vec::new();
         if !settings.system_prompt.is_empty() {
             head.push(&settings.system_prompt);
+        }
+        // The skill catalog: already narrowed for this turn, so this only joins
+        // it. It sits above the history like any standing rule, because it is
+        // one — what the model may load is the same fact at step one and step
+        // nine, and putting it in `added` would repeat it in every request body.
+        if let Some(catalog) = &settings.skill_catalog {
+            head.push(catalog);
         }
         // What the plugins want added, requested here rather than baked into
         // `system_prompt`: only this point knows the user's message, which is

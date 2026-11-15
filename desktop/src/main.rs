@@ -1059,6 +1059,77 @@ pub(crate) async fn dispatch(
             }
         }
 
+        // The skill-loading mode, switched from a pack's panel.
+        //
+        // Its own command rather than a field on save_settings: that one's
+        // argument list is already long enough that adding a sixteenth
+        // positional parameter would make every caller a place to get it wrong.
+        // This is one string, and the page sends it exactly when a human clicks
+        // one of four buttons.
+        "set_skill_mode" => {
+            let mode = command.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+            // A mode is a name a pack defines, so an unknown one is not an
+            // error to refuse here — refusing would make a new pack's mode
+            // unusable until the kernel learned about it. Empty clears it.
+            match state.lock().expect("state lock").set_skill_mode(mode) {
+                Ok(saved) => {
+                    emit(&sink, json!({ "ev": "skill_mode", "mode": saved }));
+                    // The status carries the mode too, and the panel paints
+                    // from either; pushing it keeps a second tab in step.
+                    let status = state.lock().expect("state lock").describe();
+                    emit(&sink, json!({ "ev": "status", "status": status }));
+                }
+                Err(error) => emit(
+                    &sink,
+                    json!({ "ev": "error", "message": format!("切换技能模式失败：{error:#}") }),
+                ),
+            }
+        }
+
+        // Edit one field of the skill-judge settings. The panel sends
+        // `{key: "jev.model", value: "..."}`, dotted so a single setter covers
+        // every mode without a command per field.
+        "set_skill_config" => {
+            let key = command.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            let value = command.get("value").and_then(|v| v.as_str()).unwrap_or("");
+            match state
+                .lock()
+                .expect("state lock")
+                .set_skill_config(key, value)
+            {
+                Ok(()) => {
+                    emit(&sink, json!({ "ev": "skill_config", "key": key }));
+                    let status = state.lock().expect("state lock").describe();
+                    emit(&sink, json!({ "ev": "status", "status": status }));
+                }
+                Err(error) => emit(
+                    &sink,
+                    json!({ "ev": "error", "message": format!("保存技能设置失败：{error:#}") }),
+                ),
+            }
+        }
+
+        // Ask the configured decision model one real question, so "is it
+        // configured right" is answered by the provider instead of by a guess
+        // about whether the fields look filled in.
+        "test_skill_judge" => {
+            // The config is copied out and the lock released before the await:
+            // holding a std `MutexGuard` across one makes this whole dispatch
+            // future non-`Send`, which the relay lane requires.
+            let config = state
+                .lock()
+                .expect("state lock")
+                .skill_judge_config();
+            let result = crate::state::test_skill_judge(&config).await;
+            match result {
+                Ok(detail) => emit(&sink, json!({ "ev": "skill_test", "ok": true, "detail": detail })),
+                Err(error) => emit(
+                    &sink,
+                    json!({ "ev": "skill_test", "ok": false, "error": format!("{error:#}") }),
+                ),
+            }
+        }
+
         "apply_pack" => {
             let path = command.get("path").and_then(|v| v.as_str()).unwrap_or("");
             if path.is_empty() {
@@ -2028,10 +2099,26 @@ async fn load_installed_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSi
     // Place what this build ships before listing: the packs decide what a
     // conversation has, and a report rather than a failure keeps a full or
     // read-only disk from stopping the shell.
+    //
+    // The lines go to the page as well as to stderr. They used to go to stderr
+    // only, which made every decision in here invisible from the one place a
+    // user looks: a pack kept because its files had been edited, a pack skipped
+    // because the archive would not place, a pack repaired — all of it arrived
+    // as "the pack is not in my list" with nothing to read. A notice is the
+    // cheapest honest answer, and the pack list is rebuilt right after, so the
+    // two are never out of step.
     match nguruvilu::preinstall::seed(&dir).await {
-        Ok(placed) if !placed.is_empty() => eprintln!("[preinstall] {}", placed.join(", ")),
+        Ok(placed) if !placed.is_empty() => {
+            eprintln!("[preinstall] {}", placed.join(", "));
+            for line in &placed {
+                notice(&sink, line, false);
+            }
+        }
         Ok(_) => {}
-        Err(error) => eprintln!("[preinstall] {error:#}"),
+        Err(error) => {
+            eprintln!("[preinstall] {error:#}");
+            notice(&sink, &format!("预置包处理失败：{error:#}"), true);
+        }
     }
 
     let packs = match nguruvilu::pack::installed(&dir) {
@@ -2910,6 +2997,17 @@ fn emit_panels(state: &Arc<Mutex<AppState>>, sink: &Arc<dyn EventSink>) {
 /// Send one event to the page.
 fn emit(sink: &Arc<dyn EventSink>, value: Value) {
     sink.emit(value);
+}
+
+/// One line about something the shell decided, shown where a user is looking.
+///
+/// Not an error: an error means this turn failed. These are decisions about
+/// packs — kept because edited, repaired because damaged, skipped because the
+/// archive would not place — and the page already has a place for a one-line
+/// message that is not a failure.
+fn notice(sink: &Arc<dyn EventSink>, line: &str, bad: bool) {
+    eprintln!("[notice] {line}");
+    emit(sink, json!({ "ev": "notice", "text": line, "bad": bad }));
 }
 
 // Everything from here to `free_upload_name` answers the window: the command

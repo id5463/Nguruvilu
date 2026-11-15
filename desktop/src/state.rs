@@ -248,7 +248,7 @@ impl nguruvilu::model::ModelAccess for DesktopModelAccess {
             .snapshot()
             .system_prompt(&self.base_prompt);
         let tool_names = self.tools().names();
-        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog_with_tools(&tool_names) {
+        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog_with_tools(&tool_names, None) {
             prompt.push_str("\n\n");
             prompt.push_str(&catalog);
         }
@@ -266,7 +266,7 @@ impl nguruvilu::model::ModelAccess for DesktopModelAccess {
     fn subagent_prompt(&self) -> String {
         let mut prompt = self.base_prompt.clone();
         let tool_names = self.tools().names();
-        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog_with_tools(&tool_names) {
+        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog_with_tools(&tool_names, None) {
             prompt.push_str("\n\n");
             prompt.push_str(&catalog);
         }
@@ -326,6 +326,15 @@ pub struct SharedConfig {
     /// the app is shutting down. `None` means the turn runs without asking
     /// plugins anything, which is what a headless test wants.
     pub kernel: Arc<Mutex<Option<std::sync::Weak<Mutex<nguruvilu::plugin::Kernel>>>>>,
+    /// The skill catalog the next turn should use, already narrowed by whichever
+    /// mode is configured.
+    ///
+    /// Written before the turn and read inside `settings()`, because the two
+    /// halves cannot be one step: deciding a catalog can mean awaiting a model,
+    /// and `TurnConfig::settings` is synchronous. Storing the answer instead of
+    /// deciding inside it is what keeps the trait usable by the headless path
+    /// too.
+    pub skill_catalog: Mutex<Option<String>>,
 }
 
 impl SharedConfig {
@@ -368,13 +377,28 @@ impl TurnConfig for SharedConfig {
                 system_prompt.push_str(&block);
             }
         }
-        let tool_names = snapshot.tools.names();
-        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog_with_tools(&tool_names) {
+        // The catalog is decided before this turn starts, not here: deciding
+        // can mean awaiting a model, and this function is synchronous. When
+        // nothing was staged the registry decides with no narrowing, which is
+        // the `full` behaviour and the old one.
+        let staged = self.skill_catalog.lock().expect("skill catalog lock").clone();
+        let catalog = match staged {
+            Some(catalog) => Some(catalog),
+            None => {
+                let tool_names = snapshot.tools.names();
+                self.skills
+                    .lock()
+                    .expect("skills lock")
+                    .catalog_with_tools(&tool_names, None)
+            }
+        };
+        if let Some(catalog) = &catalog {
             system_prompt.push_str("\n\n");
-            system_prompt.push_str(&catalog);
+            system_prompt.push_str(catalog);
         }
         TurnSettings {
             system_prompt,
+            skill_catalog: catalog,
             tools: snapshot.tools,
             model: snapshot.model_route.model,
             version: snapshot.version,
@@ -592,6 +616,7 @@ impl AppState {
             // Wired after the kernel exists; a turn that runs before then
             // simply gets no plugin additions.
             kernel: Arc::new(Mutex::new(None)),
+            skill_catalog: Mutex::new(None),
         });
 
         let store = JsonlStore::open(sessions_root())?;
@@ -770,6 +795,11 @@ impl AppState {
                 "description": s.description,
             })).collect::<Vec<_>>(),
             "skill_roots": skills.roots().iter().map(|r| r.display().to_string()).collect::<Vec<_>>(),
+            // Which mode decides what a catalog shows. The page draws a
+            // four-way switch from this, so it has to be in the status the
+            // page already receives — a separate event would arrive before
+            // the switch exists and leave it showing a stale choice.
+            "skill_mode": self.settings.skill_mode.clone(),
             "plugins": self.kernel.plugin_names(),
             // Which pack brought each one: `delegate ← subagent`, so a
             // capability can be read back to the pack it came from.
@@ -1174,6 +1204,100 @@ impl AppState {
     ///
     /// Applying matters as much as saving: a user who just typed a key expects
     /// the next message to use it, not the next launch.
+    /// Set which mechanism picks what a skill catalog shows.
+    ///
+    /// Stored, not enforced here: the modes are a pack's business, and a kernel
+    /// that only understood its own list would block the next pack's mode. So
+    /// this writes whatever name it is given and reports it back — the same
+    /// rule the pack system follows everywhere else, that the kernel carries
+    /// what a pack declares rather than deciding what it may declare.
+    ///
+    /// An empty string clears the choice, which restores the kernel's own
+    /// behaviour (everything loaded).
+    pub fn set_skill_mode(&mut self, mode: &str) -> Result<String> {
+        let value = mode.trim().to_string();
+        self.settings.skill_mode = if value.is_empty() { None } else { Some(value.clone()) };
+        self.settings.save()?;
+        Ok(value)
+    }
+
+    /// Set one field of the skill-judge settings, addressed as `mode.field`.
+    ///
+    /// One setter instead of one command per field: the panel's menu is data,
+    /// and a new field should appear there without a kernel-side handler to
+    /// match. An empty value clears the field rather than storing `""`, so a
+    /// key the user blanked stays blank instead of authenticating with nothing.
+    pub fn set_skill_config(&mut self, key: &str, value: &str) -> Result<()> {
+        let (mode, field) = key
+            .split_once('.')
+            .ok_or_else(|| anyhow::anyhow!("字段名要是 模式.字段，例如 jev.model，收到 {key:?}"))?;
+        let judge = self.settings.skill_judge.get_or_insert_with(Default::default);
+        let value = value.trim().to_string();
+        match mode {
+            "jev" => {
+                let jev = judge.jev.get_or_insert_with(Default::default);
+                match field {
+                    "endpoint" => jev.endpoint = value,
+                    "api_key" => jev.api_key = value,
+                    "model" => jev.model = value,
+                    "threshold" => {
+                        jev.threshold = value
+                            .parse()
+                            .map_err(|_| anyhow!("阈值要是一个 0 到 1 之间的数，收到 {value:?}"))?
+                    }
+                    other => anyhow::bail!("jev 没有字段 {other}"),
+                }
+            }
+            "llm" => {
+                let llm = judge.llm.get_or_insert_with(Default::default);
+                match field {
+                    "endpoint" => llm.endpoint = value,
+                    "api_key" => llm.api_key = value,
+                    "model" => llm.model = value,
+                    "max_skills" => {
+                        llm.max_skills = value
+                            .parse()
+                            .map_err(|_| anyhow!("max_skills 要是一个整数，收到 {value:?}"))?
+                    }
+                    other => anyhow::bail!("llm 没有字段 {other}"),
+                }
+            }
+            "regex" => match field {
+                // One per line: a comma-separated phrase list cannot hold a
+                // phrase that contains a comma.
+                "extra_triggers" => {
+                    let regex = judge.regex.get_or_insert_with(Default::default);
+                    regex.extra_triggers = value
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                }
+                other => anyhow::bail!("regex 没有字段 {other}"),
+            },
+            other => anyhow::bail!("没有 {other} 这个模式"),
+        }
+        self.settings.save()?;
+        Ok(())
+    }
+
+    /// Ask the configured decision model one question and report what came back.
+    ///
+    /// A real round trip rather than a field check: "endpoint and key are
+    /// filled in" is also true of a wrong key against a wrong host, and the
+    /// point of a test button is to be told which one it is.
+    /// The JeV configuration a test would use, copied out for a caller that has
+    /// to await: taking it here and awaiting elsewhere is what keeps a lock off
+    /// the await.
+    pub fn skill_judge_config(&self) -> nguruvilu::settings::JevMode {
+        self.settings
+            .skill_judge
+            .as_ref()
+            .and_then(|j| j.jev.clone())
+            .unwrap_or_default()
+    }
+
     pub fn save_settings(
         &mut self,
         base_url: &str,
@@ -1217,6 +1341,15 @@ impl AppState {
             // Preserving it here is what stops an unrelated save from quietly
             // putting a route that cannot stream back into streaming mode.
             delivery: self.settings.delivery.clone(),
+            // Carried through, not rebuilt: saving the connection settings is
+            // not a statement about which skill mode is chosen, and dropping it
+            // here would silently reset the switch every time the page saved.
+            skill_mode: self.settings.skill_mode.clone(),
+            // Same rule as `skill_mode`: saving the connection settings is not a
+            // statement about how much a skill decision model should be trusted,
+            // and the keys typed into that panel must survive a save from this
+            // one. They are edited through `set_skill_config`, not here.
+            skill_judge: self.settings.skill_judge.clone(),
             degrade_on_stall: self.settings.degrade_on_stall,
             proxy: proxy.trim().to_string(),
             context_window: context_window.filter(|t| *t > 0),
@@ -1504,6 +1637,13 @@ impl AppState {
             .collect();
         Ok(json!({
             "dir": dir.display().to_string(),
+            // Directories that look like a pack but are not one, because the
+            // manifest is missing. Before this they were skipped in silence and
+            // the only symptom was an absence from the list, which reads exactly
+            // like "never installed" — the hardest kind of bug to see, because
+            // there is nothing to look at. Reported with the name they were
+            // wearing and what a repair needs.
+            "broken": Self::broken_pack_dirs(&dir),
             "packs": packs.iter().map(|pack| json!({
                 "name": pack.manifest.name,
                 "description": pack.manifest.description,
@@ -1533,6 +1673,64 @@ impl AppState {
                 })),
             })).collect::<Vec<_>>(),
         }))
+    }
+
+    /// Directories in the packs folder that look like a pack but do not read
+    /// as one.
+    ///
+    /// Two different failures share this shape and both used to be invisible:
+    ///
+    ///   no manifest  — a directory of files with no `ngu.index.json`, which is
+    ///                  what a half-finished install or a hand copy leaves;
+    ///   no assembly  — a manifest that parses but no `assembly.yaml`, so the
+    ///                  pack is listed nowhere and loads nothing.
+    ///
+    /// `installed()` only returns packs it could read, so without this the only
+    /// symptom is an absence from the list — indistinguishable from a pack that
+    /// was never installed, and an absence explains nothing. The reason string
+    /// names which of the two it is, because "my pack is missing" and "my pack
+    /// is missing its assembly" need different fixes.
+    fn broken_pack_dirs(dir: &Path) -> Vec<Value> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let path = entry.path();
+            let files = std::fs::read_dir(&path).map(|it| it.flatten().count()).unwrap_or(0);
+            // An empty directory is a leftover of a delete, not a pack someone
+            // is looking for. Skip it rather than report noise on every start.
+            if files == 0 {
+                continue;
+            }
+            let manifest = nguruvilu::pack::read_manifest(&path);
+            let reason = match &manifest {
+                Err(_) => format!(
+                    "目录里没有清单文件 {}（或旧名 {}）—— 内核不认它，所以列表里看不到",
+                    nguruvilu::pack::MANIFEST_NAME,
+                    nguruvilu::pack::LEGACY_MANIFEST_NAMES.join(" / ")
+                ),
+                Ok(_) if !path.join("assembly.yaml").is_file() => {
+                    "有清单但没有 assembly.yaml —— 装不上任何东西，所以列表里看不到"
+                        .to_string()
+                }
+                // Readable pack: `installed()` already lists it.
+                Ok(_) => continue,
+            };
+            out.push(json!({
+                "name": path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                "path": path.display().to_string(),
+                "files": files,
+                "reason": reason,
+            }));
+        }
+        out
     }
 
     /// Install an archive and report what landed.
@@ -2269,6 +2467,105 @@ impl AgentObserver for UiObserver {
 /// text as an ordinary prompt. The serve shell calls this directly: its
 /// command queue would otherwise hold the message until the very turn it
 /// steers has already ended.
+/// Ask the configured decision model one question and report what came back.
+///
+/// A real round trip rather than a field check: "endpoint and key are filled in"
+/// is also true of a wrong key against a wrong host, and the point of a test
+/// button is to be told which one it is. A free function rather than a method so
+/// the state lock is released before the await.
+pub async fn test_skill_judge(config: &nguruvilu::settings::JevMode) -> Result<String> {
+    if config.api_key.trim().is_empty() {
+        anyhow::bail!("还没填 JeV 的密钥");
+    }
+    let started = std::time::Instant::now();
+    let answer = nguruvilu::tools::judge::evaluate(
+        &config.settings(),
+        serde_json::json!("这是一次连接测试。"),
+        serde_json::json!({
+            "ping": {
+                "type": "noul",
+                "instructions": "这段文本是在说中文吗？"
+            }
+        }),
+    )
+    .await?;
+    let probability = answer
+        .get("answers")
+        .and_then(|a| a.get("ping"))
+        .and_then(|p| p.get("noul"))
+        .and_then(serde_json::Value::as_f64);
+    let model = answer
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("(未报告)");
+    let tokens = answer
+        .get("usage")
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    Ok(format!(
+        "{model}，{}ms，{tokens} tokens，示例答案 {}",
+        started.elapsed().as_millis(),
+        probability.map(|p| format!("{p:.2}")).unwrap_or_else(|| "?".into())
+    ))
+}
+
+/// Decide this turn's skill catalog and stage it for `settings()` to read.
+///
+/// Split from the turn because of one asymmetry: choosing can require awaiting a
+/// decision model, and `TurnConfig::settings` cannot await. Doing the work here
+/// and storing the answer keeps the trait synchronous without giving up the two
+/// modes that need a network round trip.
+///
+/// A selector that fails is not allowed to hide skills. Every failure — no key,
+/// a timeout, a provider that changed shape — stages the full catalog, because a
+/// turn that silently lost half its skills looks exactly like a turn where those
+/// skills do not exist.
+async fn stage_skill_catalog(
+    config: &Arc<SharedConfig>,
+    settings: &nguruvilu::settings::Settings,
+    query: &str,
+) {
+    let mode = settings
+        .skill_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or("full")
+        .to_string();
+    let judge_settings = settings.skill_judge.clone().unwrap_or_default();
+
+    // The registry is scanned on the reload thread, so the ids taken here are a
+    // snapshot. That is the same rule the tool table follows: a turn runs against
+    // the facts it was told at its start.
+    let skills: Vec<nguruvilu::skills::Skill> = {
+        let registry = config.skills.lock().expect("skills lock");
+        registry.list().into_iter().cloned().collect()
+    };
+    let refs: Vec<&nguruvilu::skills::Skill> = skills.iter().collect();
+    let tool_names = config.runtime.lock().expect("runtime lock").snapshot().tools.names();
+
+    let judge = nguruvilu::skills::judge::for_mode(Some(&mode), &judge_settings);
+    let ask = nguruvilu::skills::judge::Ask { query, skills: &refs };
+
+    let keep = match judge.keep(&ask).await {
+        Ok(keep) => Some(keep),
+        Err(error) => {
+            eprintln!("[skills] 判断模式 {mode} 失败，本轮显示全部技能：{error:#}");
+            None
+        }
+    };
+    // An empty set means "nothing matched", which reads as "there are no
+    // skills". Showing everything is the honest answer to a selector that found
+    // nothing.
+    let keep = keep.filter(|k| !k.is_empty());
+
+    let registry = config.skills.lock().expect("skills lock");
+    let catalog = registry.catalog_with_tools(&tool_names, keep.as_ref());
+    drop(registry);
+    *config.skill_catalog.lock().expect("skill catalog lock") = catalog;
+}
+
 pub fn try_steer(guard: &mut AppState, text: &str) -> Option<String> {
     if text.trim().is_empty() {
         return None;
@@ -2314,7 +2611,7 @@ pub async fn run_turn(
     // One turn per session, decided under the lock so two prompts racing for
     // the same history cannot both pass the check.
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let (session_id, client, config, messages, events, inbox, workspace, max_steps) = {
+    let (session_id, client, config, messages, events, inbox, workspace, max_steps, settings_snapshot, concrete_config) = {
         let mut guard = state.lock().expect("state lock");
         // The conversation this turn belongs to, resolved once under the lock:
         // an explicit target wins, without one the conversation on screen. A
@@ -2387,6 +2684,14 @@ pub async fn run_turn(
             // answering short questions, and hard-coding 50 meant the desktop was
             // the one front end that could not be told.
             guard.settings.max_steps(),
+            // The settings this turn decides with, copied out from under the
+            // lock: a mode switch during the turn is next turn's news, the same
+            // rule the tool table and the catalog follow.
+            guard.settings.clone(),
+            // The concrete config, kept beside the `dyn TurnConfig` clone
+            // because staging the catalog needs the fields only the concrete
+            // type has.
+            Arc::clone(&guard.config),
         )
     };
     let observer = Arc::new(UiObserver::new(
@@ -2424,6 +2729,12 @@ pub async fn run_turn(
     sink.emit(json!({ "ev": "turn_start", "text": &text, "session": &session_id }));
 
     let turn_started = std::time::Instant::now();
+    // Decide this turn's skill catalog before the turn starts. Here and not in
+    // `settings()` because two of the four modes ask a model, and that call has
+    // to be awaited; `TurnConfig::settings` is synchronous. The answer is staged
+    // on the shared config, which is what the frozen turn then reads.
+    stage_skill_catalog(&concrete_config, &settings_snapshot, &text).await;
+
     let result = agent.run(&text).await;
     let turn_ms = turn_started.elapsed().as_millis() as u64;
     match &result {

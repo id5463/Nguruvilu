@@ -239,7 +239,7 @@ enum Command {
     },
     /// Build a `.ngupack` archive from a pack directory.
     Pack {
-        /// Pack directory (must contain ds.index.json, or the older dsh.index.json).
+        /// Pack directory (must contain ngu.index.json; older spellings are read).
         dir: PathBuf,
         /// Output archive path. Defaults to <name>-<version>.ngupack.
         #[arg(short, long)]
@@ -599,7 +599,7 @@ impl nguruvilu::model::ModelAccess for CliModelAccess {
             .snapshot()
             .system_prompt(&self.base_prompt);
         let tool_names = self.tools().names();
-        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog_with_tools(&tool_names) {
+        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog_with_tools(&tool_names, None) {
             prompt.push_str("\n\n");
             prompt.push_str(&catalog);
         }
@@ -617,7 +617,7 @@ impl nguruvilu::model::ModelAccess for CliModelAccess {
     fn subagent_prompt(&self) -> String {
         let mut prompt = self.base_prompt.clone();
         let tool_names = self.tools().names();
-        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog_with_tools(&tool_names) {
+        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog_with_tools(&tool_names, None) {
             prompt.push_str("\n\n");
             prompt.push_str(&catalog);
         }
@@ -671,7 +671,7 @@ impl TurnConfig for CliConfig {
         }
 
         let tool_names = snapshot.tools.names();
-        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog_with_tools(&tool_names) {
+        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog_with_tools(&tool_names, None) {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&catalog);
         }
@@ -688,6 +688,10 @@ impl TurnConfig for CliConfig {
             // plugin seam exists for the desktop shell, which has a kernel to
             // ask.
             plugin_hooks: None,
+            // The catalog is already in `system_prompt` above. This path decides
+            // synchronously, so nothing here could ask a model; the modes that
+            // need one belong to the desktop, which can await.
+            skill_catalog: None,
         }
     }
 }
@@ -2954,7 +2958,7 @@ fn mcp_import_command(
         "mcp": "mcp.json",
     });
     std::fs::write(
-        dir.join("dsh.index.json"),
+        dir.join(nguruvilu::pack::MANIFEST_NAME),
         serde_json::to_string_pretty(&manifest)?,
     )?;
     std::fs::write(
@@ -3333,7 +3337,7 @@ fn ui_command(dir: Option<&PathBuf>, as_json: bool) -> Result<()> {
     } else {
         println!("wrote the built-in interface to {}", target.display());
         println!("edit index.html, then `ngu pack {}`", target.display());
-        println!("the declaration in dsh.index.json points at it");
+        println!("the declaration in ngu.index.json points at it");
     }
     Ok(())
 }

@@ -168,6 +168,28 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<crate::tools::search::SearchSettings>,
 
+    /// Which mechanism picks what a skill catalog shows.
+    ///
+    /// Four modes, each a different trade: `full` loads everything (no
+    /// selection at all, best while there are few skills), `regex` applies
+    /// rules and no model (predictable and free), `jev` asks a decision model
+    /// per skill (accurate, about $0.00002 a call), `llm` lets a language model
+    /// pick from the whole catalog at once (most flexible, most expensive).
+    ///
+    /// A string rather than an enum so a pack can add a mode without a kernel
+    /// change; the pack that owns the modes validates it. Absent means the
+    /// kernel keeps doing what it always did, which is `full`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_mode: Option<String>,
+
+    /// How the skill modes that need a model reach one, and how they decide.
+    ///
+    /// Absent means every mode falls back to `full`, which is what a user with
+    /// no keys configured should get: a selector that cannot ask its question
+    /// must not silently hide skills.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_judge: Option<SkillJudgeSettings>,
+
     /// The decision judge (Jev / TypeSafe System One), when configured.
     ///
     /// Absent means no `judge` tool — the same rule as search: a tool that
@@ -227,9 +249,112 @@ impl std::fmt::Debug for Settings {
     }
 }
 
+/// How the skill modes that need a model reach one, and how they decide.
+///
+/// One struct for all four modes rather than a `union`: the panel edits them in
+/// one place, and a user switching modes mid-session should not lose the JeV
+/// key they typed while on `regex`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SkillJudgeSettings {
+    /// `jev` mode: the decision model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jev: Option<JevMode>,
+    /// `llm` mode: the language model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm: Option<LlmMode>,
+    /// `regex` mode: phrases that apply to every skill.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regex: Option<RegexMode>,
+}
+
+/// Configuration for the `jev` mode.
+///
+/// The endpoint is the host only, because the path `/v1/systemone` is part of
+/// the protocol rather than a choice: a full URL typed into this field would
+/// produce `/v1/systemone/v1/systemone`, which fails with a 404 that says
+/// nothing about the cause.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JevMode {
+    /// Host, e.g. `https://api.commandcode.ai/provider`.
+    pub endpoint: String,
+    /// Bearer key; the panel only ever shows "(set)".
+    pub api_key: String,
+    /// Model alias. `typesafe/jev` tracks the current version.
+    pub model: String,
+    /// Probability at or above which a skill is kept. 0.5 is the point where
+    /// the model says "more likely than not", and moving it is how a user
+    /// trades a missing skill against a flooded catalog.
+    pub threshold: f64,
+}
+
+impl Default for JevMode {
+    fn default() -> Self {
+        Self {
+            endpoint: "https://api.commandcode.ai/provider".into(),
+            api_key: String::new(),
+            model: "typesafe/jev".into(),
+            threshold: 0.5,
+        }
+    }
+}
+
+impl JevMode {
+    /// The transport settings the judge client expects.
+    pub fn settings(&self) -> crate::tools::judge::JudgeSettings {
+        crate::tools::judge::JudgeSettings {
+            endpoint: self.endpoint.clone(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+        }
+    }
+}
+
+/// Configuration for the `llm` mode.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LlmMode {
+    pub endpoint: String,
+    pub api_key: String,
+    pub model: String,
+    /// How many skills the model may keep. A cap exists because this mode can
+    /// answer "all of them", which defeats the reason it ran.
+    pub max_skills: usize,
+}
+
+impl Default for LlmMode {
+    fn default() -> Self {
+        Self {
+            endpoint: "https://api.commandcode.ai/provider".into(),
+            api_key: String::new(),
+            model: "google/gemini-3.5-flash".into(),
+            max_skills: 5,
+        }
+    }
+}
+
+impl LlmMode {
+    pub fn settings(&self) -> crate::tools::judge::JudgeSettings {
+        crate::tools::judge::JudgeSettings {
+            endpoint: self.endpoint.clone(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+        }
+    }
+}
+
+/// Configuration for the `regex` mode.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RegexMode {
+    /// Phrases that make every skill match. For a user whose requests keep
+    /// landing in words no skill author wrote down.
+    pub extra_triggers: Vec<String>,
+}
+
 /// Everything but the first and last few characters, for display.
-fn mask(secret: &str) -> String {
-    let secret = secret.trim();
+fn mask(secret: &str) -> String {    let secret = secret.trim();
     if secret.is_empty() {
         return String::new();
     }
