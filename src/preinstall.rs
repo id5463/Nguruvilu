@@ -33,6 +33,20 @@ use sha2::{Digest, Sha256};
 /// Embedded rather than sitting beside the executable: the single-file
 /// requirement applies to what the user downloads, and a program that needs a
 /// payload folder to be complete is not a single-file program.
+///
+/// # This list is the last place the kernel names packs
+///
+/// It has to: a fresh machine has no `~/.nguruvilu/packs`, so *something* has to
+/// arrive with the binary or the first run has no interface and no tools at all.
+/// What changed is that the list is now only about *seeding*, not about
+/// capability: nothing here is consulted when a pack loads, and adding a pack to
+/// a running machine does not touch this file.
+///
+/// The entry names come from the directories `packs/` contains, and each
+/// archive's own manifest is the authority on its name and version — the tuples
+/// here are a build-time convenience for `ngu doctor` output, not a source of
+/// truth. That is why `judge` can leave this list without any code changing:
+/// see [`SHIPPED_NAMES`].
 pub const SHIPPED: &[(&str, &str, &[u8])] = &[
     (
         "starter",
@@ -45,6 +59,11 @@ pub const SHIPPED: &[(&str, &str, &[u8])] = &[
         include_bytes!("../packs/judge/judge-1.0.0.ngupack"),
     ),
 ];
+
+/// The names in [`SHIPPED`], for callers that only want to know what arrives.
+pub fn shipped_names() -> Vec<&'static str> {
+    SHIPPED.iter().map(|(name, _, _)| *name).collect()
+}
 
 /// The five packs this project once shipped separately, now merged into
 /// `starter`: chinese, ui, search, subagent, computer-use.

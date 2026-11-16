@@ -487,8 +487,16 @@ pub struct AppState {
     /// pack's reload, is stopped when the pack unloads, and is stopped for
     /// good when the window closes.
     pub mcp: Vec<Arc<nguruvilu::mcp::McpClient>>,
-    /// The judge plugin's settings cell — same contract as search.
-    pub judge_cell: nguruvilu::tools::judge::SettingsCell,
+    /// The kernel's own state, published where packs can read and change it.
+    ///
+    /// Kept on the state rather than dropped after bootstrap because the kernel
+    /// is replaced wholesale when a pack is applied or unloaded
+    /// ([`restore_kernel`](Self::restore_kernel)). A fresh kernel has an empty
+    /// service table, so without republishing, every pack in the new kernel
+    /// would look at a table with no `settings` in it — and a plugin that reads
+    /// its own configuration from there (the judge does) would silently become
+    /// a no-op.
+    pub published: nguruvilu::state::Published,
     /// The user's own settings, before any pack folded over them.
     ///
     /// [`recompute_pack_content`](Self::recompute_pack_content) starts from
@@ -529,10 +537,6 @@ impl AppState {
         // one `ngu` uses, so the shell and the CLI cannot disagree about what
         // exists. Defining is not enabling: a pack's assembly decides what loads.
         kernel.define_builtins();
-        // The judge's settings live in the host's cell, so a save re-applies the
-        // fibers without rebuilding the plugin.
-        let judge_cell = nguruvilu::tools::judge::cell(nguruvilu::tools::judge::from_settings(&settings));
-        nguruvilu::tools::judge::install(&mut kernel, judge_cell.clone());
         // The kernel's own state, published where a pack can change it. Same
         // rule as the CLI: the shell keeps the handles so its hot path reads
         // directly, and publishes the same allocations so a pack's write lands
@@ -683,7 +687,7 @@ impl AppState {
             last_prompt_tokens: None,
             pending,
             mcp: Vec::new(),
-            judge_cell,
+            published,
             pack_baseline,
         };
         // The session this process boots into is already current: its start
@@ -1393,12 +1397,11 @@ impl AppState {
         // the panel is most likely to have touched.
         self.route = ModelRoute::from_settings(&self.settings);
 
-        // The judge takes the panel's three fields the same way.
-        nguruvilu::tools::judge::configure(
-            &mut self.kernel,
-            &self.judge_cell,
-            nguruvilu::tools::judge::from_settings(&self.settings),
-        )?;
+        // The judge re-reads the settings it now finds published. Nothing is
+        // pushed into it: a plugin that reads the table itself cannot drift
+        // from the file the panel just wrote.
+        self.kernel
+            .reload_plugin(nguruvilu::tools::judge::PLUGIN)?;
         let tools = Arc::new(self.kernel.tools().clone());
 
         let mut runtime = self.config.runtime.lock().expect("runtime lock");
@@ -1704,15 +1707,24 @@ impl AppState {
     /// settings only when no plugin provided one.
     pub fn restore_kernel(&mut self, kernel: Kernel) -> Result<()> {
         self.kernel = kernel;
+        // The new kernel's service table is empty. Publish the settings, route
+        // and persona into it before anything reads them — a plugin that takes
+        // its configuration from the table cannot tell an unloaded pack from an
+        // unpublished one, and the two mean opposite things.
+        let handle = self.published.clone();
+        handle.publish(&mut self.kernel);
+        // A settings save that happened while the other kernel was in use lands
+        // here too: the handles are the shell's, so the values are current.
+        *handle
+            .settings
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.settings.clone();
         let network = self.settings.network.clone();
         nguruvilu::network::install(&mut self.kernel, network)?;
 
-        // A pack may have configured the judge too — same re-apply.
-        nguruvilu::tools::judge::configure(
-            &mut self.kernel,
-            &self.judge_cell,
-            nguruvilu::tools::judge::from_settings(&self.settings),
-        )?;
+        // A pack may have configured the judge too — same re-read.
+        self.kernel
+            .reload_plugin(nguruvilu::tools::judge::PLUGIN)?;
 
         let tools = Arc::new(self.kernel.tools().clone());
         let mut route = ModelRoute::from_settings(&self.settings);

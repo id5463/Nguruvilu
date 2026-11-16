@@ -1414,6 +1414,63 @@ pub(crate) async fn dispatch(
 
 
 
+        // A panel asking for a tool, any tool.
+        //
+        // One arm, and it names no capability: `name` is a runtime argument, so
+        // the thousandth pack adds nothing here. A panel that wants the
+        // `pack-market` MCP server's `market_search` passes the registered tool
+        // name and the kernel looks it up in the same table the model uses.
+        //
+        // # Why not `mcp_call`
+        //
+        // The first version of this arm was `"mcp_call"`, added because
+        // `pack-market`'s panel posted exactly that and the shell answered
+        // `unknown command 'mcp_call'`. Copying the name out of an error message
+        // is how a command table turns into a catalog of capabilities: the next
+        // pack would need `plugin_call`, then `skill_call`, then something
+        // nobody predicted, and every one of them is the kernel learning a name
+        // it should never have needed. MCP tools are already ordinary entries in
+        // the tool table (`mcp__<server>__<tool>`), so there was nothing to add.
+        //
+        // The pack was wrong, not the kernel, and the pack is what changed.
+        "tool_call" => {
+            let name = command
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let args = command
+                .get("args")
+                .or_else(|| command.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+
+            // The registry is cloned out under the lock and asked with the lock
+            // released: a tool can be slow (an MCP round trip, a shell), and
+            // holding the app state across it would freeze every other panel.
+            let tools = {
+                let guard = state.lock().expect("state lock");
+                Arc::new(guard.kernel.tools().clone())
+            };
+            let result = tools.execute(&name, &args.to_string()).await;
+            let payload = match result {
+                Ok(output) => json!({
+                    "ev": "tool_result",
+                    "tool": name,
+                    // The protocol shape a panel already knows how to read.
+                    "result": {
+                        "content": [{ "type": "text", "text": output.text }],
+                    },
+                }),
+                Err(error) => json!({
+                    "ev": "tool_result",
+                    "tool": name,
+                    "error": { "message": format!("{error:#}") },
+                }),
+            };
+            emit(&sink, payload);
+        }
+
         "" => {
             emit(&sink, json!({ "ev": "error", "message": "empty command" }));
         }
@@ -1958,15 +2015,11 @@ async fn drain_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
             // pack that configured search leaves the tool behind its key. One
             // disjoint borrow of the state — a MutexGuard does not split into
             // field borrows by itself.
-            let settings = guard.settings.clone();
-            let AppState {
-                kernel, judge_cell, ..
-            } = &mut *guard;
-            let judge = nguruvilu::tools::judge::configure(
-                kernel,
-                judge_cell,
-                nguruvilu::tools::judge::from_settings(&settings),
-            );
+            let AppState { kernel, .. } = &mut *guard;
+            // Re-read rather than push: the judge takes its own settings out of
+            // the table the shell just published, so a pack that changed them is
+            // handled by the same path as the panel.
+            let judge = kernel.reload_plugin(nguruvilu::tools::judge::PLUGIN);
             if let Err(error) = judge {
                 emit(
                     &sink,

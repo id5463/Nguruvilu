@@ -538,11 +538,14 @@ impl StateHandle {
         // simply calls `set` stores the bare `RwLock`. Accepting either is what
         // lets a pack change the kernel's state without knowing which way the
         // host published it.
+        // The host's shape: it kept its own `Arc<RwLock<T>>` and published the
+        // same allocation, so this write lands in the memory the host reads.
         if let Some(lock) = self.get::<Arc<RwLock<T>>>(name) {
             let mut guard = lock.write().unwrap_or_else(|poisoned| poisoned.into_inner());
             change(&mut guard);
             return true;
         }
+        // A plugin's shape: it called `set` with a bare `RwLock`.
         if let Some(lock) = self.get::<RwLock<T>>(name) {
             let mut guard = lock.write().unwrap_or_else(|poisoned| poisoned.into_inner());
             change(&mut guard);
@@ -552,13 +555,29 @@ impl StateHandle {
     }
 
     /// Read a service the kernel installed.
+    /// Read a service the kernel installed.
+    ///
+    /// Two shapes, because the host publishes one and the table stores another:
+    /// a host that keeps its own handle stores `Arc<RwLock<T>>`, while a plugin
+    /// that simply called `set` stores the value it was given. Asking for `T`
+    /// finds either — the `Arc` wrapper is unwrapped for you — so a pack does not
+    /// have to know which way the kernel published the thing it wants to read.
     pub fn get<T: Any + Send + Sync>(&self, name: &str) -> Option<Arc<T>> {
         let real = self.realm.realm_of(name);
-        self.table
+        let entry = self
+            .table
             .read()
             .get(&(name.to_string(), real))
-            .map(|entry| Arc::clone(&entry.value))
-            .and_then(|value| value.downcast::<T>().ok())
+            .map(|entry| Arc::clone(&entry.value))?;
+        if let Ok(theirs) = Arc::clone(&entry).downcast::<T>() {
+            return Some(theirs);
+        }
+        // The value behind one more `Arc`: what `publish_state` makes from a
+        // host's own `Arc<RwLock<T>>`.
+        entry
+            .downcast::<Arc<T>>()
+            .ok()
+            .map(|inner| Arc::clone(inner.as_ref()))
     }
 
     /// Every name currently in the table.
@@ -1083,10 +1102,7 @@ impl Kernel {
         crate::tools::longhorizon::define(self);
         crate::tools::documents::define(self);
         crate::tools::restart::define(self);
-        crate::tools::judge::install(
-            self,
-            crate::tools::judge::cell(None),
-        );
+        crate::tools::judge::install(self);
     }
 
     /// The base tools without a kernel, for a caller that only wants a registry.

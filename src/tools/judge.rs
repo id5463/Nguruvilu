@@ -152,8 +152,8 @@ pub fn cell(judge: Option<JudgeSettings>) -> SettingsCell {
 /// Make the code available: a pack's assembly asking for `builtin:judge`
 /// decides whether a conversation actually has a judge. Same split as
 /// `builtin:delegate` and `builtin:search`.
-pub fn install(kernel: &mut crate::plugin::Kernel, judge: SettingsCell) {
-    kernel.define(std::sync::Arc::new(Judge { judge }));
+pub fn install(kernel: &mut crate::plugin::Kernel) {
+    kernel.define(std::sync::Arc::new(Judge));
 }
 
 /// Push new settings and re-apply every fiber of the plugin: the tool appears
@@ -169,22 +169,39 @@ pub fn configure(
 }
 
 /// The plugin behind [`TOOL`].
-pub struct Judge {
-    judge: SettingsCell,
-}
+///
+/// Carries nothing: its settings are read from the kernel's published table on
+/// every apply, so a settings save re-applies it without the host having to
+/// remember to push anything.
+pub struct Judge;
 
 impl crate::plugin::Plugin for Judge {
     fn name(&self) -> &str {
         PLUGIN
     }
 
-    fn apply(&self, _ctx: &crate::plugin::PluginCtx) -> Result<crate::plugin::Contributions> {
-        let current = self
-            .judge
+    /// Whether a judge exists is the pack's own question, answered from the
+    /// published settings rather than from a cell the host pushes.
+    ///
+    /// The host used to own a `SettingsCell`, deserialize `Settings::judge` into
+    /// it, and call `configure` after every save. Three host call sites in
+    /// `main.rs` and three in the shell knew what a `judge` was, all so one
+    /// plugin could read one key. Now the plugin reads the same `settings`
+    /// service a pack's own code would, and the host knows nothing:
+    /// `ctx.change::<Settings>` is the only thing it has to publish.
+    fn inject(&self) -> Vec<String> {
+        vec![crate::state::SETTINGS.to_string()]
+    }
+
+    fn apply(&self, ctx: &crate::plugin::PluginCtx) -> Result<crate::plugin::Contributions> {
+        let published = ctx
+            .get::<std::sync::RwLock<crate::settings::Settings>>(crate::state::SETTINGS)
+            .ok_or_else(|| anyhow!("the host has not published its settings"))?;
+        let settings = published
             .read()
             .map(|guard| guard.clone())
-            .unwrap_or(None);
-        match current {
+            .unwrap_or_default();
+        match from_settings(&settings) {
             Some(judge) if judge.is_configured() => {
                 Ok(crate::plugin::Contributions::new().tool(tool(judge)?))
             }
@@ -546,14 +563,24 @@ mod tests {
     }
 
     /// The kernel a pack that asks for `builtin:judge` leaves behind.
-    fn loaded(judge: Option<JudgeSettings>) -> (Kernel, SettingsCell) {
+    ///
+    /// The settings are published the way a host publishes them, because that is
+    /// now how the plugin is configured: there is no cell to hand it. `None`
+    /// means "the user has not configured a judge", which is an empty entry
+    /// rather than a missing one — the table always has a settings slot.
+    fn loaded(judge: Option<JudgeSettings>) -> Kernel {
         let mut kernel = Kernel::new();
-        let cell = cell(judge);
-        install(&mut kernel, cell.clone());
+        let mut settings = crate::settings::Settings::default();
+        if let Some(judge) = judge {
+            into_settings(&mut settings, Some(judge)).unwrap();
+        }
+        let published = crate::state::Published::install(&mut kernel, settings);
+        drop(published);
+        install(&mut kernel);
         kernel
             .load(PLUGIN, RealmMap::new(), Value::Null)
             .unwrap();
-        (kernel, cell)
+        kernel
     }
 
     #[test]
@@ -573,21 +600,37 @@ mod tests {
     #[test]
     fn defining_alone_puts_no_tool_in_the_table() {
         let mut kernel = Kernel::new();
-        install(&mut kernel, cell(Some(settings("sk-test"))));
+        install(&mut kernel);
         assert!(kernel.tools().get(TOOL).is_none());
         assert!(kernel.plugin(PLUGIN).is_some(), "but the code is available");
     }
 
     #[test]
-    fn configure_makes_the_tool_appear_and_vanish() {
-        let (mut kernel, cell) = loaded(None);
+    fn a_key_in_the_settings_table_makes_the_tool_appear_and_leave() {
+        // The judge is configured by writing its own entry into the settings the
+        // kernel publishes, then re-applying it — the same path a pack uses. No
+        // host-side cell is involved, because a host that has to remember to push
+        // a value is a host that can forget.
+        let mut kernel = loaded(None);
         assert!(kernel.tools().get(TOOL).is_none(), "nothing configured");
 
-        configure(&mut kernel, &cell, Some(settings("sk-test"))).unwrap();
+        let stored = kernel
+            .service_view(RealmMap::new())
+            .get::<std::sync::RwLock<crate::settings::Settings>>(crate::state::SETTINGS)
+            .expect("the host published its settings");
+        stored
+            .write()
+            .unwrap()
+            .set_pack(
+                PACK,
+                serde_json::to_value(settings("sk-test")).unwrap(),
+            );
+        kernel.reload_plugin(PLUGIN).unwrap();
         assert!(kernel.tools().get(TOOL).is_some(), "a key lands the tool");
         assert_eq!(kernel.tools().owner(TOOL), Some(PLUGIN));
 
-        configure(&mut kernel, &cell, None).unwrap();
+        stored.write().unwrap().packs.remove(PACK);
+        kernel.reload_plugin(PLUGIN).unwrap();
         assert!(kernel.tools().get(TOOL).is_none(), "off takes it away");
     }
 

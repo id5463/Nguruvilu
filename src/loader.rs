@@ -1007,41 +1007,29 @@ fn mcp_env(declared: &std::collections::BTreeMap<String, String>) -> std::collec
             env.insert("NGU_EXE".to_string(), exe.display().to_string());
         }
     }
-    // Settings a pack would otherwise have to write its own file to read. They
-    // are values the *user* chose through a panel, and the panel's choice has to
-    // reach the process that acts on it — a settings field nobody can read is a
-    // switch that does nothing.
+    // Every pack's settings, as one JSON object, under one name.
     //
-    // Declared entries still win: a pack that hardcodes its own targets is
-    // saying it does not want this control, and silently overriding that would
-    // be the surprise.
-    // The proxy pack's two settings come out of the table packs keep their
-    // settings in, not out of fields the kernel used to declare for it. The
-    // kernel does not know what a `mode` or a `target` is; it knows the pack
-    // asked for a slot and hands that slot to the process as an environment
-    // variable, which is what the pack reads anyway.
-    let settings = crate::settings::Settings::load().unwrap_or_default();
-    let proxy = settings.pack("mcp-proxy");
-    if !env.contains_key("NGU_MCP_MODE") {
-        if let Some(mode) = proxy.get("mode").and_then(|v| v.as_str()).map(str::trim) {
-            if !mode.is_empty() {
-                env.insert("NGU_MCP_MODE".to_string(), mode.to_string());
+    // Before this, each pack that wanted a setting the user had chosen needed a
+    // kernel-side reader: `mcp-proxy` had `NGU_MCP_MODE` and `NGU_MCP_TARGETS`
+    // written out here by name, which made the kernel know that a pack called
+    // `mcp-proxy` exists and that it has settings called `mode` and `targets`.
+    // That is the shape this whole change is trying to remove — a pack cannot be
+    // added without editing this function.
+    //
+    // One variable instead: the whole `packs` table, verbatim. A server that
+    // wants its own settings reads `NGU_PACK_SETTINGS` and takes its own key;
+    // one that wants nothing ignores it. The kernel's involvement ends at
+    // "serialize the map".
+    //
+    // Declared entries still win, for the ordinary reason: a pack that hardcodes
+    // an environment variable is saying it does not want this control.
+    if !env.contains_key("NGU_PACK_SETTINGS") {
+        let settings = crate::settings::Settings::load().unwrap_or_default();
+        if !settings.packs.is_empty() {
+            if let Ok(text) = serde_json::to_string(&settings.packs) {
+                env.insert("NGU_PACK_SETTINGS".to_string(), text);
             }
         }
-    }
-    let targets: Vec<String> = proxy
-        .get("targets")
-        .and_then(|v| v.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    if !env.contains_key("NGU_MCP_TARGETS") && !targets.is_empty() {
-        env.insert("NGU_MCP_TARGETS".to_string(), targets.join("
-"));
     }
     env
 }

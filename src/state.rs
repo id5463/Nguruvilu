@@ -112,9 +112,13 @@ impl Published {
     /// Called at startup and again after anything the host itself changed, so a
     /// pack always finds a live value rather than a stale copy.
     pub fn publish(&self, kernel: &mut Kernel) {
-        kernel.publish_state(SETTINGS, Arc::clone(&self.settings));
-        kernel.publish_state(ROUTE, Arc::clone(&self.route));
-        kernel.publish_state(PERSONA, Arc::clone(&self.persona));
+        // `_arc`, not the plain call: the host already holds these behind an
+        // `Arc` and publishes *that same allocation*, so a pack's write lands in
+        // the memory the host reads. `publish_state` would wrap it again
+        // (`Arc<Arc<RwLock<_>>>`) and no reader would find it.
+        kernel.publish_state_arc(SETTINGS, Arc::clone(&self.settings) as Arc<dyn std::any::Any + Send + Sync>);
+        kernel.publish_state_arc(ROUTE, Arc::clone(&self.route) as Arc<dyn std::any::Any + Send + Sync>);
+        kernel.publish_state_arc(PERSONA, Arc::clone(&self.persona) as Arc<dyn std::any::Any + Send + Sync>);
     }
 
     /// The settings as they are right now.
@@ -184,3 +188,4 @@ mod tests {
         }
     }
 }
+

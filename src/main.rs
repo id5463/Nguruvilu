@@ -932,8 +932,6 @@ async fn run() -> Result<()> {
     kernel.define_builtins();
     // The judge keeps its settings in the host's cell rather than in the plugin,
     // so a settings save can re-apply the fibers without rebuilding anything.
-    let judge_cell = nguruvilu::tools::judge::cell(nguruvilu::tools::judge::from_settings(&settings));
-    nguruvilu::tools::judge::install(&mut kernel, judge_cell.clone());
     // The kernel's own state, published where a pack can reach and change it:
     // settings, route, persona. Reading stays direct (`published.settings()`),
     // because routing the hot path through a string lookup would make every turn
@@ -1122,13 +1120,10 @@ async fn run() -> Result<()> {
             ChangePayload::Persona(persona.clone()),
         ))?;
     }
-    // The judge keeps its own cell: settings first, fibers re-apply, and the
-    // table says whether a verdict is available this turn.
-    nguruvilu::tools::judge::configure(
-        &mut kernel,
-        &judge_cell,
-        nguruvilu::tools::judge::from_settings(&settings),
-    )?;
+    // The judge re-reads the settings it now finds published, and the table
+    // says whether a verdict is available this turn. The host does not hand it
+    // a value: a plugin that reads `settings` itself cannot drift from the file.
+    kernel.reload_plugin(nguruvilu::tools::judge::PLUGIN)?;
     if kernel.tools().get(nguruvilu::tools::judge::TOOL).is_some() {
         eprintln!("[judge] enabled");
     }
@@ -1466,7 +1461,6 @@ async fn run() -> Result<()> {
                 injection: &injection,
                 queue: &pending_packs,
                 mcp: &mut mcp_clients,
-                judge: &judge_cell,
                 persona_override: cli.persona.clone(),
                 baseline: pack_baseline,
             }
@@ -1544,7 +1538,6 @@ async fn run() -> Result<()> {
                     injection: &injection,
                     queue: &pending_packs,
                     mcp: &mut mcp_clients,
-                    judge: &judge_cell,
                     persona_override: cli.persona.clone(),
                     baseline: pack_baseline,
                 },
@@ -4247,8 +4240,6 @@ struct PackHost<'a> {
     /// The session's MCP servers: joined when a pack loads, stopped when it
     /// unloads, and stopped for good on the way out.
     mcp: &'a mut Vec<Arc<nguruvilu::mcp::McpClient>>,
-    /// The judge plugin's settings cell — same rule, `judge::configure`.
-    judge: &'a nguruvilu::tools::judge::SettingsCell,
     /// An explicit `--persona` from this run: adoption joins the installed
     /// packs' souls, and this outranks them, so it goes back on top after
     /// every drain.
@@ -4415,11 +4406,10 @@ impl PackHost<'_> {
             *self.injection
                 .lock()
                 .expect("injection lock") = Arc::new(adopted.injections);
-            nguruvilu::tools::judge::configure(
-                self.kernel,
-                self.judge,
-                nguruvilu::tools::judge::from_settings(self.settings),
-            )?;
+            // The judge re-reads whatever the settings now say, including a
+            // pack that changed them. Nothing is pushed into it.
+            self.kernel
+                .reload_plugin(nguruvilu::tools::judge::PLUGIN)?;
             // The route may have moved with the pack's content, and the tool
             // table certainly did; both are published together so the next
             // turn reads one consistent view.

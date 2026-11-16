@@ -409,40 +409,63 @@ impl Settings {
         self.packs.insert(name.into(), value);
     }
 
-    /// Fold the fields this struct used to carry by name into [`Settings::packs`].
+    /// Move a pre-`packs` settings file's top-level pack keys into [`Settings::packs`].
     ///
-    /// `skill_mode`, `mcp_proxy_mode`, `mcp_proxy_targets` and `judge` were
-    /// fields of this struct, so a settings file written before the change has
-    /// them at the top level. They are moved under their pack names on load
-    /// rather than dropped: an upgrade must not lose a key the user typed.
+    /// This struct used to carry four fields that belonged to three packs:
+    /// `skill_mode`, `mcp_proxy_mode`, `mcp_proxy_targets` and `judge`. An
+    /// existing settings file has them at the top level, where `serde` now files
+    /// them under [`Settings::unknown`], and dropping them would lose a key the
+    /// user typed.
     ///
-    /// Idempotent — a file already migrated has nothing to move, and a pack that
+    /// # Why this is a table of strings and not three pack names
+    ///
+    /// It has to name them: `skill_mode` is not derivable from `skill-router`,
+    /// and the whole point is to move values written by a build that knew both
+    /// names. This is the one place left in the kernel that says a pack called
+    /// `judge` exists — and it is a **migration**, not a dependency: it runs on
+    /// a file written before the change and does nothing on any file after.
+    ///
+    /// The honest fix is to delete this once the old files are gone; a
+    /// version-numbered settings file would have made it unnecessary from the
+    /// start. It is kept, bounded and commented, rather than spread through
+    /// three host call sites the way it was.
+    ///
+    /// Idempotent: a file already migrated has nothing to move, and a pack that
     /// has since written its own entry is not overwritten by an old key.
     pub fn migrate_legacy_pack_keys(&mut self) {
         use serde_json::{json, Value};
 
-        let legacy = self.unknown.clone();
-        for (reserved, pack) in [
-            ("skill_mode", "skill-router"),
-            ("mcp_proxy_mode", "mcp-proxy"),
-            ("mcp_proxy_targets", "mcp-proxy"),
-            ("judge", "judge"),
-        ] {
-            let Some(value) = legacy.get(reserved).cloned() else {
+        // `<old top-level key>` → `<pack>` and, when the old key's name is not
+        // the new one, `<new key inside that pack>`.
+        const MIGRATIONS: &[(&str, &str, &str)] = &[
+            ("skill_mode", "skill-router", "skill_mode"),
+            ("mcp_proxy_mode", "mcp-proxy", "mcp_proxy_mode"),
+            ("mcp_proxy_targets", "mcp-proxy", "mcp_proxy_targets"),
+            ("judge", "judge", "judge"),
+        ];
+
+        for (old_key, pack, new_key) in MIGRATIONS {
+            let Some(value) = self.unknown.get(*old_key).cloned() else {
                 continue;
             };
-            if self.packs.contains_key(pack) {
-                continue;
-            }
+            // Never overwrite: a pack that has run since the upgrade owns its
+            // own entry, and its value is newer than the leftover.
             let entry = self
                 .packs
-                .entry(pack.to_string())
+                .entry((*pack).to_string())
                 .or_insert_with(|| Value::Object(Default::default()));
-            if let Some(map) = entry.as_object_mut() {
-                map.insert(reserved.to_string(), value);
-            } else {
-                *entry = json!({ reserved: value });
+            match entry.as_object_mut() {
+                Some(map) => {
+                    map.entry((*new_key).to_string()).or_insert(value);
+                }
+                None => *entry = json!({ *new_key: value }),
             }
+        }
+
+        // The old keys are moved, not copied: leaving them would make every
+        // later load re-migrate from a stale copy.
+        for (old_key, _, _) in MIGRATIONS {
+            self.unknown.remove(*old_key);
         }
     }
 
@@ -1189,3 +1212,4 @@ mod tests {
         );
     }
 }
+

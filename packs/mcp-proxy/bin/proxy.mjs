@@ -52,8 +52,28 @@ function resolveProgram(command) {
   return { program: command, needsShell: false };
 }
 
-const MODE = (process.env.NGU_MCP_MODE || 'proxy').trim().toLowerCase();
-const TARGET_SPEC = process.env.NGU_MCP_TARGETS || '';
+// 自己的设置，从内核递过来的整张表里取自己那一段。
+//
+// 内核以前为这个包写死了两个变量（NGU_MCP_MODE / NGU_MCP_TARGETS），
+// 那意味着内核知道自己有一个叫 mcp-proxy 的包、还知道它有两个设置项。
+// 现在内核只递一整张 `{包名: 设置}` 的 JSON，包自己取——内核不认识
+// 这里面任何一个名字，也就不会因为多了一个包而要改代码。
+function ownSettings() {
+  const raw = process.env.NGU_PACK_SETTINGS;
+  if (!raw) return {};
+  try {
+    const all = JSON.parse(raw);
+    return (all && typeof all === 'object' && all['mcp-proxy']) || {};
+  } catch (e) {
+    return {};
+  }
+}
+
+const SETTINGS = ownSettings();
+const MODE = String(SETTINGS.mode || 'proxy').trim().toLowerCase();
+const TARGET_SPEC = Array.isArray(SETTINGS.targets)
+  ? SETTINGS.targets.join('\n')
+  : (typeof SETTINGS.targets === 'string' ? SETTINGS.targets : '');
 const DEBUG = process.env.NGU_MCP_DEBUG === '1';
 
 function log(...args) {
@@ -469,3 +489,4 @@ function shutdown() {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 process.stdin.on('end', shutdown);
+
