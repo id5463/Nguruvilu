@@ -1,0 +1,11 @@
+{
+  "servers": [
+    {
+      "id": "pack-market",
+      "transport": "stdio",
+      "command": "node",
+      "args": ["bin/market.mjs"],
+      "scope": "session"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+version: 1
+name: pack-market
+defaults:
+  scope: session
+  on_failure: skip
+stages:
+- name: pack
+  mcp:
+  - id: pack-market
+    source: stdio:node bin/market.mjs
+    scope: session
+    transport: stdio
+    command: node
+    args:
+    - bin/market.mjs
