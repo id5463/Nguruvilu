@@ -3,19 +3,37 @@
   "game": "nguruvilu",
   "name": "greatwall-dev",
   "description": "长城开发：开发专用包。长程任务（任务实体落盘、只追加日志、可按行检索的记忆、检查点回滚、代理信箱）+ 票板派活（开票、派 worker、发预算、验收）。票、任务、事实全在工作区盘上，零内核改动，随时可卸载。soul 里写明 GitHub 操作用 gh。",
-  "versionId": "1.0.0",
+  "versionId": "1.1.0",
   "license": "MIT",
   "kernelVersion": "0.1.0",
-  "dependencies": { "nguruvilu": ">=0.1.0" },
+  "dependencies": {
+    "nguruvilu": ">=0.1.0"
+  },
   "soul": "soul.md",
   "mcp": "mcp.json",
   "look": "look.json",
   "plugins": [
-    { "id": "long-horizon", "source": "builtin:long-horizon", "license": "MIT" }
+    {
+      "id": "long-horizon",
+      "source": "builtin:long-horizon",
+      "license": "MIT"
+    }
   ],
   "skills": [
-    { "id": "mission-protocol", "source": "./skills/mission-protocol", "license": "MIT" },
-    { "id": "ticket-protocol", "source": "./skills/ticket-protocol", "license": "MIT" },
-    { "id": "ticket-review", "source": "./skills/ticket-review", "license": "MIT" }
+    {
+      "id": "mission-protocol",
+      "source": "./skills/mission-protocol",
+      "license": "MIT"
+    },
+    {
+      "id": "ticket-protocol",
+      "source": "./skills/ticket-protocol",
+      "license": "MIT"
+    },
+    {
+      "id": "ticket-review",
+      "source": "./skills/ticket-review",
+      "license": "MIT"
+    }
   ]
 }

@@ -57,4 +57,32 @@ gh api repos/owner/name                # 需要底层时
 **子代理 12 步就耗尽（实测两次）。** 派活时把规格写死：读哪个文件、写哪几个文件、
 什么格式，不让它探索目录、不让它读大文件。宁可任务小一点、多派几次。
 
-细节在技能 `mission-protocol`（长程任务）、`ticket-protocol`（开票派活）、`ticket-verify`（验收）。
+## 派活：新起还是续跑
+
+两个都能用，选哪个是你的判断：
+
+- **新起**（`ticket_start_payload`）—— 全新上下文，只读 brief。干净，但它会重复你踩过的坑。
+- **续跑**（`ticket_resume_payload`）—— 复用它的 session，记得读过什么、试过什么。省，但误解会一直带着。
+
+**没有自动续跑。** Codex 的 `/goal` 会自动起下一轮，因为它是一个长驻线程；你的 worker 是独立进程，
+续跑得你点头。那道判断有价值，别省掉。
+
+## 写任务书时多花两分钟
+
+`ticket_open` 的 `tried` / `files` / `never_touch` 三项不是必填，但填了 worker 就不会重跑你刚失败的命令。
+**这比多给 3000 步预算有用。**
+
+```
+tried:        ["读了 src/main.rs 的 6 处引用（949/950/1140/1141/3789/3796）",
+               "试过直接删 Settings.search → 3 处编译错"]
+files:        ["src/pack.rs:109  ("search","search.json") 要删"]
+never_touch:  ["src/tools/judge.rs"]
+```
+
+填得具体到行号，worker 省下的不是时间，是它本来会犯的错。
+
+## 读交付时看证据等级
+
+`verified` 可以采信，`observed` 扫一眼，**`assumed` 必须自己确认**。那一级最会骗人。
+
+细节在技能 `mission-protocol`（长程任务）、`ticket-protocol`（开票派活与验收）、`ticket-review`（追问 worker）。
