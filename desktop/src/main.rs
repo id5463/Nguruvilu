@@ -2015,17 +2015,6 @@ async fn drain_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
             // pack that configured search leaves the tool behind its key. One
             // disjoint borrow of the state — a MutexGuard does not split into
             // field borrows by itself.
-            let AppState { kernel, .. } = &mut *guard;
-            // Re-read rather than push: the judge takes its own settings out of
-            // the table the shell just published, so a pack that changed them is
-            // handled by the same path as the panel.
-            let judge = kernel.reload_plugin(nguruvilu::tools::judge::PLUGIN);
-            if let Err(error) = judge {
-                emit(
-                    &sink,
-                    json!({ "ev": "error", "message": format!("judge config: {error:#}") }),
-                );
-            }
         }
         // Panels, theme, and labels move with the kernel, and the tool table
         // is what the next turn reads.

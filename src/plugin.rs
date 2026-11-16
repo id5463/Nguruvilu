@@ -1101,8 +1101,6 @@ impl Kernel {
         crate::tools::subagent::define(self);
         crate::tools::longhorizon::define(self);
         crate::tools::documents::define(self);
-        crate::tools::restart::define(self);
-        crate::tools::judge::install(self);
     }
 
     /// The base tools without a kernel, for a caller that only wants a registry.

@@ -144,8 +144,50 @@ pub struct PluginEntry {
     #[serde(flatten)]
     pub base: EntryBase,
     /// Plugin configuration passed to `apply`.
+    ///
+    /// A plugin that runs as a process receives this verbatim in its
+    /// `describe` reply's surroundings; one compiled into the kernel gets it
+    /// through `PluginCtx`.
     #[serde(default)]
     pub config: Value,
+    /// Build the executable from source inside the pack, when it is not there.
+    ///
+    /// A plugin is an executable, and a pack that ships one has two choices: put
+    /// the binary in the archive (platform-specific, large, and unverifiable on
+    /// a machine that did not build it) or ship the source and let the machine
+    /// build it. This says the second, and names what to run.
+    ///
+    /// Conceptually `cargo`, `go`, or `make`: the field names a **directory to
+    /// build in** and a **binary to end up with**, not a toolchain. Keeping
+    /// `cargo` out of the field name is what stops this from being an enum of
+    /// build systems in a year.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<BuildSpec>,
+}
+
+/// How to produce a plugin's executable from source.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BuildSpec {
+    /// Directory to build in, relative to the pack.
+    ///
+    /// `dir` rather than `crate` because `crate` is a Rust keyword and this field
+    /// must not assume Rust is the build tool.
+    #[serde(default = "default_build_dir")]
+    pub dir: String,
+    /// The binary to expect afterwards; also the name passed to the build tool.
+    pub binary: String,
+    /// Arguments for the build command. Defaults to what a Cargo release build
+    /// wants, which is the only one implemented.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// The build command. Defaults to `cargo`; a pack that builds with
+    /// something else says so and does not need a kernel change.
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+fn default_build_dir() -> String {
+    "src".to_string()
 }
 
 /// An MCP server entry.
@@ -310,6 +352,8 @@ pub struct PlannedStep {
     pub source: String,
     /// Plugin configuration, for plugin steps.
     pub config: Value,
+    /// How to build the executable, for plugin steps that ship source.
+    pub build: Option<BuildSpec>,
     /// MCP spec, for mcp steps.
     pub mcp: Option<McpEntry>,
     /// Skill hash, for skill steps.
@@ -548,6 +592,10 @@ impl Assembly {
                     config: match raw {
                         Raw::Plugin(p) => p.config.clone(),
                         _ => Value::Null,
+                    },
+                    build: match raw {
+                        Raw::Plugin(p) => p.build.clone(),
+                        _ => None,
                     },
                     mcp: match raw {
                         Raw::Mcp(m) => Some(m.clone()),

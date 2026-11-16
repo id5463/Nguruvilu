@@ -1397,11 +1397,6 @@ impl AppState {
         // the panel is most likely to have touched.
         self.route = ModelRoute::from_settings(&self.settings);
 
-        // The judge re-reads the settings it now finds published. Nothing is
-        // pushed into it: a plugin that reads the table itself cannot drift
-        // from the file the panel just wrote.
-        self.kernel
-            .reload_plugin(nguruvilu::tools::judge::PLUGIN)?;
         let tools = Arc::new(self.kernel.tools().clone());
 
         let mut runtime = self.config.runtime.lock().expect("runtime lock");
@@ -1722,9 +1717,6 @@ impl AppState {
         let network = self.settings.network.clone();
         nguruvilu::network::install(&mut self.kernel, network)?;
 
-        // A pack may have configured the judge too — same re-read.
-        self.kernel
-            .reload_plugin(nguruvilu::tools::judge::PLUGIN)?;
 
         let tools = Arc::new(self.kernel.tools().clone());
         let mut route = ModelRoute::from_settings(&self.settings);

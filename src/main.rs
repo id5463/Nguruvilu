@@ -1120,13 +1120,6 @@ async fn run() -> Result<()> {
             ChangePayload::Persona(persona.clone()),
         ))?;
     }
-    // The judge re-reads the settings it now finds published, and the table
-    // says whether a verdict is available this turn. The host does not hand it
-    // a value: a plugin that reads `settings` itself cannot drift from the file.
-    kernel.reload_plugin(nguruvilu::tools::judge::PLUGIN)?;
-    if kernel.tools().get(nguruvilu::tools::judge::TOOL).is_some() {
-        eprintln!("[judge] enabled");
-    }
 
     // A pack's numbers replace the standing ones, so the route is rebuilt from
     // what the settings now say — and the client is built from that route
@@ -4406,10 +4399,6 @@ impl PackHost<'_> {
             *self.injection
                 .lock()
                 .expect("injection lock") = Arc::new(adopted.injections);
-            // The judge re-reads whatever the settings now say, including a
-            // pack that changed them. Nothing is pushed into it.
-            self.kernel
-                .reload_plugin(nguruvilu::tools::judge::PLUGIN)?;
             // The route may have moved with the pack's content, and the tool
             // table certainly did; both are published together so the next
             // turn reads one consistent view.

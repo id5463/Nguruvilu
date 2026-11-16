@@ -1,0 +1,20 @@
+[package]
+name = "ngu-restart"
+version = "1.0.0"
+edition = "2021"
+description = "The restart plugin: let the agent restart the kernel it runs in"
+license = "MIT"
+
+[[bin]]
+name = "ngu-restart"
+path = "main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"

@@ -10,8 +10,22 @@ import { dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const INDEX_ENV = 'NGU_MARKET_INDEX';
+/// The catalogue this pack publishes, used when no environment variable says
+/// otherwise.
+///
+/// The bundled copy is still read first and still works offline — it is what
+/// makes the market usable straight after install. But an entry's `url` is now
+/// absolute (see `index.json`), so the bundled copy and the remote one describe
+/// the same archives in the same way, and a machine that has never cloned this
+/// repository can still download them.
+const DEFAULT_INDEX_URL =
+  'https://raw.githubusercontent.com/id5463/Nguruvilu/main/packs/pack-market/index.json';
 /// Directory of the bundled index, when that is where the catalogue came from.
 let bundledIndexDir = null;
+/// The URL the catalogue came from, when it came over the network. A relative
+/// `url` in an entry resolves against this, so a self-hosted index that names
+/// `store/x.zip` keeps working wherever it is served from.
+let remoteIndexBase = null;
 const NO_INDEX_MSG =
   '未配置商店索引地址：设置环境变量 NGU_MARKET_INDEX 为索引 JSON 的 URL';
 
@@ -62,6 +76,9 @@ async function loadIndex() {
   if (!data || !Array.isArray(data.packs)) {
     throw new ToolError(`索引格式不对：缺少 packs 数组（${url}）`);
   }
+  // A relative `url` is resolved against whatever served the catalogue, so a
+  // self-hosted index keeps working wherever it is mounted.
+  remoteIndexBase = url;
   return data.packs;
 }
 
@@ -235,6 +252,20 @@ async function marketInstall(args) {
     }
     if (!res.ok) throw new ToolError(`下载失败：${raw_url} — HTTP ${res.status}`);
     bytes = Buffer.from(await res.arrayBuffer());
+  } else if (remoteIndexBase) {
+    // The catalogue came over the network but this entry is relative: resolve it
+    // against the index URL rather than the filesystem.
+    const resolved = new URL(raw_url, remoteIndexBase).toString();
+    let res;
+    try {
+      res = await fetch(resolved);
+    } catch (err) {
+      throw new ToolError(
+        `下载失败：${resolved} — ${err && err.message ? err.message : err}`,
+      );
+    }
+    if (!res.ok) throw new ToolError(`下载失败：${resolved} — HTTP ${res.status}`);
+    bytes = Buffer.from(await res.arrayBuffer());
   } else {
     // Relative to the bundled index, or absolute when the entry says so.
     const base = bundledIndexDir || process.cwd();
@@ -385,3 +416,4 @@ rl.on('line', (line) => {
 });
 
 rl.on('close', () => process.exit(0));
+

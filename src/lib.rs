@@ -43,6 +43,7 @@ pub mod model;
 pub mod plugin;
 pub mod preinstall;
 pub mod pricing;
+pub mod protocol;
 pub mod request;
 pub mod routes;
 pub mod session;

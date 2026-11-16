@@ -3,9 +3,16 @@ name: judge
 defaults:
   scope: session
   on_failure: skip
+# The judge is no longer compiled into the kernel: this pack ships the source and
+# the kernel builds and runs it on first load. It reads its endpoint and key out
+# of the pack settings table (`judge.endpoint` / `judge.api_key`), which is why a
+# settings save takes effect on the next call with nothing pushed into it.
 stages:
 - name: pack
   plugins:
   - id: judge
-    source: builtin:judge
+    source: plugin:bin/ngu-judge
     scope: global
+    build:
+      dir: src
+      binary: ngu-judge

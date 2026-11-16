@@ -76,6 +76,11 @@ pub struct Loader {
     ledger_path: PathBuf,
     pack: String,
     pack_dir: Option<PathBuf>,
+    /// Plugin processes this loader started, kept alive for as long as it is.
+    ///
+    /// Held rather than dropped because dropping one stops it: the process is
+    /// the capability, and a plugin whose process ended contributes nothing.
+    processes: Vec<Arc<crate::protocol::Process>>,
 }
 
 impl Loader {
@@ -89,6 +94,7 @@ impl Loader {
             ledger,
             ledger_path,
             pack: pack.into(),
+            processes: Vec::new(),
             pack_dir: None,
         }
     }
@@ -232,10 +238,20 @@ impl Loader {
     /// would be a security hole rather than a feature. Anything else is
     /// refused with a clear message.
     fn load_plugin(&mut self, step: &PlannedStep) -> Result<Outcome> {
+        // `plugin:<path>` is a process. This is the ordinary way a capability
+        // arrives now: the pack ships an executable (or the source for one), the
+        // kernel starts it once, and `src/protocol.rs` defines the four
+        // operations they exchange.
+        //
+        // It is checked before anything else because a process plugin has no
+        // entry in `kernel.define(...)`: the whole point is that the kernel was
+        // not rebuilt to know about it.
+        if let Some(raw) = step.source.strip_prefix("plugin:") {
+            return self.load_process_plugin(step, raw);
+        }
         // `dylib:<path>` defines the plugin on the spot by loading a shared
-        // library. This is the only source form that runs native code, so it is
-        // always explicit in the manifest — never inferred from a file
-        // extension.
+        // library. Kept for compatibility; `plugin:` is the recommended form and
+        // the one every shipped pack uses.
         let name = if let Some(raw) = step.source.strip_prefix("dylib:") {
             let path = self.resolve_source(raw);
             let plugin = unsafe { DynamicPlugin::load(&path) }
@@ -589,6 +605,284 @@ fn pack_cwd(pack_dir: Option<&std::path::Path>, command: &str, args: &[String]) 
     }
 
     /// Resolve a source path against the pack directory when it is relative.
+    /// Load a plugin that runs as a process.
+    ///
+    /// Three steps, in this order, because each makes the next cheaper:
+    ///
+    /// 1. **Build it if the pack ships source and the binary is missing.**
+    /// 2. **Start it.** One spawn; the process stays for the life of the loader.
+    ///    Measured: 45 ms to start against 0.25 ms per call, so reconnecting per
+    ///    call would make the protocol 180x slower than the transport it uses.
+    /// 3. **Register what it declared.** Each tool becomes an ordinary entry in
+    ///    the tool table, owned by `plugin:<id>`, so unloading removes exactly
+    ///    what this plugin added.
+    fn load_process_plugin(&mut self, step: &PlannedStep, raw: &str) -> Result<Outcome> {
+        let pack_dir = self.pack_dir.clone();
+        let path = self.resolve_process_path(raw, pack_dir.as_deref());
+
+        let build_spec = step.build.clone();
+        let path = match path {
+            Some(path) => path,
+            None => match build_spec {
+                Some(build) => self.build_plugin(step, &build)?,
+                None => {
+                    return Err(anyhow!(
+                        "plugin '{}' names '{}', which is not there, and the pack \
+                         declares no `build` to produce it",
+                        step.id,
+                        raw
+                    ))
+                }
+            },
+        };
+
+        let mut spec = crate::protocol::Spec::new(step.id.clone(), path.display().to_string());
+        if let Some(dir) = &pack_dir {
+            // A plugin that came with a pack runs inside it, the same rule MCP
+            // servers already follow: a relative path in its own arguments then
+            // means what the pack author meant.
+            spec = spec.in_dir(dir.display().to_string());
+        }
+        // Every pack's settings, verbatim. The kernel serialises a map and its
+        // involvement ends — see `SETTINGS_VAR`.
+        if let Ok(text) = serde_json::to_string(&self.pack_settings()) {
+            spec.env.insert(crate::protocol::SETTINGS_VAR.to_string(), text);
+        }
+
+        let process = start_process(&spec)
+            .with_context(|| format!("loading process plugin '{}'", step.id))?;
+        let process = Arc::new(process);
+
+        let owner = format!("plugin:{}", step.id);
+        let mut registered: Vec<String> = Vec::new();
+        for decl in &process.description().tools {
+            let handler_process = Arc::clone(&process);
+            let tool_name = decl.name.clone();
+            let def = crate::tools::ToolDef::new(
+                decl.name.clone(),
+                decl.description.clone(),
+                decl.parameters.clone(),
+                owner.clone(),
+                move |args| {
+                    let process = Arc::clone(&handler_process);
+                    let name = tool_name.clone();
+                    Box::pin(async move {
+                        let value = process.call(&name, args).await?;
+                        // A plugin answers with JSON. Text is what the model
+                        // reads, so a string answer is passed through and
+                        // anything else is serialised compactly.
+                        Ok(match value {
+                            serde_json::Value::String(text) => {
+                                crate::tools::ToolOutput::text(text)
+                            }
+                            other => crate::tools::ToolOutput::text(
+                                serde_json::to_string(&other).unwrap_or_default(),
+                            ),
+                        })
+                    }) as crate::tools::ToolFuture
+                },
+            );
+            if let Err(error) = self
+                .kernel
+                .tools_mut()
+                .register(def, ConflictPolicy::Override)
+            {
+                for tool in &registered {
+                    self.kernel.tools_mut().unregister(tool);
+                }
+                return Err(error);
+            }
+            registered.push(decl.name.clone());
+        }
+
+        let tool_count = registered.len();
+        let panel_count = process.description().panels.len();
+        self.processes.push(Arc::clone(&process));
+
+        self.ledger.record(LedgerEntry {
+            kind: EntryKind::Plugin.as_str().into(),
+            id: step.id.clone(),
+            source: step.source.clone(),
+            sha1: None,
+            path: Some(path.display().to_string()),
+            scope: scope_name(step.scope).into(),
+            pack: self.pack.clone(),
+            installed_at: now_iso(),
+        });
+
+        if tool_count == 0 && panel_count == 0 {
+            return Ok(Outcome::Skipped(
+                "plugin described neither a tool nor a panel".into(),
+            ));
+        }
+        Ok(Outcome::Loaded)
+    }
+
+    /// Where a `plugin:` source points, if it is there.
+    ///
+    /// Relative paths resolve inside the pack; a bare name is handed to the
+    /// operating system's `PATH` lookup, exactly like every other `command` in
+    /// this loader.
+    fn resolve_process_path(
+        &self,
+        raw: &str,
+        pack_dir: Option<&std::path::Path>,
+    ) -> Option<PathBuf> {
+        let candidate = PathBuf::from(raw);
+        if candidate.is_absolute() {
+            return candidate.is_file().then_some(candidate);
+        }
+        if !raw.contains('/') && !raw.contains('\\') {
+            // A bare name: let `Command` resolve it. Claiming a file we have not
+            // checked would be worse than letting the spawn say it is missing.
+            return Some(candidate);
+        }
+        let dir = pack_dir?;
+        let joined = dir.join(&candidate);
+        joined.is_file().then_some(joined)
+    }
+
+    /// Build a plugin from the source a pack ships.
+    ///
+    /// The toolchain is the pack's choice (`build.command`), not an enum here:
+    /// the field names a directory and a binary, which is everything a build
+    /// needs to know and everything the kernel should ever learn about one.
+    ///
+    /// A build that fails reports the command it ran and the compiler's own
+    /// words. That is the whole value of building on the user's machine: the
+    /// error names the real problem (a missing toolchain, a crates index the
+    /// machine cannot reach) rather than "the binary is missing from the
+    /// archive".
+    fn build_plugin(
+        &self,
+        step: &PlannedStep,
+        build: &crate::assembly::BuildSpec,
+    ) -> Result<PathBuf> {
+        let pack_dir = self.pack_dir.clone().ok_or_else(|| {
+            anyhow!("plugin '{}' needs a build but has no pack directory", step.id)
+        })?;
+        let dir = pack_dir.join(&build.dir);
+        if !dir.is_dir() {
+            return Err(anyhow!(
+                "plugin '{}' declares `build` with dir '{}', which is not a directory \
+                 under {}",
+                step.id,
+                build.dir,
+                pack_dir.display()
+            ));
+        }
+        let command = build.command.clone().unwrap_or_else(|| "cargo".to_string());
+        let args: Vec<String> = if build.args.is_empty() {
+            vec![
+                "build".into(),
+                "--release".into(),
+                // `--offline` unless the pack overrides: a build that reaches
+                // the network while a turn is starting is a stall with no
+                // explanation, and the crates a pack needs are in its lockfile
+                // by the time it ships.
+                "--offline".into(),
+            ]
+        } else {
+            build.args.clone()
+        };
+
+        // Resolve the program through the *extended* PATH rather than letting
+        // `Command` use the inherited one.
+        //
+        // On Windows the program lookup happens against the parent's PATH before
+        // any `env` override applies, so `Command::new("cargo")` fails even with
+        // a corrected child PATH. Resolving the absolute path first is the only
+        // order that works.
+        let program = resolve_program(&command).unwrap_or_else(|| std::path::PathBuf::from(&command));
+        let mut spawn = std::process::Command::new(&program);
+        spawn.args(&args).current_dir(&dir);
+        // The toolchain has to be findable even when this process was started
+        // with a narrower PATH than the user's shell has.
+        //
+        // Measured cause: `cargo` lives on `I:\cargoin` and was added to the
+        // user's PATH, but the running `ngu` inherited the PATH it was launched
+        // with, so a pack that built fine by hand failed here with "program not
+        // found". A build step that only works when the parent happens to have
+        // the right environment is a build step that fails for the user who
+        // never opened a terminal.
+        if let Some(path) = toolchain_path() {
+            spawn.env("PATH", path);
+        }
+        // `CARGO_HOME` is where the crates index and the download cache live. A
+        // build with the wrong one is not a build that fails to find `cargo` —
+        // it is a build that finds `cargo` and then cannot find a single crate,
+        // which is a much more confusing message. When the caller has not set
+        // it, take the one the toolchain on `PATH` implies.
+        if std::env::var_os("CARGO_HOME").is_none() {
+            if let Some(home) = cargo_home_from_path() {
+                // `RUSTUP_HOME` is the toolchains; `CARGO_HOME` is the crates.
+                // They are usually siblings, and a machine that moved one moved
+                // the other — but only claim it when the directory is there, so
+                // a plain cargo install (no rustup) is left alone.
+                let toolchains = home.join("..").join("rustup");
+                if toolchains.join("toolchains").is_dir() {
+                    if std::env::var_os("RUSTUP_HOME").is_none() {
+                        spawn.env("RUSTUP_HOME", &toolchains);
+                    }
+                }
+                spawn.env("CARGO_HOME", home);
+            }
+        }
+        let output = spawn
+            .output()
+            .with_context(|| {
+                format!(
+                    "building plugin '{}' with `{}` in {} — is the toolchain installed \
+                     and on PATH?",
+                    step.id,
+                    command,
+                    dir.display()
+                )
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!(
+                "building plugin '{}' failed: `{} {}` in {} exited {}.\n{}",
+                step.id,
+                command,
+                args.join(" "),
+                dir.display(),
+                output.status,
+                stderr.trim()
+            ));
+        }
+
+        let candidates = [
+            dir.join("target").join("release").join(&build.binary),
+            dir.join("target")
+                .join("release")
+                .join(format!("{}.exe", build.binary)),
+            dir.join(&build.binary),
+        ];
+        for candidate in candidates {
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+        Err(anyhow!(
+            "plugin '{}' built without error but produced no '{}' under {}",
+            step.id,
+            build.binary,
+            dir.join("target/release").display()
+        ))
+    }
+
+    /// Every pack's settings, as the table a plugin reads.
+    ///
+    /// Serialised here rather than in `protocol` because the loader is what has
+    /// a process to hand it to; the protocol module never reads the settings
+    /// file.
+    fn pack_settings(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
+        crate::settings::Settings::load()
+            .unwrap_or_default()
+            .packs
+    }
+
     fn resolve_source(&self, raw: &str) -> PathBuf {
         let candidate = PathBuf::from(raw);
         if candidate.is_absolute() {
@@ -1032,6 +1326,153 @@ fn mcp_env(declared: &std::collections::BTreeMap<String, String>) -> std::collec
         }
     }
     env
+}
+
+/// Start a plugin process from a synchronous caller.
+///
+/// `Loader` runs inside the host's async runtime most of the time, but
+/// `load_plugin` is a synchronous method reached from `apply`, and the process
+/// start is a `tokio` operation. Building a current-thread runtime here rather
+/// than making every caller async keeps one boundary: everything above this line
+/// is sync, everything below is not.
+/// The cargo home implied by wherever `cargo` was found.
+///
+/// `cargo` lives in `<CARGO_HOME>/bin`, so the parent of its directory is the
+/// home — which is the directory holding `registry/`. A machine that installed
+/// Rust anywhere but the default has its cache there and nowhere else, and the
+/// default (`~/.cargo`) does not exist at all.
+fn cargo_home_from_path() -> Option<std::path::PathBuf> {
+    let cargo = resolve_program("cargo")?;
+    let home = cargo.parent()?.parent()?;
+    // Only when it actually looks like a cargo home: a `cargo` on a plain
+    // `PATH` with no registry beside it is not one, and setting `CARGO_HOME` to
+    // nonsense replaces a clear error with a confusing one.
+    home.join("registry").is_dir().then(|| home.to_path_buf())
+}
+
+/// Find an executable by name, looking where a shell would.
+///
+/// `None` when it is not on any of those paths, which leaves the caller to try a
+/// bare name and report the operating system's own error.
+fn resolve_program(command: &str) -> Option<std::path::PathBuf> {
+    let direct = std::path::Path::new(command);
+    if direct.components().count() > 1 {
+        return direct.is_file().then(|| direct.to_path_buf());
+    }
+    let path = toolchain_path()?;
+    let exts: Vec<&str> = if cfg!(windows) {
+        vec!["", ".exe", ".cmd", ".bat"]
+    } else {
+        vec![""]
+    };
+    for dir in std::env::split_paths(&path) {
+        for ext in &exts {
+            let candidate = dir.join(format!("{command}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// A `PATH` that includes the usual toolchain locations, whether or not the
+/// process was started with one.
+///
+/// The cheap part is the process's own `PATH`, extended with `CARGO_HOME`/`.cargo`
+/// when they are set. The expensive part — asking the OS for the *user's*
+/// configured `PATH` rather than the inherited one — is only worth it on Windows,
+/// where a program started from Explorer or a shortcut gets a stale environment
+/// and a developer's toolchain is on a drive the default `PATH` has never heard
+/// of.
+///
+/// Returns `None` when there is nothing to add, so the caller can leave the
+/// environment alone: copying a `PATH` that is already right is a way to be wrong
+/// about it later.
+fn toolchain_path() -> Option<std::ffi::OsString> {
+    let mut parts: Vec<String> = std::env::var("PATH")
+        .unwrap_or_default()
+        .split(if cfg!(windows) { ';' } else { ':' })
+        .filter(|part| !part.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    let before = parts.len();
+
+    // The user's own environment, which on Windows is what their shell would
+    // have had. Read only here, and only when a build is about to run.
+    #[cfg(windows)]
+    {
+        for (var, scope) in [("Path", "User"), ("Path", "Machine")] {
+            let script = format!("[Environment]::GetEnvironmentVariable('{var}','{scope}')");
+            // Absolute path, not a bare name: this runs precisely when the
+            // inherited `PATH` is the broken thing, so a lookup through it would
+            // fail for the reason we are here to fix.
+            let shell = std::path::Path::new(&std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()))
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe");
+            if let Ok(output) = std::process::Command::new(&shell)
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .output()
+            {
+                if output.status.success() {
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    for part in text.split(';') {
+                        let part = part.trim();
+                        if !part.is_empty() && !parts.iter().any(|known| known == part) {
+                            parts.push(part.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // `CARGO_HOME` names where cargo keeps its binaries; a machine that set it
+    // did so for a reason and `cargo` is almost certainly in `<it>/bin`.
+    if let Ok(home) = std::env::var("CARGO_HOME") {
+        let candidate = std::path::Path::new(&home).join("bin");
+        let text = candidate.display().to_string();
+        if !parts.iter().any(|known| known == &text) {
+            parts.push(text);
+        }
+    }
+
+    // On Windows the user's `PATH` is consulted even when nothing was added:
+    // the inherited value is not the one a developer's shell has, and the whole
+    // point of this function is to bridge that gap rather than to be frugal.
+    if parts.len() == before && !cfg!(windows) {
+        return None;
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(std::ffi::OsString::from(parts.join(if cfg!(windows) { ";" } else { ":" })))
+}
+
+fn start_process(spec: &crate::protocol::Spec) -> Result<crate::protocol::Process> {
+    match tokio::runtime::Handle::try_current() {
+        // Already inside a runtime: `block_on` there panics. A dedicated thread
+        // with its own runtime is the only correct way to wait.
+        Ok(_) => std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| anyhow!("building a runtime: {error}"))
+                        .and_then(|runtime| runtime.block_on(crate::protocol::Process::start(spec)))
+                })
+                .join()
+                .map_err(|_| anyhow!("the plugin start thread panicked"))?
+        }),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| anyhow!("building a runtime: {error}"))
+            .and_then(|runtime| runtime.block_on(crate::protocol::Process::start(spec))),
+    }
 }
 
 fn scope_name(scope: Scope) -> &'static str {
@@ -1906,6 +2347,7 @@ stages:
             order: 0,
             source: "stdio:node bin/srv.mjs".into(),
             config: serde_json::Value::Null,
+            build: None,
             mcp: Some(entry.clone()),
             sha1: None,
             requires: None,
@@ -1939,6 +2381,7 @@ stages:
             order: 0,
             source: "stdio:npx -y some-server".into(),
             config: serde_json::Value::Null,
+            build: None,
             mcp: Some(entry.clone()),
             sha1: None,
             requires: None,

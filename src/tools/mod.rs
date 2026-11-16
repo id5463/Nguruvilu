@@ -23,7 +23,6 @@ pub mod jobs;
 pub mod longhorizon;
 pub mod pack;
 pub mod readers;
-pub mod restart;
 
 pub mod spill;
 pub mod subagent;

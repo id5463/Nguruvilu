@@ -3,12 +3,19 @@ name: restart
 defaults:
   scope: session
   on_failure: skip
+# `restart` is no longer compiled into the kernel. This pack ships the source and
+# the kernel runs the executable it produces — see
+# `docs/plugin-protocol.md`. `path` points at the binary the pack built, and
+# `source` at the directory to build it from when it is not there yet.
 stages:
 - name: pack
   plugins:
   - id: restart
-    source: builtin:restart
+    source: plugin:bin/ngu-restart
     scope: global
+    build:
+      dir: src
+      binary: ngu-restart
   skills:
   - id: restart-guide
     source: skills/restart-guide
