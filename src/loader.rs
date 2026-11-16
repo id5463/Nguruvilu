@@ -747,9 +747,26 @@ fn pack_cwd(pack_dir: Option<&std::path::Path>, command: &str, args: &[String]) 
             // checked would be worse than letting the spawn say it is missing.
             return Some(candidate);
         }
-        let dir = pack_dir?;
+        let dir = absolute(pack_dir?);
         let joined = dir.join(&candidate);
-        joined.is_file().then_some(joined)
+        if joined.is_file() {
+            return Some(joined);
+        }
+        // The platform's own suffix, when the name does not carry one.
+        //
+        // A pack says `plugin:bin/ngu-restart` and means the binary on whatever
+        // machine this is. Windows needs `.exe`; Unix does not. Resolving both
+        // here is what lets one `assembly.yaml` work on either — measured on a
+        // Linux server, where the first version looked for `ngu-restart` with no
+        // suffix, did not find it, and reported "the file is missing" for a file
+        // that had compiled a moment earlier.
+        for suffix in platform_suffixes() {
+            let with_suffix = dir.join(format!("{}{suffix}", candidate.display()));
+            if with_suffix.is_file() {
+                return Some(with_suffix);
+            }
+        }
+        None
     }
 
     /// Build a plugin from the source a pack ships.
@@ -771,7 +788,20 @@ fn pack_cwd(pack_dir: Option<&std::path::Path>, command: &str, args: &[String]) 
         let pack_dir = self.pack_dir.clone().ok_or_else(|| {
             anyhow!("plugin '{}' needs a build but has no pack directory", step.id)
         })?;
-        let dir = pack_dir.join(&build.dir);
+        // Absolute, always. The pack directory a caller hands over may be
+        // relative (`packs/restart`, as `ngu apply` passes it), and a relative
+        // path survives neither a `current_dir` change nor the spawn below —
+        // measured on a Linux server, where the build succeeded, the binary
+        // existed, and starting it failed with "No such file or directory"
+        // because the path was resolved against the *pack* once and the
+        // *process's* directory twice.
+        let dir = if pack_dir.is_absolute() {
+            pack_dir.join(&build.dir)
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&pack_dir).join(&build.dir))
+                .unwrap_or_else(|_| pack_dir.join(&build.dir))
+        };
         if !dir.is_dir() {
             return Err(anyhow!(
                 "plugin '{}' declares `build` with dir '{}', which is not a directory \
@@ -1450,6 +1480,21 @@ fn toolchain_path() -> Option<std::ffi::OsString> {
             parts.push(text);
         }
     }
+    // `~/.cargo/bin`, spelled out.
+    //
+    // This is where rustup puts `cargo`, and a server started by systemd or by a
+    // shell that never sourced `~/.cargo/env` does not have it on `PATH`. The
+    // variable above only helps a machine that exports `CARGO_HOME`; most do
+    // not, and the default location is the one that is right. Measured on the
+    // Ubuntu server: `cargo` at `/home/ubuntu/.cargo/bin/cargo`, absent from the
+    // service's `PATH`, and every pack build failed with "program not found".
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let candidate = std::path::Path::new(&home).join(".cargo").join("bin");
+        let text = candidate.display().to_string();
+        if candidate.is_dir() && !parts.iter().any(|known| known == &text) {
+            parts.push(text);
+        }
+    }
 
     // On Windows the user's `PATH` is consulted even when nothing was added:
     // the inherited value is not the one a developer's shell has, and the whole
@@ -1461,6 +1506,34 @@ fn toolchain_path() -> Option<std::ffi::OsString> {
         return None;
     }
     Some(std::ffi::OsString::from(parts.join(if cfg!(windows) { ";" } else { ":" })))
+}
+
+/// The same path, made absolute against the process directory.
+///
+/// A pack directory handed to the loader is often relative (`packs/restart`),
+/// and a relative executable path is resolved against whatever directory the
+/// child ends up in — which for a process plugin is the pack itself. The two
+/// disagree, and the symptom is "No such file or directory" for a file that is
+/// right there.
+fn absolute(path: &std::path::Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The suffixes an executable may carry on this platform, best first.
+///
+/// Empty string first so an exact name always wins: a pack that says
+/// `bin/ngu-restart.exe` gets that file, not `bin/ngu-restart.exe.exe`.
+fn platform_suffixes() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["", ".exe"]
+    } else {
+        &[""]
+    }
 }
 
 fn start_process_with_state_for(spec: &crate::protocol::Spec) -> Result<crate::protocol::Process> {
