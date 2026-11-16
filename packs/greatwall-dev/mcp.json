@@ -4,7 +4,9 @@
       "id": "ticket",
       "transport": "stdio",
       "command": "node",
-      "args": ["files/ticket-mcp.mjs"],
+      "args": [
+        "bin/ticket-mcp.mjs"
+      ],
       "scope": "session"
     }
   ]

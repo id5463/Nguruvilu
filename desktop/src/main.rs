@@ -2724,6 +2724,13 @@ fn serve_loopback_connection(
 
     // GET (and anything else): the interface file, as always.
     let (body, mime) = serve_ui(&path);
+    if body.is_empty() {
+        // A resource that is not there answers 404, not `200` with nothing: a
+        // stylesheet served as an empty success looks like a page with no
+        // styles, which is how a missing `ui.css` hid for a day.
+        respond_loopback(&mut stream, "404 Not Found", "text/plain; charset=utf-8", b"not found");
+        return;
+    }
     respond_loopback(&mut stream, "200 OK", mime, &body);
 }
 
@@ -2821,7 +2828,16 @@ pub(crate) fn set_active_ui(stack: Vec<PathBuf>) {
 pub(crate) fn serve_ui(path: &str) -> (Vec<u8>, &'static str) {
     let builtin = || (UI_HTML.as_bytes().to_vec(), "text/html; charset=utf-8");
 
+    // Expanding a non-document path is decided before anything else looks at
+    // the sources. Doing it inside the fallback meant a build with no pack
+    // installed answered the built-in document for `/ui.css` too — the same
+    // silent substitution, one branch earlier.
+    let wants_document = path_is_document(path);
+
     let Some(sources) = ACTIVE_SOURCES.get() else {
+        if !wants_document {
+            return (Vec::new(), "text/plain; charset=utf-8");
+        }
         return builtin();
     };
 
@@ -2872,12 +2888,48 @@ pub(crate) fn serve_ui(path: &str) -> (Vec<u8>, &'static str) {
         }
     }
 
-    // Nothing has it: fall back to the first source's index.html, so a stale
-    // link still lands on the page instead of a blank response.
+    // Nothing has it. What to answer depends on what was asked for, and this
+    // used to ignore that: every miss answered `index.html` with `200 OK`.
+    //
+    // The cost was invisible for a long time. A pack directory missing
+    // `ui.css` served the 150 KB document under `Content-Type: text/html` for a
+    // URL the page loads as a stylesheet, so the browser parsed it as CSS, found
+    // fourteen junk rules, and drew an unstyled document — no layout, no
+    // composer, the session list filling the screen. It looked exactly like the
+    // conversation history had been deleted, and the data was on disk the whole
+    // time.
+    //
+    // A resource that is not the document must say so. `404` for a missing
+    // `.css`, `.js`, `.png` — the browser then shows its own missing-resource
+    // behaviour instead of silently parsing an HTML page as styling.
+    if !wants_document {
+        // Not a document: the caller asked for one specific file and it is not
+        // there. `text/plain` rather than the usual HTML error page, because the
+        // reader is a browser fetching a resource, not a person reading a page.
+        return (Vec::new(), "text/plain; charset=utf-8");
+    }
+
+    // A document path that is not there still lands on the page: a stale link
+    // to `/old-route` should open the interface, not a blank screen.
     sources
         .first()
         .and_then(|source| source.find(Path::new("index.html")))
         .unwrap_or_else(builtin)
+}
+
+/// Whether a requested path names the document rather than a resource inside it.
+///
+/// The distinction is the whole point: a document path that is not there should
+/// land on the interface (a stale `/old-route` opening the page is friendly), and
+/// a `.css` or `.js` that is not there must say `not found` rather than hand back
+/// the document under the wrong content type.
+fn path_is_document(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, rest)| rest.to_ascii_lowercase())
+        .unwrap_or_default();
+    extension.is_empty() || extension == "html" || extension == "htm"
 }
 
 /// Resolve a relative path inside one interface root, or `None` if it escapes
@@ -3207,5 +3259,39 @@ mod tests {
         )));
         assert!(!content_type_is_multipart(Some("application/json")));
         assert!(!content_type_is_multipart(None));
+    }
+
+    /// A stylesheet must never be answered with the document.
+    ///
+    /// The bug this pins: `serve_ui` fell back to `index.html` for every miss,
+    /// so a pack directory without `ui.css` served the 150 KB page under
+    /// `text/html` for a URL the browser loads as a stylesheet. It parsed as CSS,
+    /// produced fourteen junk rules, and drew an unstyled document — which reads
+    /// exactly like lost conversation history.
+    #[test]
+    fn a_resource_path_is_not_a_document() {
+        assert!(path_is_document("") );
+        assert!(path_is_document("index.html"));
+        assert!(path_is_document("/index.html"));
+        assert!(path_is_document("old-route"));
+        assert!(!path_is_document("ui.css"));
+        assert!(!path_is_document("/ui.css"));
+        assert!(!path_is_document("app.js"));
+        assert!(!path_is_document("logo.png"));
+        // A dot in a directory name must not make the last segment look like an
+        // extension: `/v1.2/page` is a document.
+        assert!(path_is_document("/v1.2/page"));
+    }
+
+    #[test]
+    fn a_missing_resource_has_no_body_to_serve() {
+        // With no interface source installed, the built-in document is the only
+        // thing there is — and it must still refuse to stand in for a stylesheet.
+        let (body, mime) = serve_ui("ui.css");
+        assert!(body.is_empty(), "a missing stylesheet must not serve the page");
+        assert!(mime.starts_with("text/plain"));
+        let (body, mime) = serve_ui("");
+        assert!(!body.is_empty(), "the document itself still answers");
+        assert!(mime.starts_with("text/html"));
     }
 }

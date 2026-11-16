@@ -1,0 +1,23 @@
+version: 1
+name: greatwall-dev
+defaults:
+  scope: session
+  on_failure: skip
+# 一个包，两半：票板的 MCP（派活）+ 长程任务的内核插件（任务实体、日志、记忆）。
+# 两半都以 on_failure: skip 装载——一个起不来不该让另一个也不工作，
+# 而失败本身会以 notice 送到界面，不会静默。
+stages:
+- name: core
+  plugins:
+  - id: long-horizon
+    source: builtin:long-horizon
+    scope: global
+- name: tools
+  mcp:
+  - id: ticket
+    source: stdio:node bin/ticket-mcp.mjs
+    scope: session
+    transport: stdio
+    command: node
+    args:
+    - bin/ticket-mcp.mjs

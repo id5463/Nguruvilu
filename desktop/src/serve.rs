@@ -1140,6 +1140,14 @@ fn ui_response(path: &str) -> (u16, &'static str, Vec<u8>) {
         plain(404, "not found")
     } else {
         let (bytes, content_type) = serve_ui(entry);
+        // An empty body means `serve_ui` decided this was a resource that is
+        // not there, rather than a document path. Answering `200` with nothing
+        // would make a missing stylesheet indistinguishable from one that
+        // happened to be blank, which is the same silence this whole path was
+        // fixed to break.
+        if bytes.is_empty() {
+            return plain(404, "not found");
+        }
         (200, content_type, bytes)
     }
 }

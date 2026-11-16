@@ -1,0 +1,15 @@
+{
+  "formatVersion": 1,
+  "game": "nguruvilu",
+  "name": "mcp-proxy",
+  "description": "MCP 代理：把多个 MCP 服务器合成一个 call 工具。填一次目标清单，工具表里只多一条，而不是几十条。支持三模态——full 全部暴露、single 每个服务器一个入口、proxy 全部合并成一个。",
+  "versionId": "1.0.0",
+  "license": "MIT",
+  "kernelVersion": "0.1.0",
+  "dependencies": { "nguruvilu": ">=0.1.0" },
+  "mcp": "mcp.json",
+  "look": "look.json",
+  "skills": [
+    { "id": "mcp-proxy-guide", "source": "./skills/mcp-proxy-guide", "license": "MIT" }
+  ]
+}

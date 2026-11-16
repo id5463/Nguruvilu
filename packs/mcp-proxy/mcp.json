@@ -1,0 +1,11 @@
+{
+  "servers": [
+    {
+      "id": "mcp-proxy",
+      "transport": "stdio",
+      "command": "node",
+      "args": ["bin/proxy.mjs"],
+      "scope": "session"
+    }
+  ]
+}

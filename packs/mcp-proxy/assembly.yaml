@@ -1,0 +1,16 @@
+version: 1
+name: mcp-proxy
+defaults:
+  scope: session
+  on_failure: skip
+stages:
+- name: pack
+  mcp:
+  - id: mcp-proxy
+    source: stdio:node bin/proxy.mjs
+    scope: session
+    transport: stdio
+    command: node
+    args:
+    - bin/proxy.mjs
+    env: {}
