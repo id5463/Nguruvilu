@@ -312,6 +312,22 @@ fn pack_cwd(pack_dir: Option<&std::path::Path>, command: &str, args: &[String]) 
             .as_ref()
             .ok_or_else(|| anyhow!("mcp step '{}' has no server definition", step.id))?;
 
+        // Handed to a proxy: this server is still declared here, it just is not
+        // started here. The pack keeps saying what it provides, the proxy
+        // decides how much of it the model sees.
+        //
+        // Nothing is registered, so the ledger gets no `mcp` entry either — an
+        // entry would make unload try to unregister tools that were never
+        // registered. What the pack *does* get is a line in the proxy's target
+        // list, written below, and that is what has to be withdrawn on unload.
+        if let Some(proxy_id) = entry.via_proxy.as_deref() {
+            let line = proxy_target_line(step, entry, self.pack_dir.as_deref())?;
+            crate::loader::register_proxy_target(proxy_id, line);
+            return Ok(Outcome::Skipped(format!(
+                "handed to MCP proxy '{proxy_id}'"
+            )));
+        }
+
         let spec = match entry.transport {
             Transport::StreamableHttp => {
                 // One URL carries every message; a declaration without one
@@ -344,7 +360,18 @@ fn pack_cwd(pack_dir: Option<&std::path::Path>, command: &str, args: &[String]) 
                 // ticket pack's worker launch burned six steps hunting for the
                 // executable and never started. So every stdio MCP server gets
                 // `NGU_EXE` — the host's own path — unless it declared its own.
-                let env = mcp_env(&entry.env);
+                let mut env = mcp_env(&entry.env);
+                // A proxy starts the servers its packs handed to it. The list is
+                // built during the same load pass that reaches this line, so it
+                // is complete by the time the proxy's own entry is loaded — packs
+                // sort alphabetically and `mcp-proxy` sorts before the packs that
+                // hand it work only by luck, which is why the list is also
+                // re-read at spawn time by the proxy itself.
+                let handed = proxy_targets_for(&step.id);
+                if !handed.is_empty() {
+                    env.insert("NGU_MCP_TARGETS".to_string(), handed.join("
+"));
+                }
                 McpSpec {
                     id: step.id.clone(),
                     command,
@@ -859,6 +886,83 @@ fn plugin_name(source: &str, fallback: &str) -> String {
 /// plugin — and a pack that shells out to `ngu` (starting a worker, checking a
 /// flag) needs exactly that. `${VAR}` references are left untouched on purpose:
 /// substitution happens where the values are known.
+/// Lines handed to each proxy, keyed by proxy id.
+///
+/// Process-wide because a proxy's target list is not per-session: the proxy is
+/// one child process however many conversations exist, so a per-conversation list
+/// would have to be merged back into one anyway.
+static PROXY_TARGETS: std::sync::Mutex<
+    Option<std::collections::BTreeMap<String, Vec<String>>>,
+> = std::sync::Mutex::new(None);
+
+/// The command line a proxy should run for one declared server.
+///
+/// The shape is the proxy's own, not the kernel's: `name=command args`, with a
+/// `cwd=<dir>::` prefix when the server is a script named relative to its pack.
+/// A pack that declares `node bin/x.mjs` means *its* `bin`, and the proxy starts
+/// its children elsewhere — the prefix is what carries that.
+fn proxy_target_line(
+    step: &PlannedStep,
+    entry: &crate::assembly::McpEntry,
+    pack_dir: Option<&std::path::Path>,
+) -> Result<String> {
+    let command = entry
+        .command
+        .clone()
+        .ok_or_else(|| anyhow!("mcp '{}' is handed to a proxy but declares no command", step.id))?;
+    // The pack's own directory, when the server is a script that came with it.
+    // Same rule the direct-spawn path uses: an argument that resolves to a file
+    // inside the pack means the pack's directory is where the process belongs.
+    let cwd = {
+        let inside = |candidate: &str| {
+            pack_dir
+                .map(|dir| {
+                    let path = std::path::Path::new(candidate);
+                    !path.is_absolute() && dir.join(path).is_file()
+                })
+                .unwrap_or(false)
+        };
+        if inside(&command) || entry.args.iter().any(|arg| inside(arg)) {
+            pack_dir
+                .map(|dir| format!("cwd={}::", dir.display()))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        }
+    };
+    let mut line = format!("{}={cwd}{command}", step.id);
+    for arg in &entry.args {
+        line.push(' ');
+        line.push_str(arg);
+    }
+    Ok(line)
+}
+
+/// Record one server for a proxy to start.
+fn register_proxy_target(proxy_id: &str, line: String) {
+    let mut guard = PROXY_TARGETS.lock().expect("proxy target table");
+    let table = guard.get_or_insert_with(Default::default);
+    let entry = table.entry(proxy_id.to_string()).or_default();
+    if !entry.contains(&line) {
+        entry.push(line);
+    }
+}
+
+/// The targets a proxy should start this process, one per line.
+///
+/// Read when the proxy itself is launched. Settings' own `mcp_proxy_targets` are
+/// not consulted here: those are the user's hand-written list for servers no pack
+/// declares, and mixing the two would make it impossible to tell which line came
+/// from where when one of them fails to start.
+fn proxy_targets_for(proxy_id: &str) -> Vec<String> {
+    PROXY_TARGETS
+        .lock()
+        .expect("proxy target table")
+        .as_ref()
+        .and_then(|table| table.get(proxy_id).cloned())
+        .unwrap_or_default()
+}
+
 fn mcp_env(declared: &std::collections::BTreeMap<String, String>) -> std::collections::HashMap<String, String> {
     let mut env: std::collections::HashMap<String, String> =
         declared.iter().map(|(k, v)| (k.clone(), v.clone())).collect();

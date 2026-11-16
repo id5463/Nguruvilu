@@ -551,7 +551,7 @@ struct CliConfig {
     ///
     /// Behind a lock and shared with the pack host, so a pack hot-loaded
     /// between turns replaces them for the next turn rather than the next run.
-    injection: Arc<Mutex<Arc<nguruvilu::context::InjectionEngine>>>,
+    injection: Arc<Mutex<Arc<dyn nguruvilu::context::InjectionSource>>>,
     /// The workspace whose mission board the prompt should name, once known.
     ///
     /// A cell rather than a plain path because the turn settings are assembled
@@ -1114,9 +1114,10 @@ async fn run() -> Result<()> {
     // Each pack's content replaces the standing one: the pack is the unit the
     // user chose, so it decides. They are folded in load order, so the last
     // pack to speak is the one in force — the same rule the window follows.
-    let injection = Arc::new(Mutex::new(Arc::new(
-        nguruvilu::context::InjectionEngine::load_default(),
-    )));
+    let injection: Arc<Mutex<Arc<dyn nguruvilu::context::InjectionSource>>> =
+        Arc::new(Mutex::new(Arc::new(
+            nguruvilu::context::InjectionEngine::load_default(),
+        )));
     // The user's own settings, before any pack folds over them: a drain's
     // set-shaped recompute starts here, so unloading a pack takes back what
     // it brought while the stored values come back with it.
@@ -3071,6 +3072,7 @@ fn classify_server(
                 args: Vec::new(),
                 env: std::collections::BTreeMap::new(),
                 scope: Some("session".into()),
+                via_proxy: None,
                 platforms: std::collections::BTreeMap::new(),
                 url: Some(url.to_string()),
                 headers,
@@ -3116,6 +3118,7 @@ fn classify_server(
         args,
         env,
         scope: Some("session".into()),
+        via_proxy: None,
         platforms: std::collections::BTreeMap::new(),
         url: None,
         headers: std::collections::BTreeMap::new(),
@@ -4098,8 +4101,12 @@ fn show_injections(for_text: Option<&str>, as_json: bool) -> Result<()> {
     let activated: Vec<String> = match for_text {
         Some(text) => {
             let probe = vec![nguruvilu::message::Message::user(text)];
-            engine
-                .inject(&probe, 128_000, nguruvilu::hotreload::CachePolicy::Balanced)
+            nguruvilu::context::InjectionSource::inject(
+                &engine,
+                &probe,
+                128_000,
+                nguruvilu::hotreload::CachePolicy::Balanced,
+            )
                 .activated
         }
         None => Vec::new(),
@@ -4189,7 +4196,7 @@ fn adopt_content(
     content: nguruvilu::content::PackContent,
     settings: &mut Settings,
     runtime: &mut Runtime,
-    injection: &Arc<Mutex<Arc<nguruvilu::context::InjectionEngine>>>,
+    injection: &Arc<Mutex<Arc<dyn nguruvilu::context::InjectionSource>>>,
 ) -> Result<()> {
     for line in content.summary() {
         eprintln!("pack content: {line}");
@@ -4281,7 +4288,7 @@ struct PackHost<'a> {
     skills: &'a Arc<Mutex<SkillRegistry>>,
     runtime: &'a Arc<Mutex<Runtime>>,
     settings: &'a mut Settings,
-    injection: &'a Arc<Mutex<Arc<nguruvilu::context::InjectionEngine>>>,
+    injection: &'a Arc<Mutex<Arc<dyn nguruvilu::context::InjectionSource>>>,
     queue: &'a nguruvilu::tools::pack::PendingQueue,
     /// The session's MCP servers: joined when a pack loads, stopped when it
     /// unloads, and stopped for good on the way out.

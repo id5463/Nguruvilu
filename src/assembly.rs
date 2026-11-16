@@ -179,6 +179,25 @@ pub struct McpEntry {
     /// Per-call timeout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+
+    /// Hand this server to a proxy instead of registering its tools directly.
+    ///
+    /// A pack declares its server the same way it always did; this says *who
+    /// starts it*. Set it and the kernel does not spawn the server at all — it
+    /// appends the command line to the proxy's target list, and the proxy
+    /// exposes one entry that reaches all of them.
+    ///
+    /// Measured reason: the packs installed here declare 102 tools between them
+    /// (57 + 29 + 8 + 6 + 2). Every one of those is a line the model reads before
+    /// it answers, and a conversation uses three or four. Behind a proxy the same
+    /// capability costs one tool.
+    ///
+    /// The alternative — editing every pack's `mcp.json` — was tried first and
+    /// rejected: it makes a pack's own manifest a lie about what it provides, and
+    /// uninstalling the proxy would leave every pack with no tools at all rather
+    /// than the tools it declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_proxy: Option<String>,
 }
 
 /// A skill entry.

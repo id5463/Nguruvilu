@@ -918,6 +918,12 @@ pub struct McpServerDecl {
     /// `session` or `global`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// Hand this server to the named MCP proxy instead of registering its tools.
+    ///
+    /// Same field, same meaning as the one on an assembly entry: a pack keeps
+    /// declaring its servers in `mcp.json`, and this says who starts them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_proxy: Option<String>,
     /// One source per platform, when a server ships a different artifact to
     /// each. A non-empty map replaces the single `source` at install time:
     /// the entry for `fetch::platform_tag()` is fetched — an archive URL is

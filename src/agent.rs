@@ -88,7 +88,7 @@ pub struct TurnSettings {
     /// requiring a restart.
     pub policy: Arc<dyn ContextPolicy>,
     /// Extra fragments to place in this request, and where.
-    pub injection: Arc<crate::context::InjectionEngine>,
+    pub injection: Arc<dyn crate::context::InjectionSource>,
     /// Cache policy, which decides whether a prefix injection is allowed.
     pub cache_policy: crate::hotreload::CachePolicy,
     /// Ask the loaded plugins what they want done for this turn.
@@ -146,7 +146,7 @@ pub struct StaticConfig {
     /// Context window, threshold, and how much survives a compaction.
     pub policy: Arc<dyn ContextPolicy>,
     /// Extra fragments to place in each request.
-    pub injection: Arc<crate::context::InjectionEngine>,
+    pub injection: Arc<dyn crate::context::InjectionSource>,
     /// Cache policy, which decides whether a prefix injection is allowed.
     pub cache_policy: crate::hotreload::CachePolicy,
 }
@@ -277,7 +277,7 @@ pub struct LoopState {
     /// What a stop reports as the error.
     pub stop_reason: String,
     /// Injection engine override, for tests and embedding.
-    pub injection_override: Option<Arc<crate::context::InjectionEngine>>,
+    pub injection_override: Option<Arc<dyn crate::context::InjectionSource>>,
     /// The user's message that started this turn.
     ///
     /// Carried rather than read back off `messages`: a loop decides where the
@@ -486,7 +486,7 @@ pub struct Agent {
     /// change made in a settings panel lands on the next turn.
     summarizer: Arc<dyn Summarizer>,
     /// Injection engine override, for tests and embedding.
-    injection_override: Option<Arc<crate::context::InjectionEngine>>,
+    injection_override: Option<Arc<dyn crate::context::InjectionSource>>,
     /// A stop request for this turn, when the host can cancel it.
     ///
     /// Checked between steps, between stream events, and between tool joins —
@@ -728,7 +728,7 @@ impl Agent {
     }
 
     /// Set the injection engine used for the next turn.
-    pub fn set_injection(&mut self, injection: Arc<crate::context::InjectionEngine>) {
+    pub fn set_injection(&mut self, injection: Arc<dyn crate::context::InjectionSource>) {
         self.injection_override = Some(injection);
     }
 

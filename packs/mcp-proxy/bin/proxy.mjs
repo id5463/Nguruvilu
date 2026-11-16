@@ -94,7 +94,19 @@ function parseTargets(spec) {
     }
     if (current) argv.push(current);
     if (argv.length === 0) continue;
-    out.push({ name, command: argv[0], args: argv.slice(1) });
+    // cwd=<dir>::<command> — two colons, because a Windows path has one in
+    // its drive letter: splitting cwd=C:\x:node at the first colon yields "C"
+    // and "\x:node". The single-colon form was tried first and every Windows
+    // target failed with "spawn C:\Program Files\nodejs\node.exe ENOENT" — the
+    // drive letter had been eaten.
+    let cwd = null;
+    let command = argv[0];
+    const cdMatch = /^cwd=(.+?)::(.*)$/.exec(command);
+    if (cdMatch) {
+      cwd = cdMatch[1];
+      command = cdMatch[2];
+    }
+    out.push({ name, command, args: argv.slice(1), cwd });
   }
   return out;
 }
@@ -138,6 +150,10 @@ class Session {
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
         windowsVerbatimArguments: resolved.needsShell,
+        // A pack's own script is named relative to *its* directory. Without
+        // this the child would resolve `bin/x.mjs` against the proxy's cwd and
+        // fail with a module-not-found that says nothing about why.
+        cwd: this.target.cwd || undefined,
       });
       this.child = child;
       let settled = false;

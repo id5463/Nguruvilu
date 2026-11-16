@@ -360,6 +360,28 @@ impl ScanScope {
 }
 
 /// Decides what to inject.
+///
+/// A trait rather than a concrete type so a pack can answer the question itself.
+/// The kernel's own engine is [`InjectionEngine`], which reads entries from
+/// `injections.json` and matches substrings; a pack that wants regular
+/// expressions, a decision model, or anything else supplies its own and the loop
+/// asks it the same question it asks the built-in one.
+///
+/// The shape is one method returning [`Injection`] rather than a pipeline of
+/// hooks: what goes into a prompt is decided in one place, and a pack that had to
+/// cooperate with the kernel's own engine through several calls would be an
+/// engine *next to* it, not *instead of* it.
+pub trait InjectionSource: Send + Sync + std::fmt::Debug {
+    /// What to add to this request, given the conversation so far.
+    fn inject(
+        &self,
+        messages: &[Message],
+        context_window: usize,
+        policy: CachePolicy,
+    ) -> Injection;
+}
+
+/// Decides what to inject.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InjectionEngine {
     /// Entries, in declaration order.
@@ -533,7 +555,7 @@ impl InjectionEngine {
     ///
     /// `messages` is the conversation so far; `context_window` sizes the
     /// budget; `policy` decides whether the prefix is available.
-    pub fn inject(
+    fn run(
         &self,
         messages: &[Message],
         context_window: usize,
@@ -690,7 +712,23 @@ impl InjectionEngine {
         result.overflowed = overflowed;
         result
     }
+}
 
+impl InjectionSource for InjectionEngine {
+
+    /// The kernel engine as one source among any others.
+    fn inject(
+        &self,
+        messages: &[Message],
+        context_window: usize,
+        policy: CachePolicy,
+    ) -> Injection {
+        // The work lives in an inherent method so this impl cannot call itself.
+        self.run(messages, context_window, policy)
+    }
+}
+
+impl InjectionEngine {
     /// Choose the winner of a group, from the members that actually qualify.
     ///
     /// Qualifying means all three: enabled, its own trigger fired in this pass
