@@ -786,6 +786,11 @@ impl AppState {
             // page already receives — a separate event would arrive before
             // the switch exists and leave it showing a stale choice.
             "skill_mode": self.settings.skill_mode.clone(),
+            // The proxy panel paints its switch and its target list from these,
+            // the same way the skill panel paints from `skill_mode`: a separate
+            // event would arrive before the panel exists.
+            "mcp_proxy_mode": self.settings.mcp_proxy_mode.clone(),
+            "mcp_proxy_targets": self.settings.mcp_proxy_targets.clone(),
             "plugins": self.kernel.plugin_names(),
             // Which pack brought each one: `delegate ← subagent`, so a
             // capability can be read back to the pack it came from.
@@ -1207,6 +1212,34 @@ impl AppState {
         Ok(value)
     }
 
+    /// Choose how the MCP proxy presents its targets.
+    ///
+    /// Not validated against a list here. The set of modes belongs to the pack
+    /// that reads it, and a kernel that refused `proxy` because it had not heard
+    /// of it would make the pack's own name for its own mode unusable.
+    pub fn set_mcp_proxy_mode(&mut self, mode: &str) -> Result<String> {
+        let value = mode.trim().to_string();
+        self.settings.mcp_proxy_mode =
+            if value.is_empty() { None } else { Some(value.clone()) };
+        self.settings.save()?;
+        Ok(value)
+    }
+
+    /// Replace the proxy's target list.
+    ///
+    /// Blank lines are dropped rather than stored: the panel's textarea sends
+    /// whatever it holds, and an empty line is not a server.
+    pub fn set_mcp_proxy_targets(&mut self, targets: &[String]) -> Result<Vec<String>> {
+        let kept: Vec<String> = targets
+            .iter()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+        self.settings.mcp_proxy_targets = kept.clone();
+        self.settings.save()?;
+        Ok(kept)
+    }
+
     pub fn save_settings(
         &mut self,
         base_url: &str,
@@ -1254,6 +1287,11 @@ impl AppState {
             // not a statement about which skill mode is chosen, and dropping it
             // here would silently reset the switch every time the page saved.
             skill_mode: self.settings.skill_mode.clone(),
+            // Same rule as `skill_mode`: the connection panel saving must not
+            // reset a choice made in the proxy panel. Both are edited through
+            // their own commands and carried through here untouched.
+            mcp_proxy_mode: self.settings.mcp_proxy_mode.clone(),
+            mcp_proxy_targets: self.settings.mcp_proxy_targets.clone(),
             degrade_on_stall: self.settings.degrade_on_stall,
             proxy: proxy.trim().to_string(),
             context_window: context_window.filter(|t| *t > 0),

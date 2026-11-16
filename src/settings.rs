@@ -182,6 +182,23 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_mode: Option<String>,
 
+    /// How the MCP proxy presents the servers it forwards to.
+    ///
+    /// `proxy` merges every target behind one `call`; `single` gives each
+    /// server its own entry; `full` exposes them by their original names.
+    /// Stored here rather than in the pack so uninstalling the pack does not
+    /// lose the choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_proxy_mode: Option<String>,
+
+    /// The servers the proxy forwards to, one `name=command args` per entry.
+    ///
+    /// Strings rather than a typed struct because only the pack parses them:
+    /// the kernel stores what the panel typed and hands it over through the
+    /// environment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_proxy_targets: Vec<String>,
+
     /// The decision judge (Jev / TypeSafe System One), when configured.
     ///
     /// Absent means no `judge` tool — the same rule as search: a tool that

@@ -16,6 +16,41 @@
 // 用分号或换行分隔多条。等号左边是给模型看的短名字。
 
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { delimiter, join } from 'node:path';
+
+/// Find the file to actually launch for a command name.
+///
+/// Windows does not run a `.cmd` shim through `spawn` — `chrome-devtools-mcp` is
+/// a `.cmd` in npm's global bin, and spawning the bare name fails with ENOENT
+/// even though it works in a shell. The kernel solves this for its own MCP
+/// clients (`resolve_program`); the proxy spawns its own children, so it needs
+/// the same lookup or it would only work for servers that happen to be `.exe`.
+///
+/// An explicit extension wins: a caller that named a file gets that file.
+function resolveProgram(command) {
+  if (process.platform !== 'win32') return { program: command, needsShell: false };
+  const backslash = String.fromCharCode(92);
+  if (command.includes('/') || command.includes(backslash)) {
+    // A path the caller named: respect it, but a shim still needs a shell.
+    return { program: command, needsShell: /\.(cmd|bat)$/i.test(command) };
+  }
+  if (/\.[a-z0-9]+$/i.test(command)) {
+    return { program: command, needsShell: /\.(cmd|bat)$/i.test(command) };
+  }
+
+  const extensions = ['.exe', '.cmd', '.bat', ''];
+  const dirs = (process.env.PATH || '').split(delimiter).filter(Boolean);
+  for (const dir of dirs) {
+    for (const extension of extensions) {
+      const candidate = join(dir, command + extension);
+      if (existsSync(candidate)) {
+        return { program: candidate, needsShell: /\.(cmd|bat)$/i.test(candidate) };
+      }
+    }
+  }
+  return { program: command, needsShell: false };
+}
 
 const MODE = (process.env.NGU_MCP_MODE || 'proxy').trim().toLowerCase();
 const TARGET_SPEC = process.env.NGU_MCP_TARGETS || '';
@@ -85,9 +120,24 @@ class Session {
   start() {
     if (this.ready) return this.ready;
     this.ready = new Promise((resolve, reject) => {
-      const child = spawn(this.target.command, this.target.args, {
+      // A `.cmd` is a batch script, and `spawn` cannot execute one directly on
+      // Windows — `EINVAL`, not the friendlier `ENOENT` a missing file gives.
+      // npm installs every CLI as a `.cmd` shim, so this is the common case for
+      // any MCP server published to npm, not an edge.
+      //
+      // `shell: true` would fix it by handing the whole line to cmd.exe, but it
+      // also re-parses quotes and `&` in arguments. Invoking `cmd.exe /c` with an
+      // argv array keeps the arguments as separate strings, so a path with a
+      // space or an ampersand still arrives intact.
+      const resolved = resolveProgram(this.target.command);
+      const program = resolved.needsShell ? process.env.ComSpec || 'cmd.exe' : resolved.program;
+      const argv = resolved.needsShell
+        ? ['/c', resolved.program, ...this.target.args]
+        : this.target.args;
+      const child = spawn(program, argv, {
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
+        windowsVerbatimArguments: resolved.needsShell,
       });
       this.child = child;
       let settled = false;

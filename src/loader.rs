@@ -867,6 +867,29 @@ fn mcp_env(declared: &std::collections::BTreeMap<String, String>) -> std::collec
             env.insert("NGU_EXE".to_string(), exe.display().to_string());
         }
     }
+    // Settings a pack would otherwise have to write its own file to read. They
+    // are values the *user* chose through a panel, and the panel's choice has to
+    // reach the process that acts on it — a settings field nobody can read is a
+    // switch that does nothing.
+    //
+    // Declared entries still win: a pack that hardcodes its own targets is
+    // saying it does not want this control, and silently overriding that would
+    // be the surprise.
+    let settings = crate::settings::Settings::load().unwrap_or_default();
+    if !env.contains_key("NGU_MCP_MODE") {
+        if let Some(mode) = settings.mcp_proxy_mode.as_deref().map(str::trim) {
+            if !mode.is_empty() {
+                env.insert("NGU_MCP_MODE".to_string(), mode.to_string());
+            }
+        }
+    }
+    if !env.contains_key("NGU_MCP_TARGETS") && !settings.mcp_proxy_targets.is_empty() {
+        env.insert(
+            "NGU_MCP_TARGETS".to_string(),
+            settings.mcp_proxy_targets.join("
+"),
+        );
+    }
     env
 }
 

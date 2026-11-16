@@ -1086,6 +1086,51 @@ pub(crate) async fn dispatch(
             }
         }
 
+        // The proxy panel's two edits. Both store and echo, so the page can
+        // confirm what was kept rather than assume the save was literal.
+        "set_mcp_proxy_mode" => {
+            let mode = command.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+            match state.lock().expect("state lock").set_mcp_proxy_mode(mode) {
+                Ok(saved) => {
+                    emit(&sink, json!({ "ev": "mcp_proxy_mode", "mode": saved }));
+                    let status = state.lock().expect("state lock").describe();
+                    emit(&sink, json!({ "ev": "status", "status": status }));
+                }
+                Err(error) => emit(
+                    &sink,
+                    json!({ "ev": "error", "message": format!("保存代理模式失败：{error:#}") }),
+                ),
+            }
+        }
+
+        "set_mcp_proxy_targets" => {
+            let targets: Vec<String> = command
+                .get("targets")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            match state
+                .lock()
+                .expect("state lock")
+                .set_mcp_proxy_targets(&targets)
+            {
+                Ok(kept) => {
+                    emit(&sink, json!({ "ev": "mcp_proxy_targets", "targets": kept }));
+                    let status = state.lock().expect("state lock").describe();
+                    emit(&sink, json!({ "ev": "status", "status": status }));
+                }
+                Err(error) => emit(
+                    &sink,
+                    json!({ "ev": "error", "message": format!("保存代理清单失败：{error:#}") }),
+                ),
+            }
+        }
+
         "apply_pack" => {
             let path = command.get("path").and_then(|v| v.as_str()).unwrap_or("");
             if path.is_empty() {
