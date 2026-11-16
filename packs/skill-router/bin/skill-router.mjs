@@ -250,7 +250,8 @@ function ngram(skills, query, limit) {
 async function jev(skills, query, limit) {
   const endpoint = process.env.NGU_JEV_ENDPOINT
     || 'https://api.commandcode.ai/provider/v1/systemone';
-  const model = process.env.NGU_JEV_MODEL || 'typesafe/jev-1.14.0';
+  // 端点只认这两个名字；写 `jev-1.14.0` 返回 400 并告诉你能用哪两个。
+  const model = process.env.NGU_JEV_MODEL || 'typesafe/jev';
   const key = process.env.NGU_JEV_KEY
     || process.env.CODECOMMAND_API_KEY
     || '';
@@ -260,47 +261,87 @@ async function jev(skills, query, limit) {
       results: [],
     };
   }
+  if (!skills.length) return { results: [] };
 
-  const asked = skills.map(async (skill) => {
-    const body = {
-      model,
-      input: {
-        question: query,
-        context: `Skill: ${skill.id}\nDescription: ${skill.description}`,
-      },
-      // 判断性模型要的是「问句 + 物品」，不是对话。
-      answers: { needed: { type: 'noul' } },
-    };
-    try {
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${key}`,
-        },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(15000),
-      });
-      if (!response.ok) {
-        return { id: skill.id, score: 0, why: `jev http ${response.status}` };
-      }
-      const data = await response.json();
-      // 形状：{ answers: { needed: { type: "noul", noul: 0.83 } } }
-      const probability = data?.answers?.needed?.noul;
-      const score = typeof probability === 'number' ? probability : 0;
-      return { id: skill.id, score: Math.round(score * 1000) / 1000, why: 'jev' };
-    } catch (error) {
-      return { id: skill.id, score: 0, why: `jev ${error.message}` };
+  // 一次问全部技能，不是每个技能问一次。
+  //
+  // 这不是省钱的小优化：`questions` 共享同一个 `state`，所以模型对每个技能
+  // 的判断都建立在同一份对请求的理解上。分开问它就六次重新理解这句话，答出
+  // 来的数不再可比。
+  //
+  // 字段名是实测的，不是猜的：请求体是 `state` + `questions`（不是
+  // `input` + `answers`），回答在 `answers.<id>.noul`，是个概率。
+  let state = `用户请求：
+${query}
+
+可用技能：
+`;
+  for (const skill of skills) {
+    state += `- ${skill.id}: ${skill.description}`;
+    if (skill.triggers && skill.triggers.length) {
+      state += ` [触发词: ${skill.triggers.join(', ')}]`;
     }
-  });
+    state += `
+`;
+  }
 
-  const all = await Promise.all(asked);
-  return {
-    results: all
-      .filter((r) => r.score > 0.15)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit),
-  };
+  const questions = {};
+  for (const skill of skills) {
+    questions[skill.id] = {
+      type: 'noul',
+      instructions: `处理这个用户请求时，需要用到「${skill.id}」这个技能吗？`,
+    };
+  }
+
+  try {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${key}`,
+      },
+      body: JSON.stringify({ model, state, questions }),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      return {
+        error: `jev http ${response.status}: ${detail.slice(0, 200)}`,
+        results: [],
+      };
+    }
+    const data = await response.json();
+    const answers = (data && data.answers) || {};
+
+    const results = [];
+    for (const skill of skills) {
+      const entry = answers[skill.id];
+      if (!entry) continue;
+      // `noul` 是概率。有的实现回 `value: true/false`，两种都读，
+      // 因为拒绝读一种形状会把正确答案变成错误。
+      let probability = typeof entry.noul === 'number' ? entry.noul : null;
+      if (probability === null && typeof entry.value === 'boolean') {
+        probability = entry.value ? 1 : 0;
+      }
+      if (probability === null) continue;
+      if (probability > 0.15) {
+        results.push({
+          id: skill.id,
+          score: Math.round(probability * 1000) / 1000,
+          via: ['jev'],
+          why: `noul ${probability.toFixed(2)}`,
+          description: skill.description,
+          path: skill.path,
+        });
+      }
+    }
+    return {
+      results: results.sort((a, b) => b.score - a.score).slice(0, limit),
+      usage: data.usage || null,
+    };
+  } catch (error) {
+    return { error: `jev 请求失败: ${error.message}`, results: [] };
+  }
 }
 
 // ---------------------------------------------------------------- 4. LLM 直选
