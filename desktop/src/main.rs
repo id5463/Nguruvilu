@@ -2633,9 +2633,20 @@ fn serve_loopback_connection(
             respond_loopback(&mut stream, "403 Forbidden", "text/plain; charset=utf-8", b"origin not allowed");
             return;
         }
-        if !content_type_is_multipart(header_value(&head, "content-type")) {
-            eprintln!("[ui] upload refused: content type is not multipart");
-            respond_loopback(&mut stream, "415 Unsupported Media Type", "text/plain; charset=utf-8", b"uploads must be multipart/form-data");
+        // The page sends the file's bytes with the name in the query string,
+        // which is the shape serve mode has always accepted. This used to
+        // demand `multipart/form-data` and then read the name from `?name=` —
+        // the two halves described different requests, so every upload from the
+        // window was answered 415 while serve mode worked. One protocol for both
+        // doors: raw bytes, name in the query.
+        if content_type_is_multipart(header_value(&head, "content-type")) {
+            eprintln!("[ui] upload refused: the page sends raw bytes, not multipart");
+            respond_loopback(
+                &mut stream,
+                "415 Unsupported Media Type",
+                "text/plain; charset=utf-8",
+                b"send the file's bytes with ?name=<file name>",
+            );
             return;
         }
         let content_length: usize = header_value(&head, "content-length")
