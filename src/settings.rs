@@ -31,7 +31,7 @@ pub const DEFAULT_MODEL: &str = "deepseek-v4.1-flash";
 /// newer build — fail the whole parse, and [`Settings::load`] answered a failed
 /// parse with [`Settings::default`]. The next `ngu config set` then wrote that
 /// default back over the file, so a single typo cost the user their `api_key`,
-/// model, network tuning, search and judge credentials at once. The unknown keys
+/// model, network tuning, judge credentials at once. The unknown keys
 /// land in [`Settings::unknown`] and are written back out unchanged.
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -161,50 +161,25 @@ pub struct Settings {
     #[serde(default)]
     pub tool_output: ToolOutputSettings,
 
-    /// Web search, when configured.
+    /// Settings a pack owns, keyed by pack name.
     ///
-    /// Absent means no web_search tool is registered at all — a tool that
-    /// always fails is worse than one that is not there.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub search: Option<crate::tools::search::SearchSettings>,
-
-    /// Which mechanism picks what a skill catalog shows.
+    /// # Why this replaced four named fields
     ///
-    /// Four modes, each a different trade: `full` loads everything (no
-    /// selection at all, best while there are few skills), `regex` applies
-    /// rules and no model (predictable and free), `jev` asks a decision model
-    /// per skill (accurate, about $0.00002 a call), `llm` lets a language model
-    /// pick from the whole catalog at once (most flexible, most expensive).
+    /// `skill_mode`, `mcp_proxy_mode`, `mcp_proxy_targets` and `judge` used to
+    /// live here by name. Each one was the kernel knowing about one specific
+    /// pack: a third-party pack that wanted a setting had to either add a field
+    /// to this struct or keep its own file. The first is editing the kernel, and
+    /// the second loses the settings panel.
     ///
-    /// A string rather than an enum so a pack can add a mode without a kernel
-    /// change; the pack that owns the modes validates it. Absent means the
-    /// kernel keeps doing what it always did, which is `full`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skill_mode: Option<String>,
-
-    /// How the MCP proxy presents the servers it forwards to.
+    /// So the kernel stores an arbitrary JSON object per pack name and
+    /// **interprets none of it**. A pack reads and writes `packs["its-name"]`
+    /// itself, through `PluginCtx::config` at load time or whatever API it
+    /// chooses at runtime. The kernel's only job is to round-trip the bytes.
     ///
-    /// `proxy` merges every target behind one `call`; `single` gives each
-    /// server its own entry; `full` exposes them by their original names.
-    /// Stored here rather than in the pack so uninstalling the pack does not
-    /// lose the choice.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mcp_proxy_mode: Option<String>,
-
-    /// The servers the proxy forwards to, one `name=command args` per entry.
-    ///
-    /// Strings rather than a typed struct because only the pack parses them:
-    /// the kernel stores what the panel typed and hands it over through the
-    /// environment.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub mcp_proxy_targets: Vec<String>,
-
-    /// The decision judge (Jev / TypeSafe System One), when configured.
-    ///
-    /// Absent means no `judge` tool — the same rule as search: a tool that
-    /// cannot authenticate costs a turn every time the model tries it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub judge: Option<crate::tools::judge::JudgeSettings>,
+    /// The old keys still work: `Settings::migrate_legacy_pack_keys` folds them
+    /// in on load, so an existing settings file loses nothing.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub packs: std::collections::BTreeMap<String, serde_json::Value>,
 
     /// Extra fields merged into every request body.
     ///
@@ -250,8 +225,7 @@ impl std::fmt::Debug for Settings {
             .field("relay_url", &self.relay_url)
             .field("relay_token", &mask(&self.relay_token))
             .field("max_output_tokens", &self.max_output_tokens)
-            .field("search", &self.search.is_some())
-            .field("judge", &self.judge.is_some())
+            .field("packs", &self.packs.keys().collect::<Vec<_>>())
             .field("extra_body", &self.extra_body.keys().collect::<Vec<_>>())
             .field("unknown", &self.unknown.keys().collect::<Vec<_>>())
             .finish()
@@ -275,7 +249,7 @@ fn mask(secret: &str) -> String {    let secret = secret.trim();
 /// Write a file that may hold credentials.
 ///
 /// On Unix the file is created `0o600`: `settings.json` carries the API key, the
-/// relay token, and the search/judge credentials, and `0o644` in a `0o755`
+/// relay token, and the judge credentials, and `0o644` in a `0o755`
 /// directory means every other local user can read them. `sync_all` is called
 /// before the rename so a crash just after it cannot leave the renamed file
 /// empty.
@@ -421,6 +395,57 @@ fn default_job_wait_secs() -> u64 {
 }
 
 impl Settings {
+    /// One pack's stored settings, or `Null` when it has never written any.
+    ///
+    /// The kernel's only accessor over [`Settings::packs`]: it hands back
+    /// whatever is there and asks nothing about the shape, because the shape is
+    /// the pack's business.
+    pub fn pack(&self, name: &str) -> serde_json::Value {
+        self.packs.get(name).cloned().unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Store one pack's settings.
+    pub fn set_pack(&mut self, name: impl Into<String>, value: serde_json::Value) {
+        self.packs.insert(name.into(), value);
+    }
+
+    /// Fold the fields this struct used to carry by name into [`Settings::packs`].
+    ///
+    /// `skill_mode`, `mcp_proxy_mode`, `mcp_proxy_targets` and `judge` were
+    /// fields of this struct, so a settings file written before the change has
+    /// them at the top level. They are moved under their pack names on load
+    /// rather than dropped: an upgrade must not lose a key the user typed.
+    ///
+    /// Idempotent — a file already migrated has nothing to move, and a pack that
+    /// has since written its own entry is not overwritten by an old key.
+    pub fn migrate_legacy_pack_keys(&mut self) {
+        use serde_json::{json, Value};
+
+        let legacy = self.unknown.clone();
+        for (reserved, pack) in [
+            ("skill_mode", "skill-router"),
+            ("mcp_proxy_mode", "mcp-proxy"),
+            ("mcp_proxy_targets", "mcp-proxy"),
+            ("judge", "judge"),
+        ] {
+            let Some(value) = legacy.get(reserved).cloned() else {
+                continue;
+            };
+            if self.packs.contains_key(pack) {
+                continue;
+            }
+            let entry = self
+                .packs
+                .entry(pack.to_string())
+                .or_insert_with(|| Value::Object(Default::default()));
+            if let Some(map) = entry.as_object_mut() {
+                map.insert(reserved.to_string(), value);
+            } else {
+                *entry = json!({ reserved: value });
+            }
+        }
+    }
+
     /// The runtime budgets these settings describe.
     ///
     /// Every accessor treats `0` as "not written" and falls back to the shipped
@@ -664,6 +689,9 @@ impl Settings {
             eprintln!("[settings] continuing with defaults; the file on disk is untouched");
             Self::default()
         });
+        // Before anything reads a pack setting: a file written by an older build
+        // keeps its values at the top level, and they belong under pack names.
+        settings.migrate_legacy_pack_keys();
 
         if let Ok(value) = std::env::var("NGU_BASE_URL") {
             if !value.trim().is_empty() {
@@ -710,12 +738,13 @@ impl Settings {
             settings.proxy = value.trim().to_string();
         }
 
-        if let Some(from_env) = crate::tools::search::from_env() {
-            settings.search = Some(from_env);
-        }
-
+        // The judge's credentials come from the environment like everything
+        // else, and land under the pack's own key: the kernel does not know what
+        // a `judge` is, it only knows the pack asked for a place to keep things.
         if let Some(from_env) = crate::tools::judge::from_env() {
-            settings.judge = Some(from_env);
+            if let Ok(value) = serde_json::to_value(from_env) {
+                settings.set_pack("judge", value);
+            }
         }
 
         if let Ok(value) = std::env::var("NGU_MAX_OUTPUT_TOKENS") {
@@ -857,8 +886,6 @@ mod tests {
             relay_token: String::new(),
             max_output_tokens: None,
             network: crate::network::NetworkSettings::default(),
-            search: None,
-            judge: None,
             extra_body: serde_json::Map::new(),
             ..Default::default()
         };
@@ -885,8 +912,6 @@ mod tests {
             relay_token: String::new(),
             max_output_tokens: None,
             network: crate::network::NetworkSettings::default(),
-            search: None,
-            judge: None,
             extra_body: serde_json::Map::new(),
             ..Default::default()
         };

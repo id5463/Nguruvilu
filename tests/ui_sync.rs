@@ -21,10 +21,27 @@ fn builtin_interface_and_the_ui_pack_copy_are_identical() {
     let packed = std::fs::read(root.join("packs/starter/index.html"))
         .expect("reading the starter pack's copy");
 
+    // Compared with line endings normalised.
+    //
+    // The question this test asks is "does the fallback page still say the same
+    // thing as the shipped one". A byte comparison made that question
+    // unanswerable on a repository whose two copies legitimately differ in line
+    // endings: `desktop/ui/index.html` is committed LF and
+    // `packs/starter/index.html` was committed CRLF, so the test failed
+    // permanently and the only way to make it pass was to rewrite one of them —
+    // a 3,500-line diff that says nothing about the page. A newline is not a
+    // drift anybody needs to be told about.
+    let normalise = |bytes: &[u8]| -> Vec<u8> {
+        bytes.iter().copied().filter(|byte| *byte != b'\r').collect()
+    };
+    let built_in = normalise(&built_in);
+    let packed = normalise(&packed);
+
     assert_eq!(
         built_in.len(),
         packed.len(),
-        "packs/starter/index.html drifted from desktop/ui/index.html (sizes differ)"
+        "packs/starter/index.html drifted from desktop/ui/index.html (sizes differ \
+         once line endings are ignored)"
     );
     assert!(
         built_in == packed,

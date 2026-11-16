@@ -335,7 +335,8 @@ impl AgentLoop for BuiltinLoop {
                 state.client.clone(),
                 Arc::new(StaticStateConfig { settings: state.settings.clone() }),
                 std::mem::take(&mut state.messages),
-            );
+            )
+            .as_builtin();
             agent.max_steps = state.max_steps;
             agent.observer = Arc::clone(&state.observer);
             agent.summarizer = Arc::clone(&state.summarizer);
@@ -539,6 +540,48 @@ pub struct Agent {
     /// this field existed. A replaced loop is handed the state wholesale; see
     /// [`AgentLoop`] for why that is the shape rather than a curated view.
     replaced_loop: Option<Arc<dyn AgentLoop>>,
+    /// Whether this agent *is* the built-in loop.
+    ///
+    /// A guard, not a setting: the built-in loop builds an [`Agent`] to do its
+    /// work, and that inner agent must not pick up an installed loop or the two
+    /// would call each other for ever.
+    builtin: bool,
+}
+
+/// The loop installed by whoever assembled this process.
+///
+/// A pack that ships a loop cannot hand it to every caller — the callers are the
+/// CLI, the desktop shell, and a subagent, and none of them knows the pack
+/// exists. So the loop is published process-wide the same way the tool budgets
+/// are (`tools::set_budgets`), and each caller asks for it with
+/// [`Agent::with_installed_loop`].
+///
+/// Process-wide rather than per-session on purpose: a loop changes how a turn
+/// thinks, and a machine that has installed one expects every turn to think that
+/// way. A caller that wants the built-in loop simply does not ask.
+static INSTALLED_LOOP: std::sync::RwLock<Option<Arc<dyn AgentLoop>>> =
+    std::sync::RwLock::new(None);
+
+/// Install the loop every subsequent turn runs on.
+///
+/// Replacing an installed loop is allowed: a second pack's loop wins, and the
+/// loser's turns run the winner's code until the process restarts. That is the
+/// same "last writer wins" rule the service table uses, and for the same reason
+/// — refusing would make the kernel decide which of two packs is legitimate.
+pub fn install_loop(loop_impl: Arc<dyn AgentLoop>) {
+    let mut slot = INSTALLED_LOOP.write().unwrap_or_else(|p| p.into_inner());
+    *slot = Some(loop_impl);
+}
+
+/// Remove the installed loop, returning it. Turns go back to the built-in one.
+pub fn uninstall_loop() -> Option<Arc<dyn AgentLoop>> {
+    let mut slot = INSTALLED_LOOP.write().unwrap_or_else(|p| p.into_inner());
+    slot.take()
+}
+
+/// The installed loop, if any.
+pub fn installed_loop() -> Option<Arc<dyn AgentLoop>> {
+    INSTALLED_LOOP.read().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
 impl Agent {
@@ -558,6 +601,7 @@ impl Agent {
             subtask: false,
             stop_reason: STOPPED.to_string(),
             replaced_loop: None,
+            builtin: false,
         }
     }
 
@@ -645,6 +689,33 @@ impl Agent {
     /// that never calls this runs exactly the code it always ran.
     pub fn with_loop(mut self, loop_impl: Arc<dyn AgentLoop>) -> Self {
         self.replaced_loop = Some(loop_impl);
+        self
+    }
+
+    /// Use the loop installed process-wide, when one was installed.
+    ///
+    /// This is the line that makes a pack-supplied loop reach every caller
+    /// without any of them naming the pack: they ask "is there a loop?" and the
+    /// answer comes from [`installed_loop`].
+    ///
+    /// It does not apply to the built-in loop's own agent — that agent is what
+    /// runs when nobody installed anything, and letting it pick up an installed
+    /// loop would make it call itself for ever.
+    pub fn with_installed_loop(mut self) -> Self {
+        if !self.builtin && self.replaced_loop.is_none() {
+            if let Some(loop_impl) = installed_loop() {
+                self.replaced_loop = Some(loop_impl);
+            }
+        }
+        self
+    }
+
+    /// Mark this agent as the built-in loop running.
+    ///
+    /// Set by [`BuiltinLoop`] on the agent it builds, so the recursion guard in
+    /// [`Agent::with_installed_loop`] has something to check.
+    pub fn as_builtin(mut self) -> Self {
+        self.builtin = true;
         self
     }
 

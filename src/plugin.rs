@@ -440,6 +440,133 @@ impl ServiceTable {
     }
 }
 
+/// A plugin's write access to the kernel's shared state.
+///
+/// The service table was already the one open slot in the kernel — a name and an
+/// `Arc<dyn Any>` — but it was readable only. That made the kernel's own state
+/// (settings, route, persona, the loop) visible to a pack and unreachable: a pack
+/// could *see* the model route and not change it, and the only way to change it
+/// was to edit the kernel.
+///
+/// This is the same table with its lock opened for writing. It is deliberately
+/// not a new abstraction: [`ServiceTable`] already had `write()`, used by the
+/// kernel itself when a fiber provides a service. Handing the same lock to a
+/// plugin is the difference between "the kernel lets you look" and "the kernel
+/// lets you change it".
+///
+/// There is no permission check here and none anywhere else in the kernel: a
+/// pack runs with the same authority the kernel does, which is the whole premise
+/// of a pack making the kernel do something the kernel did not know about.
+#[derive(Clone)]
+pub struct StateHandle {
+    table: Arc<ServiceTable>,
+    /// The plugin doing the writing, recorded on every entry it installs.
+    pub owner: String,
+    /// Realm new entries land in.
+    realm: RealmMap,
+}
+
+impl StateHandle {
+    fn of(table: Arc<ServiceTable>, owner: impl Into<String>, realm: RealmMap) -> Self {
+        Self { table, owner: owner.into(), realm }
+    }
+
+    /// A handle over a brand-new table, for a plugin applied outside a kernel.
+    ///
+    /// `ngu plugin load` and the tests apply a plugin without assembling one,
+    /// and a plugin that writes state still needs somewhere to write it. The
+    /// table is fresh and empty, so the writes are visible to nothing — which
+    /// is the honest answer for a plugin applied in isolation.
+    pub fn detached(owner: impl Into<String>) -> Self {
+        Self::of(Arc::new(ServiceTable::default()), owner, RealmMap::new())
+    }
+
+    /// Install or replace a service under `name`.
+    ///
+    /// Replacing is not an error: the later writer wins, whether that writer is
+    /// a second pack or the same pack reloading. Two packs that both claim
+    /// `settings` is a real collision, and the honest answer is "the last one
+    /// loaded owns it" rather than a kernel that refuses to start.
+    pub fn set<T: Any + Send + Sync>(&self, name: &str, value: T) {
+        self.insert_arc(name, Arc::new(value));
+    }
+
+    /// Install or replace a service that is already behind an `Arc`.
+    pub fn insert_arc(&self, name: &str, value: Arc<dyn Any + Send + Sync>) {
+        let real = self.realm.realm_of(name);
+        let mut guard = self.table.write();
+        let serial = guard
+            .get(&(name.to_string(), real))
+            .map(|entry| entry.serial + 1)
+            .unwrap_or(1);
+        guard.insert(
+            (name.to_string(), real),
+            ServiceEntry {
+                value,
+                fiber: 0,
+                owner: self.owner.clone(),
+                serial,
+            },
+        );
+        self.table.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Remove a service by name. Reports whether it was there.
+    pub fn remove(&self, name: &str) -> bool {
+        let real = self.realm.realm_of(name);
+        let existed = self.table.write().remove(&(name.to_string(), real)).is_some();
+        if existed {
+            self.table.generation.fetch_add(1, Ordering::Relaxed);
+        }
+        existed
+    }
+
+    /// Replace whatever `T` is stored under `name`, in place.
+    ///
+    /// The ordinary shape of "a pack changes the kernel's state": the value is
+    /// behind an `RwLock` the kernel itself reads, so a pack mutates it without
+    /// the kernel having to know which pack did.
+    ///
+    /// `false` when nothing is stored under that name, or when it holds a
+    /// different type — both are reported rather than papered over, because a
+    /// pack that expected to change the settings and silently did not is the
+    /// failure this method exists to make visible.
+    pub fn update<T: Any + Send + Sync>(&self, name: &str, change: impl FnOnce(&mut T)) -> bool {
+        // Two shapes, because both are ordinary. A host that keeps its own
+        // `Arc<RwLock<T>>` and publishes the same allocation (so a pack's write
+        // lands in the memory the host reads) stores the `Arc`; a plugin that
+        // simply calls `set` stores the bare `RwLock`. Accepting either is what
+        // lets a pack change the kernel's state without knowing which way the
+        // host published it.
+        if let Some(lock) = self.get::<Arc<RwLock<T>>>(name) {
+            let mut guard = lock.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+            change(&mut guard);
+            return true;
+        }
+        if let Some(lock) = self.get::<RwLock<T>>(name) {
+            let mut guard = lock.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+            change(&mut guard);
+            return true;
+        }
+        false
+    }
+
+    /// Read a service the kernel installed.
+    pub fn get<T: Any + Send + Sync>(&self, name: &str) -> Option<Arc<T>> {
+        let real = self.realm.realm_of(name);
+        self.table
+            .read()
+            .get(&(name.to_string(), real))
+            .map(|entry| Arc::clone(&entry.value))
+            .and_then(|value| value.downcast::<T>().ok())
+    }
+
+    /// Every name currently in the table.
+    pub fn names(&self) -> Vec<String> {
+        self.table.read().keys().map(|(name, _)| name.clone()).collect()
+    }
+}
+
 
 /// What a plugin can see while it loads.
 pub struct PluginCtx {
@@ -451,6 +578,17 @@ pub struct PluginCtx {
     pub realm: RealmMap,
     /// Read-only service lookup, already scoped to `realm`.
     pub services: ServiceView,
+    /// **Write** access to the same table.
+    ///
+    /// `services` answers "what is there"; this answers "make it different".
+    /// Every kernel state worth changing — the settings, the model route, the
+    /// loop, the tool table — is stored as a service behind an `RwLock`, so a
+    /// pack changes it here and the kernel reads the new value on its next turn
+    /// without knowing which pack did it.
+    ///
+    /// Adding this field is the whole of "a pack can modify the kernel": the
+    /// table, the lock, and the generation counter already existed.
+    pub state: StateHandle,
     /// Plugin configuration.
     pub config: Value,
     /// The event bus: observational subscription only (see `events.rs`) —
@@ -459,9 +597,38 @@ pub struct PluginCtx {
 }
 
 impl PluginCtx {
+    /// A context for a plugin applied outside a kernel.
+    ///
+    /// One fresh table shared by `services` and `state`, so a plugin that writes
+    /// and then reads sees its own write — which is what applying it in
+    /// isolation is supposed to mean.
+    pub fn detached(plugin: impl Into<String>) -> Self {
+        let plugin = plugin.into();
+        let table = Arc::new(ServiceTable::default());
+        let realm = RealmMap::new();
+        Self {
+            services: ServiceView::of(Arc::clone(&table), realm.clone()),
+            state: StateHandle::of(table, plugin.clone(), realm.clone()),
+            plugin,
+            fiber: 0,
+            realm,
+            config: Value::Null,
+            events: crate::events::EventBus::default(),
+        }
+    }
+
     /// Look up a service visible to this plugin.
     pub fn get<T: Any + Send + Sync>(&self, name: &str) -> Option<Arc<T>> {
         self.services.get::<T>(name)
+    }
+
+    /// Change a service the kernel installed, in place.
+    ///
+    /// The one call a pack needs to retune the kernel: the value is behind the
+    /// kernel's own `RwLock`, so this is the same mutation the kernel would make
+    /// itself. `false` when the name holds nothing of that type.
+    pub fn change<T: Any + Send + Sync>(&self, name: &str, f: impl FnOnce(&mut T)) -> bool {
+        self.state.update::<T>(name, f)
     }
 
     /// Whether a service is visible.
@@ -747,91 +914,6 @@ pub struct ToolCallView {
     pub arguments: String,
 }
 
-/// A permission decision.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Decision {
-    /// No opinion.
-    Abstain,
-    /// Allow the action.
-    Allow,
-    /// Refuse the action, with a reason.
-    Deny(String),
-}
-
-/// An action a plugin may be asked about.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Action {
-    /// Category, e.g. `tool`, `fs.write`, `bash`, `net`, `hotreload`.
-    pub kind: String,
-    /// Human-readable detail.
-    pub detail: String,
-}
-
-impl Action {
-    /// Build an action.
-    pub fn new(kind: impl Into<String>, detail: impl Into<String>) -> Self {
-        Self { kind: kind.into(), detail: detail.into() }
-    }
-}
-
-/// A permission provider contributed by a plugin.
-///
-/// Providers are consulted as a **collection**, never as a pipeline: the result
-/// must not depend on registration order. Any denial wins.
-pub trait PermissionProvider: Send + Sync {
-    /// Name for diagnostics.
-    fn name(&self) -> &str;
-    /// The decision for one action.
-    fn check(&self, action: &Action) -> Decision;
-}
-
-/// The permission stack: collection semantics with deny-wins.
-#[derive(Default, Clone)]
-pub struct PermissionStack {
-    providers: Vec<Arc<dyn PermissionProvider>>,
-}
-
-impl PermissionStack {
-    /// An empty stack: everything is allowed.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Register a provider. The stack is a collection, so order carries no
-    /// meaning; providers are sorted by name purely for reproducibility.
-    pub fn register(&mut self, provider: Arc<dyn PermissionProvider>) {
-        self.providers.push(provider);
-        self.providers.sort_by(|a, b| a.name().cmp(b.name()));
-    }
-
-    /// Remove a provider by name.
-    pub fn unregister(&mut self, name: &str) -> bool {
-        let before = self.providers.len();
-        self.providers.retain(|p| p.name() != name);
-        self.providers.len() != before
-    }
-
-    /// Consult every provider. Order-independent by construction.
-    pub fn check(&self, action: &Action) -> Decision {
-        let mut denials = Vec::new();
-        for provider in &self.providers {
-            if let Decision::Deny(reason) = provider.check(action) {
-                denials.push(format!("{}: {reason}", provider.name()));
-            }
-        }
-        if denials.is_empty() {
-            Decision::Allow
-        } else {
-            Decision::Deny(denials.join("; "))
-        }
-    }
-
-    /// Names of registered providers.
-    pub fn providers(&self) -> Vec<&str> {
-        self.providers.iter().map(|p| p.name()).collect()
-    }
-}
-
 /// What the kernel did during one refresh.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReloadEvent {
@@ -899,7 +981,6 @@ pub struct Kernel {
     services: Arc<ServiceTable>,
     /// Tools contributed by each fiber, so unload removes exactly its own.
     fiber_tools: BTreeMap<u64, Vec<String>>,
-    permissions: PermissionStack,
     tools: ToolRegistry,
     counter: Arc<AtomicU64>,
     realm_counter: Arc<AtomicU64>,
@@ -917,15 +998,24 @@ impl Default for Kernel {
 }
 
 impl Kernel {
-    /// An empty kernel with the four base tools registered.
+    /// An empty kernel.
+    ///
+    /// **No tools.** `read`, `write`, `edit`, `bash` and the job tools used to be
+    /// registered here, before any pack could load — which meant a pack could
+    /// never replace one, and the only way to change `bash` was to edit this
+    /// file. They are now published by [`Kernel::install_bootstrap`], which a
+    /// pack is free to override because every registration goes through
+    /// [`crate::tools::ConflictPolicy::Override`].
+    ///
+    /// A test that wants the bootstrap set calls that method; a caller that
+    /// wants none calls nothing.
     pub fn new() -> Self {
         Self {
             plugins: BTreeMap::new(),
             fibers: BTreeMap::new(),
             services: Arc::new(ServiceTable::default()),
             fiber_tools: BTreeMap::new(),
-            permissions: PermissionStack::new(),
-            tools: ToolRegistry::with_base_tools().expect("base tools register"),
+            tools: ToolRegistry::new(),
             counter: Arc::new(AtomicU64::new(1)),
             realm_counter: Arc::new(AtomicU64::new(1)),
             instance_counter: 0,
@@ -948,6 +1038,87 @@ impl Kernel {
         self.tools.set_session(session, workspace);
     }
 
+    /// Register the tools a kernel cannot start without.
+    ///
+    /// Four file and shell tools plus the job tools behind `bash background`.
+    /// Called by the host before anything else loads.
+    ///
+    /// # Why this is not `Kernel::new`
+    ///
+    /// A pack that wants a different `bash` — one that logs every command, or
+    /// refuses a working directory, or runs in a container — had no way to say
+    /// so while the base tools were installed inside `new`: by the time a pack
+    /// loaded, the name was taken and the policy was `Error`. Splitting the call
+    /// out is what makes the four tools ordinary contributions like any other.
+    ///
+    /// The names still appear here, and that is honest rather than avoidable:
+    /// *something* has to install the tools a conversation cannot function
+    /// without. What changed is that installing them is a choice a host makes,
+    /// not a fact about the kernel.
+    pub fn install_bootstrap(&mut self) -> Result<()> {
+        crate::tools::base::register_all(&mut self.tools)
+    }
+
+    /// Define every `builtin:` plugin this binary carries.
+    ///
+    /// # Why this exists as one call
+    ///
+    /// The list used to be written out three times — in `ngu`'s `run`, in `ngu
+    /// apply`, and in the desktop shell — and each copy drifted. `ngu apply` was
+    /// the one that fell behind: it never defined `delegate`, `long-horizon` or
+    /// `judge`, so `ngu apply packs/starter/assembly.yaml` failed with
+    /// "plugin 'delegate' is not defined in this kernel" while the desktop
+    /// loaded the same pack without complaint. That is the exact failure mode a
+    /// pack system is supposed to make impossible: the same pack working or not
+    /// depending on which entrance you came through.
+    ///
+    /// # You still have to name the binaries you ship
+    ///
+    /// `builtin:` means "compiled into this binary", so this function is where
+    /// the binary admits what it contains. A pack still decides whether any of it
+    /// loads — defining is not enabling — and a pack can still replace any of
+    /// these tools, because registration is `Override`.
+    pub fn define_builtins(&mut self) {
+        crate::tools::subagent::define(self);
+        crate::tools::longhorizon::define(self);
+        crate::tools::documents::define(self);
+        crate::tools::restart::define(self);
+        crate::tools::judge::install(
+            self,
+            crate::tools::judge::cell(None),
+        );
+    }
+
+    /// The base tools without a kernel, for a caller that only wants a registry.
+    ///
+    /// [`Kernel::install_bootstrap`] installs them into a kernel; this is the
+    /// same set as a free-standing [`crate::tools::ToolRegistry`], which is what
+    /// a subagent, a test, or an embedded agent wants.
+    pub fn bootstrap_registry() -> Result<crate::tools::ToolRegistry> {
+        crate::tools::ToolRegistry::with_base_tools()
+    }
+
+    /// Publish a value under a name a plugin can find and change.
+    ///
+    /// This is how the kernel makes *its own* state reachable: the settings, the
+    /// route, the persona, and anything else worth a pack's attention. It is
+    /// `StateHandle::set` reached from the kernel side, with the kernel recorded
+    /// as the owner so an unload of a pack cannot remove what the kernel put
+    /// there.
+    pub fn publish_state<T: Any + Send + Sync>(&mut self, name: &str, value: T) {
+        self.publish_state_arc(name, Arc::new(value));
+    }
+
+    /// [`Kernel::publish_state`] for a value that is already behind an `Arc`.
+    ///
+    /// The ordinary case: the host keeps its own `Arc<RwLock<Settings>>` so it
+    /// does not pay a string lookup on every turn, and publishes the same
+    /// allocation so a pack's write lands in the memory the host reads.
+    pub fn publish_state_arc(&mut self, name: &str, value: Arc<dyn Any + Send + Sync>) {
+        StateHandle::of(Arc::clone(&self.services), "kernel", RealmMap::new())
+            .insert_arc(name, value);
+    }
+
     /// The kernel's event bus (shared with every clone of the tool table).
     ///
     /// Observational only: subscribers watch facts; vetoes belong to the
@@ -959,16 +1130,6 @@ impl Kernel {
     /// The tool table, mutably.
     pub fn tools_mut(&mut self) -> &mut ToolRegistry {
         &mut self.tools
-    }
-
-    /// The permission stack.
-    pub fn permissions(&self) -> &PermissionStack {
-        &self.permissions
-    }
-
-    /// The permission stack, mutably.
-    pub fn permissions_mut(&mut self) -> &mut PermissionStack {
-        &mut self.permissions
     }
 
     /// Create a fresh realm id.
@@ -1887,6 +2048,11 @@ impl Kernel {
             fiber,
             realm: realm.clone(),
             services: self.service_view(realm.clone()),
+            state: StateHandle::of(
+                Arc::clone(&self.services),
+                plugin_name.to_string(),
+                realm.clone(),
+            ),
             config: config.clone(),
             events: self.tools.events(),
         };
@@ -2028,7 +2194,7 @@ impl Kernel {
         let mut registered: Vec<String> = Vec::with_capacity(tools.len());
         for def in tools {
             let name = def.name.clone();
-            match self.tools.register(def, ConflictPolicy::Error) {
+            match self.tools.register(def, ConflictPolicy::Override) {
                 Ok(()) => registered.push(name),
                 Err(error) => {
                     eprintln!("[plugin] '{plugin}' could not register tool '{name}': {error:#}");
@@ -2345,6 +2511,7 @@ mod tests {
     #[test]
     fn unloading_removes_services_and_tools() {
         let mut kernel = Kernel::new();
+        kernel.install_bootstrap().unwrap();
         kernel.define(Named::new("contributor", |_| {
             Ok(Contributions::new()
                 .service("svc", Arc::new(1u8))
@@ -2431,45 +2598,6 @@ mod tests {
 
         // Validation happens before installation, so the tool never appeared.
         assert!(kernel.tools().get("latecomer_tool").is_none());
-    }
-
-    #[test]
-    fn permission_denials_win_regardless_of_registration_order() {
-        struct Fixed(&'static str, Decision);
-        impl PermissionProvider for Fixed {
-            fn name(&self) -> &str {
-                self.0
-            }
-            fn check(&self, _action: &Action) -> Decision {
-                self.1.clone()
-            }
-        }
-
-        let action = Action::new("bash", "rm -rf /");
-
-        let mut stack = PermissionStack::new();
-        stack.register(Arc::new(Fixed("allower", Decision::Allow)));
-        stack.register(Arc::new(Fixed("denier", Decision::Deny("nope".into()))));
-        let first = stack.check(&action);
-
-        // Same providers registered the other way round must agree.
-        let mut reversed = PermissionStack::new();
-        reversed.register(Arc::new(Fixed("denier", Decision::Deny("nope".into()))));
-        reversed.register(Arc::new(Fixed("allower", Decision::Allow)));
-        let second = reversed.check(&action);
-
-        assert_eq!(first, second, "decision must not depend on order");
-        assert!(matches!(first, Decision::Deny(_)));
-
-        // With no denials the stack allows.
-        let mut permissive = PermissionStack::new();
-        permissive.register(Arc::new(Fixed("allower", Decision::Allow)));
-        permissive.register(Arc::new(Fixed("silent", Decision::Abstain)));
-        assert_eq!(permissive.check(&action), Decision::Allow);
-
-        // Unregistering the denier flips the decision.
-        stack.unregister("denier");
-        assert_eq!(stack.check(&action), Decision::Allow);
     }
 
     #[test]

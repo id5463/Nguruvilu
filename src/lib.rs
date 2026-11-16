@@ -52,6 +52,7 @@ pub mod source;
 pub mod theme;
 pub mod ui;
 pub mod size;
+pub mod state;
 pub mod skills;
 pub mod tools;
 
@@ -72,17 +73,17 @@ pub use llm::{LlmClient, LlmConfig, LlmEvent};
 pub use loader::{LoadReport, Loader, Outcome};
 pub use mcp::{McpClient, McpSpec, McpTool};
 pub use message::{Message, Role, ToolCall};
-pub use network::{NetworkPolicy, NetworkSettings};
+pub use network::NetworkSettings;
 pub use pack::{InstalledPack, PackManifest, VerifyReport};
 pub use plugin::{
-    Action, Contributions, Decision, FiberState, Kernel, PermissionProvider, PermissionStack,
-    Plugin, PluginCtx, RealmId, RealmMap, ReloadEvent,
+    Contributions, FiberState, Kernel, Plugin, PluginCtx, RealmId, RealmMap, ReloadEvent,
 };
 pub use request::{ExtraFields, RequestShaper};
 pub use settings::Settings;
 pub use source::{FilesystemSource, PackSource};
 pub use model::{ModelAccess, ModelService};
 pub use theme::{Theme, ThemeRegistry};
+pub use state::{Persona, Published, Route};
 pub use ui::{UiPanel, UiRegistry, UiSlot};
 pub use size::{format_size, parse_size};
 pub use window::{ContextPolicy, ContextWindow, WindowSource};

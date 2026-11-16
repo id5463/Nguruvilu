@@ -155,6 +155,58 @@ pub fn check_base_url(base_url: &str) -> Result<()> {
     ))
 }
 
+/// A [`ModelAccess`] over a fixed route and tool table.
+///
+/// For a caller that is not running a turn: `ngu apply` loads a pack so the
+/// caller can see what it contributes, and `delegate` injects the `llm` service,
+/// so the service has to exist or the plugin loads and contributes nothing. This
+/// publishes the route from the settings file and the kernel's own tool table —
+/// enough for a plugin to apply, and nothing that could call a model.
+pub struct StaticAccess {
+    route: ModelRoute,
+    tools: Arc<ToolRegistry>,
+    prompt: String,
+}
+
+impl StaticAccess {
+    /// Publish `route` and `tools` as they are.
+    pub fn new(route: ModelRoute, tools: Arc<ToolRegistry>) -> Self {
+        Self { route, tools, prompt: String::new() }
+    }
+
+    /// Override the standing instructions a nested agent would get.
+    pub fn with_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.prompt = prompt.into();
+        self
+    }
+}
+
+impl ModelAccess for StaticAccess {
+    fn route(&self) -> ModelRoute {
+        self.route.clone()
+    }
+
+    fn client(&self) -> Result<LlmClient> {
+        self.route.client_for(&self.route.model)
+    }
+
+    fn client_for(&self, model: &str) -> Result<LlmClient> {
+        self.route.client_for(model)
+    }
+
+    fn tools(&self) -> Arc<ToolRegistry> {
+        Arc::clone(&self.tools)
+    }
+
+    fn system_prompt(&self) -> String {
+        self.prompt.clone()
+    }
+
+    fn context_policy(&self) -> Arc<dyn crate::window::ContextPolicy> {
+        Arc::new(crate::window::DefaultContextPolicy::default())
+    }
+}
+
 /// The name a plugin looks the service up under.
 pub const SERVICE: &str = "llm";
 
@@ -375,14 +427,7 @@ mod tests {
     #[test]
     fn applying_the_plugin_contributes_the_service() {
         let service = ModelService::new(fixed());
-        let ctx = PluginCtx {
-            plugin: "model".into(),
-            fiber: 1,
-            realm: RealmMap::new(),
-            services: crate::plugin::ServiceView::default(),
-            config: serde_json::Value::Null,
-            events: crate::events::EventBus::default(),
-        };
+        let ctx = PluginCtx::detached("model");
         let contributions = crate::plugin::Plugin::apply(&service, &ctx).unwrap();
         assert_eq!(contributions.services.len(), 1);
         assert_eq!(contributions.services[0].0, SERVICE);

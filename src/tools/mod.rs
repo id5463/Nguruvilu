@@ -24,7 +24,7 @@ pub mod longhorizon;
 pub mod pack;
 pub mod readers;
 pub mod restart;
-pub mod search;
+
 pub mod spill;
 pub mod subagent;
 

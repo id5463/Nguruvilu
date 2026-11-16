@@ -402,12 +402,6 @@ enum ConfigAction {
         /// Milliseconds before the first retry; doubles each attempt.
         #[arg(long)]
         retry_backoff_ms: Option<u64>,
-        /// Search provider: tavily, brave, or exa.
-        #[arg(long)]
-        search_provider: Option<String>,
-        /// Search API key. The tool appears only when this is set.
-        #[arg(long)]
-        search_api_key: Option<String>,
         /// Judge endpoint, e.g. https://api.typesafe.ai (no path).
         #[arg(long)]
         judge_endpoint: Option<String>,
@@ -924,34 +918,28 @@ async fn run() -> Result<()> {
 
     // The kernel owns the tool table; skills add one tool to it.
     let mut kernel = Kernel::new();
+    // The tools a conversation cannot work without. Installed as a call rather
+    // than inside `Kernel::new`, so a pack can replace any of them: every
+    // registration below goes through `ConflictPolicy::Override`.
+    kernel.install_bootstrap()?;
     // The agent can build, install, load, and unload packs itself; the host
     // applies the load and unload between turns.
     let pending_packs = Arc::new(nguruvilu::tools::pack::PendingQueue::new());
     nguruvilu::tools::pack::register_with(kernel.tools_mut(), Some(Arc::clone(&pending_packs)))?;
-    // The subagent's code is available to a pack, not loaded by the kernel:
-    // `packs/starter` asks for `builtin:delegate` and it appears, and without
-    // that pack the kernel has no such tool.
-    nguruvilu::tools::subagent::define(&mut kernel);
-    // Available to a pack, not loaded by the kernel: `packs/long-horizon` asks
-    // for `builtin:long-horizon` and the mission tools appear.
-    nguruvilu::tools::longhorizon::define(&mut kernel);
-    // Same for document reading (读不了就装包): `packs/documents` asks for
-    // `builtin:documents` and `read` learns PDF/Office; without the pack,
-    // `read` says so and names what is installed.
-    nguruvilu::tools::documents::define(&mut kernel);
-    // Available to a pack, not loaded by the kernel: a conversation that
-    // wants to restart its own process asks for `builtin:restart`.
-    nguruvilu::tools::restart::define(&mut kernel);
-    // Same split for search: the code is available, the pack's assembly is
-    // what makes a conversation have it. The cell is the host's copy of the
-    // settings — filled now, refilled after pack content lands, and again
-    // whenever something changes them.
-    let search_cell = nguruvilu::tools::search::cell(settings.search.clone());
-    nguruvilu::tools::search::install(&mut kernel, search_cell.clone());
-    // And the same split for the judge: code in the kernel, permission to
-    // exist from the pack, settings from the host's cell.
-    let judge_cell = nguruvilu::tools::judge::cell(settings.judge.clone());
+    // Every `builtin:` plugin this binary carries, defined in one place so the
+    // CLI, `ngu apply`, and the desktop cannot disagree about what exists.
+    // Defining is not enabling: a pack's assembly still decides what loads.
+    kernel.define_builtins();
+    // The judge keeps its settings in the host's cell rather than in the plugin,
+    // so a settings save can re-apply the fibers without rebuilding anything.
+    let judge_cell = nguruvilu::tools::judge::cell(nguruvilu::tools::judge::from_settings(&settings));
     nguruvilu::tools::judge::install(&mut kernel, judge_cell.clone());
+    // The kernel's own state, published where a pack can reach and change it:
+    // settings, route, persona. Reading stays direct (`published.settings()`),
+    // because routing the hot path through a string lookup would make every turn
+    // pay for a feature it may not use.
+    let published = nguruvilu::state::Published::install(&mut kernel, settings.clone());
+    settings = published.settings();
     if !skills.is_empty() {
         register_skill_tool(kernel.tools_mut(), Arc::new(skills.clone()))?;
     }
@@ -1134,17 +1122,13 @@ async fn run() -> Result<()> {
             ChangePayload::Persona(persona.clone()),
         ))?;
     }
-    // A pack may be what configured search, so the settings go back into the
-    // plugin after the content lands: the fibers re-apply, and the tool table
-    // says the truth about whether search is usable right now.
-    nguruvilu::tools::search::configure(&mut kernel, &search_cell, settings.search.clone())?;
-    if kernel.tools().get(nguruvilu::tools::search::TOOL).is_some() {
-        eprintln!("[search] enabled");
-    }
-
     // The judge keeps its own cell: settings first, fibers re-apply, and the
     // table says whether a verdict is available this turn.
-    nguruvilu::tools::judge::configure(&mut kernel, &judge_cell, settings.judge.clone())?;
+    nguruvilu::tools::judge::configure(
+        &mut kernel,
+        &judge_cell,
+        nguruvilu::tools::judge::from_settings(&settings),
+    )?;
     if kernel.tools().get(nguruvilu::tools::judge::TOOL).is_some() {
         eprintln!("[judge] enabled");
     }
@@ -1344,6 +1328,10 @@ async fn run() -> Result<()> {
             let original_len = session.messages.len();
             let mut agent = Agent::new(client, Arc::clone(&config), session.messages.clone())
                 .with_max_steps(cli.max_steps.unwrap_or_else(|| settings.max_steps()))
+                // A pack may have installed its own loop; without this line that
+                // pack's code shipped and never ran — which was the state of the
+                // `with_loop` chain before: written, tested, unreachable.
+                .with_installed_loop()
                 .with_observer(observer)
                 // This CLI turn's session, fixed for the turn: a plugin that
                 // re-pins the registry mid-turn (or a second process) cannot
@@ -1478,7 +1466,6 @@ async fn run() -> Result<()> {
                 injection: &injection,
                 queue: &pending_packs,
                 mcp: &mut mcp_clients,
-                search: &search_cell,
                 judge: &judge_cell,
                 persona_override: cli.persona.clone(),
                 baseline: pack_baseline,
@@ -1557,7 +1544,6 @@ async fn run() -> Result<()> {
                     injection: &injection,
                     queue: &pending_packs,
                     mcp: &mut mcp_clients,
-                    search: &search_cell,
                     judge: &judge_cell,
                     persona_override: cli.persona.clone(),
                     baseline: pack_baseline,
@@ -1782,6 +1768,7 @@ async fn interactive(
 
     let mut agent = Agent::new(client, Arc::clone(&config), session.messages.clone())
         .with_max_steps(max_steps)
+        .with_installed_loop()
         .with_observer(Arc::new(PrettyObserver { quiet: false }))
         // The interactive session this loop serves, fixed for every turn it
         // runs (the id and workspace do not change while the loop is alive).
@@ -2458,8 +2445,25 @@ async fn apply_assembly(
         });
 
     let mut kernel = Kernel::new();
+    // The base tools, and every `builtin:` plugin this binary carries — the same
+    // two calls `run` makes. Without them `ngu apply` could not load a pack whose
+    // assembly names a builtin, which is how it drifted before.
+    kernel.install_bootstrap()?;
+    kernel.define_builtins();
     // The agent can build and install packs itself.
     nguruvilu::tools::pack::register(kernel.tools_mut())?;
+    // The model access service. `delegate` injects it, so without this a pack
+    // naming `builtin:delegate` loads and contributes nothing — the silent
+    // failure this command used to have. Applying a pack is not the same as
+    // running a turn, so the route comes from the settings file and needs no
+    // key: nothing here will call the model.
+    let plan_settings = Settings::resolve();
+    let access: Arc<dyn nguruvilu::model::ModelAccess> =
+        Arc::new(nguruvilu::model::StaticAccess::new(
+            nguruvilu::hotreload::ModelRoute::from_settings(&plan_settings),
+            Arc::new(kernel.tools().clone()),
+        ));
+    nguruvilu::model::install(&mut kernel, access)?;
     if !skills.is_empty() {
         register_skill_tool(kernel.tools_mut(), Arc::new(skills.clone()))?;
     }
@@ -3519,14 +3523,7 @@ fn plugin_load(path: &PathBuf, as_json: bool) -> Result<()> {
 
     // Tools are registered through a callback during `apply`, so the plugin has
     // to be applied once before its contributions are visible.
-    let ctx = nguruvilu::plugin::PluginCtx {
-        plugin: plugin.name().to_string(),
-        fiber: 0,
-        realm: nguruvilu::plugin::RealmMap::new(),
-        services: nguruvilu::plugin::ServiceView::default(),
-        config: serde_json::Value::Null,
-        events: nguruvilu::events::EventBus::default(),
-    };
+    let ctx = nguruvilu::plugin::PluginCtx::detached(plugin.name());
     let contributions = PluginTrait::apply(&plugin, &ctx)?;
     let tools: Vec<String> = contributions.tools.iter().map(|t| t.name.clone()).collect();
     let logs = plugin.log_lines();
@@ -3610,14 +3607,7 @@ fn plugin_load(path: &PathBuf, as_json: bool) -> Result<()> {
 fn plugin_call(path: &PathBuf, tool: &str, args: &str, as_json: bool) -> Result<()> {
     let plugin = unsafe { nguruvilu::dylib::DynamicPlugin::load(path)? };
 
-    let ctx = nguruvilu::plugin::PluginCtx {
-        plugin: plugin.name().to_string(),
-        fiber: 0,
-        realm: nguruvilu::plugin::RealmMap::new(),
-        services: nguruvilu::plugin::ServiceView::default(),
-        config: serde_json::Value::Null,
-        events: nguruvilu::events::EventBus::default(),
-    };
+    let ctx = nguruvilu::plugin::PluginCtx::detached(plugin.name());
     PluginTrait::apply(&plugin, &ctx)?;
 
     let arguments: serde_json::Value =
@@ -3676,8 +3666,6 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             pool_idle_timeout,
             retry_attempts,
             retry_backoff_ms,
-            search_provider,
-            search_api_key,
             judge_endpoint,
             judge_key,
             judge_model,
@@ -3782,43 +3770,12 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
             }
             // A value that would behave unlike its name is reported here rather
             // than at the first failed request.
-            if search_provider.is_some() || search_api_key.is_some() {
-                let mut search = settings
-                    .search
-                    .clone()
-                    .unwrap_or_else(|| nguruvilu::tools::search::SearchSettings {
-                        provider: nguruvilu::tools::search::Dialect::Tavily,
-                        api_key: String::new(),
-                        endpoint: None,
-                        max_results: 5,
-                    });
-                if let Some(name) = search_provider {
-                    search.provider = nguruvilu::tools::search::Dialect::parse(name).ok_or_else(
-                        || {
-                            anyhow!(
-                                "unknown search provider '{name}'; expected one of {}",
-                                nguruvilu::tools::search::Dialect::all()
-                                    .iter()
-                                    .map(|d| d.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            )
-                        },
-                    )?;
-                }
-                if let Some(key) = search_api_key {
-                    search.api_key = key.clone();
-                }
-                settings.search = Some(search);
-            }
-
-            // The judge mirrors search: one of three flags means "touch it",
+            //
+            // The judge: one of three flags means "touch it",
             // the key alone decides whether the tool exists, and an endpoint
             // must be a URL because a typo here becomes a failed call later.
             if judge_endpoint.is_some() || judge_key.is_some() || judge_model.is_some() {
-                let mut judge = settings
-                    .judge
-                    .clone()
+                let mut judge = nguruvilu::tools::judge::from_settings(&settings)
                     .unwrap_or_else(nguruvilu::tools::judge::JudgeSettings::default);
                 if let Some(endpoint) = judge_endpoint {
                     let endpoint = endpoint.trim().trim_end_matches('/').to_string();
@@ -3833,7 +3790,7 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
                 if let Some(model) = judge_model {
                     judge.model = model.trim().to_string();
                 }
-                settings.judge = Some(judge);
+                nguruvilu::tools::judge::into_settings(&mut settings, Some(judge))?;
             }
 
             let network_problems = settings.network.problems();
@@ -3871,7 +3828,7 @@ fn config_command(action: Option<&ConfigAction>, as_json: bool) -> Result<()> {
                         &settings.reasoning_effort
                     }
                 );
-                if let Some(judge) = &settings.judge {
+                if let Some(judge) = nguruvilu::tools::judge::from_settings(&settings) {
                     println!(
                         "  judge:    {} ({})",
                         judge.endpoint,
@@ -4269,9 +4226,6 @@ fn adopt_content(
             .lock()
             .expect("injection lock") = Arc::new(rules);
     }
-    if let Some(search) = &content.search {
-        search.apply(&mut settings.search);
-    }
     Ok(())
 }
 
@@ -4293,9 +4247,6 @@ struct PackHost<'a> {
     /// The session's MCP servers: joined when a pack loads, stopped when it
     /// unloads, and stopped for good on the way out.
     mcp: &'a mut Vec<Arc<nguruvilu::mcp::McpClient>>,
-    /// The search plugin's settings cell: a hot load may have configured
-    /// search, and the plugin re-reads it through `search::configure`.
-    search: &'a nguruvilu::tools::search::SettingsCell,
     /// The judge plugin's settings cell — same rule, `judge::configure`.
     judge: &'a nguruvilu::tools::judge::SettingsCell,
     /// An explicit `--persona` from this run: adoption joins the installed
@@ -4464,18 +4415,10 @@ impl PackHost<'_> {
             *self.injection
                 .lock()
                 .expect("injection lock") = Arc::new(adopted.injections);
-            // A hot load may have configured search as well: the settings go
-            // back into the plugin's cell and its fibers re-apply, so the tool
-            // table is in step before it is published.
-            nguruvilu::tools::search::configure(
-                self.kernel,
-                self.search,
-                self.settings.search.clone(),
-            )?;
             nguruvilu::tools::judge::configure(
                 self.kernel,
                 self.judge,
-                self.settings.judge.clone(),
+                nguruvilu::tools::judge::from_settings(self.settings),
             )?;
             // The route may have moved with the pack's content, and the tool
             // table certainly did; both are published together so the next
@@ -4611,7 +4554,11 @@ mod tests {
         std::fs::write(root.join("other-2.0.0.ngupack"), b"two").unwrap();
         let error = format!("{:#}", pack_archive_in(&root).expect_err("two archives"));
         assert!(error.contains("2 archives"), "{error}");
-        assert!(error.contains("demo-1.0.0.dshpack"), "{error}");
+        // The listing names the archives as they are on disk. This asserted
+        // `demo-1.0.0.dshpack` — the old archived suffix — long after the code
+        // started writing `.ngupack`, so the assertion could only pass by
+        // accident of the message mentioning both spellings.
+        assert!(error.contains("demo-1.0.0.ngupack"), "{error}");
         std::fs::remove_dir_all(&root).ok();
     }
 

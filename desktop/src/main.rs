@@ -869,20 +869,6 @@ pub(crate) async fn dispatch(
                 .get("max_output_tokens")
                 .and_then(|v| v.as_str())
                 .and_then(|v| nguruvilu::size::parse_size(v).ok());
-            // Web search: provider decides on/off, blank key box keeps the
-            // stored key — the same two rules the panel applies to the model key.
-            let search_provider = command
-                .get("search_provider")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let search_api_key = command
-                .get("search_api_key")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let search_endpoint = command
-                .get("search_endpoint")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
             // The judge's three: same rules as search (blank key keeps the
             // stored one; blank endpoint with blank key turns it off).
             let judge_endpoint = command
@@ -901,14 +887,6 @@ pub(crate) async fn dispatch(
             // an unloaded pack's absence never reads as "the user erased it".
             // A payload without flags (scripted call) falls back to "present
             // when any of its fields was sent".
-            let search_present = command
-                .get("search_present")
-                .and_then(|v| v.as_bool())
-                .unwrap_or_else(|| {
-                    command.get("search_provider").is_some()
-                        || command.get("search_api_key").is_some()
-                        || command.get("search_endpoint").is_some()
-                });
             let judge_present = command
                 .get("judge_present")
                 .and_then(|v| v.as_bool())
@@ -946,10 +924,6 @@ pub(crate) async fn dispatch(
                     tool_prune_keep,
                     tool_keep_images,
                     budgets,
-                    search_provider,
-                    search_api_key,
-                    search_endpoint,
-                    search_present,
                     judge_endpoint,
                     judge_api_key,
                     judge_model,
@@ -1986,23 +1960,12 @@ async fn drain_packs(state: Arc<Mutex<AppState>>, sink: Arc<dyn EventSink>) {
             // field borrows by itself.
             let settings = guard.settings.clone();
             let AppState {
-                kernel, search_cell, judge_cell, ..
+                kernel, judge_cell, ..
             } = &mut *guard;
-            let search = nguruvilu::tools::search::configure(
-                kernel,
-                search_cell,
-                settings.search.clone(),
-            );
-            if let Err(error) = search {
-                emit(
-                    &sink,
-                    json!({ "ev": "error", "message": format!("search config: {error:#}") }),
-                );
-            }
             let judge = nguruvilu::tools::judge::configure(
                 kernel,
                 judge_cell,
-                settings.judge.clone(),
+                nguruvilu::tools::judge::from_settings(&settings),
             );
             if let Err(error) = judge {
                 emit(

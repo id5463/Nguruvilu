@@ -1,0 +1,20 @@
+{
+  "formatVersion": 1,
+  "game": "nguruvilu",
+  "name": "web-search",
+  "versionId": "1.0.0",
+  "license": "MIT",
+  "kernelVersion": "0.1.0",
+  "dependencies": {
+    "nguruvilu": ">=0.1.0"
+  },
+  "mcp": "mcp.json",
+  "skills": [
+    {
+      "id": "web-search",
+      "source": "skills/web-search",
+      "license": "MIT"
+    }
+  ],
+  "description": "Web search: one tool over Tavily, Brave and Exa. Lifted out of the kernel because a kernel tool that ignored settings.proxy could not be fixed from a pack."
+}

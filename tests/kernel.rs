@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use nguruvilu::agent::TurnConfig;
 use nguruvilu::assembly::Assembly;
-use nguruvilu::context::{CachePolicy, InjectionEngine, InjectionEntry, PositionKind};
+use nguruvilu::context::{CachePolicy, InjectionEngine, InjectionEntry, InjectionSource, PositionKind};
 use nguruvilu::git::GitSnapshot;
 use nguruvilu::hotreload::{
     ApplyOutcome, Change, ChangeKind, ChangePayload, Consent, ModelRoute, Runtime,
@@ -345,6 +345,10 @@ fn replacing_a_dependency_rewires_dependents_without_a_manual_reload() {
 #[test]
 fn unloading_a_plugin_removes_its_service_and_tool() {
     let mut kernel = Kernel::new();
+    // `Kernel::new` carries no tools: the base set is a call a host makes, so a
+    // pack can replace any of them. This test asserts a base tool survives an
+    // unload, so it installs them first.
+    kernel.install_bootstrap().unwrap();
     kernel.define(Arc::new(Contributor {
         name: "contrib".into(),
         service: "thing".into(),
@@ -585,7 +589,7 @@ fn the_injection_engine_budgets_and_places_fragments() {
     ));
 
     let conversation = vec![Message::user("please read this pdf")];
-    let injection = engine.inject(&conversation, 8000, CachePolicy::Balanced);
+    let injection = InjectionSource::inject(&engine, &conversation, 8000, CachePolicy::Balanced);
 
     assert_eq!(injection.prefix, vec!["standing rule"]);
     assert_eq!(injection.tail, vec!["use pdftotext"]);
@@ -598,7 +602,7 @@ fn cache_first_moves_prefix_injections_into_the_history() {
     let mut engine = InjectionEngine::new();
     engine.add(InjectionEntry::constant("rule", "standing rule").at(PositionKind::Prefix));
 
-    let injection = engine.inject(&[Message::user("hi")], 8000, CachePolicy::CacheFirst);
+    let injection = InjectionSource::inject(&engine, &[Message::user("hi")], 8000, CachePolicy::CacheFirst);
     assert!(injection.prefix.is_empty(), "the prefix was left alone");
     assert_eq!(injection.tail, vec!["standing rule"], "but the fragment still landed");
     assert_eq!(injection.relocated, vec!["rule"]);
@@ -696,6 +700,7 @@ fn turn_settings_carry_the_skills_catalog_into_the_prompt() {
                 policy: Arc::new(nguruvilu::window::DefaultContextPolicy::default()),
                 injection: Arc::new(InjectionEngine::load_default()),
                 cache_policy: CachePolicy::default(),
+                plugin_hooks: None,
             }
         }
     }

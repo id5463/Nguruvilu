@@ -1,0 +1,31 @@
+version: 1
+name: web-search
+defaults:
+  scope: session
+  on_failure: skip
+# Search used to be a kernel tool. It read only NGU_PROXY and fell back to
+# no_proxy(), while the model route read settings.proxy — so on a machine where
+# the model provider answers directly and the search API does not, every search
+# returned 403 with nothing in the UI to explain it.
+#
+# Since the tool could not be corrected without a new kernel build, it became a
+# pack. The kernel keeps no search implementation now; this process owns the
+# dialect table and the proxy order.
+#
+# `python` rather than `python3`: the latter does not exist on Windows, and an
+# MCP server that cannot be launched costs a turn every time a model tries it.
+stages:
+- name: pack
+  mcp:
+  - id: web-search
+    via_proxy: mcp-proxy
+    source: stdio:python bin/web_search.py
+    scope: session
+    transport: stdio
+    command: python
+    args:
+    - bin/web_search.py
+  skills:
+  - id: web-search-skill
+    source: skills/web-search
+    scope: session

@@ -804,6 +804,9 @@ mod tests {
         std::fs::write(&path, pdf).unwrap();
 
         let mut kernel = crate::plugin::Kernel::new();
+        // `read` is no longer installed by `Kernel::new`: the bootstrap set is a
+        // call a host makes, so that a pack can replace any of its tools.
+        kernel.install_bootstrap().unwrap();
         define(&mut kernel);
         kernel
             .load(

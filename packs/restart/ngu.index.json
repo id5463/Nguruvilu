@@ -1,0 +1,26 @@
+{
+  "formatVersion": 1,
+  "game": "nguruvilu",
+  "name": "restart",
+  "description": "让代理重启它自己所在的进程：改完配置、换掉包、更新二进制之后不必等人来重启（需要进程管理器，例如 systemd Restart=always，否则退出就是死掉）",
+  "versionId": "1.0.0",
+  "license": "MIT",
+  "kernelVersion": "0.1.0",
+  "dependencies": {
+    "nguruvilu": ">=0.1.0"
+  },
+  "plugins": [
+    {
+      "id": "restart",
+      "source": "builtin:restart",
+      "license": "MIT"
+    }
+  ],
+  "skills": [
+    {
+      "id": "restart-guide",
+      "source": "skills/restart-guide",
+      "license": "MIT"
+    }
+  ]
+}

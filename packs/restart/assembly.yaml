@@ -1,0 +1,15 @@
+version: 1
+name: restart
+defaults:
+  scope: session
+  on_failure: skip
+stages:
+- name: pack
+  plugins:
+  - id: restart
+    source: builtin:restart
+    scope: global
+  skills:
+  - id: restart-guide
+    source: skills/restart-guide
+    scope: session

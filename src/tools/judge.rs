@@ -45,7 +45,7 @@ const PATH: &str = "/v1/systemone";
 
 /// How the judge is reached and which model answers.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct JudgeSettings {
     /// API base, e.g. `https://api.typesafe.ai` — no path.
     pub endpoint: String,
@@ -102,6 +102,40 @@ pub fn from_env() -> Option<JudgeSettings> {
         }
     }
     Some(settings)
+}
+
+/// The key this pack's settings live under in [`crate::settings::Settings::packs`].
+pub const PACK: &str = "judge";
+
+/// The judge's settings out of the settings file, for a host that has one.
+///
+/// The kernel does not declare a `judge` field any more — that was the kernel
+/// knowing about one pack by name. What it keeps instead is
+/// [`crate::settings::Settings::packs`], an arbitrary JSON object per pack, and
+/// this function is the judge pack's own reading of its own entry.
+///
+/// A host that has no settings (tests, an embedded kernel) passes `None` and the
+/// tool simply stays absent, which is the same rule as before: no key, no tool.
+pub fn from_settings(settings: &crate::settings::Settings) -> Option<JudgeSettings> {
+    let entry = settings.pack(PACK);
+    if entry.is_null() {
+        return None;
+    }
+    serde_json::from_value(entry).ok()
+}
+
+/// Write this pack's settings back into the settings file's pack table.
+pub fn into_settings(
+    settings: &mut crate::settings::Settings,
+    judge: Option<JudgeSettings>,
+) -> Result<()> {
+    match judge {
+        Some(judge) => settings.set_pack(PACK, serde_json::to_value(judge)?),
+        None => {
+            settings.packs.remove(PACK);
+        }
+    }
+    Ok(())
 }
 
 /// The host's copy of the judge settings, shared with the plugin.

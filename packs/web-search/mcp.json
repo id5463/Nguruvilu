@@ -1,0 +1,13 @@
+{
+  "servers": [
+    {
+      "id": "web-search",
+      "transport": "stdio",
+      "command": "python",
+      "args": [
+        "bin/web_search.py"
+      ],
+      "scope": "session"
+    }
+  ]
+}

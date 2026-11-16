@@ -220,7 +220,7 @@ fn default_range() -> String {
 /// files covers every platform, and it can be as large as it needs to be
 /// because it is fetched rather than carried.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct UiDecl {
     /// Identifier, used to select it.
     #[serde(default)]
@@ -751,7 +751,7 @@ pub struct Component {
 
 /// `models.json`: how to talk to the model.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelsFile {
     /// Endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -791,73 +791,10 @@ pub struct ModelsFile {
 
 /// `search.json`: which search provider this pack expects.
 ///
-/// Carried like `models.json`, and for the same reason: the key itself never
-/// travels, only the name of the variable holding it. A pack that names a
-/// provider whose variable is unset leaves the tool unregistered — a search
-/// tool that cannot authenticate costs a turn every time the model tries it.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SearchFile {
-    /// `tavily`, `brave`, or `exa`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<crate::tools::search::Dialect>,
-    /// **Name** of the environment variable holding the key. Never the key.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key_env: Option<String>,
-    /// Endpoint override, for a proxy or a mirror.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
-    /// How many results to ask for.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_results: Option<usize>,
-}
-
-impl SearchFile {
-    /// Fold this pack's choices into the standing search settings.
-    ///
-    /// A pack that ships with the kernel does not outvote what the user has
-    /// already configured: it fills what is absent, and only builds the whole
-    /// thing when nothing is there yet. An unset variable never erases a key
-    /// that already works, and with no standing settings and no provider in
-    /// the file there is nothing to build on — the settings stay unset, which
-    /// is the honest outcome: no provider, no tool.
-    pub fn apply(&self, current: &mut Option<crate::tools::search::SearchSettings>) {
-        if current.is_none() {
-            let Some(provider) = self.provider else {
-                return;
-            };
-            let defaults = crate::tools::search::SearchSettings::default();
-            *current = Some(crate::tools::search::SearchSettings {
-                provider,
-                endpoint: self.endpoint.clone(),
-                max_results: self
-                    .max_results
-                    .filter(|limit| *limit > 0)
-                    .unwrap_or(defaults.max_results),
-                ..defaults
-            });
-        }
-        let Some(merged) = current.as_mut() else {
-            return;
-        };
-        if merged.endpoint.is_none() {
-            merged.endpoint = self.endpoint.clone();
-        }
-        if merged.api_key.trim().is_empty() {
-            if let Some(var) = &self.api_key_env {
-                if let Ok(value) = std::env::var(var) {
-                    if !value.trim().is_empty() {
-                        merged.api_key = value;
-                    }
-                }
-            }
-        }
-    }
-}
 
 /// `context.json`: how much to remember.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ContextFile {
     /// Window, as `128K` or a number.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -875,7 +812,7 @@ pub struct ContextFile {
 
 /// `mcp.json`: MCP servers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct McpFile {
     /// The servers.
     #[serde(default)]
@@ -884,7 +821,7 @@ pub struct McpFile {
 
 /// One MCP server declaration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct McpServerDecl {
     /// Identifier.
     pub id: String,
@@ -1000,7 +937,7 @@ fn default_transport() -> String {
 
 /// `look.json`: themes and panels.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct LookFile {
     /// Themes this pack offers.
     ///
@@ -1078,7 +1015,7 @@ pub struct LookFile {
 
 /// One pack-defined panel kind.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct PanelType {
     /// Which built-in shape this type is drawn with. Only `html` exists today:
     /// a type decides how the fragment is produced, not how it is hosted.
@@ -3364,12 +3301,13 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_field_in_a_content_file_is_refused() {
-        // A typo in a content file would otherwise be a setting that silently
-        // does nothing.
+    fn an_unknown_field_in_a_content_file_is_kept() {
+        // Kept, so a pack written for a newer kernel still loads on this one —
+        // the field it does not understand is ignored rather than taking the
+        // whole pack down with it.
         let text = "{\"window\": \"128K\", \"compactPercentage\": 75}";
-        let error = serde_json::from_str::<ContextFile>(text).expect_err("must refuse");
-        assert!(format!("{error}").contains("compactPercentage"), "{error}");
+        let context: ContextFile = serde_json::from_str(text).expect("kept, not refused");
+        assert_eq!(context.window.as_deref(), Some("128K"));
     }
 
     #[test]
@@ -3655,60 +3593,6 @@ mod tests {
     }
 
     #[test]
-    fn a_search_file_builds_settings_from_nothing_and_never_outvotes_a_person() {
-        use crate::tools::search::{Dialect, SearchSettings};
-
-        // From nothing, the file is the whole configuration.
-        let file: SearchFile = serde_json::from_str(
-            r#"{"provider":"tavily","apiKeyEnv":"NGU_TEST_SEARCH_KEY","maxResults":7}"#,
-        )
-        .unwrap();
-        std::env::set_var("NGU_TEST_SEARCH_KEY", "tk-test");
-        let mut current: Option<SearchSettings> = None;
-        file.apply(&mut current);
-        let built = current.expect("built from the file");
-        assert!(matches!(built.provider, Dialect::Tavily));
-        assert_eq!(built.max_results, 7);
-        assert_eq!(built.api_key, "tk-test");
-        assert!(built.is_configured());
-
-        // With something standing, the file fills gaps and changes nothing else:
-        // a pack that ships with the kernel does not outvote its user.
-        let mut standing = Some(SearchSettings {
-            provider: Dialect::Brave,
-            api_key: "brave-key".into(),
-            endpoint: None,
-            max_results: 3,
-        });
-        file.apply(&mut standing);
-        let kept = standing.expect("still there");
-        assert!(matches!(kept.provider, Dialect::Brave), "the choice stays");
-        assert_eq!(kept.max_results, 3, "so does the limit");
-        assert_eq!(kept.api_key, "brave-key", "and the key");
-
-        // An unset variable fills an empty key and never replaces a full one.
-        let mut empty = Some(SearchSettings {
-            provider: Dialect::Exa,
-            api_key: String::new(),
-            endpoint: None,
-            max_results: 5,
-        });
-        file.apply(&mut empty);
-        assert_eq!(
-            empty.as_ref().unwrap().api_key,
-            "tk-test",
-            "an empty key takes what the environment offers"
-        );
-        std::env::remove_var("NGU_TEST_SEARCH_KEY");
-        file.apply(&mut empty);
-        assert_eq!(
-            empty.as_ref().unwrap().api_key,
-            "tk-test",
-            "and a missing variable does not erase it"
-        );
-    }
-
-    #[test]
     fn a_server_with_platforms_round_trips_and_an_empty_map_is_omitted() {
         let text = r#"{"servers":[{"id":"d","command":"d","platforms":{
             "win-x64":{"source":"https://host/a.zip","sha256":"aa","command":"d.exe"},
@@ -3938,13 +3822,5 @@ mod tests {
         assert!(text.contains(&other), "{text}");
     }
 
-    #[test]
-    fn a_search_file_without_a_provider_changes_nothing() {
-        // No provider and nothing standing means there is nothing to build on;
-        // inventing one would be a guess that can reach the network.
-        let file: SearchFile = serde_json::from_str(r#"{"maxResults":3}"#).unwrap();
-        let mut current: Option<crate::tools::search::SearchSettings> = None;
-        file.apply(&mut current);
-        assert!(current.is_none());
-    }
+
 }

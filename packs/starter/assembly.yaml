@@ -9,6 +9,3 @@ stages:
   - id: delegate
     source: builtin:delegate
     scope: global
-  - id: search
-    source: builtin:search
-    scope: global

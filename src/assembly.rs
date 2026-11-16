@@ -85,7 +85,6 @@ pub enum Transport {
 
 /// Defaults applied to every entry in a manifest.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
 pub struct Defaults {
     /// Default scope.
     #[serde(default)]
@@ -103,7 +102,6 @@ pub struct Defaults {
 
 /// One loadable entry, shared shape across the three kinds.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct EntryBase {
     /// Identifier, unique within the manifest.
     pub id: String,
@@ -141,7 +139,6 @@ pub struct EntryBase {
 
 /// A plugin entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PluginEntry {
     /// Shared entry fields.
     #[serde(flatten)]
@@ -153,7 +150,6 @@ pub struct PluginEntry {
 
 /// An MCP server entry.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct McpEntry {
     /// Shared entry fields.
     #[serde(flatten)]
@@ -202,7 +198,6 @@ pub struct McpEntry {
 
 /// A skill entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SkillEntry {
     /// Shared entry fields.
     #[serde(flatten)]
@@ -214,7 +209,6 @@ pub struct SkillEntry {
 
 /// One stage: a coarse ordering group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Stage {
     /// Stage name, for diagnostics.
     pub name: String,
@@ -231,7 +225,6 @@ pub struct Stage {
 
 /// Teardown policy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Teardown {
     /// Unload stages in reverse order.
     #[serde(default = "default_true")]
@@ -250,7 +243,6 @@ impl Default for Teardown {
 
 /// A parsed `assembly.yaml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Assembly {
     /// Format version.
     #[serde(default = "default_version")]
@@ -659,10 +651,20 @@ teardown:
     }
 
     #[test]
-    fn unknown_fields_are_rejected_rather_than_ignored() {
-        let error = Assembly::parse("version: 1\nstages: []\nstrategy: nonsense\n")
-            .expect_err("unknown top-level field");
-        assert!(format!("{error:#}").contains("parsing assembly manifest"));
+    fn an_unknown_field_does_not_stop_the_pack_from_loading() {
+        // This used to be `unknown_fields_are_rejected_rather_than_ignored`,
+        // asserting `deny_unknown_fields`. That rule made the kernel refuse a
+        // whole pack because it carried one field the kernel had not heard of —
+        // `via_proxy` on an mcp entry did exactly that, and the symptom was a
+        // pack that could not be installed on an older binary at all. A pack
+        // must be able to grow a field without the kernel being rebuilt.
+        let assembly = Assembly::parse("version: 1
+stages: []
+strategy: nonsense
+")
+            .expect("an unknown top-level field is kept, not refused");
+        assert_eq!(assembly.version, 1);
+        assert!(assembly.stages.is_empty());
     }
 
     #[test]

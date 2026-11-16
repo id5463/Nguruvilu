@@ -12,7 +12,6 @@
   "soul": "soul.md",
   "injections": "injections.json",
   "look": "look.json",
-  "search": "search.json",
   "ui": {
     "id": "ui",
     "title": "内置界面(可改的起点)",
@@ -24,11 +23,6 @@
     {
       "id": "delegate",
       "source": "builtin:delegate",
-      "license": "MIT"
-    },
-    {
-      "id": "search",
-      "source": "builtin:search",
       "license": "MIT"
     }
   ]

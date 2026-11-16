@@ -487,11 +487,6 @@ pub struct AppState {
     /// pack's reload, is stopped when the pack unloads, and is stopped for
     /// good when the window closes.
     pub mcp: Vec<Arc<nguruvilu::mcp::McpClient>>,
-    /// The search plugin's settings cell.
-    ///
-    /// The plugin holds this and reads it when its fibers apply; the panel
-    /// writes it through `search::configure`, which also re-applies them.
-    pub search_cell: nguruvilu::tools::search::SettingsCell,
     /// The judge plugin's settings cell — same contract as search.
     pub judge_cell: nguruvilu::tools::judge::SettingsCell,
     /// The user's own settings, before any pack folded over them.
@@ -523,33 +518,26 @@ impl AppState {
         let scan = skills.scan();
 
         let mut kernel = Kernel::new();
+        // The tools a conversation cannot work without, installed as a call so a
+        // pack can replace any of them — see `Kernel::install_bootstrap`.
+        kernel.install_bootstrap()?;
         // The agent can build, install, load, and unload packs itself; the
         // shell applies the load and unload between turns.
         let pending = Arc::new(nguruvilu::tools::pack::PendingQueue::new());
         nguruvilu::tools::pack::register_with(kernel.tools_mut(), Some(Arc::clone(&pending)))?;
-        // Available to a pack, not loaded by the kernel: `packs/subagent` asks
-        // for `builtin:delegate` and it appears.
-        nguruvilu::tools::subagent::define(&mut kernel);
-        // Same rule for long tasks (长程任务): `packs/long-horizon` asks for
-        // `builtin:long-horizon` and the mission tools appear — missions,
-        // recall, mailboxes, and the tick that runs one step of one in a
-        // fresh worker.
-        nguruvilu::tools::longhorizon::define(&mut kernel);
-        // Same for document reading (读不了就装包): `packs/documents` asks for
-        // `builtin:documents` and `read` learns PDF/Office.
-        nguruvilu::tools::documents::define(&mut kernel);
-        // Available to a pack, not loaded by the kernel: a conversation that
-        // wants to restart its own process asks for `builtin:restart`.
-        nguruvilu::tools::restart::define(&mut kernel);
-        // Available to a pack, not loaded by the kernel: `packs/search` asks
-        // for `builtin:search` and it appears — with a tool only while a key
-        // is configured (see `search::configure`).
-        let search_cell = nguruvilu::tools::search::cell(settings.search.clone());
-        nguruvilu::tools::search::install(&mut kernel, search_cell.clone());
-        // The judge follows the same rule: code available, pack decides,
-        // settings from the host's cell.
-        let judge_cell = nguruvilu::tools::judge::cell(settings.judge.clone());
+        // Every `builtin:` plugin this binary carries, in one call — the same
+        // one `ngu` uses, so the shell and the CLI cannot disagree about what
+        // exists. Defining is not enabling: a pack's assembly decides what loads.
+        kernel.define_builtins();
+        // The judge's settings live in the host's cell, so a save re-applies the
+        // fibers without rebuilding the plugin.
+        let judge_cell = nguruvilu::tools::judge::cell(nguruvilu::tools::judge::from_settings(&settings));
         nguruvilu::tools::judge::install(&mut kernel, judge_cell.clone());
+        // The kernel's own state, published where a pack can change it. Same
+        // rule as the CLI: the shell keeps the handles so its hot path reads
+        // directly, and publishes the same allocations so a pack's write lands
+        // in the memory the shell reads.
+        let published = nguruvilu::state::Published::install(&mut kernel, settings.clone());
         // The audit log: every event appended to <data>/events.jsonl for this
         // process. Dropping the returned disposer is deliberate — a disposer
         // unsubscribes only when called, never when dropped.
@@ -695,7 +683,6 @@ impl AppState {
             last_prompt_tokens: None,
             pending,
             mcp: Vec::new(),
-            search_cell,
             judge_cell,
             pack_baseline,
         };
@@ -785,12 +772,20 @@ impl AppState {
             // four-way switch from this, so it has to be in the status the
             // page already receives — a separate event would arrive before
             // the switch exists and leave it showing a stale choice.
-            "skill_mode": self.settings.skill_mode.clone(),
+            //
+            // Read out of the pack table, not out of a named field: the kernel
+            // does not know what a skill mode is, only that `skill-router` keeps
+            // something under its own name.
+            "skill_mode": self.settings.pack("skill-router").get("mode").cloned(),
             // The proxy panel paints its switch and its target list from these,
-            // the same way the skill panel paints from `skill_mode`: a separate
-            // event would arrive before the panel exists.
-            "mcp_proxy_mode": self.settings.mcp_proxy_mode.clone(),
-            "mcp_proxy_targets": self.settings.mcp_proxy_targets.clone(),
+            // the same way the skill panel paints from `skill_mode`.
+            "mcp_proxy_mode": self.settings.pack("mcp-proxy").get("mode").cloned(),
+            "mcp_proxy_targets": self
+                .settings
+                .pack("mcp-proxy")
+                .get("targets")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
             "plugins": self.kernel.plugin_names(),
             // Which pack brought each one: `delegate ← subagent`, so a
             // capability can be read back to the pack it came from.
@@ -812,18 +807,14 @@ impl AppState {
             "configured": self.settings.is_configured(),
             "missing": self.settings.missing(),
             "api_key_masked": self.settings.masked_key(),
-            // The panel sets these; the key itself never comes back.
-            "search": match &self.settings.search {
-                Some(search) => json!({
-                    "provider": serde_json::to_value(&search.provider).unwrap_or(Value::Null),
-                    "endpoint": search.endpoint,
-                    "key": if search.api_key.trim().is_empty() { "(not set)" } else { "(set)" },
-                }),
-                None => json!({ "provider": "", "endpoint": "", "key": "(not set)" }),
-            },
+            // Search is not the kernel's: `web-search` is an MCP pack, and its
+            // key lives in that pack's own settings. The page still asks for
+            // this field, so it is answered with the shape it expects and no
+            // claim about a capability the kernel no longer has.
+            "search": json!({ "provider": "", "endpoint": "", "key": "(not set)" }),
             // Same shape for the judge: endpoint and model are not secrets;
             // the key is reported as presence only.
-            "judge": match &self.settings.judge {
+            "judge": match nguruvilu::tools::judge::from_settings(&self.settings) {
                 Some(judge) => json!({
                     "endpoint": judge.endpoint,
                     "model": judge.model,
@@ -1207,7 +1198,12 @@ impl AppState {
     /// behaviour (everything loaded).
     pub fn set_skill_mode(&mut self, mode: &str) -> Result<String> {
         let value = mode.trim().to_string();
-        self.settings.skill_mode = if value.is_empty() { None } else { Some(value.clone()) };
+        store_pack_setting(
+            &mut self.settings,
+            "skill-router",
+            "mode",
+            if value.is_empty() { None } else { Some(json!(value)) },
+        );
         self.settings.save()?;
         Ok(value)
     }
@@ -1219,8 +1215,12 @@ impl AppState {
     /// of it would make the pack's own name for its own mode unusable.
     pub fn set_mcp_proxy_mode(&mut self, mode: &str) -> Result<String> {
         let value = mode.trim().to_string();
-        self.settings.mcp_proxy_mode =
-            if value.is_empty() { None } else { Some(value.clone()) };
+        store_pack_setting(
+            &mut self.settings,
+            "mcp-proxy",
+            "mode",
+            if value.is_empty() { None } else { Some(json!(value)) },
+        );
         self.settings.save()?;
         Ok(value)
     }
@@ -1235,7 +1235,12 @@ impl AppState {
             .map(|line| line.trim().to_string())
             .filter(|line| !line.is_empty())
             .collect();
-        self.settings.mcp_proxy_targets = kept.clone();
+        store_pack_setting(
+            &mut self.settings,
+            "mcp-proxy",
+            "targets",
+            Some(json!(kept.clone())),
+        );
         self.settings.save()?;
         Ok(kept)
     }
@@ -1263,10 +1268,6 @@ impl AppState {
         // job_wait_secs. A field the page did not send keeps what is stored — a
         // partial save must not zero a deadline.
         budgets: Option<Value>,
-        search_provider: &str,
-        search_api_key: &str,
-        search_endpoint: &str,
-        search_present: bool,
         judge_endpoint: &str,
         judge_api_key: &str,
         judge_model: &str,
@@ -1283,15 +1284,10 @@ impl AppState {
             // Preserving it here is what stops an unrelated save from quietly
             // putting a route that cannot stream back into streaming mode.
             delivery: self.settings.delivery.clone(),
-            // Carried through, not rebuilt: saving the connection settings is
-            // not a statement about which skill mode is chosen, and dropping it
-            // here would silently reset the switch every time the page saved.
-            skill_mode: self.settings.skill_mode.clone(),
-            // Same rule as `skill_mode`: the connection panel saving must not
-            // reset a choice made in the proxy panel. Both are edited through
-            // their own commands and carried through here untouched.
-            mcp_proxy_mode: self.settings.mcp_proxy_mode.clone(),
-            mcp_proxy_targets: self.settings.mcp_proxy_targets.clone(),
+            // Carried through, not rebuilt: saving the connection settings is not
+            // a statement about what a pack stores, and dropping it here would
+            // silently reset every pack's settings on every save.
+            packs: self.settings.packs.clone(),
             degrade_on_stall: self.settings.degrade_on_stall,
             proxy: proxy.trim().to_string(),
             context_window: context_window.filter(|t| *t > 0),
@@ -1329,26 +1325,21 @@ impl AppState {
             // A section the page does not show (its pack is unloaded) is not a
             // section the user cleared: absent means "keep what is stored",
             // present means "these fields are the truth".
-            search: if search_present {
-                resolve_search(
-                    &self.settings.search,
-                    search_provider,
-                    search_api_key,
-                    search_endpoint,
-                )?
-            } else {
-                self.settings.search.clone()
-            },
-            judge: if judge_present {
-                resolve_judge(&self.settings.judge, judge_endpoint, judge_api_key, judge_model)?
-            } else {
-                self.settings.judge.clone()
-            },
             extra_body: self.settings.extra_body.clone(),
             // Keys this build does not know about are carried through: the panel
             // saving a field must not delete what a plugin or a newer build wrote.
             unknown: self.settings.unknown.clone(),
         };
+        // The judge's three fields go into the pack table under the judge pack's
+        // own name. `judge_present` says whether the page is showing that
+        // section at all — an unloaded pack's absence must not read as "the user
+        // erased it", which is the same rule every other panel follows.
+        if judge_present {
+            let stored = nguruvilu::tools::judge::from_settings(&settings);
+            let merged = resolve_judge(&stored, judge_endpoint, judge_api_key, judge_model)?;
+            nguruvilu::tools::judge::into_settings(&mut settings, merged)?;
+        }
+
         // The budgets the panel moves. Anything present must be usable, so a zero
         // is dropped here rather than written: these numbers are read by the next
         // tool call, and a zero would mean every call on this machine times out
@@ -1402,20 +1393,11 @@ impl AppState {
         // the panel is most likely to have touched.
         self.route = ModelRoute::from_settings(&self.settings);
 
-        // And the search tool follows its key at once: a key typed into the
-        // panel goes into the plugin's cell and its fibers re-apply, so
-        // `search_web` appears in the very next status — and vanishes when
-        // the key does.
-        nguruvilu::tools::search::configure(
-            &mut self.kernel,
-            &self.search_cell,
-            self.settings.search.clone(),
-        )?;
         // The judge takes the panel's three fields the same way.
         nguruvilu::tools::judge::configure(
             &mut self.kernel,
             &self.judge_cell,
-            self.settings.judge.clone(),
+            nguruvilu::tools::judge::from_settings(&self.settings),
         )?;
         let tools = Arc::new(self.kernel.tools().clone());
 
@@ -1725,21 +1707,11 @@ impl AppState {
         let network = self.settings.network.clone();
         nguruvilu::network::install(&mut self.kernel, network)?;
 
-        // A pack may be what configured search: the settings go into the
-        // plugin's cell and its fibers re-apply against this kernel — the
-        // tool present while a key is configured, absent when it is not (a
-        // search tool that cannot authenticate costs a turn every time the
-        // model tries it).
-        nguruvilu::tools::search::configure(
-            &mut self.kernel,
-            &self.search_cell,
-            self.settings.search.clone(),
-        )?;
         // A pack may have configured the judge too — same re-apply.
         nguruvilu::tools::judge::configure(
             &mut self.kernel,
             &self.judge_cell,
-            self.settings.judge.clone(),
+            nguruvilu::tools::judge::from_settings(&self.settings),
         )?;
 
         let tools = Arc::new(self.kernel.tools().clone());
@@ -1768,45 +1740,6 @@ impl AppState {
     }
 }
 
-/// Fold the panel's three search fields into the stored settings.
-///
-/// The panel never receives the stored key, so a blank box means "keep it" —
-/// the same rule as the model key. The provider decides whether search is on:
-/// an empty value means off, and off drops what was stored, because a key that
-/// no reachable tool can use is worse than no key. The panel's hint says so,
-/// and `search_web` appears only while a key is actually configured.
-fn resolve_search(
-    stored: &Option<nguruvilu::tools::search::SearchSettings>,
-    provider: &str,
-    api_key: &str,
-    endpoint: &str,
-) -> Result<Option<nguruvilu::tools::search::SearchSettings>> {
-    let provider = provider.trim();
-    if provider.is_empty() {
-        return Ok(None);
-    }
-    let dialect = nguruvilu::tools::search::Dialect::parse(provider).ok_or_else(|| {
-        anyhow!(
-            "unknown search provider '{provider}'; expected {}",
-            nguruvilu::tools::search::Dialect::all()
-                .iter()
-                .map(|candidate| format!("{candidate:?}").to_lowercase())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    })?;
-    let mut merged = stored.clone().unwrap_or_default();
-    merged.provider = dialect;
-    if !api_key.trim().is_empty() {
-        merged.api_key = api_key.trim().to_string();
-    }
-    merged.endpoint = if endpoint.trim().is_empty() {
-        None
-    } else {
-        Some(endpoint.trim().to_string())
-    };
-    Ok(Some(merged))
-}
 
 /// Fold the panel's judge fields into the stored settings.
 ///
@@ -1843,6 +1776,37 @@ fn resolve_judge(
         merged.model = model.to_string();
     }
     Ok(Some(merged))
+}
+
+/// Write one key of one pack's settings, removing it when `value` is `None`.
+///
+/// The kernel's whole involvement in a pack's settings: keep the JSON, do not
+/// read it. Extracted because four call sites did the same three lines and each
+/// of them used to be a field on `Settings`.
+fn store_pack_setting(
+    settings: &mut Settings,
+    pack: &str,
+    key: &str,
+    value: Option<Value>,
+) {
+    let mut entry = settings.pack(pack);
+    if !entry.is_object() {
+        entry = Value::Object(Default::default());
+    }
+    let map = entry.as_object_mut().expect("built above");
+    match value {
+        Some(value) => {
+            map.insert(key.to_string(), value);
+        }
+        None => {
+            map.remove(key);
+        }
+    }
+    if map.is_empty() {
+        settings.packs.remove(pack);
+    } else {
+        settings.set_pack(pack, entry);
+    }
 }
 
 /// The recorded working directory of a session, which must be present.
@@ -2536,6 +2500,9 @@ pub async fn run_turn(
     ));
     let mut agent = Agent::new(client, config, messages)
         .with_max_steps(max_steps)
+        // A pack-supplied loop, if one was installed. Same rule as the CLI: the
+        // shell never names the pack, it only asks whether there is a loop.
+        .with_installed_loop()
         .with_observer(Arc::clone(&observer) as Arc<dyn AgentObserver>)
         .with_cancel(stop_rx)
         .with_inbox(inbox)

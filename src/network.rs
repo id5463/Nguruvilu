@@ -33,7 +33,7 @@ pub const SERVICE: &str = "network";
 
 /// The numbers that decide how a request is sent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct NetworkSettings {
     /// Whole-request timeout, in seconds.
     #[serde(default = "default_request_timeout")]
@@ -405,11 +405,15 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_field_is_refused() {
-        // A typo would otherwise be a setting that silently does nothing.
+    fn an_unknown_field_is_kept_rather_than_refused() {
+        // The opposite of what this asserted before. Refusing turned one typo
+        // into a settings file that does not parse at all, which is a worse
+        // failure than a field being ignored: the whole file is lost, not the
+        // one key. A newer build's field must survive a round trip through
+        // this one.
         let text = "{\"retryAttemps\": 9}";
-        let error = serde_json::from_str::<NetworkSettings>(text).expect_err("must refuse");
-        assert!(format!("{error}").contains("retryAttemps"), "{error}");
+        let settings: NetworkSettings = serde_json::from_str(text).expect("kept, not refused");
+        assert_eq!(settings.retry_attempts, NetworkSettings::default().retry_attempts);
     }
 
     #[test]

@@ -32,8 +32,6 @@ pub struct PackContent {
     pub injections: Option<crate::context::InjectionEngine>,
     /// MCP servers, from `mcp.json`.
     pub mcp: Option<McpFile>,
-    /// Search provider, from `search.json`.
-    pub search: Option<crate::pack::SearchFile>,
 }
 
 impl PackContent {
@@ -44,12 +42,11 @@ impl PackContent {
             && self.context.is_none()
             && self.injections.is_none()
             && self.mcp.is_none()
-            && self.search.is_none()
     }
 
     /// Fold the settings-side content of this pack onto `settings`.
     ///
-    /// Route, context window, and search — the host-owned fields a pack may
+    /// Route and context window — the host-owned fields a pack may
     /// declare over the user's own. A field the pack does not carry keeps the
     /// value already there, so packs compose in the order they are applied.
     /// Persona and injections are deliberately *not* handled here: the persona
@@ -112,10 +109,6 @@ impl PackContent {
                 settings.compact_keep_recent = keep.max(1);
             }
         }
-
-        if let Some(search) = &self.search {
-            search.apply(&mut settings.search);
-        }
     }
 
     /// One line per part, for diagnostics.
@@ -153,22 +146,6 @@ impl PackContent {
         if let Some(mcp) = &self.mcp {
             out.push(format!("{} MCP server(s)", mcp.servers.len()));
         }
-        if let Some(search) = &self.search {
-            let mut parts = Vec::new();
-            if let Some(provider) = &search.provider {
-                parts.push(format!("provider {provider:?}"));
-            }
-            if let Some(var) = &search.api_key_env {
-                parts.push(format!("key from ${var}"));
-            }
-            if let Some(endpoint) = &search.endpoint {
-                parts.push(format!("endpoint {endpoint}"));
-            }
-            if let Some(limit) = search.max_results {
-                parts.push(format!("{limit} result(s)"));
-            }
-            out.push(format!("search ({})", parts.join(", ")));
-        }
         out
     }
 }
@@ -176,7 +153,7 @@ impl PackContent {
 /// Read every content file a pack names, without touching the kernel.
 ///
 /// This is the read-only half of [`apply`]: persona, route, context, rules,
-/// search, MCP declarations — everything the *host* owns. Appearance is the
+/// MCP declarations — everything the *host* owns. Appearance is the
 /// one kernel-owned part and is deliberately left to `apply`, so a recomputation
 /// pass over the installed packs can re-read what they contribute without
 /// reinstalling appearance fibers that are already in place.
@@ -213,14 +190,6 @@ pub fn read(dir: &Path, manifest: &PackManifest) -> Result<PackContent> {
 
     if let Some(file) = &manifest.injections {
         content.injections = Some(crate::pack::read_injections(&dir.join(file.path()))?);
-    }
-
-    if let Some(file) = &manifest.search {
-        let path = dir.join(file.path());
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        content.search = Some(serde_json::from_str(&text)
-            .with_context(|| format!("{} is not a valid search file", path.display()))?);
     }
 
     if let Some(file) = &manifest.mcp {
@@ -851,37 +820,6 @@ mod tests {
         assert_eq!(models.model.as_deref(), Some("m"));
         assert_eq!(models.extra_body.len(), 1);
         assert!(summary[0].contains("route"));
-    }
-
-    #[test]
-    fn the_search_file_parses_and_reports_itself() {
-        let dir = scratch("search");
-        let mut manifest = PackManifest::new("route", "1.0.0");
-        manifest.search = Some("search.json".into());
-        write_manifest(&dir, &manifest).unwrap();
-        std::fs::write(
-            dir.join("search.json"),
-            "{\"provider\":\"brave\",\"apiKeyEnv\":\"BRAVE_KEY\",\"maxResults\":4}",
-        )
-        .unwrap();
-
-        let mut kernel = crate::plugin::Kernel::new();
-        let content = apply(&mut kernel, &dir, &manifest).unwrap();
-        let search = content.search.clone().expect("parsed");
-        assert!(matches!(
-            search.provider,
-            Some(crate::tools::search::Dialect::Brave)
-        ));
-        assert_eq!(search.api_key_env.as_deref(), Some("BRAVE_KEY"));
-        assert_eq!(search.max_results, Some(4));
-        assert!(
-            content
-                .summary()
-                .iter()
-                .any(|line| line.contains("search") && line.contains("Brave")),
-            "{:?}",
-            content.summary()
-        );
     }
 
     #[test]

@@ -262,8 +262,40 @@ impl Loader {
         // Which pack asked, for the panel: the manifest beside the assembly
         // is the same source `pack:` naming uses — not the label, which would
         // have to be split on a dash.
-        self.kernel
+        let fiber = self
+            .kernel
             .load_owned(&name, realm, step.config.clone(), self.origin())?;
+
+        // A plugin whose dependencies are not present loads without error and
+        // contributes nothing — `activate` returns early on `Epoch::Inactive`.
+        // That is a silent failure with a misleading report: the caller is told
+        // "loaded", the pack looks installed, and the tool the pack promised
+        // never appears. It cost an afternoon once: `ngu apply packs/starter`
+        // reported `plugin:delegate` loaded while the tool table held no
+        // `delegate`, because that entrance had not published the `llm` service
+        // every `delegate` fiber injects.
+        //
+        // Reporting `Pending` with the missing names is the honest outcome: the
+        // pack is not wrong, and the entrance that forgot a dependency is named.
+        if let Some(fiber) = self.kernel.fiber(fiber) {
+            if fiber.state == crate::plugin::FiberState::Pending {
+                let view = self.kernel.service_view(fiber.realm.clone());
+                let missing: Vec<&str> = fiber
+                    .inject
+                    .iter()
+                    .filter(|dependency| !view.has(dependency))
+                    .map(|dependency| dependency.as_str())
+                    .collect();
+                return Ok(Outcome::Skipped(format!(
+                    "plugin '{name}' is defined but waiting for {} — nothing of it is                      active until that is published",
+                    if missing.is_empty() {
+                        "a service this host did not install".to_string()
+                    } else {
+                        format!("service(s) {}", missing.join(", "))
+                    }
+                )));
+            }
+        }
 
         self.ledger.record(LedgerEntry {
             kind: EntryKind::Plugin.as_str().into(),
@@ -430,7 +462,11 @@ fn pack_cwd(pack_dir: Option<&std::path::Path>, command: &str, args: &[String]) 
                 },
             );
 
-            if let Err(error) = self.kernel.tools_mut().register(def, ConflictPolicy::Error) {
+            // `Override`, not `Error`: a pack is allowed to replace a kernel
+            // tool. Refusing made the four base tools and the job tools
+            // unreachable property — a pack that wanted a stricter `bash` had no
+            // way to say so, and the answer was "edit the kernel".
+            if let Err(error) = self.kernel.tools_mut().register(def, ConflictPolicy::Override) {
                 // Roll back the tools this server already contributed, so a
                 // partial server never half-registers.
                 for tool in &registered {
@@ -979,20 +1015,33 @@ fn mcp_env(declared: &std::collections::BTreeMap<String, String>) -> std::collec
     // Declared entries still win: a pack that hardcodes its own targets is
     // saying it does not want this control, and silently overriding that would
     // be the surprise.
+    // The proxy pack's two settings come out of the table packs keep their
+    // settings in, not out of fields the kernel used to declare for it. The
+    // kernel does not know what a `mode` or a `target` is; it knows the pack
+    // asked for a slot and hands that slot to the process as an environment
+    // variable, which is what the pack reads anyway.
     let settings = crate::settings::Settings::load().unwrap_or_default();
+    let proxy = settings.pack("mcp-proxy");
     if !env.contains_key("NGU_MCP_MODE") {
-        if let Some(mode) = settings.mcp_proxy_mode.as_deref().map(str::trim) {
+        if let Some(mode) = proxy.get("mode").and_then(|v| v.as_str()).map(str::trim) {
             if !mode.is_empty() {
                 env.insert("NGU_MCP_MODE".to_string(), mode.to_string());
             }
         }
     }
-    if !env.contains_key("NGU_MCP_TARGETS") && !settings.mcp_proxy_targets.is_empty() {
-        env.insert(
-            "NGU_MCP_TARGETS".to_string(),
-            settings.mcp_proxy_targets.join("
-"),
-        );
+    let targets: Vec<String> = proxy
+        .get("targets")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !env.contains_key("NGU_MCP_TARGETS") && !targets.is_empty() {
+        env.insert("NGU_MCP_TARGETS".to_string(), targets.join("
+"));
     }
     env
 }

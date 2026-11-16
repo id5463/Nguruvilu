@@ -48,14 +48,7 @@ fn demo_library() -> Option<PathBuf> {
 
 /// A context good enough for a plugin that injects nothing.
 fn bare_ctx(plugin: &str) -> PluginCtx {
-    PluginCtx {
-        plugin: plugin.to_string(),
-        fiber: 0,
-        realm: RealmMap::new(),
-        services: ServiceView::default(),
-        config: serde_json::Value::Null,
-        events: nguruvilu::events::EventBus::default(),
-    }
+    PluginCtx::detached(plugin)
 }
 
 #[test]
@@ -186,6 +179,10 @@ fn the_plugin_loads_into_the_kernel_and_its_tool_runs() {
     };
 
     let mut kernel = Kernel::new();
+    // `Kernel::new` is empty on purpose: the base tools are a call a host
+    // makes, so a pack can replace any of them. This test asserts a base tool
+    // survives an unload, so it installs them first.
+    kernel.install_bootstrap().unwrap();
     let plugin = unsafe { DynamicPlugin::load(&path) }.expect("load");
     let name = plugin.name().to_string();
     kernel.define(Arc::new(plugin));

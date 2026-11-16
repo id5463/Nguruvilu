@@ -507,6 +507,23 @@ pub(crate) fn resolve_program(command: &str) -> std::path::PathBuf {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        // UTF-8 in and out, always.
+        //
+        // A Windows Python child reads stdin with the console's code page — `gbk`
+        // on a Chinese machine — and a request containing any non-ASCII byte
+        // makes its `json.loads` throw, which exits the process and surfaces to
+        // the caller as "MCP server closed the connection". The kernel writes
+        // UTF-8 (JSON is UTF-8), so the two disagreed and every server written in
+        // Python handled ASCII requests and died on the first Chinese one.
+        //
+        // Declared entries still win: a server that needs another encoding says
+        // so, and this is a default rather than a rule.
+        if !spec.env.contains_key("PYTHONIOENCODING") {
+            command.env("PYTHONIOENCODING", "utf-8");
+        }
+        if !spec.env.contains_key("PYTHONUTF8") {
+            command.env("PYTHONUTF8", "1");
+        }
         for (key, value) in &spec.env {
             command.env(key, value);
         }

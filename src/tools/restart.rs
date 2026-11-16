@@ -76,12 +76,117 @@ fn supervision() -> Result<RestartPlan, String> {
     if parent == Some(1) {
         return Ok(RestartPlan::Adopted);
     }
+    // Windows has no PID 1 and no systemd, so neither check above can fire
+    // there. Before this branch existed, `restart` was a tool that was
+    // installed, advertised, and then refused every single time on Windows —
+    // the "a tool that cannot work costs a turn every time the model tries it"
+    // failure the rest of the pack system is careful to avoid.
+    //
+    // The question on Windows is the same one in different clothes: did
+    // something other than a person's terminal start this process? A service
+    // host, a scheduled task, or a detached wrapper is "yes"; a console window
+    // is "no", and there exiting really is final.
+    #[cfg(windows)]
+    if let Some(plan) = windows_supervision(parent) {
+        return Ok(plan);
+    }
     Err(format!(
         "this process is not supervised (parent pid {:?}), so exiting would stop it \
-         for good. Start it under a supervisor — `systemctl restart <unit>` from \
-         `bash` is the safe way to restart from here, or wrap it in one.",
+         for good. Start it under a supervisor — on Linux `systemctl restart <unit>`, \
+         on Windows a service or a scheduled task — or run it from `bash` and restart \
+         it there.",
         parent
     ))
+}
+
+/// Whether a Windows process will be started again when it exits.
+///
+/// Three signals, in order of how much they prove:
+///
+/// * **`NGU_SUPERVISED`** — whoever deployed this said so. The direct analogue of
+///   systemd's `INVOCATION_ID`, and the only one that works when the supervisor
+///   is something we cannot recognise.
+/// * **`SESSIONNAME=Services`** — the process belongs to the service session.
+///   Windows sets this for a service host without any help from us.
+/// * **The parent is not a terminal** — a `bash.exe`, `cmd.exe`,
+///   `powershell.exe`, `pwsh.exe`, a terminal emulator, or `explorer.exe` parent
+///   means a person is sitting in front of it. Anything else (`services.exe`,
+///   `svchost.exe`, a CI agent, an `ngu serve` wrapper) is a supervisor.
+#[cfg(windows)]
+fn windows_supervision(parent: Option<u32>) -> Option<RestartPlan> {
+    if std::env::var_os("NGU_SUPERVISED").is_some() {
+        return Some(RestartPlan::Supervised);
+    }
+    if std::env::var("SESSIONNAME")
+        .map(|name| name.eq_ignore_ascii_case("Services"))
+        .unwrap_or(false)
+    {
+        return Some(RestartPlan::Supervised);
+    }
+    let name = windows_parent_name(parent?)?;
+    if is_interactive_parent(&name) {
+        None
+    } else {
+        Some(RestartPlan::Supervised)
+    }
+}
+
+/// Whether this parent image is a person's terminal rather than a supervisor.
+///
+/// A shell parent means someone is sitting in front of it: exiting closes their
+/// window and nothing starts it again. `conhost.exe` is deliberately **not** in
+/// the list — it hosts the console of a service session too, so treating it as
+/// interactive would make a supervised service look unattended.
+///
+/// A function of its own because this is the decision worth testing: the rest of
+/// [`windows_supervision`] is two environment lookups and one process spawn.
+fn is_interactive_parent(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [
+        "bash.exe",
+        "sh.exe",
+        "cmd.exe",
+        "powershell.exe",
+        "pwsh.exe",
+        "windowsterminal.exe",
+        "alacritty.exe",
+        "mintty.exe",
+        "wezterm-gui.exe",
+        "explorer.exe",
+        "code.exe",
+    ]
+    .iter()
+    .any(|shell| lower == *shell)
+}
+
+/// The image name of a Windows process, asked of the OS rather than guessed.
+///
+/// `wmic` is deprecated and missing from parts of Windows 11; the CIM instance
+/// query through PowerShell is what is actually there. One process spawn, only
+/// on the restart path, and only after the two cheap environment checks failed.
+#[cfg(windows)]
+fn windows_parent_name(pid: u32) -> Option<String> {
+    let script = format!("(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").Name");
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Unix never needs this: [`supervision`] already answered from `/proc`.
+#[cfg(not(windows))]
+#[allow(dead_code)]
+fn windows_supervision(_parent: Option<u32>) -> Option<RestartPlan> {
+    None
 }
 
 enum RestartPlan {
@@ -189,6 +294,46 @@ async fn run(args: serde_json::Value) -> anyhow::Result<ToolOutput> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_declared_supervisor_is_believed_without_asking_anyone() {
+        // `NGU_SUPERVISED` is the escape hatch for supervisors we cannot
+        // recognise: a CI runner, a process manager that is not systemd, an
+        // `ngu serve` wrapper. Whoever deployed it knows; this is how they say
+        // so. It has to short-circuit *before* the parent-pid query, or the
+        // escape hatch only works on the platforms that need it least.
+        std::env::set_var("NGU_SUPERVISED", "1");
+        let plan = supervision();
+        std::env::remove_var("NGU_SUPERVISED");
+        assert!(
+            matches!(plan, Ok(RestartPlan::Supervised)),
+            "a declared supervisor must be believed: {plan:?}",
+            plan = plan.as_ref().err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_shell_parent_is_not_a_supervisor() {
+        // The failure this branch was written for: on Windows `parent_pid` used
+        // to return `None` unconditionally, so `restart` was installed,
+        // advertised, and refused every time. A console window really is not a
+        // supervisor — but nothing else was ever recognised either.
+        for shell in ["bash.exe", "cmd.exe", "PowerShell.exe", "pwsh.exe"] {
+            // Call the classifier with an explicit name rather than spawning a
+            // process: the mapping is what carries the decision.
+            assert!(
+                is_interactive_parent(shell),
+                "{shell} is a person's terminal, not a supervisor"
+            );
+        }
+        for supervisor in ["services.exe", "svchost.exe", "ngu-serve.exe"] {
+            assert!(
+                !is_interactive_parent(supervisor),
+                "{supervisor} starts its child again when it exits"
+            );
+        }
+    }
 
     #[test]
     fn a_missing_reason_is_refused() {

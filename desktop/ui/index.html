@@ -1698,7 +1698,7 @@ window.addEventListener("message", (event) => {
       // "此刻没有东西可显示"的面板都会在输入框上方留一条空白带——一条永远
       // 空着的横条不是留白，是把输入框往下推。
       const empty = Math.round(height) <= 0;
-      frame.style.height = empty ? "0px" : Math.min(Math.max(Math.round(height), 40), 480) + "px";
+      frame.style.height = empty ? "0px" : Math.min(Math.max(Math.round(height), 40), 900) + "px";
       if (frame.parentElement) frame.parentElement.style.display = empty ? "none" : "";
     }
     return;
@@ -2958,20 +2958,54 @@ function state() {
 // Events that arrive before the page script has finished declaring its state
 // are queued and replayed in order once it has. Without this, an early event
 // reads a `const` that is still in its temporal dead zone and is dropped.
+// Events that arrive before the page has finished declaring its state are
+// queued and replayed in order. The queue exists for one reason: an early event
+// would read a `const` still in its temporal dead zone and be dropped.
+//
+// It used to be a one-way door. `pageReady` was set by `flushPendingEvents()`,
+// which sat on the last line of the page script — so any exception anywhere
+// above it left the page permanently un-ready, and *every* event was queued
+// forever. The symptom was indistinguishable from data loss: the session list
+// worked (it is drawn by its own handler), but the transcript showed "New
+// session. Nothing said yet." while the server kept sending all 659 messages.
+// One pack's panel script threw `host is not defined` and took the whole
+// conversation view with it.
+//
+// Two changes make that impossible now:
+//
+//   1. A safety timer flips `pageReady` on its own shortly after load, whether
+//      or not the last line ever runs. The worst case becomes "some handlers
+//      were not registered yet", not "nothing renders, ever".
+//   2. `dispatchEvent_` is wrapped per call, so one handler that throws cannot
+//      stop the handlers after it — the same rule the hook runner follows.
+let readyTimer = null;
+function armReadyTimer() {
+  if (readyTimer !== null) return;
+  readyTimer = setTimeout(() => {
+    if (!pageReady) {
+      pageReady = true;
+      while (pendingEvents.length > 0) dispatchEvent_(pendingEvents.shift());
+      notice("页面初始化没有跑完，已强制就绪：某些功能可能不可用", true);
+    }
+  }, 3000);
+}
 function receive(event) {
   if (!pageReady) {
     pendingEvents.push(event);
+    armReadyTimer();
     return;
   }
   dispatchEvent_(event);
 }
 function flushPendingEvents() {
   pageReady = true;
+  if (readyTimer !== null) { clearTimeout(readyTimer); readyTimer = null; }
   while (pendingEvents.length > 0) dispatchEvent_(pendingEvents.shift());
 }
 
 function dispatchEvent_(event) {
   const name = event.ev;
+  try {
   if (name === "status") {
     latest = event.status || {};
     if (latest.session) currentSessionId = latest.session;
@@ -2997,7 +3031,15 @@ function dispatchEvent_(event) {
   }
   // 面板也要收一份：它拿不到这条总线，任务面板正是靠 `tool_end` 才知道工具结果
   // 到了。放在本页处理函数之后 —— 内置界面先画，面板是补充信息。
-  postToPanels(event);
+  try {
+    postToPanels(event);
+  } catch (error) {
+    notice("转发事件 " + name + " 给面板时出错: " + error.message, true);
+  }
+  } catch (error) {
+    // 一个事件类型处理失败不能让后面的全停：本轮之后还有几百个事件要画。
+    notice("界面处理 " + name + " 时出错: " + error.message, true);
+  }
 }
 
 // `hook` is the extension point packs get: it decorates what the page hands
