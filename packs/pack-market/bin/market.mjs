@@ -6,10 +6,12 @@ import { createInterface } from 'node:readline';
 import { createHash } from 'node:crypto';
 import { mkdir, writeFile, unlink, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { dirname, isAbsolute, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const INDEX_ENV = 'NGU_MARKET_INDEX';
+/// Directory of the bundled index, when that is where the catalogue came from.
+let bundledIndexDir = null;
 const NO_INDEX_MSG =
   '未配置商店索引地址：设置环境变量 NGU_MARKET_INDEX 为索引 JSON 的 URL';
 
@@ -71,6 +73,12 @@ async function loadIndex() {
 async function loadBundledIndex() {
   const here = dirname(fileURLToPath(import.meta.url));
   const path = join(here, '..', 'index.json');
+  // Remembered so a relative `url` in the entry can be resolved against it.
+  // The archives this pack carries are named `store/x.zip`, which is meaningful
+  // only relative to the index that names them — `fetch` rejects it outright
+  // with "Failed to parse URL", so downloading from the bundled catalogue was
+  // impossible until this was tracked.
+  bundledIndexDir = dirname(path);
   let raw;
   try {
     raw = await readFile(path, 'utf8');
@@ -208,17 +216,37 @@ async function marketInstall(args) {
   const target = join(marketDir(), safeFileName(pack.name, pack.version));
   await mkdir(marketDir(), { recursive: true });
 
-  let res;
-  try {
-    res = await fetch(pack.url);
-  } catch (err) {
-    throw new ToolError(
-      `下载失败：${pack.url} — ${err && err.message ? err.message : err}`,
-    );
-  }
-  if (!res.ok) throw new ToolError(`下载失败：${pack.url} — HTTP ${res.status}`);
+  // A relative url means "next to the index that named it", and the bundled
+  // catalogue is a file on disk. Node's `fetch` refuses `file://` outright
+  // ("fetch failed", with no detail), so a local entry is read directly instead
+  // of pretending to download it. Remote entries still go through `fetch`.
+  const raw_url = String(pack.url);
+  const is_remote = /^https?:/i.test(raw_url);
 
-  const bytes = Buffer.from(await res.arrayBuffer());
+  let bytes;
+  if (is_remote) {
+    let res;
+    try {
+      res = await fetch(raw_url);
+    } catch (err) {
+      throw new ToolError(
+        `下载失败：${raw_url} — ${err && err.message ? err.message : err}`,
+      );
+    }
+    if (!res.ok) throw new ToolError(`下载失败：${raw_url} — HTTP ${res.status}`);
+    bytes = Buffer.from(await res.arrayBuffer());
+  } else {
+    // Relative to the bundled index, or absolute when the entry says so.
+    const base = bundledIndexDir || process.cwd();
+    const local_path = isAbsolute(raw_url) ? raw_url : join(base, raw_url);
+    try {
+      bytes = await readFile(local_path);
+    } catch (err) {
+      throw new ToolError(
+        `读取失败：${local_path} — ${err.code || err.message}`
+      );
+    }
+  }
   await writeFile(target, bytes);
 
   const actual = createHash('sha256').update(bytes).digest('hex');
