@@ -689,6 +689,22 @@ fn pack_cwd(pack_dir: Option<&std::path::Path>, command: &str, args: &[String]) 
             registered.push(decl.name.clone());
         }
 
+        // Readers: a format this plugin teaches the kernel's own `read`.
+        //
+        // Registered into the same table the kernel version used, with a process
+        // where the closure was — see `readers::register_process`. The disposers
+        // go on the ledger's effects so an unload takes them with the tools.
+        let mut reader_count = 0;
+        for decl in &process.description().readers {
+            crate::tools::readers::register_process(crate::tools::readers::ProcessReader {
+                id: decl.id.clone(),
+                process: Arc::clone(&process),
+                magic: decl.magic.clone(),
+                extensions: decl.extensions.clone(),
+            });
+            reader_count += 1;
+        }
+
         let tool_count = registered.len();
         let panel_count = process.description().panels.len();
         self.processes.push(Arc::clone(&process));
@@ -704,9 +720,9 @@ fn pack_cwd(pack_dir: Option<&std::path::Path>, command: &str, args: &[String]) 
             installed_at: now_iso(),
         });
 
-        if tool_count == 0 && panel_count == 0 {
+        if tool_count == 0 && panel_count == 0 && reader_count == 0 {
             return Ok(Outcome::Skipped(
-                "plugin described neither a tool nor a panel".into(),
+                "plugin described no tool, panel, or reader".into(),
             ));
         }
         Ok(Outcome::Loaded)

@@ -9,11 +9,5 @@
   "dependencies": {
     "nguruvilu": ">=0.1.0"
   },
-  "plugins": [
-    {
-      "id": "documents",
-      "source": "builtin:documents",
-      "license": "MIT"
-    }
-  ]
-}
+  "plugins": []
+}

@@ -71,6 +71,86 @@ struct Reader {
     convert: Convert,
 }
 
+/// A reader whose converter is a plugin process rather than a closure.
+///
+/// The closure form cannot cross a process boundary, which is why `documents`
+/// used to be kernel code: it registered two `Arc<dyn Fn>` and `read` called them
+/// inline. A plugin instead answers two questions over the protocol — "is this
+/// yours?" and "convert it" — and the kernel keeps the same registry, with a
+/// process where the closure was.
+pub struct ProcessReader {
+    /// Stable identity (`pdf`, `office`, …).
+    pub id: String,
+    /// The plugin to ask.
+    pub process: std::sync::Arc<crate::protocol::Process>,
+    /// What it claims, as magic prefixes and file extensions.
+    ///
+    /// Declared as data rather than as a probe function: the probe has to run on
+    /// every `read` of a non-text file, and a process round trip to answer "is
+    /// this yours" would cost 0.25 ms per byte of every binary file read. The
+    /// kernel checks the cheap declaration; the plugin only runs when it matches.
+    pub magic: Vec<String>,
+    /// Extensions it claims, lowercase and without the dot.
+    pub extensions: Vec<String>,
+}
+
+/// Register a plugin-backed reader, returning a disposer.
+pub fn register_process(spec: ProcessReader) -> impl FnOnce() + Send {
+    let id = spec.id.clone();
+    let nonce = next_nonce();
+    let process = std::sync::Arc::clone(&spec.process);
+    let magic = spec.magic.clone();
+    let extensions = spec.extensions.clone();
+    let claimed_id = id.clone();
+    {
+        let mut guard = registry_lock();
+        guard.retain(|r| r.id != id);
+        guard.push(Reader {
+            id: id.clone(),
+            owner: format!("plugin:{}", spec.process.id()),
+            nonce,
+            // The probe is the declaration, checked locally.
+            claims: Arc::new(move |bytes, path| {
+                if magic.iter().any(|prefix| bytes.starts_with(prefix.as_bytes())) {
+                    return true;
+                }
+                match path.extension().and_then(|e| e.to_str()) {
+                    Some(ext) => {
+                        let lower = ext.to_ascii_lowercase();
+                        extensions.iter().any(|known| *known == lower)
+                    }
+                    None => false,
+                }
+            }),
+            convert: Arc::new(move |bytes, path| {
+                process_convert(&process, &claimed_id, bytes, path)
+            }),
+        });
+    }
+    move || {
+        registry_lock().retain(|r| !(r.id == id && r.nonce == nonce));
+    }
+}
+
+/// Ask a plugin to convert a file, on the thread `read` already runs readers on.
+///
+/// Blocking rather than async because `readers::convert` is called from
+/// `spawn_blocking`: the kernel already treats a conversion as slow work and has
+/// parked a thread for it, so awaiting inside would need a second runtime for no
+/// gain.
+fn process_convert(
+    process: &std::sync::Arc<crate::protocol::Process>,
+    id: &str,
+    bytes: &[u8],
+    path: &Path,
+) -> ReadOutcome {
+    match process.convert_blocking(id, bytes, path) {
+        Ok(text) if !text.trim().is_empty() => ReadOutcome::Text(text),
+        Ok(_) => ReadOutcome::NotMine,
+        Err(error) => ReadOutcome::Unreadable(format!("{error:#}")),
+    }
+}
+
 /// How `read` sees the registry's answer.
 pub enum ReadAnswer {
     /// A reader produced text.

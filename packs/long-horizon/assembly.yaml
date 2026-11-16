@@ -1,0 +1,21 @@
+version: 1
+name: long-horizon
+defaults:
+  scope: session
+  on_failure: skip
+# The mission tools are a process now, not kernel code. The panel was already
+# data (`look.json`); it moved out of the kernel in the same commit, so this pack
+# is the first one that carries a whole capability: interface and tools together.
+stages:
+- name: pack
+  plugins:
+  - id: long-horizon
+    source: plugin:bin/ngu-long-horizon
+    scope: global
+    build:
+      dir: src
+      binary: ngu-long-horizon
+  skills:
+  - id: mission-protocol
+    source: skills/mission-protocol
+    scope: session

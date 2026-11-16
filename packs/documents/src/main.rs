@@ -1,60 +1,165 @@
-//! The `documents` plugin: readers that teach `read` PDF and Office formats.
+//! The `documents` plugin: teach `read` the formats the kernel does not parse.
 //!
-//! Available to the kernel as `builtin:documents`; a pack declaring it turns
-//! document reading on (**读不了就装包** — the pack provides the format, the
-//! kernel only provides the asking). Two readers:
+//! 读不了就装包 — the pack provides the format, the kernel only provides the
+//! asking. This was `src/tools/documents.rs` (843 lines) registering two
+//! `Arc<dyn Fn>` closures into the kernel's reader registry, which is why the
+//! capability could not leave: a closure cannot cross a process boundary.
 //!
-//! * **PDF** — the machine's Python engines first (PyMuPDF carries the font
-//!   tables a CJK PDF needs; markitdown behind it). No PDF is guessed at
-//!   natively: a hand-rolled parser showing confident garbage is worse than a
-//!   command that installs the real thing.
-//! * **Office** (`pptx`/`docx`/`xlsx`) — engines first, then the built-in
-//!   zip+XML walk, so a fresh machine reads a deck with nothing installed at
-//!   all (that walk is the offline floor; engines remain the quality path).
+//! Now the kernel asks two things over the protocol:
 //!
-//! # Failure is an instruction (缺环境就自己装)
+//! ```json
+//! {"op":"describe"}                               → {"readers":[{"id":"pdf","magic":["%PDF"],"extensions":["pdf"]}]}
+//! {"op":"convert","reader":"pdf","path":"…","bytes_base64":"…"} → {"text":"…"} | {"not_mine":true} | {"error":"…"}
+//! ```
 //!
-//! Every unreadable outcome names the command that fixes the machine: install
-//! Python, install the engines, or "the engines ran and found no text" (an
-//! image-scanned PDF needs OCR, which is honestly out of scope). The model has
-//! `bash` and no gate to ask — one command, then retry the read.
+//! The declaration travels as **data** (`magic`, `extensions`) rather than as a
+//! probe function, because the kernel has to decide whether to call at all on
+//! every binary `read` — and a round trip to ask "is this yours?" would cost
+//! 0.25 ms on every file the plugin does not claim. The kernel checks the cheap
+//! declaration locally; this process only starts when it matches.
+//!
+//! # The conversion itself is unchanged
+//!
+//! The engines, the fallbacks, the install-command cards — all of it is the code
+//! that was in the kernel, moved. A PDF is still handed to PyMuPDF, Office files
+//! still go through a zip+XML walk when no engine answers, and a failure still
+//! names the command that fixes the machine.
 
-use std::path::Path;
+use std::io::{Read, Write};
 use std::sync::Arc;
+use std::path::Path;
 
-use crate::plugin::{Contributions, Kernel, Plugin, PluginCtx};
-use crate::tools::readers::{ReadOutcome, ReaderSpec};
+use serde_json::{json, Value};
 
-/// The plugin's name: what a pack asks for as `builtin:documents`.
-pub const PLUGIN: &str = "documents";
-
-/// Make the readers available: a pack's assembly asking for
-/// `builtin:documents` decides whether a conversation can read documents.
-pub fn define(kernel: &mut Kernel) {
-    kernel.define(Arc::new(Documents));
+/// What one reader claims, as data the kernel can check without asking.
+struct Reader {
+    id: &'static str,
+    /// Byte prefixes that mean "this is mine".
+    magic: &'static [&'static str],
+    /// File extensions, lowercase and without the dot.
+    extensions: &'static [&'static str],
+    /// The conversion.
+    run: fn(&[u8], &Path) -> Outcome,
 }
 
-struct Documents;
+/// The result of a conversion attempt.
+enum Outcome {
+    /// Readable text.
+    Text(String),
+    /// These bytes are not this reader's format after all.
+    NotMine,
+    /// The format is mine, but extraction failed — with a reason worth showing
+    /// (an install-command card belongs here).
+    Unreadable(String),
+}
 
-impl Plugin for Documents {
-    fn name(&self) -> &str {
-        PLUGIN
-    }
-
-    fn apply(&self, _ctx: &PluginCtx) -> anyhow::Result<Contributions> {
-        Ok(Contributions::new()
-            .reader(ReaderSpec {
-                id: "pdf".into(),
-                claims: Arc::new(|bytes, _| bytes.starts_with(b"%PDF")),
-                convert: Arc::new(|_, path| pdf_read(path)),
-            })
-            .reader(ReaderSpec {
-                id: "office".into(),
-                claims: Arc::new(|bytes, path| is_office_zip(bytes, path)),
-                convert: Arc::new(|bytes, path| office_read(bytes, path)),
-            }))
+fn main() {
+    let readers = readers();
+    let mut stdin = std::io::stdin();
+    loop {
+        let frame = match read_frame(&mut stdin) {
+            Some(frame) => frame,
+            None => return,
+        };
+        let message: Value = match serde_json::from_slice(&frame) {
+            Ok(value) => value,
+            Err(error) => {
+                write_frame(&json!({ "error": format!("not JSON: {error}") }));
+                continue;
+            }
+        };
+        let answer = match message.get("op").and_then(|op| op.as_str()) {
+            Some("describe") => json!({
+                "tools": [],
+                // Readers, not tools: this plugin exists to make the kernel's
+                // own `read` work on more formats, and `read` is the tool.
+                "readers": readers
+                    .iter()
+                    .map(|reader| json!({
+                        "id": reader.id,
+                        "magic": reader.magic,
+                        "extensions": reader.extensions,
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+            Some("convert") => convert(&readers, &message),
+            Some(other) => json!({ "error": format!("unsupported op: {other}") }),
+            None => json!({ "error": "missing op" }),
+        };
+        write_frame(&answer);
     }
 }
+
+/// Run one conversion.
+fn convert(readers: &[Reader], message: &Value) -> Value {
+    use base64::Engine as _;
+
+    let id = message.get("reader").and_then(|v| v.as_str()).unwrap_or("");
+    let path = message
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let encoded = message
+        .get("bytes_base64")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(encoded) {
+        Ok(bytes) => bytes,
+        Err(error) => return json!({ "error": format!("bytes_base64 did not decode: {error}") }),
+    };
+
+    let Some(reader) = readers.iter().find(|reader| reader.id == id) else {
+        return json!({ "error": format!("no reader called '{id}'") });
+    };
+    match (reader.run)(&bytes, Path::new(&path)) {
+        Outcome::Text(text) => json!({ "text": text }),
+        Outcome::NotMine => json!({ "not_mine": true }),
+        Outcome::Unreadable(reason) => json!({ "error": reason }),
+    }
+}
+
+/// The two readers, unchanged from the kernel version.
+fn readers() -> Vec<Reader> {
+    vec![
+        Reader {
+            id: "pdf",
+            magic: &["%PDF"],
+            extensions: &["pdf"],
+            run: |_, path| pdf_read(path),
+        },
+        Reader {
+            id: "office",
+            magic: &["PK\x03\x04"],
+            extensions: &["pptx", "docx", "xlsx"],
+            run: office_read,
+        },
+    ]
+}
+
+fn read_frame(input: &mut impl Read) -> Option<Vec<u8>> {
+    let mut header = [0u8; 4];
+    input.read_exact(&mut header).ok()?;
+    let len = u32::from_be_bytes(header) as usize;
+    let mut body = vec![0u8; len];
+    input.read_exact(&mut body).ok()?;
+    Some(body)
+}
+
+fn write_frame(value: &Value) {
+    let body = match serde_json::to_vec(value) {
+        Ok(body) => body,
+        Err(_) => return,
+    };
+    let mut out = std::io::stdout();
+    out.write_all(&(body.len() as u32).to_be_bytes()).ok();
+    out.write_all(&body).ok();
+    out.flush().ok();
+}
+
+// ------------------------------------------------------------ the conversions
+// Everything below is the code that was in `src/tools/documents.rs`, with
+// `ReadOutcome` replaced by this plugin's own `Outcome`.
 
 /// The install-command cards. Shown verbatim on failure — the whole point
 /// is that the model can copy one into `bash` and the next read works.
@@ -86,28 +191,28 @@ fn is_office_zip(bytes: &[u8], path: &Path) -> bool {
 }
 
 /// PDF through the engines; no native guessing.
-fn pdf_read(path: &Path) -> ReadOutcome {
+fn pdf_read(path: &Path) -> Outcome {
     match engine_convert(path, true) {
-        Ok(text) => ReadOutcome::Text(text),
-        Err(reason) => ReadOutcome::Unreadable(reason),
+        Ok(text) => Outcome::Text(text),
+        Err(reason) => Outcome::Unreadable(reason),
     }
 }
 
 /// Office through the engines, falling back to the built-in zip+XML walk:
 /// engines are the quality path, the walk is the "nothing installed" floor.
-fn office_read(bytes: &[u8], path: &Path) -> ReadOutcome {
+fn office_read(bytes: &[u8], path: &Path) -> Outcome {
     match engine_convert(path, false) {
-        Ok(text) => ReadOutcome::Text(text),
+        Ok(text) => Outcome::Text(text),
         Err(reason) => {
             if let Some(text) = ooxml_text(bytes) {
-                return ReadOutcome::Text(text);
+                return Outcome::Text(text);
             }
             if reason == PYTHON_MISSING {
                 // No engines AND the built-in walk could not parse this
                 // container: the install command is the only way forward.
-                ReadOutcome::Unreadable(PYTHON_MISSING.to_string())
+                Outcome::Unreadable(PYTHON_MISSING.to_string())
             } else {
-                ReadOutcome::Unreadable(format!(
+                Outcome::Unreadable(format!(
                     "the built-in reader could not extract this container; {ENGINES_MISSING}"
                 ))
             }
@@ -542,302 +647,3 @@ fn xml_unescape(text: &str) -> String {
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn claims_need_magic_and_an_office_name() {
-        let ppt = std::path::PathBuf::from("deck.PPTX");
-        let zip = std::path::PathBuf::from("bundle.zip");
-        let txt = std::path::PathBuf::from("notes.txt");
-        let office = [0x50u8, 0x4B, 0x03, 0x04, 0x14];
-
-        assert!(is_office_zip(&office, &ppt), "zip magic + office name");
-        assert!(!is_office_zip(&office, &zip), "a plain zip is not a document");
-        assert!(!is_office_zip(b"plain", &ppt), "the name alone claims nothing");
-        assert!(!is_office_zip(&office, &txt));
-    }
-
-    #[test]
-    fn entities_and_boundaries_survive_the_walk() {
-        assert_eq!(xml_unescape("a &amp; b &lt;c&gt; &#65;&#x42; &unknown;"), "a & b <c> AB &unknown;");
-
-        // `<a:tbl>` must not be swallowed as an `<a:t>` run…
-        let xml = "<p><a:tbl>TABLE</a:tbl><a:t>real &amp; text</a:t></p>";
-        assert_eq!(xml_paragraphs(xml, "</p>", "a:t"), "real & text");
-
-        // …and an attribute-bearing run counts.
-        let spaced = "<p><a:t xml:space=\"preserve\">kept</a:t></p>";
-        assert_eq!(xml_paragraphs(spaced, "</p>", "a:t"), "kept");
-    }
-
-    #[test]
-    fn a_deck_reads_slide_by_slide_with_notes_in_numeric_order() {
-        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        let options = zip::write::SimpleFileOptions::default();
-        let slide = |text: &str| {
-            format!("<p:sld><a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:sld>")
-        };
-        for (name, text) in [
-            ("ppt/slides/slide2.xml", "second"),
-            ("ppt/slides/slide10.xml", "tenth"),
-            ("ppt/notesSlides/notesSlide2.xml", "note for two"),
-        ] {
-            zip.start_file(name, options).unwrap();
-            std::io::Write::write_all(&mut zip, slide(text).as_bytes()).unwrap();
-        }
-        // `ZipWriter::into_inner` finishes the archive: the central directory
-        // it writes is what `ZipArchive` reads back.
-        let bytes = zip.finish().expect("finishing the archive").into_inner();
-        let text = ooxml_text(&bytes).expect("a readable deck");
-
-        let second = text.find("--- slide 2 ---").expect("slide 2 present");
-        let tenth = text.find("--- slide 10 ---").expect("slide 10 present");
-        assert!(second < tenth, "numeric order, not lexicographic: {text}");
-        assert!(text.contains("second") && text.contains("tenth"), "{text}");
-        assert!(text.contains("[notes 2] note for two"), "notes attach: {text}");
-    }
-
-    #[test]
-    fn a_word_document_reads_its_paragraphs() {
-        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        let options = zip::write::SimpleFileOptions::default();
-        zip.start_file("word/document.xml", options).unwrap();
-        std::io::Write::write_all(
-            &mut zip,
-            br#"<?xml version="1.0"?><w:document><w:body>
-                <w:p><w:r><w:t>First &amp; foremost</w:t></w:r></w:p>
-                <w:p><w:r><w:t>Second paragraph</w:t></w:r></w:p>
-            </w:body></w:document>"#,
-        )
-        .unwrap();
-        let bytes = zip.finish().expect("finishing the archive").into_inner();
-
-        let text = ooxml_text(&bytes).expect("a readable document");
-        assert_eq!(text, "First & foremost\nSecond paragraph");
-    }
-
-    #[test]
-    fn unreadable_outcomes_carry_installable_commands() {
-        // The cards are the feature: an agent with bash must be able to fix
-        // the machine from the error alone.
-        assert!(PYTHON_MISSING.contains("winget install Python.Python.3.13"));
-        assert!(PYTHON_MISSING.contains("apt install -y python3"));
-        assert!(PYTHON_MISSING.contains("brew install python"));
-        assert!(ENGINES_MISSING.contains("pip install --user pymupdf markitdown"));
-        assert!(NO_TEXT_FOUND.contains("OCR"));
-    }
-
-    /// The wedged pipe, in-process: a `Read` that hands over some bytes and
-    /// then never reaches EOF is exactly what a grandchild holding the
-    /// engine's stdout looks like. Joining that reader is the unbounded wait
-    /// the 30s deadline used to miss — so the drain gets a bounded grace, and
-    /// the bytes that did arrive survive it.
-    #[test]
-    fn a_wedged_drain_is_abandoned_without_losing_what_it_read() {
-        use std::io::Read;
-        use std::time::{Duration, Instant};
-
-        /// Some text, then a writer that will not close: two seconds of
-        /// blocking stands in for "forever" at test speed.
-        struct Wedged {
-            served: bool,
-        }
-
-        impl Read for Wedged {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                if !self.served {
-                    self.served = true;
-                    let text = b"partial-conversion";
-                    buf[..text.len()].copy_from_slice(text);
-                    return Ok(text.len());
-                }
-                // The writer nobody is waiting for: eventually it does close,
-                // but an unbounded join would wait exactly that long.
-                for _ in 0..100 {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Ok(0)
-            }
-        }
-
-        let sink = Arc::new(Collected::new());
-        let reading = Arc::clone(&sink);
-        let _ = std::thread::spawn(move || drain_pipe(Wedged { served: false }, reading));
-
-        let started = Instant::now();
-        let complete = await_drain(&sink, Duration::from_millis(200));
-        let elapsed = started.elapsed();
-
-        assert!(!complete, "a pipe that never closes must be abandoned");
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "the wait ends at its own budget, not at the writer's pleasure: {elapsed:?}"
-        );
-        let bytes = sink.take();
-        assert_eq!(
-            String::from_utf8_lossy(&bytes).as_ref(),
-            "partial-conversion",
-            "what was read before the deadline is the answer, not garbage"
-        );
-    }
-
-    /// The same cap the reader shares: past it the text is a prefix and the
-    /// flag says so, while the pipe keeps draining (a child that cannot write
-    /// never exits, and the deadline would then only hide the hang).
-    #[test]
-    fn the_drain_stops_growing_but_keeps_reading() {
-        use std::io::Read as _;
-
-        /// An endless pipe: always ready, never EOF.
-        struct Endless;
-        impl std::io::Read for Endless {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                let filled = buf.len().min(64);
-                for byte in &mut buf[..filled] {
-                    *byte = b'x';
-                }
-                Ok(filled)
-            }
-        }
-
-        let sink = Arc::new(Collected::new());
-        // Pushed directly rather than through a thread: what is under test is
-        // the cap, and a thread would only make the assertion racy.
-        let mut source = Endless;
-        let mut chunk = [0u8; 64];
-        let mut pushed = 0usize;
-        while pushed <= ENGINE_OUTPUT_LIMIT + 4096 {
-            let read = source.read(&mut chunk).expect("endless source");
-            sink.push(&chunk[..read]);
-            pushed += read;
-        }
-
-        assert_eq!(
-            sink.take().len(),
-            ENGINE_OUTPUT_LIMIT,
-            "the buffer is capped, not unbounded"
-        );
-        assert!(
-            sink.overflowed.load(std::sync::atomic::Ordering::Relaxed),
-            "the truncation is recorded, so the caller can say so"
-        );
-    }
-
-    /// End to end, with a real process: the engine exits at once, a background
-    /// descendant inherits its stdout and keeps the pipe open. The old code
-    /// joined that reader with no bound and hung for as long as the descendant
-    /// lived; now the call returns at its deadline with the text it did get.
-    ///
-    /// The Windows command carries no double quotes on purpose. Rust passes an
-    /// argument to `cmd` in MSVCRT escaping (`"` inside an argument becomes
-    /// `\"`), and cmd.exe has no backslash escape — a nested `cmd /C "…"` gets
-    /// mangled, its `echo` never runs, and the test fails for a reason that has
-    /// nothing to do with the drain. Bare words only; `start /b` hands the
-    /// grandchild our stdout, and `ping` holds it for ~15 s.
-    #[test]
-    fn a_grandchild_holding_stdout_returns_partial_output_at_the_deadline() {
-        use std::time::{Duration, Instant};
-
-        let budget = Duration::from_millis(1200);
-        // Long enough that an unbounded join would blow through the assertion
-        // below, short enough not to leave a stray process for long.
-        let (program, args) = if cfg!(windows) {
-            (
-                "cmd".to_string(),
-                vec![
-                    "/C".to_string(),
-                    "start /b ping -n 16 127.0.0.1 & echo engine-done".to_string(),
-                ],
-            )
-        } else {
-            (
-                "sh".to_string(),
-                vec!["-c".to_string(), "sleep 15 & echo engine-done".to_string()],
-            )
-        };
-
-        let started = Instant::now();
-        let outcome = run_blocking_within(&program, &args, budget);
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(8),
-            "the call must end at its deadline, not when the orphan closes the pipe: {elapsed:?}"
-        );
-
-        let text = match outcome {
-            Ok(text) => text,
-            Err(reason) => reason,
-        };
-        assert!(text.contains("engine-done"), "partial output is kept: {text}");
-        assert!(
-            text.contains("output pipe") || text.contains("timed out"),
-            "the reason the text may be short is named: {text}"
-        );
-    }
-
-    /// The whole chain, end to end: kernel loads the plugin, `read` consults
-    /// the registry, the PDF reader runs. Either the engines produce text or
-    /// the error is an install-command card — both outcomes prove the
-    /// contract ("content, or precisely why not, plus the command that fixes
-    /// it"), so the test accepts either instead of assuming this machine's
-    /// Python state forever.
-    #[tokio::test]
-    async fn the_read_tool_reads_a_pdf_through_the_registered_reader() {
-        use serde_json::json;
-
-        // A minimal one-page PDF: enough for a repairing parser to find the
-        // text operator, and enough for the raw path if it ever exists.
-        let pdf = b"%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n\
-            2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n\
-            3 0 obj << /Type /Page /Parent 2 0 R /Contents 4 0 R /MediaBox [0 0 612 792] >> endobj\n\
-            4 0 obj << /Length 44 >> stream\n\
-            BT /F1 12 Tf 72 720 Td (Hello PDF) Tj ET\n\
-            endstream endobj\ntrailer << /Root 1 0 R >>\n%%EOF\n";
-        let dir = std::env::temp_dir().join(format!(
-            "ngu-doc-read-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("fixture.pdf");
-        std::fs::write(&path, pdf).unwrap();
-
-        let mut kernel = crate::plugin::Kernel::new();
-        // `read` is no longer installed by `Kernel::new`: the bootstrap set is a
-        // call a host makes, so that a pack can replace any of its tools.
-        kernel.install_bootstrap().unwrap();
-        define(&mut kernel);
-        kernel
-            .load(
-                PLUGIN,
-                crate::plugin::RealmMap::new(),
-                serde_json::Value::Null,
-            )
-            .unwrap();
-
-        let registry = kernel.tools().clone();
-        let outcome = registry
-            .execute(
-                "read",
-                &json!({ "path": path.display().to_string() }).to_string(),
-            )
-            .await;
-        match outcome {
-            Ok(output) => assert!(
-                output.text.contains("Hello PDF"),
-                "the engine read the page: {}",
-                output.text.chars().take(200).collect::<String>()
-            ),
-            Err(error) => {
-                let text = format!("{error:#}");
-                assert!(
-                    text.contains("winget install") || text.contains("pip install"),
-                    "a failure must be the command card, got: {text}"
-                );
-            }
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}

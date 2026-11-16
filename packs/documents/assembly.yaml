@@ -3,12 +3,18 @@ name: documents
 defaults:
   scope: session
   on_failure: skip
-# 读不了就装包。内核的 `read` 只会读文本；这个包给 `read` 装上 PDF 和 Office
-# 的 reader（`Contributions::reader`），装上之后同一个 `read` 调用就能读二进制
-# 文档，卸载之后 `read` 会说"这个格式读不了"，并列出已经装了什么。
+# 读不了就装包。内核的 `read` 只会读文本；这个插件给它装上 PDF 和 Office。
+#
+# The plugin declares its formats as data (`magic` prefixes and `extensions`) so
+# the kernel can decide whether to call without a round trip, and answers
+# `{"op":"convert"}` when it matches. `readers.rs` kept the same registry; a
+# process stands where the closure used to be.
 stages:
 - name: pack
   plugins:
   - id: documents
-    source: builtin:documents
+    source: plugin:bin/ngu-documents
     scope: global
+    build:
+      dir: src
+      binary: ngu-documents

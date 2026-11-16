@@ -9,18 +9,13 @@
   "dependencies": {
     "nguruvilu": ">=0.1.0"
   },
-  "plugins": [
-    {
-      "id": "long-horizon",
-      "source": "builtin:long-horizon",
-      "license": "MIT"
-    }
-  ],
+  "plugins": [],
   "skills": [
     {
       "id": "mission-protocol",
       "source": "./skills/mission-protocol",
       "license": "MIT"
     }
-  ]
-}
+  ],
+  "look": "look.json"
+}

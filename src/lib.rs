@@ -36,6 +36,7 @@ pub mod ledger;
 pub mod llm;
 pub mod loader;
 pub mod mcp;
+pub mod mission;
 pub mod message;
 pub mod network;
 pub mod pack;

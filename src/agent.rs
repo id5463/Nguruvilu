@@ -26,7 +26,7 @@ use tokio::task::JoinSet;
 use crate::compaction::{self, Compaction, Summarizer};
 use crate::llm::{self, LlmClient, LlmEvent, PartialCallView, TokenUsage};
 use crate::message::{Message, ToolCall};
-use crate::tools::longhorizon::MissionBrief;
+use crate::mission::MissionBrief;
 use crate::tools::ToolRegistry;
 use crate::window::{self, ContextPolicy, ContextWindow};
 
@@ -788,7 +788,7 @@ impl Agent {
             return None;
         }
         let workspace = self.identity.as_ref()?.workspace.as_deref()?;
-        crate::tools::longhorizon::running_mission(workspace)
+        crate::mission::running_mission(workspace)
     }
 
 

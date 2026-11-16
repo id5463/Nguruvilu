@@ -165,6 +165,19 @@ pub struct PanelDecl {
     pub script: Option<String>,
 }
 
+/// One file format a plugin can convert.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ReaderDecl {
+    /// Stable identity (`pdf`, `office`, …).
+    pub id: String,
+    /// Byte prefixes that mean "this is mine", as UTF-8 strings.
+    #[serde(default)]
+    pub magic: Vec<String>,
+    /// File extensions it claims, lowercase and without the dot.
+    #[serde(default)]
+    pub extensions: Vec<String>,
+}
+
 /// What a plugin reports about itself.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Description {
@@ -174,6 +187,14 @@ pub struct Description {
     /// Panels it contributes.
     #[serde(default)]
     pub panels: Vec<PanelDecl>,
+    /// File formats it can convert, for the kernel's own `read`.
+    ///
+    /// Data rather than a probe function: `read` has to decide whether to call
+    /// on every binary file, and a round trip to ask "is this yours?" would cost
+    /// 0.25 ms on every file the plugin does not claim. The kernel checks these
+    /// declarations locally and only starts a process when one matches.
+    #[serde(default)]
+    pub readers: Vec<ReaderDecl>,
     /// Where its settings live in the pack table, if it wants any.
     ///
     /// Advisory only: the kernel does not read it. It is here so a panel's
@@ -431,6 +452,29 @@ impl Process {
                 Some(ask) => ask,
                 None => return Ok(value),
             };
+            // A plugin asking for a model turn. Answered by the same provider
+            // that answers `state` — the provider is the kernel, and what it can
+            // do for a plugin is one list, not two.
+            if let Some(turn) = asked.get("model") {
+                let body = match &self.state {
+                    Some(provider) => match provider(&format!("model:{turn}")) {
+                        Some(value) => serde_json::to_vec(&json!({
+                            "ask": { "id": asked.get("id").cloned().unwrap_or(Value::Null) },
+                            "value": value,
+                        }))?,
+                        None => serde_json::to_vec(&json!({
+                            "ask": { "id": asked.get("id").cloned().unwrap_or(Value::Null) },
+                            "error": "the kernel cannot run a model turn for this plugin",
+                        }))?,
+                    },
+                    None => serde_json::to_vec(&json!({
+                        "ask": { "id": asked.get("id").cloned().unwrap_or(Value::Null) },
+                        "error": "this process was started without a state provider",
+                    }))?,
+                };
+                write_frame_async(&mut inner.stdin, &body).await?;
+                continue;
+            }
             let (key, id) = match asked.get("state") {
                 Some(key) => (
                     key.as_str().unwrap_or("").to_string(),
@@ -480,6 +524,69 @@ impl Process {
             return Err(anyhow!("{}", message));
         }
         Ok(answer.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Ask a plugin to convert a file, from a blocking caller.
+    ///
+    /// The protocol's two file operations, for a reader that runs inside `read`'s
+    /// `spawn_blocking`. Content travels as base64 because it is bytes and JSON
+    /// is text: a PDF is not a string, and pretending otherwise is how a
+    /// conversion starts failing on the first byte above 0x7F.
+    ///
+    /// One round trip, not two: the plugin is told the path and the bytes, and
+    /// answers with text or "not mine". A separate "is this yours" call would
+    /// double the cost for a question the plugin can answer while it has the
+    /// bytes anyway.
+    pub fn convert_blocking(&self, id: &str, bytes: &[u8], path: &std::path::Path) -> Result<String> {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let answer = self.blocking_request(json!({
+            "op": "convert",
+            "reader": id,
+            "path": path.display().to_string(),
+            "bytes_base64": encoded,
+        }))?;
+        if let Some(error) = answer.get("error") {
+            return Err(anyhow!("{error}"));
+        }
+        Ok(answer
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string())
+    }
+
+    /// One round trip, blocking.
+    ///
+    /// Needs its own thread and runtime when called from inside an async context:
+    /// `block_on` panics on a runtime thread, and the caller here is a
+    /// `spawn_blocking` thread — which has no runtime of its own but is *inside*
+    /// one. A current-thread runtime on a fresh thread is the only correct shape.
+    pub fn blocking_request(&self, message: Value) -> Result<Value> {
+        let body = serde_json::to_vec(&message)?;
+        if body.len() > MAX_FRAME {
+            return Err(anyhow!(
+                "plugin '{}' request is {} bytes, over the {MAX_FRAME} limit",
+                self.id,
+                body.len()
+            ));
+        }
+        // A blocking caller cannot await, so the whole exchange runs on its own
+        // thread with its own runtime.
+        let this = self as *const Self as usize;
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    let process = unsafe { &*(this as *const Self) };
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| anyhow!("building a runtime: {error}"))
+                        .and_then(|runtime| runtime.block_on(process.request(message.clone())))
+                })
+                .join()
+                .map_err(|_| anyhow!("the plugin request thread panicked"))?
+        })
     }
 
     /// Read one of the kernel's state slots.
@@ -768,4 +875,5 @@ mod tests {
         }
     }
 }
+
 

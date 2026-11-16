@@ -1099,8 +1099,6 @@ impl Kernel {
     /// these tools, because registration is `Override`.
     pub fn define_builtins(&mut self) {
         crate::tools::subagent::define(self);
-        crate::tools::longhorizon::define(self);
-        crate::tools::documents::define(self);
     }
 
     /// The base tools without a kernel, for a caller that only wants a registry.
