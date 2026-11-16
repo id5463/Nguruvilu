@@ -305,6 +305,15 @@ pub trait ContextPolicy: Send + Sync {
     fn prune(&self) -> crate::compaction::PrunePolicy {
         crate::compaction::PrunePolicy::default()
     }
+
+    /// The share of the window at which a summary replaces the front of the log.
+    ///
+    /// Exposed so the request builder can thin history *before* it gets there.
+    /// The two are different decisions on one ladder; a builder that guessed this
+    /// number would drift from the compactor's own.
+    fn compact_at_percent(&self) -> u32 {
+        75
+    }
 }
 
 /// The kernel's default policy: configured window, or provider, or table, or floor.
@@ -396,6 +405,10 @@ impl ContextPolicy for DefaultContextPolicy {
 
     fn keep_recent(&self) -> usize {
         self.keep_recent
+    }
+
+    fn compact_at_percent(&self) -> u32 {
+        self.threshold_percent
     }
 
     fn prune(&self) -> crate::compaction::PrunePolicy {

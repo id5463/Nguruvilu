@@ -555,6 +555,23 @@ impl PrunePolicy {
         }
     }
 
+    /// The "aggressive" preset: what runs once a turn is close to compacting.
+    ///
+    /// Near the threshold the question stops being "how much of this result does
+    /// the model still need" and becomes "which of these can we keep at all".
+    /// Two thousand characters of head and no tail keeps the command and the
+    /// start of its output — enough to know what happened — while a tool call's
+    /// output is exactly the thing that grows without bound.
+    pub fn aggressive() -> Self {
+        Self {
+            enabled: true,
+            head_chars: 300,
+            tail_chars: 0,
+            keep_recent: 2,
+            keep_images: 1,
+        }
+    }
+
     /// The "pointer only" preset: an old result becomes one line naming its file.
     pub fn pointer_only() -> Self {
         Self {
@@ -1269,5 +1286,43 @@ mod tests {
         let now = vec![user("one"), user("inserted"), user("two"), user("three")];
         let refused = locate_span(&now, 2, &first, &last).expect_err("must refuse");
         assert!(refused.contains("not the 2 it recorded"), "{refused}");
+    }
+
+    /// The three rungs of the ladder, and the one property that matters most:
+    /// nothing is touched while there is room.
+    #[test]
+    fn the_ladder_keeps_history_whole_until_it_has_to_thin() {
+        // Below the quiet line: `loose` is disabled, so a long tool result and an
+        // old image both survive verbatim even though they are far past the
+        // keep_recent window. This is the whole point of the change: a model that
+        // asked for 200 KB of build output should see it while the window can
+        // hold it, not a `[thinned]` line it cannot act on.
+        let loose = PrunePolicy::loose();
+        assert!(loose.is_noop());
+
+        // Middle rung: the default preset thins, and says so.
+        let normal = PrunePolicy::default();
+        assert!(!normal.is_noop());
+        assert_eq!(normal.keep_recent, 8);
+
+        // Top rung: aggressive keeps far less than the default.
+        let hard = PrunePolicy::aggressive();
+        assert!(hard.head_chars < normal.head_chars);
+        assert!(hard.keep_recent < normal.keep_recent);
+        assert_eq!(hard.tail_chars, 0);
+        assert_eq!(hard.keep_images, 1);
+    }
+
+    #[test]
+    fn a_disabled_policy_returns_the_history_untouched() {
+        let messages = vec![
+            user("hello"),
+            Message::tool_result("call-1", "bash", "x".repeat(200_000)),
+        ];
+        // 200 KB is well past every keep_recent and head_chars, so if the policy
+        // were honoured in the wrong direction this would come back thinned.
+        let out = prune_tool_results(&messages, &PrunePolicy::loose());
+        assert_eq!(out.len(), messages.len());
+        assert_eq!(out[1].text().len(), 200_000, "loose must not touch a result");
     }
 }

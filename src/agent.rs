@@ -1761,10 +1761,36 @@ impl Agent {
         // every original byte, so raising the limit later brings the detail back
         // and an audit still sees what happened; nothing here mutates state.
         //
-        // Two passes, in this order: old tool text first (a thinned result still
-        // keeps its pointer), then old inline images — the heavier of the two,
-        // since a screenshot travels on every later step as base64.
-        let policy = settings.policy.prune();
+        // Thinning is not free, so it is not unconditional. Under half a window
+        // the model gets the conversation exactly as it happened — that is the
+        // state where a long tool output is *useful*, and replacing it with
+        // "[old tool output thinned]" throws away the thing the model asked for
+        // while there is still room to keep it. The ladder:
+        //
+        //   below `quiet_at`      — nothing is touched at all
+        //   below `compact_percent` — old tool text and images are thinned
+        //   at or above it         — the preset becomes aggressive
+        //
+        // Compaction (a summary replacing the front of the log) stays a separate
+        // decision made by `compact`, because it is the only one that is
+        // irreversible in the request.
+        let used = crate::window::estimate_history(&self.messages);
+        let share = if window.tokens == 0 {
+            0
+        } else {
+            (used.saturating_mul(100) / window.tokens) as u32
+        };
+        // Where thinning starts. Three quarters of the way to compaction leaves
+        // room for the tool results a turn is actually using while still being
+        // early enough that the prompt does not jump straight to a summary.
+        const QUIET_AT_PERCENT: u32 = 35;
+        let policy = if share < QUIET_AT_PERCENT {
+            crate::compaction::PrunePolicy::loose()
+        } else if share < settings.policy.compact_at_percent() {
+            settings.policy.prune()
+        } else {
+            crate::compaction::PrunePolicy::aggressive()
+        };
         let thinned = crate::compaction::prune_tool_results(&self.messages, &policy);
         let history = crate::compaction::prune_images(&thinned, &policy);
 
@@ -1999,9 +2025,80 @@ mod tests {
     /// The whole point of thinning, end to end: what leaves this process is
     /// smaller, what is stored is not.
     #[test]
+    /// The rule that makes the ladder worth having: while the window has room,
+    /// a tool result reaches the model exactly as the tool produced it.
+    ///
+    /// Before this, thinning ran on every request regardless of how full the
+    /// window was. A model that ran a build and got 200 KB back saw
+    /// `[old tool output thinned: 204800 chars · ...]` on the very next step —
+    /// the answer to its own question, replaced by a note about the answer.
+    #[test]
+    fn a_tool_result_reaches_the_model_intact_while_there_is_room() {
+        let tools = Arc::new(ToolRegistry::with_base_tools().unwrap());
+        let mut config_inner = StaticConfig::new("SYS", Arc::clone(&tools), "m");
+        config_inner.policy = Arc::new(crate::window::DefaultContextPolicy {
+            // A million tokens of room for a history of a few thousand: nowhere
+            // near the quiet line.
+            configured: Some(1_000_000),
+            threshold_percent: 75,
+            keep_recent: 8,
+            provider_window: None,
+            reserve: 0,
+            prune: crate::compaction::PrunePolicy::default(),
+        });
+        let config: Arc<dyn TurnConfig> = Arc::new(config_inner);
+
+        let mut history = Vec::new();
+        for index in 0..12 {
+            history.push(Message::tool_result(
+                format!("call-{index}"),
+                "bash",
+                format!("r{index} {}", "x".repeat(20_000)),
+            ));
+        }
+        let agent = Agent::new(
+            LlmClient::new(crate::llm::LlmConfig::new("http://localhost:1", "k", "m")).unwrap(),
+            Arc::clone(&config),
+            history,
+        );
+
+        let request = agent.build_request(&config.settings(), None).0;
+        let thinned = request
+            .iter()
+            .filter(|message| message.text().contains("chars thinned"))
+            .count();
+        assert_eq!(thinned, 0, "nothing is thinned while the window is mostly empty");
+        let full = request
+            .iter()
+            .filter(|message| message.text().len() >= 20_000)
+            .count();
+        assert_eq!(full, 12, "every result arrives at its full size");
+    }
+
     fn an_old_tool_result_and_image_leave_the_request_but_not_the_history() {
         let tools = Arc::new(ToolRegistry::with_base_tools().unwrap());
-        let config: Arc<dyn TurnConfig> = Arc::new(StaticConfig::new("SYS", Arc::clone(&tools), "m"));
+        // A deliberately small window: the ladder only thins once history has
+        // grown into a real share of what the model can hold, and this test is
+        // about what thinning does — not about when it starts. The "when" has its
+        // own test below.
+        let mut config_inner = StaticConfig::new("SYS", Arc::clone(&tools), "m");
+        config_inner.policy = Arc::new(
+            crate::window::DefaultContextPolicy {
+                // Sized so this history lands on the middle rung. Measured
+                // rather than guessed: the estimate counts CJK and base64
+                // differently from ASCII, and a window picked by arithmetic on
+                // character counts landed on the wrong rung twice. 80 k against
+                // this history sits above the quiet line and below the
+                // compaction threshold, so the default preset runs.
+                configured: Some(120_000),
+                threshold_percent: 75,
+                keep_recent: 8,
+                provider_window: None,
+                reserve: 0,
+                prune: crate::compaction::PrunePolicy::default(),
+            },
+        );
+        let config: Arc<dyn TurnConfig> = Arc::new(config_inner);
 
         let mut history = Vec::new();
         for index in 0..12 {
