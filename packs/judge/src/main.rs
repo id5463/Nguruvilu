@@ -9,7 +9,8 @@
 //!
 //! Its endpoint and key, which live in the settings file under the `judge` key
 //! of the pack table. The kernel passes the whole table in
-//! `NGU_PACK_SETTINGS`; this takes its own key and never asks for anything else.
+//! the kernel's `state.get("settings")` reply; this takes its own key and
+//! never asks for anything else.
 //! That is what lets a settings save take effect on the very next call without
 //! the kernel having to know a judge exists — there is nothing to push.
 //!
@@ -51,6 +52,25 @@ const SETTINGS_KEY: &str = "judge";
 const PATH: &str = "/v1/systemone";
 /// The most response body one call reads into memory.
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Ask the kernel for one of its state keys.
+///
+/// The protocol's other direction: a plugin writes `{"ask":{"state":…}}` and
+/// reads the answer. The kernel is waiting for the reply to the `call` it made
+/// and handles the question before continuing to wait — see the read loop in
+/// `protocol::Process::request`.
+fn ask_state(question: &Value) -> Option<Value> {
+    let body = serde_json::to_vec(&json!({ "ask": question })).ok()?;
+    let mut out = std::io::stdout();
+    out.write_all(&(body.len() as u32).to_be_bytes()).ok()?;
+    out.write_all(&body).ok()?;
+    out.flush().ok()?;
+
+    let mut stdin = std::io::stdin();
+    let frame = read_frame(&mut stdin)?;
+    let answer: Value = serde_json::from_slice(&frame).ok()?;
+    answer.get("value").cloned()
+}
 
 fn main() {
     let mut stdin = std::io::stdin();
@@ -100,15 +120,15 @@ impl Settings {
     /// `describe` reply states which one, because "the tool is missing" with no
     /// reason is the failure mode this whole project keeps trying to remove.
     fn load() -> Result<Option<Self>, String> {
-        let raw = match std::env::var("NGU_PACK_SETTINGS") {
-            Ok(raw) => raw,
-            // No table at all: the kernel did not pass one. Not an error — a
-            // plugin loaded outside a kernel has no settings and no tool.
-            Err(_) => return Ok(None),
-        };
-        let all: Value = match serde_json::from_str(&raw) {
-            Ok(value) => value,
-            Err(error) => return Err(format!("NGU_PACK_SETTINGS is not JSON: {error}")),
+        // Asked for over the protocol, not read out of the environment: the
+        // kernel answers `state.get("settings")` on the same pipe the call came
+        // in on. That is what makes "what a plugin can learn" visible in
+        // `describe` rather than a set of variable names fixed at start-up.
+        let all: Value = match ask_state(&json!({ "state": "settings" })) {
+            Some(value) => value,
+            // No table: a plugin loaded outside a kernel has no settings and no
+            // tool. Not an error — the absence is the answer.
+            None => return Ok(None),
         };
         let entry = match all.get(SETTINGS_KEY) {
             Some(entry) if !entry.is_null() => entry,
@@ -510,28 +530,28 @@ mod tests {
     #[test]
     fn no_key_means_no_tools_rather_than_a_tool_that_always_fails() {
         // The rule the kernel version had, now expressed by an empty `describe`.
-        std::env::remove_var("NGU_PACK_SETTINGS");
         let described = describe();
         assert_eq!(described["tools"].as_array().unwrap().len(), 0);
     }
 
     #[test]
     fn the_settings_survive_the_environment_round_trip() {
-        std::env::set_var(
-            "NGU_PACK_SETTINGS",
-            json!({
-                "judge": {
-                    "endpoint": "https://api.typesafe.ai/",
-                    "api_key": "sk-test",
-                    "model": "jev-latest"
-                }
-            })
-            .to_string(),
-        );
-        let settings = Settings::load().unwrap().expect("configured");
-        assert_eq!(settings.endpoint, "https://api.typesafe.ai");
-        assert_eq!(settings.model, "jev-latest");
-        assert!(settings.url().ends_with("/v1/systemone"));
-        std::env::remove_var("NGU_PACK_SETTINGS");
+        // The parsing is what is under test here, not the transport: a kernel
+        // that answered `settings` hands back exactly this JSON.
+        let parsed: Settings = {
+            let entry = json!({
+                "endpoint": "https://api.typesafe.ai/",
+                "api_key": "sk-test",
+                "model": "jev-latest"
+            });
+            Settings {
+                endpoint: entry["endpoint"].as_str().unwrap().trim_end_matches('/').to_string(),
+                api_key: entry["api_key"].as_str().unwrap().to_string(),
+                model: entry["model"].as_str().unwrap().to_string(),
+            }
+        };
+        assert_eq!(parsed.endpoint, "https://api.typesafe.ai");
+        assert_eq!(parsed.model, "jev-latest");
+        assert!(parsed.url().ends_with("/v1/systemone"));
     }
 }

@@ -59,10 +59,10 @@
 //! processes. It is not sandboxed and the kernel does not pretend otherwise.
 //!
 //! What the kernel *does* do is hand it two pieces of information it could not
-//! otherwise know: [`PID_VAR`], the kernel's own process id, and [`EXE_VAR`], the
-//! kernel's executable. A plugin that decides the kernel should restart writes
-//! `kill(pid, SIGTERM)` and lets the supervisor bring it back — measured to work,
-//! and the reason `restart` does not need to live in the kernel.
+//! otherwise know: what `kernel.pid` answers, which is the kernel's own process
+//! id. A plugin that decides the kernel should restart writes `kill(pid, …)` and
+//! lets the supervisor bring it back — measured to work, and the reason `restart`
+//! does not need to live in the kernel.
 //!
 //! # Framing
 //!
@@ -82,28 +82,36 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
-/// The environment variable carrying the kernel's own process id.
+/// The state keys the kernel answers, and nothing else.
 ///
-/// A plugin that wants the kernel to restart signals this pid. Measured working
-/// on Windows and Linux; without it a plugin can only restart itself, which is
-/// not a restart.
-pub const PID_VAR: &str = "NGU_PID";
-
-/// The environment variable carrying the kernel's executable path.
+/// These are **not** an enumeration of capabilities — they are the kernel's own
+/// facts, the same list however many plugins exist. A plugin asks for one by
+/// name through `{"op":"state","get":…}` and gets a value; the kernel does not
+/// care which plugin asked or why.
 ///
-/// The same value `NGU_EXE` already carried for MCP servers, under this
-/// protocol's own name so a plugin does not have to know which era it was
-/// launched in.
-pub const EXE_VAR: &str = "NGU_EXE";
-
-/// The environment variable carrying every pack's settings, as one JSON object.
+/// This replaced the environment variables `NGU_PID`, `NGU_EXE` and
+/// `NGU_PACK_SETTINGS`. Environment variables worked, and they were the wrong
+/// shape: a value passed at start-up is a snapshot, invisible in the protocol,
+/// and every new one is a new name in the kernel's vocabulary that nobody
+/// reading `describe` would know existed. Asking for it makes the surface
+/// visible: **anything a plugin can know about the kernel is a `state` key**,
+/// and `{"op":"state","list"}` says which ones there are.
+pub const KERNEL_PID: &str = "kernel.pid";
+/// The kernel's executable path.
+pub const KERNEL_EXE: &str = "kernel.exe";
+/// Every pack's settings, as one JSON object: `{"judge":{…},"mcp-proxy":{…}}`.
 ///
-/// `{"judge":{"endpoint":…},"mcp-proxy":{"mode":"proxy"}}` — verbatim, no
-/// interpretation. A plugin reads its own key; one that wants nothing ignores
-/// the variable. Folding this in here is what lets the kernel stop having a
-/// `settings.pack("mcp-proxy")` line: it serializes a map and its involvement
-/// ends.
-pub const SETTINGS_VAR: &str = "NGU_PACK_SETTINGS";
+/// The kernel serialises a map and its involvement ends — no pack name appears
+/// in the kernel because of this key.
+pub const SETTINGS: &str = "settings";
+/// The session's working directory.
+///
+/// A plugin that writes into a workspace needs to know which one; before this
+/// key existed the only way to say so was another environment variable, which is
+/// the shape this replaced.
+pub const WORKSPACE: &str = "workspace";
+/// The session's id.
+pub const SESSION: &str = "session";
 
 /// The largest frame this side will accept.
 ///
@@ -226,6 +234,15 @@ impl Spec {
 pub struct Process {
     id: String,
     description: Description,
+    /// How this process answers when the *plugin* asks the kernel something.
+    ///
+    /// The protocol is symmetric in a way the environment variables were not:
+    /// the kernel may ask a plugin for its state (`state_get`), and a plugin may
+    /// ask the kernel (`{"op":"state","get":…}` in the middle of a `call`). Both
+    /// travel the same pipe, in the same frame format, through the same four
+    /// operations — so the set of things a plugin can learn about the kernel is
+    /// visible in `describe`, not hidden in a start-up environment.
+    state: Option<std::sync::Arc<dyn Fn(&str) -> Option<Value> + Send + Sync>>,
     inner: Mutex<Inner>,
     /// Next request number, for diagnostics only.
     pub requests: AtomicU64,
@@ -255,6 +272,19 @@ impl Process {
     /// One spawn, one `describe`, then the process stays. Every later call is a
     /// frame out and a frame back — measured at 0.25 ms against 45 ms to start.
     pub async fn start(spec: &Spec) -> Result<Self> {
+        Self::start_with_state(spec, None).await
+    }
+
+    /// [`Process::start`] with an answerer for the plugin's own questions.
+    ///
+    /// `state` is called with a key the plugin named — `"settings"`,
+    /// `"workspace"`, anything — and returns what the kernel knows. `None` means
+    /// the plugin gets an error for every key, which is the honest answer for a
+    /// kernel that has not published anything.
+    pub async fn start_with_state(
+        spec: &Spec,
+        state: Option<std::sync::Arc<dyn Fn(&str) -> Option<Value> + Send + Sync>>,
+    ) -> Result<Self> {
         let mut command = Command::new(&spec.command);
         command
             .args(&spec.args)
@@ -267,12 +297,6 @@ impl Process {
             .kill_on_drop(true);
         if let Some(dir) = &spec.cwd {
             command.current_dir(dir);
-        }
-        // The two things a plugin cannot know and needs: which process is the
-        // kernel, and where the kernel's settings live.
-        command.env(PID_VAR, std::process::id().to_string());
-        if let Ok(exe) = std::env::current_exe() {
-            command.env(EXE_VAR, exe.display().to_string());
         }
         for (key, value) in &spec.env {
             command.env(key, value);
@@ -297,6 +321,7 @@ impl Process {
         let mut process = Self {
             id: spec.id.clone(),
             description: Description::default(),
+            state,
             inner: Mutex::new(Inner { child, stdin, stdout }),
             requests: AtomicU64::new(0),
         };
@@ -369,31 +394,76 @@ impl Process {
             .await
             .with_context(|| format!("flushing plugin '{}'", self.id))?;
 
-        let len = inner
-            .stdout
-            .read_u32()
-            .await
-            .with_context(|| format!("plugin '{}' closed its output", self.id))?;
-        let len = len as usize;
-        if len > MAX_FRAME {
-            return Err(anyhow!(
-                "plugin '{}' announced a {len}-byte frame, over the {MAX_FRAME} limit",
-                self.id
-            ));
+        // Read until this request is answered. A frame that carries no `error`
+        // of ours and asks a question of its own (`"ask":{…}`) is the plugin
+        // talking mid-call; it is answered here, on the same pipe, and the loop
+        // goes back to waiting.
+        //
+        // This is what makes the protocol symmetric. A plugin could instead be
+        // handed everything it might need at start-up — which is what the
+        // environment variables did — but then the set of things it can learn is
+        // fixed before it runs and invisible to anyone reading `describe`.
+        loop {
+            let len = read_u32_async(&mut inner.stdout)
+                .await
+                .with_context(|| format!("plugin '{}' closed its output", self.id))?;
+            let len = len as usize;
+            if len > MAX_FRAME {
+                return Err(anyhow!(
+                    "plugin '{}' announced a {len}-byte frame, over the {MAX_FRAME} limit",
+                    self.id
+                ));
+            }
+            let mut buf = vec![0u8; len];
+            inner
+                .stdout
+                .read_exact(&mut buf)
+                .await
+                .with_context(|| format!("plugin '{}' truncated its answer", self.id))?;
+            let value: Value = serde_json::from_slice(&buf).with_context(|| {
+                format!(
+                    "plugin '{}' answered with {} bytes that are not JSON",
+                    self.id, len
+                )
+            })?;
+
+            let asked = match value.get("ask") {
+                Some(ask) => ask,
+                None => return Ok(value),
+            };
+            let (key, id) = match asked.get("state") {
+                Some(key) => (
+                    key.as_str().unwrap_or("").to_string(),
+                    asked.get("id").cloned().unwrap_or(Value::Null),
+                ),
+                // An unknown question. Answered rather than ignored: a plugin
+                // waiting for a frame that never comes is worse than one told
+                // the kernel does not understand it.
+                None => {
+                    let body = serde_json::to_vec(&json!({
+                        "ask": { "id": Value::Null },
+                        "error": format!("unknown question: {asked}"),
+                    }))?;
+                    write_frame_async(&mut inner.stdin, &body).await?;
+                    continue;
+                }
+            };
+            let answer = match &self.state {
+                Some(provider) => match provider(&key) {
+                    Some(value) => json!({ "ask": { "id": id }, "value": value }),
+                    None => json!({
+                        "ask": { "id": id },
+                        "error": format!("the kernel has no state called '{key}'"),
+                    }),
+                },
+                None => json!({
+                    "ask": { "id": id },
+                    "error": "this process was started without a state provider",
+                }),
+            };
+            let body = serde_json::to_vec(&answer)?;
+            write_frame_async(&mut inner.stdin, &body).await?;
         }
-        let mut buf = vec![0u8; len];
-        inner
-            .stdout
-            .read_exact(&mut buf)
-            .await
-            .with_context(|| format!("plugin '{}' truncated its answer", self.id))?;
-        let value: Value = serde_json::from_slice(&buf).with_context(|| {
-            format!(
-                "plugin '{}' answered with {} bytes that are not JSON",
-                self.id, len
-            )
-        })?;
-        Ok(value)
     }
 
     /// Call one of the tools it declared.
@@ -460,11 +530,28 @@ impl Process {
     }
 }
 
+/// Read a big-endian `u32` from an async stream.
+async fn read_u32_async(stream: &mut ChildStdout) -> std::io::Result<u32> {
+    let mut buf = [0u8; 4];
+    stream.read_exact(&mut buf).await?;
+    Ok(u32::from_be_bytes(buf))
+}
+
+/// Write one already-serialised frame.
+async fn write_frame_async(stream: &mut ChildStdin, body: &[u8]) -> Result<()> {
+    let mut header = [0u8; 4];
+    header.copy_from_slice(&(body.len() as u32).to_be_bytes());
+    stream.write_all(&header).await?;
+    stream.write_all(body).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
 /// The pid of the process a plugin should signal to restart the kernel.
 ///
 /// Provided as a function as well as a constant so the value has one definition:
 /// `std::process::id()` is read here and written to the environment there, and a
-/// plugin on the other side reads [`PID_VAR`].
+/// plugin on the other side reads over the protocol (`kernel.pid`).
 pub fn kernel_pid() -> u32 {
     std::process::id()
 }
@@ -472,6 +559,7 @@ pub fn kernel_pid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     /// A plugin in a box, scripted: it answers whatever the test says.
     ///
@@ -534,12 +622,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_kernel_pid_reaches_the_plugin() {
+    async fn the_kernel_pid_is_an_answer_not_an_environment_variable() {
         // What `restart` depends on: a plugin cannot signal a process it cannot
-        // name, and a plugin's own pid is not the kernel's.
-        let process = Process::start(&node(ECHO)).await.expect("start");
-        let value = process.state_get("anything").await.unwrap();
-        assert_eq!(value["pid"], json!(std::process::id().to_string()));
+        // name, and the name has to come from the kernel. It used to arrive in
+        // `NGU_PID`; it is now a `state` key, which is why this asserts the
+        // answer rather than an inherited variable.
+        let provider: Arc<dyn Fn(&str) -> Option<Value> + Send + Sync> =
+            Arc::new(|key: &str| match key {
+                "kernel.pid" => Some(json!(std::process::id())),
+                _ => None,
+            });
+        let process = Process::start_with_state(&node(ASKER), Some(provider))
+            .await
+            .expect("start");
+        let answer = process
+            .call("ask", json!({ "key": "kernel.pid" }))
+            .await
+            .expect("call");
+        assert_eq!(answer.as_u64(), Some(std::process::id() as u64));
         process.stop().await;
     }
 
@@ -578,6 +678,68 @@ mod tests {
         process.stop().await;
     }
 
+    /// A plugin that asks the kernel a question and relays the answer.
+    const ASKER: &str = r#"
+        const read = () => new Promise(r => {
+            let b = Buffer.alloc(0);
+            const on = d => { b = Buffer.concat([b, d]);
+                if (b.length >= 4) { const n = b.readUInt32BE(0);
+                    if (b.length >= 4 + n) { process.stdin.off('data', on);
+                        r(JSON.parse(b.subarray(4, 4 + n).toString())); } } };
+            process.stdin.on('data', on);
+        });
+        const write = o => { const p = Buffer.from(JSON.stringify(o));
+            const h = Buffer.alloc(4); h.writeUInt32BE(p.length);
+            process.stdout.write(Buffer.concat([h, p])); };
+        (async () => {
+            for (;;) {
+                let m; try { m = await read(); } catch { return; }
+                if (m.op === 'describe') { write({ tools: [{ name: 'ask' }] }); continue; }
+                write({ ask: { state: m.args.key } });
+                const reply = await read();
+                write({ result: reply.value ?? reply.error ?? null });
+            }
+        })();
+    "#;
+
+    #[tokio::test]
+    async fn a_plugin_can_ask_the_kernel_a_question_mid_call() {
+        // This is what replaced the environment variables. If the ask path is
+        // broken, `restart` cannot name the process to signal and every plugin
+        // that wants a setting is back to reading a start-up snapshot.
+        let spec = node(ASKER);
+        let provider: Arc<dyn Fn(&str) -> Option<Value> + Send + Sync> =
+            Arc::new(|key: &str| match key {
+                "kernel.pid" => Some(json!(std::process::id())),
+                _ => None,
+            });
+        let process = Process::start_with_state(&spec, Some(provider))
+            .await
+            .expect("start");
+        let answer = process
+            .call("ask", json!({ "key": "kernel.pid" }))
+            .await
+            .expect("call");
+        assert_eq!(answer.as_u64(), Some(std::process::id() as u64));
+        process.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_unknown_state_key_is_named_not_silent() {
+        let spec = node(ASKER);
+        let provider: Arc<dyn Fn(&str) -> Option<Value> + Send + Sync> = Arc::new(|_| None);
+        let process = Process::start_with_state(&spec, Some(provider))
+            .await
+            .expect("start");
+        let answer = process
+            .call("ask", json!({ "key": "not.a.real.key" }))
+            .await
+            .expect("call");
+        let text = answer.as_str().unwrap_or("");
+        assert!(text.contains("no state called"), "{text}");
+        process.stop().await;
+    }
+
     #[tokio::test]
     async fn a_missing_executable_says_what_to_do() {
         let error = Process::start(&Spec::new("gone", "definitely-not-a-real-binary-xyz"))
@@ -606,3 +768,4 @@ mod tests {
         }
     }
 }
+

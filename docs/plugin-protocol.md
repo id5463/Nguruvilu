@@ -45,18 +45,41 @@
 
 **没有任何权限检查。** 插件是用户启动的进程，以用户的身份运行，拥有用户的文件系统、网络、以及给其他进程发信号的能力。内核不沙箱化它，也不假装沙箱化了。
 
-内核只给插件两样它否则拿不到的信息：
+## 插件怎么问内核（没有环境变量）
 
-| 环境变量 | 内容 |
+早期的版本用环境变量（`NGU_PID`、`NGU_PACK_SETTINGS`……）。能工作，但形状不对：
+
+- 启动时给的值是**快照**，之后变了插件不知道
+- 环境变量**不在协议里**，读 `describe` 的人看不到有这回事
+- 每加一个就是内核词汇表里多一个名字
+
+现在全部改成 **`state` 键**。插件在 `call` 中途问，内核在同一条管道上答：
+
+```json
+// 插件 → 内核
+{"ask": {"state": "kernel.pid"}}
+
+// 内核 → 插件
+{"ask": {"id": null}, "value": 12345}
+```
+
+内核的读取循环会认出这是提问，答完继续等它原来那个 `call` 的回复。
+
+### 内核目前提供的键
+
+| 键 | 内容 |
 |---|---|
-| `NGU_PID` | **内核自己的**进程号 |
-| `NGU_EXE` | 内核的可执行文件路径 |
-| `NGU_PACK_SETTINGS` | 所有包的设置，一整张 JSON 表 |
-| `NGU_PROXY` | 代理，如果用户设置了 |
+| `kernel.pid` | 内核自己的进程号 |
+| `kernel.exe` | 内核的可执行文件路径 |
+| `settings` | 所有包的设置，一整张 JSON 表 |
+| `workspace` | 当前会话的工作目录 |
+| `session` | 当前会话 id |
 
-`NGU_PID` 是 `restart` 能工作的原因：插件 `kill(内核pid)` 请求重启，supervisor 拉起来。实测可行——**任何以用户身份运行的进程都能给任何其他进程发信号**。
+**这个列表是内核自己的事实，不是能力目录。** 装第 1000 个插件也不会让它变长。键之外的提问会得到明确的 `"the kernel has no state called '…'"`，不是沉默。
 
-`NGU_PACK_SETTINGS` 的形态：
+`kernel.pid` 是 `restart` 能工作的原因：插件 `kill(内核pid)` 请求重启，supervisor 拉起来。实测可行——**任何以用户身份运行的进程都能给任何其他进程发信号**。
+
+`settings` 的形态：
 
 ```json
 {"judge": {"endpoint": "…", "api_key": "…"}, "mcp-proxy": {"mode": "proxy"}}
@@ -165,6 +188,37 @@ fn write_frame(value: &Value) {
 4. `RUSTUP_HOME` 同理，且只在 `toolchains/` 存在时才设
 
 全链路实测：清空 `CARGO_HOME`、`RUSTUP_HOME`，PATH 里没有 cargo，内核仍能自己找到工具链、编译、加载。
+
+## 协议与语言无关
+
+插件是**任意可执行文件**。`protocol.rs` 的 6 个测试全部用 **Node 一行脚本**做插件，因为"只用 Rust 子进程能跑通的测试测的是错的东西"。
+
+Python、Go、Bash、Node 都能写。下面是一个完整的 Python 插件：
+
+```python
+import json, sys, struct
+
+def read_frame():
+    h = sys.stdin.buffer.read(4)
+    if len(h) < 4: return None
+    n = struct.unpack(">I", h)[0]
+    return json.loads(sys.stdin.buffer.read(n))
+
+def write_frame(o):
+    b = json.dumps(o).encode()
+    sys.stdout.buffer.write(struct.pack(">I", len(b)) + b)
+    sys.stdout.buffer.flush()
+
+while True:
+    msg = read_frame()
+    if msg is None: break
+    if msg["op"] == "describe":
+        write_frame({"tools": [{"name": "hello", "description": "says hi"}]})
+    elif msg["op"] == "call":
+        write_frame({"result": "hi from python"})
+```
+
+`assembly.yaml` 里写 `source: plugin:bin/hello.py`，`command: python` 就能跑。
 
 ## 已迁移的插件
 

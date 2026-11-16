@@ -643,13 +643,7 @@ fn pack_cwd(pack_dir: Option<&std::path::Path>, command: &str, args: &[String]) 
             // means what the pack author meant.
             spec = spec.in_dir(dir.display().to_string());
         }
-        // Every pack's settings, verbatim. The kernel serialises a map and its
-        // involvement ends — see `SETTINGS_VAR`.
-        if let Ok(text) = serde_json::to_string(&self.pack_settings()) {
-            spec.env.insert(crate::protocol::SETTINGS_VAR.to_string(), text);
-        }
-
-        let process = start_process(&spec)
+        let process = start_process_with_state_for(&spec)
             .with_context(|| format!("loading process plugin '{}'", step.id))?;
         let process = Arc::new(process);
 
@@ -882,6 +876,8 @@ fn pack_cwd(pack_dir: Option<&std::path::Path>, command: &str, args: &[String]) 
             .unwrap_or_default()
             .packs
     }
+
+
 
     fn resolve_source(&self, raw: &str) -> PathBuf {
         let candidate = PathBuf::from(raw);
@@ -1449,6 +1445,70 @@ fn toolchain_path() -> Option<std::ffi::OsString> {
         return None;
     }
     Some(std::ffi::OsString::from(parts.join(if cfg!(windows) { ";" } else { ":" })))
+}
+
+fn start_process_with_state_for(spec: &crate::protocol::Spec) -> Result<crate::protocol::Process> {
+    // The provider captures nothing: it reads the settings file and the thread's
+    // workspace at the moment the plugin asks, so a plugin that asks twice sees
+    // a settings save that landed between the two.
+    let provider: std::sync::Arc<dyn Fn(&str) -> Option<serde_json::Value> + Send + Sync> =
+        std::sync::Arc::new(|key: &str| plugin_state_of(key));
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| anyhow!("building a runtime: {error}"))
+                        .and_then(|runtime| {
+                            runtime.block_on(crate::protocol::Process::start_with_state(
+                                spec,
+                                Some(provider),
+                            ))
+                        })
+                })
+                .join()
+                .map_err(|_| anyhow!("the plugin start thread panicked"))?
+        }),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| anyhow!("building a runtime: {error}"))
+            .and_then(|runtime| {
+                runtime.block_on(crate::protocol::Process::start_with_state(
+                    spec,
+                    Some(provider),
+                ))
+            }),
+    }
+}
+
+/// The state keys, answered from module-level state rather than from a loader.
+///
+/// Split out of `Loader::plugin_state` because the provider handed to a process
+/// must not borrow the loader: the process outlives the load call, and a borrow
+/// would tie its lifetime to a stack frame that is gone by the time a plugin
+/// asks.
+fn plugin_state_of(key: &str) -> Option<serde_json::Value> {
+    use crate::protocol::*;
+    match key {
+        KERNEL_PID => Some(serde_json::json!(crate::protocol::kernel_pid())),
+        KERNEL_EXE => std::env::current_exe()
+            .ok()
+            .map(|exe| serde_json::json!(exe.display().to_string())),
+        SETTINGS => serde_json::to_value(
+            crate::settings::Settings::load()
+                .unwrap_or_default()
+                .packs,
+        )
+        .ok(),
+        WORKSPACE => crate::tools::current_workspace()
+            .map(|dir| serde_json::json!(dir.display().to_string())),
+        SESSION => crate::tools::current_session()
+            .map(|id| serde_json::json!(id)),
+        _ => None,
+    }
 }
 
 fn start_process(spec: &crate::protocol::Spec) -> Result<crate::protocol::Process> {

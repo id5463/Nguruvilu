@@ -12,10 +12,10 @@
 //!
 //! # How it reaches the kernel
 //!
-//! It does not need to. The kernel passes its own pid in `NGU_PID`, and
-//! `kill(pid)` is a restart request — measured to work on Windows and Linux. That
-//! is why restarting does not have to be kernel business: any process running as
-//! the user can signal any other.
+//! It does not need to. It asks the kernel for `kernel.pid` over the protocol,
+//! and `kill(pid)` is a restart request — measured to work on Windows and Linux.
+//! That is why restarting does not have to be kernel business: any process
+//! running as the user can signal any other.
 //!
 //! # Why it refuses
 //!
@@ -115,12 +115,14 @@ fn run(args: Value) -> Value {
         Err(why) => return json!({ "result": why }),
     };
 
-    let pid = match std::env::var("NGU_PID").ok().and_then(|v| v.parse::<u32>().ok()) {
-        Some(pid) => pid,
+    // The kernel's pid, asked for over the protocol rather than read from the
+    // environment. Same value, and it is part of the vocabulary `describe`
+    // exposes instead of a start-up name nobody would find.
+    let pid = match ask_state(&json!({ "state": "kernel.pid" })).and_then(|v| v.as_u64()) {
+        Some(pid) => pid as u32,
         None => {
             return json!({
-                "error": "NGU_PID is not set, so this plugin cannot name the kernel to \
-                          restart. The kernel must pass its own pid in NGU_PID."
+                "error": "the kernel did not answer `kernel.pid`, so this plugin cannot \n                          name the process to restart."
             })
         }
     };
@@ -298,6 +300,32 @@ fn signal(pid: u32) {
     let _ = std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string()])
         .status();
+}
+
+/// Ask the kernel for one of its state keys.
+///
+/// This is the protocol's other direction, and it is why nothing is passed in
+/// the environment: a plugin writes `{"ask":{"state":"kernel.pid"}}` and reads
+/// the answer. The kernel is waiting for the reply to the `call` it made, and
+/// handles the question before continuing to wait — see the read loop in
+/// `protocol::Process::request`.
+///
+/// `None` when the kernel answered with an error, which the caller turns into a
+/// message. Silence is not an option: a plugin blocked on a frame that never
+/// comes would hang the tool call.
+fn ask_state(question: &serde_json::Value) -> Option<serde_json::Value> {
+    let body = serde_json::to_vec(&json!({ "ask": question })).ok()?;
+    let mut out = std::io::stdout();
+    let mut header = [0u8; 4];
+    header.copy_from_slice(&(body.len() as u32).to_be_bytes());
+    out.write_all(&header).ok()?;
+    out.write_all(&body).ok()?;
+    out.flush().ok()?;
+
+    let mut stdin = std::io::stdin();
+    let frame = read_frame(&mut stdin)?;
+    let answer: serde_json::Value = serde_json::from_slice(&frame).ok()?;
+    answer.get("value").cloned()
 }
 
 /* ---------------------------------------------------------------- framing */
