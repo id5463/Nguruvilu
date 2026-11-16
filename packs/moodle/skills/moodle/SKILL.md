@@ -13,6 +13,25 @@ description: >-
 - 服务器自动:cookie 有效 → 直接用;过期 → 用凭据重新登录并回写缓存。
 - 若报 `login rejected`:让用户更新 moodle_auth.json 里的密码。
 
+## 怎么调
+
+Moodle 的工具走 MCP 代理，只有一个入口 `call`：
+
+```json
+{"action": "call", "server": "moodle", "tool": "moodle_list_assignments", "args": {}}
+```
+
+**第一步先列目录**，确认工具名和参数：
+
+```json
+{"action": "list", "server": "moodle"}
+```
+
+六个工具：`moodle_status`、`moodle_list_courses`、`moodle_list_assignments`、
+`moodle_get_assignment`、`moodle_download`、`moodle_submit`。
+
+`args` 原样转发，字段名和类型按下面各工具的说明。
+
 ## 工具与推荐用法
 
 1. **moodle_list_assignments** — 主力工具,给"作业又多了没"的答案。
@@ -26,10 +45,31 @@ description: >-
 5. **moodle_status / moodle_list_courses** — 登录态与课程清单。
 
 ## 工作流示例
-- "Moodle 有什么新作业?" → `moodle_list_assignments`(默认 diff)
-- "全面重扫一次" → `moodle_list_assignments {refresh:true, new_only:false}`
-- "看 X 作业并下载资料" → `moodle_get_assignment` → `moodle_download`
-- "把这个文件交上去" → 用户确认后 `moodle_submit {id, files, dry_run:false}`
+
+「Moodle 有什么新作业？」——直接问，默认就是增量 diff，最省上下文：
+
+```json
+{"action":"call","server":"moodle","tool":"moodle_list_assignments","args":{}}
+```
+
+「全面重扫一次」（要 1–3 分钟，值不值得先想一下）：
+
+```json
+{"action":"call","server":"moodle","tool":"moodle_list_assignments","args":{"refresh":true,"new_only":false}}
+```
+
+「看这个作业并下载老师给的资料」：
+
+```json
+{"action":"call","server":"moodle","tool":"moodle_get_assignment","args":{"id":12345}}
+{"action":"call","server":"moodle","tool":"moodle_download","args":{"id":12345}}
+```
+
+「把这个文件交上去」——**先 dry_run**，让主人看到会发生什么，确认后再真交：
+
+```json
+{"action":"call","server":"moodle","tool":"moodle_submit","args":{"id":12345,"files":["/path/to.pdf"],"dry_run":true}}
+```
 
 ## 注意
 - 扫描覆盖 assign/quiz/forum/workshop 四类模块(以前只扫 assign 会漏)。

@@ -1,0 +1,30 @@
+version: 1
+name: mail
+defaults:
+  scope: session
+  on_failure: skip
+# The script is named relative to the pack, and the pack's argv carries no
+# absolute path at all. The version that shipped named
+# `/home/ubuntu/.nguruvilu/packs/mail-1.0.0/scripts/mail_mcp.py` — a path that
+# exists on exactly one machine, and stops existing there the moment the pack
+# version changes. `cwd` is what the kernel fills in for a script that came with
+# its pack, so this works from any install directory on either platform.
+#
+# `python3` on Windows is `python`, and an MCP server that cannot be launched
+# costs a turn every time a model tries the tool. The command is the portable
+# name; a machine without it fails loudly at load, which is the honest outcome.
+stages:
+- name: pack
+  mcp:
+  - id: mail
+    via_proxy: mcp-proxy
+    source: stdio:python scripts/mail_mcp.py
+    scope: session
+    transport: stdio
+    command: python
+    args:
+    - scripts/mail_mcp.py
+  skills:
+  - id: mail-skill
+    source: skills/mail
+    scope: session

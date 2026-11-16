@@ -3754,6 +3754,7 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
             scope: None,
+            via_proxy: None,
             platforms: BTreeMap::new(),
             url: None,
             headers: BTreeMap::new(),
@@ -3831,6 +3832,7 @@ mod tests {
                 args: vec!["mcp".into()],
                 env: BTreeMap::new(),
                 scope: Some("session".into()),
+                via_proxy: None,
                 platforms: BTreeMap::from([(
                     crate::fetch::platform_tag().to_string(),
                     PlatformSource {
@@ -3906,6 +3908,7 @@ mod tests {
                 args: Vec::new(),
                 env: BTreeMap::new(),
                 scope: None,
+                via_proxy: None,
                 platforms: BTreeMap::from([(
                     other.clone(),
                     PlatformSource {

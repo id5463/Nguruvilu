@@ -1,0 +1,35 @@
+{
+  "formatVersion": 1,
+  "game": "nguruvilu",
+  "name": "starter",
+  "description": "起始包（预装）：中文人格与注入、主题外观、网页搜索、子代理、桌面驱动 cua-driver、可改的内置界面",
+  "versionId": "1.0.0",
+  "license": "MIT",
+  "kernelVersion": "0.1.0",
+  "dependencies": {
+    "nguruvilu": ">=0.1.0"
+  },
+  "soul": "soul.md",
+  "injections": "injections.json",
+  "look": "look.json",
+  "search": "search.json",
+  "ui": {
+    "id": "ui",
+    "title": "内置界面(可改的起点)",
+    "entry": "index.html",
+    "base": true
+  },
+  "mcp": "mcp.json",
+  "plugins": [
+    {
+      "id": "delegate",
+      "source": "builtin:delegate",
+      "license": "MIT"
+    },
+    {
+      "id": "search",
+      "source": "builtin:search",
+      "license": "MIT"
+    }
+  ]
+}

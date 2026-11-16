@@ -1,0 +1,16 @@
+version: 1
+name: browser-use
+defaults:
+  scope: session
+  on_failure: skip
+stages:
+- name: pack
+  mcp:
+  - id: chrome-devtools-mcp
+    via_proxy: mcp-proxy
+    source: stdio:chrome-devtools-mcp --headless
+    scope: session
+    transport: stdio
+    command: chrome-devtools-mcp
+    args:
+    - --headless

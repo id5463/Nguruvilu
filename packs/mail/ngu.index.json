@@ -1,0 +1,20 @@
+{
+  "formatVersion": 1,
+  "game": "nguruvilu",
+  "name": "mail",
+  "versionId": "1.1.0",
+  "license": "MIT",
+  "kernelVersion": "0.1.0",
+  "dependencies": {
+    "nguruvilu": ">=0.1.0"
+  },
+  "mcp": "mcp.json",
+  "skills": [
+    {
+      "id": "mail",
+      "source": "skills/mail",
+      "license": "MIT"
+    }
+  ],
+  "description": "邮箱：读发两个真实账号——本人 Yandex（无提供方页脚，给老师发信用这个）与腾讯 Agent Mail（一次性地址收验证码）。技能里写清 call 的用法与选号规则。"
+}

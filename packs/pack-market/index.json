@@ -1,0 +1,149 @@
+{
+  "version": 1,
+  "packs": [
+    {
+      "name": "browser-use",
+      "version": "1.1.0",
+      "description": "浏览器自动化：通过 MCP 代理驱动 chrome-devtools，打开网页、点击、填表、截图、读控制台与网络。技能里写清 call 的用法。",
+      "license": "MIT",
+      "url": "packages/browser-use-1.1.0.ngupack",
+      "sha256": "90e7fc7e350860efa4b1d37f5ffe585f76f3acac45efaf23c4c7dd2c4bd8d101",
+      "size": 5911
+    },
+    {
+      "name": "documents",
+      "version": "1.0.0",
+      "description": "文档读取：documents 插件，读不了的格式会自己装环境再试（PDF/Office 等）",
+      "license": "MIT",
+      "url": "packages/documents-1.0.0.ngupack",
+      "sha256": "9c014d185c3dc21b30e6c38eed6755801615ed5578d0dfb343b1a4b97af0a53e",
+      "size": 1732
+    },
+    {
+      "name": "greatwall-dev",
+      "version": "1.0.0",
+      "description": "长城开发：开发专用包。长程任务（任务实体落盘、只追加日志、可按行检索的记忆、检查点回滚、代理信箱）+ 票板派活（开票、派 worker、发预算、验收）。票、任务、事实全在工作区盘上，零内核改动，随时可卸载。soul 里写明 GitHub 操作用 gh。",
+      "license": "MIT",
+      "url": "packages/greatwall-dev-1.0.0.ngupack",
+      "sha256": "f8a2cd4ef03913890bb7c249d6c4bf5c6569135470377d92c8731aeb69dbffa4",
+      "size": 21064
+    },
+    {
+      "name": "hook-demo",
+      "version": "1.0.0",
+      "description": "挂接点示例：给会话行加徽章，给状态栏加回合计数，不复制界面",
+      "license": "MIT",
+      "url": "packages/hook-demo-1.0.0.ngupack",
+      "sha256": "3067e991a49fce2f753f19b9663a2170991089271fbf853b85190057fc1a08eb",
+      "size": 5247
+    },
+    {
+      "name": "judge",
+      "version": "1.0.0",
+      "description": "决策评审员：用独立模型给结论第二意见（顾问式，只建议不拦截；需配置 endpoint 和 key）",
+      "license": "MIT",
+      "url": "packages/judge-1.0.0.ngupack",
+      "sha256": "79f0cb8acb2249d20fc445938a9779953767c3066183615f44c6b3a79dafbda6",
+      "size": 4274
+    },
+    {
+      "name": "long-horizon",
+      "version": "1.0.0",
+      "description": "长程任务：任务实体(目标/完成判据/下一步)落盘在会话工作区、只追加的日志、可按行检索的记忆(recall)、检查点回滚、代理信箱(横向聊天)。任务在 running 期间回合不结束，做完一步就记账接着做下一步。给超过上下文窗口几百倍、跑上百小时的任务用；界面带任务条。",
+      "license": "MIT",
+      "url": "packages/long-horizon-1.0.0.ngupack",
+      "sha256": "7fc6d43a496b28a9aa4548f976a3256edf079aa42ae01b81e366b80c8127cef9",
+      "size": 5694
+    },
+    {
+      "name": "mail",
+      "version": "1.1.0",
+      "description": "邮箱：读发两个真实账号——本人 Yandex（无提供方页脚，给老师发信用这个）与腾讯 Agent Mail（一次性地址收验证码）。技能里写清 call 的用法与选号规则。",
+      "license": "MIT",
+      "url": "packages/mail-1.1.0.ngupack",
+      "sha256": "028cd18e927a530b4a3d95171d3d9231c539965691b8e4579d5bd9f50ab3dac8",
+      "size": 10103
+    },
+    {
+      "name": "mcp-proxy",
+      "version": "1.0.1",
+      "description": "MCP 代理：把多个 MCP 服务器合成一个 call 工具。填一次目标清单，工具表里只多一条，而不是几十条。支持三模态——full 全部暴露、single 每个服务器一个入口、proxy 全部合并成一个。",
+      "license": "MIT",
+      "url": "packages/mcp-proxy-1.0.1.ngupack",
+      "sha256": "db85b146e4e7f3f1a89b18a3cf0a3e23dd914b6297a971106158f5976b2aa6aa",
+      "size": 15320
+    },
+    {
+      "name": "moodle",
+      "version": "1.0.0",
+      "description": "Moodle 学习平台（moodle.herzen.spb.ru）：采集作业/课程、看详情、下载附件、提交作业（需登录凭据）",
+      "license": "MIT",
+      "url": "packages/moodle-1.0.0.ngupack",
+      "sha256": "0b17bd9ae2936e5c38a434d67849eebe0c9e9aac4e70da819a59ed16af1f0fd0",
+      "size": 14208
+    },
+    {
+      "name": "research",
+      "version": "1.0.0",
+      "description": "深度研究：4 个技能（深度搜索、引用来源、草稿批评、出图发表）+ 研究员人格，做调研和写报告用",
+      "license": "MIT",
+      "url": "packages/research-1.0.0.ngupack",
+      "sha256": "0131480e41af386edf802ecb799a6dcfe26cc3e0594f8db8e7c656ecca96927c",
+      "size": 9886
+    },
+    {
+      "name": "skill-router",
+      "version": "1.0.2",
+      "description": "技能路由：三个检索器（词法 BM25 / 字符 n-gram / JeV 判断）并存可切换，按需挑出相关技能，而不是把全部技能塞进提示词。遵循 Agent Skills 规范（agentskills.io/specification）。",
+      "license": "MIT",
+      "url": "packages/skill-router-1.0.2.ngupack",
+      "sha256": "5c2ab3232b9d40e68509ecf590435c80582d5b64ce535e0fac80777ee10b00c0",
+      "size": 20822
+    },
+    {
+      "name": "starter",
+      "version": "1.0.0",
+      "description": "起始包（预装）：中文人格与注入、主题外观、网页搜索、子代理、桌面驱动 cua-driver、可改的内置界面",
+      "license": "MIT",
+      "url": "packages/starter-1.0.0.ngupack",
+      "sha256": "a4cce42643dbe6b5eeceadd2e4fe2cc97e782fa8a29e656718533006a446c0b0",
+      "size": 54397
+    },
+    {
+      "name": "themes",
+      "version": "1.0.0",
+      "description": "主题外观：一组可切换的界面配色（look.json）",
+      "license": "MIT",
+      "url": "packages/themes-1.0.0.ngupack",
+      "sha256": "0a3548229fb07339a4773fffec246dd81d1364ab860d6e950b2a893218743257",
+      "size": 601
+    },
+    {
+      "name": "ticket",
+      "version": "1.0.0",
+      "description": "长程模式：把这条对话变成主代理——开票、派 worker、发预算、验收结果。票与事实全在工作区盘上，零内核改动，随时可借可卸载",
+      "license": "MIT",
+      "url": "packages/ticket-1.0.0.ngupack",
+      "sha256": "0b17b8f84323b46a65533ea6274027cda21751f1994d02a8b3d7f77eb1f1f913",
+      "size": 15983
+    },
+    {
+      "name": "upload-bar",
+      "version": "1.0.0",
+      "description": "上传进度浮层：挂在输入框上方，不占页面网格，不用改 index.html",
+      "license": "MIT",
+      "url": "packages/upload-bar-1.0.0.ngupack",
+      "sha256": "f923f7de806b2b2a9ed94ec93398aac3c62b2582abbdd46fc6f922c87f556e7f",
+      "size": 6106
+    },
+    {
+      "name": "vk",
+      "version": "1.0.0",
+      "description": "VK（VKontakte）社群：读写帖子的 MCP 工具 + 使用技能（读需服务密钥，写需社群 token）",
+      "license": "MIT",
+      "url": "packages/vk-1.0.0.ngupack",
+      "sha256": "6762200b528024fa64b1e5b89bb977ddc68a9eacea38bf3a0d04758c5dadb04f",
+      "size": 3551
+    }
+  ]
+}

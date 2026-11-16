@@ -1,0 +1,21 @@
+{
+  "formatVersion": 1,
+  "game": "nguruvilu",
+  "name": "browser-use",
+  "description": "浏览器自动化：通过 MCP 代理驱动 chrome-devtools，打开网页、点击、填表、截图、读控制台与网络。技能里写清 call 的用法。",
+  "versionId": "1.1.0",
+  "license": "MIT",
+  "kernelVersion": "0.1.0",
+  "dependencies": {
+    "nguruvilu": ">=0.1.0"
+  },
+  "mcp": "mcp.json",
+  "soul": "soul.md",
+  "skills": [
+    {
+      "id": "browser-use",
+      "source": "./skills/browser-use",
+      "license": "MIT"
+    }
+  ]
+}

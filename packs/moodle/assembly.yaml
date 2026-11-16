@@ -1,0 +1,20 @@
+version: 1
+name: moodle
+defaults:
+  scope: session
+  on_failure: skip
+# `cwd` resolves the script relative to the pack. The absolute path that used to
+# live in mcp.json pinned the server to one install directory, so a version
+# bump — `moodle-1.0.0` becoming `moodle-1.0.1` — left it pointing at a directory
+# that no longer existed.
+stages:
+- name: pack
+  mcp:
+  - id: moodle-herzen
+    via_proxy: mcp-proxy
+    source: stdio:python scripts/moodle_mcp.py
+    scope: session
+    transport: stdio
+    command: python
+    args:
+    - scripts/moodle_mcp.py

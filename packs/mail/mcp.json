@@ -1,0 +1,13 @@
+{
+  "servers": [
+    {
+      "id": "mail",
+      "transport": "stdio",
+      "command": "python",
+      "args": [
+        "scripts/mail_mcp.py"
+      ],
+      "scope": "session"
+    }
+  ]
+}

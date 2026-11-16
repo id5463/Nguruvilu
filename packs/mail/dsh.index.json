@@ -1,0 +1,20 @@
+{
+  "formatVersion": 1,
+  "game": "nguruvilu",
+  "name": "mail",
+  "versionId": "1.0.0",
+  "license": "MIT",
+  "kernelVersion": "0.1.0",
+  "dependencies": {
+    "nguruvilu": ">=0.1.0"
+  },
+  "mcp": "mcp.json",
+  "skills": [
+    {
+      "id": "mail-skill",
+      "source": "skills/mail",
+      "license": "MIT"
+    }
+  ],
+  "description": "两个真实邮箱：yandex（l1u.shen@yandex.com，SMTP 直发无页脚、IMAP 收信搜索）与 Agent Mail（mingzi5876@agent.qq.com，经 agently-cli）。凭据在 ~/.nguruvilu/mail/credentials.json"
+}

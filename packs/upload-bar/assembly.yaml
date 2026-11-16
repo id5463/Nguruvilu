@@ -1,0 +1,10 @@
+version: 1
+name: upload-bar
+defaults:
+  scope: session
+  on_failure: skip
+# 纯界面包：没有 MCP、没有插件，只有 look.json 里的面板和挂接脚本。
+# assembly 仍然要写，否则装进来说"装好了"但什么都不加载——那是最难查的一种失败。
+stages:
+- name: pack
+  plugins: []

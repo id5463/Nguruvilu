@@ -102,7 +102,7 @@ pub struct Defaults {
 }
 
 /// One loadable entry, shared shape across the three kinds.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntryBase {
     /// Identifier, unique within the manifest.
@@ -152,7 +152,7 @@ pub struct PluginEntry {
 }
 
 /// An MCP server entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpEntry {
     /// Shared entry fields.

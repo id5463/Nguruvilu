@@ -1,0 +1,35 @@
+{
+  "formatVersion": 1,
+  "game": "nguruvilu",
+  "name": "research",
+  "description": "深度研究：4 个技能（深度搜索、引用来源、草稿批评、出图发表）+ 研究员人格，做调研和写报告用",
+  "versionId": "1.0.0",
+  "license": "MIT",
+  "kernelVersion": "0.1.0",
+  "dependencies": {
+    "nguruvilu": ">=0.1.0"
+  },
+  "soul": "soul.md",
+  "skills": [
+    {
+      "id": "cite-sources",
+      "source": "./skills/cite-sources",
+      "license": "MIT"
+    },
+    {
+      "id": "draft-critique",
+      "source": "./skills/draft-critique",
+      "license": "MIT"
+    },
+    {
+      "id": "publish-figures",
+      "source": "./skills/publish-figures",
+      "license": "MIT"
+    },
+    {
+      "id": "deep-search",
+      "source": "./skills/deep-search",
+      "license": "MIT"
+    }
+  ]
+}

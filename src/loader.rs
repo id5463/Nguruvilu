@@ -1839,4 +1839,74 @@ stages:
         assert!(catalog.contains("pack-skill"), "{catalog}");
         assert!(kernel.tools().get("skill").is_some());
     }
+
+    /// The line a proxy is given for one declared server.
+    ///
+    /// Two properties, both learned from failures: a pack script carries its
+    /// directory (the proxy starts children elsewhere), and a Windows drive
+    /// letter survives — the single-colon form silently truncated
+    /// `C:\Users\...` to `C`, and every target then reported ENOENT for the node
+    /// executable rather than for the path that was actually wrong.
+    #[test]
+    fn a_proxied_server_carries_its_pack_directory_and_its_drive_letter() {
+        let dir = std::env::temp_dir().join(format!("ngu-proxy-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pack = dir.join("a-pack");
+        std::fs::create_dir_all(pack.join("bin")).unwrap();
+        std::fs::write(pack.join("bin").join("srv.mjs"), "//").unwrap();
+
+        let mut entry = crate::assembly::McpEntry::default();
+        entry.command = Some("node".into());
+        entry.args = vec!["bin/srv.mjs".into()];
+        let step = crate::assembly::PlannedStep {
+            kind: crate::assembly::EntryKind::Mcp,
+            id: "ticket".into(),
+            stage: "pack".into(),
+            scope: crate::assembly::Scope::Session,
+            conflict: crate::assembly::ConflictKind::Error,
+            on_failure: crate::assembly::OnFailure::Skip,
+            load: crate::assembly::LoadMode::Eager,
+            order: 0,
+            source: "stdio:node bin/srv.mjs".into(),
+            config: serde_json::Value::Null,
+            mcp: Some(entry.clone()),
+            sha1: None,
+            requires: None,
+        };
+
+        let line = proxy_target_line(&step, &entry, Some(pack.as_path())).unwrap();
+        assert!(line.starts_with("ticket=cwd="), "{line}");
+        assert!(line.contains("::node bin/srv.mjs"), "{line}");
+        // The drive letter must survive the separator split: `cwd=C:` would be
+        // the old bug in miniature.
+        let cwd_part = line
+            .trim_start_matches("ticket=cwd=")
+            .split("::")
+            .next()
+            .unwrap();
+        assert_eq!(cwd_part, pack.as_path().display().to_string(), "{line}");
+
+        // A server that came from somewhere else keeps no cwd: moving it into
+        // the pack would change where it writes its own state.
+        let mut entry = crate::assembly::McpEntry::default();
+        entry.command = Some("npx".into());
+        entry.args = vec!["-y".into(), "some-server".into()];
+        let step = crate::assembly::PlannedStep {
+            kind: crate::assembly::EntryKind::Mcp,
+            id: "vk".into(),
+            stage: "pack".into(),
+            scope: crate::assembly::Scope::Session,
+            conflict: crate::assembly::ConflictKind::Error,
+            on_failure: crate::assembly::OnFailure::Skip,
+            load: crate::assembly::LoadMode::Eager,
+            order: 0,
+            source: "stdio:npx -y some-server".into(),
+            config: serde_json::Value::Null,
+            mcp: Some(entry.clone()),
+            sha1: None,
+            requires: None,
+        };
+        let line = proxy_target_line(&step, &entry, Some(pack.as_path())).unwrap();
+        assert_eq!(line, "vk=npx -y some-server");
+    }
 }
