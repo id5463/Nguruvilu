@@ -87,3 +87,7 @@ server-seed-profile.py
 .refs/
 
 echo-requests.jsonl
+
+# 插件二进制:各平台不同,由 `cargo build` 从包里的 src/ 生成。装包时内核
+# 会自动编,所以仓库里不该有大体积的 .exe。
+packs/*/bin/ngu-*

@@ -3,15 +3,16 @@ name: greatwall-dev
 defaults:
   scope: session
   on_failure: skip
-# 一个包，两半：票板的 MCP（派活）+ 长程任务的内核插件（任务实体、日志、记忆）。
-# 两半都以 on_failure: skip 装载——一个起不来不该让另一个也不工作，
-# 而失败本身会以 notice 送到界面，不会静默。
+# 一个包，一件事：票板的 MCP，也就是派活的那一半。
+#
+# 长程任务的工具（mission_start / advance / recall …）曾经也在这里，作为
+# `builtin:long-horizon`。它们现在是 `packs/long-horizon` 自己产的二进制，
+# 而一个包引用另一个包的构建产物是不可能的：装完之后两个包是两棵独立的
+# 目录，谁也不知道谁在那儿。所以这里只留票板；要长程任务就再装那个包。
+#
+# on_failure: skip 保留 —— 服务器起不来的时候，工具表里少几个工具是能看见
+# 的，整包装载失败是看不见的。
 stages:
-- name: core
-  plugins:
-  - id: long-horizon
-    source: builtin:long-horizon
-    scope: global
 - name: tools
   mcp:
   - id: ticket
