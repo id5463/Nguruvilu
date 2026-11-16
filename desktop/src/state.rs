@@ -306,7 +306,7 @@ pub struct SharedConfig {
     /// effect on the next turn.
     pub policy: Arc<Mutex<Arc<dyn ContextPolicy>>>,
     /// Extra fragments to place in each request.
-    pub injection: Mutex<Arc<nguruvilu::context::InjectionEngine>>,
+    pub injection: Mutex<Arc<dyn nguruvilu::context::InjectionSource>>,
     /// Working directory of the session the next turn runs in. Changed on
     /// session switch so the model is told where it is, and the tools agree.
     pub cwd: Mutex<Option<String>>,

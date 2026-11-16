@@ -6,7 +6,8 @@ import { createInterface } from 'node:readline';
 import { createHash } from 'node:crypto';
 import { mkdir, writeFile, unlink, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const INDEX_ENV = 'NGU_MARKET_INDEX';
 const NO_INDEX_MSG =
@@ -28,12 +29,19 @@ class ToolError extends Error {}
 
 function indexUrl() {
   const url = process.env[INDEX_ENV];
-  if (!url || !url.trim()) throw new ToolError(NO_INDEX_MSG);
-  return url.trim();
+  return url && url.trim() ? url.trim() : '';
 }
 
 async function loadIndex() {
+  // No index configured: read the copy that ships with this pack.
+  //
+  // This used to refuse. That made the market a package you install and then
+  // cannot use — it carries sixteen archives and an index describing them, and
+  // it would not read its own files because an environment variable was unset.
+  // A working default beats a correct error: the local catalogue is what most
+  // sessions want, and `NGU_MARKET_INDEX` still wins when it is set.
   const url = indexUrl();
+  if (!url) return loadBundledIndex();
   let res;
   try {
     res = await fetch(url, { headers: { accept: 'application/json' } });
@@ -51,6 +59,34 @@ async function loadIndex() {
   }
   if (!data || !Array.isArray(data.packs)) {
     throw new ToolError(`索引格式不对：缺少 packs 数组（${url}）`);
+  }
+  return data.packs;
+}
+
+/// The index and archives this pack ships with.
+///
+/// Read from disk rather than over HTTP: they are inside the package, and a
+/// marketplace that needs a web server to list what it already carries is one
+/// more thing to go wrong before the first search.
+async function loadBundledIndex() {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const path = join(here, '..', 'index.json');
+  let raw;
+  try {
+    raw = await readFile(path, 'utf8');
+  } catch (err) {
+    throw new ToolError(
+      `没有可用的索引：未设置 ${INDEX_ENV}，自带的 ${path} 也读不到（${err.code || err.message}）`
+    );
+  }
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new ToolError(`自带的索引不是合法 JSON：${path}`);
+  }
+  if (!data || !Array.isArray(data.packs)) {
+    throw new ToolError(`自带的索引缺少 packs 数组：${path}`);
   }
   return data.packs;
 }

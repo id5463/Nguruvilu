@@ -2,11 +2,13 @@
   "formatVersion": 1,
   "game": "nguruvilu",
   "name": "pack-market",
-  "description": "包商城：从远程索引浏览、搜索、下载 nguruvilu 包。只下载不安装，装不装由你决定。",
-  "versionId": "1.0.0",
+  "description": "包商城：从远程索引浏览、搜索、下载 nguruvilu 包。自带一份 16 个包的本地索引（store/ 下是归档）。只下载不安装。",
+  "versionId": "1.2.0",
   "license": "MIT",
   "kernelVersion": "0.1.0",
-  "dependencies": { "nguruvilu": ">=0.1.0" },
+  "dependencies": {
+    "nguruvilu": ">=0.1.0"
+  },
   "mcp": "mcp.json",
   "look": "look.json"
 }
