@@ -89,11 +89,18 @@ impl Ledger {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let text = serde_json::to_string_pretty(self)?;
-        let temp = path.with_extension("json.tmp");
+        // 临时名带随机后缀：固定叫 `installed.json.tmp` 时，两个进程同时保存
+        // 会互相删掉对方的临时文件，然后 rename 报 "系统找不到指定的文件"。
+        // 实测踩到：并行跑四个 agent 各自 apply 包，三个死在这一行。
+        let temp = path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4().simple()));
         std::fs::write(&temp, text)
             .with_context(|| format!("writing {}", temp.display()))?;
-        std::fs::rename(&temp, path)
-            .with_context(|| format!("renaming {} into place", temp.display()))?;
+        if let Err(error) = std::fs::rename(&temp, path) {
+            // 失败时留下没人要的临时文件比丢掉错误更糟。
+            let _ = std::fs::remove_file(&temp);
+            return Err(error)
+                .with_context(|| format!("renaming {} into place", temp.display()));
+        }
         Ok(())
     }
 

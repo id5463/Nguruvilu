@@ -92,3 +92,7 @@ echo-requests.jsonl
 # 会自动编,所以仓库里不该有大体积的 .exe。
 packs/*/bin/ngu-*
 .agents/
+
+# 插件构建产物:包携带源码,内核按需编译;二进制不是源码
+packs/*/ngu-*[!.]*
+packs/*/*.exe

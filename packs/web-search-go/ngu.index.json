@@ -1,0 +1,13 @@
+{
+  "formatVersion": 1,
+  "game": "nguruvilu",
+  "name": "web-search-go",
+  "versionId": "1.0.0",
+  "license": "MIT",
+  "kernelVersion": "0.1.0",
+  "dependencies": { "nguruvilu": ">=0.1.0" },
+  "description": "联网搜索（Go 版）：一个 search_web 工具覆盖 Tavily/Brave/Exa。直接暴露，不经过 MCP 代理——原包声明 via_proxy，单独安装时工具不出现。",
+  "plugins": [
+    { "id": "web-search-go", "source": "plugin:ngu-web-search-go", "license": "MIT" }
+  ]
+}

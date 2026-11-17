@@ -1,0 +1,19 @@
+version: 1
+name: web-search-go
+defaults:
+  scope: session
+  on_failure: skip
+# 一个**不同的包**，不是修原包，也不是改内核。
+#
+# 原包 packs/web-search 声明 `via_proxy: mcp-proxy`，意思是交给代理暴露。
+# 但代理只在同一个 assembly 里才启动，所以单独装那个包工具永远不出现 ——
+# 实测 0 个工具且报告 skipped 而不是 failed。
+#
+# 这个包直接暴露自己的工具。它用 Go 写，因为 Go 能在这台机器上直接交叉编译
+# 出 Linux 二进制（`GOOS=linux go build`），不需要额外工具链。
+stages:
+- name: pack
+  plugins:
+  - id: web-search-go
+    source: plugin:ngu-web-search-go
+    scope: global
