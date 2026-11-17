@@ -963,10 +963,6 @@ async fn run() -> Result<()> {
     // 一切皆调用的接线：内核默认实现进路由表，工具表进活对象槽。
     // 这里装一次，之后内核和包走同一条路 —— 否则"暴露"只是对外的假象。
     nguruvilu::kernel_routes::route_everything(&kernel);
-    // `ngu routes` 在这里就能答了：表和工具都装好了。
-    if let Some((call, raw_args)) = pending_routes.take() {
-        return routes_command(call.as_deref(), &raw_args, cli.json);
-    }
     // The judge keeps its settings in the host's cell rather than in the plugin,
     // so a settings save can re-apply the fibers without rebuilding anything.
     // The kernel's own state, published where a pack can reach and change it:
@@ -1101,6 +1097,13 @@ async fn run() -> Result<()> {
             },
             Err(error) => eprintln!("[pack] {}: {error:#}", pack.manifest.name),
         }
+    }
+
+    // `ngu routes` 要等 assembly 和已装包都进内核之后才答，
+    // 否则它看不到包的工具 —— 那正是验证包的时候要看的。
+    nguruvilu::kernel_routes::route_everything(&kernel);
+    if let Some((call, raw_args)) = pending_routes.take() {
+        return routes_command(call.as_deref(), &raw_args, cli.json);
     }
 
     let tools = Arc::new(kernel.tools().clone());
