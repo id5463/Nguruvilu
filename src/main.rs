@@ -1163,6 +1163,13 @@ async fn run() -> Result<()> {
             for entry in &report.loaded {
                 eprintln!("[pack] loaded {entry}");
             }
+            // Reuse is the normal outcome for a capability two packs both
+            // declare — delegate is wanted by the ticket board, the research
+            // pack, and a plain starter install. Saying so is what makes "only
+            // one process is running" visible rather than inferred.
+            for entry in &report.reused {
+                eprintln!("[pack] reused {entry} (already provided by another pack)");
+            }
             for entry in &report.failed {
                 eprintln!("[pack] failed {}:{}: {}", entry.kind, entry.id, entry.error);
             }

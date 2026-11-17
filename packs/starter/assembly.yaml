@@ -6,17 +6,10 @@ defaults:
 stages:
 - name: pack
   plugins:
-  # 子代理。它曾经是 `builtin:delegate`，内核里那段代码已经删掉了（和
-  # `builtin:judge` / `builtin:long-horizon` 一样搬成包），留着那行只会让装载
-  # 报 "not defined in this kernel"。
-  #
-  # 这里用一个**独立的包**，而不是把 delegate 的二进制塞进 starter：它是
-  # 可选的，而 starter 里其他东西是基础的。不装 delegate 也能用 starter，
-  # 只是没有 `delegate` 这个工具。
-  #
-  # 装载器按 `plugin:bin/ngu-delegate` 在**本包目录**里找，所以 starter 需要
-  # 自己带一份。`sync-market.py` 打包时不会跨包复制，因此这里指向本包的
-  # `bin/`；`starter/bin/` 下有没有那份二进制由打包脚本保证。
+  # 子代理。starter 声明它，`packs/delegate` 也声明它 —— 两个包都装时内核会
+  # 认出这是同一个能力（entry id 相同），只起一个进程、只注册一份工具，第二
+  # 次声明报 `reused`。所以这里放一份是安全的，也是必要的：只装 starter 的
+  # 机器也应该有子代理，不该要求它再单独装一个包。
   - id: delegate
     source: plugin:bin/ngu-delegate
     scope: global

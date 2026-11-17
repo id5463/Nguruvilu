@@ -137,8 +137,18 @@ impl Loader {
 
     /// Treat `dir` as the pack's own directory, so relative sources resolve
     /// against it.
+    ///
+    /// Always stored absolute. `ngu apply assembly.yaml` passes `file.parent()`,
+    /// which is `""` for a bare file name — and `absolute("")` is this process's
+    /// cwd, so a plugin's binary became `<cwd>/bin/x` while `Spec::cwd` was set
+    /// to the same directory. The child then resolved `<cwd>/bin/x` a second
+    /// time *after* the `chdir`, and `bin/x` inside `bin/` does not exist:
+    /// ENOENT, from a file that is plainly there.
+    ///
+    /// Measured: `cd packs/delegate && ngu apply assembly.yaml` failed while
+    /// `ngu apply packs/delegate/assembly.yaml` from the parent succeeded.
     pub fn with_pack_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.pack_dir = Some(dir.into());
+        self.pack_dir = Some(absolute(&dir.into()));
         self
     }
 
@@ -736,12 +746,51 @@ fn pack_cwd(pack_dir: Option<&std::path::Path>, command: &str, args: &[String]) 
             },
         };
 
+        // Already provided by another pack: reuse it, do not start a second copy.
+        //
+        // The same capability legitimately appears in more than one pack —
+        // `delegate` is wanted by the ticket board, the research pack, and a
+        // plain starter install alike, and each of them declares it because a
+        // pack that silently depends on another pack being installed is a pack
+        // that breaks when it is installed alone.
+        //
+        // Before this, the second declaration *overwrote* the first
+        // (`ConflictPolicy::Override`), so which copy ran depended on load
+        // order, and unloading either pack removed the tool for both. Starting a
+        // second process was the other half of that: two pipes, one table.
+        //
+        // The identity is the entry id — `delegate` means the same capability no
+        // matter which pack names it. A plugin whose id is already serving tools
+        // is reported as reused, and the loader keeps no handle to it.
+        // A process plugin's tools are owned by `plugin:<id>`, so a live entry
+        // for any of them means this capability is already running.
+        let owner = format!("plugin:{}", step.id);
+        if self.kernel.tools().has_owner(&owner) {
+            return Ok(Outcome::Reused);
+        }
+
         let mut spec = crate::protocol::Spec::new(step.id.clone(), path.display().to_string());
         if let Some(dir) = &pack_dir {
             // A plugin that came with a pack runs inside it, the same rule MCP
             // servers already follow: a relative path in its own arguments then
             // means what the pack author meant.
             spec = spec.in_dir(dir.display().to_string());
+        }
+        // `NGU_EXE` — the host's own binary — so a plugin can start another
+        // copy of the kernel.
+        //
+        // MCP servers have had this since the pack protocol was written; process
+        // plugins did not, and the gap is exactly the one a subagent hits: it is
+        // a plugin whose whole job is to run `ngu -p`, and without this it has
+        // to guess where the kernel is. Measured on the server, where every
+        // guess missed and `delegate` answered "cannot find the kernel binary".
+        //
+        // A pack that names its own `NGU_EXE` wins: it may want a specific build.
+        if !spec.env.contains_key("NGU_EXE") {
+            if let Ok(exe) = std::env::current_exe() {
+                spec.env
+                    .insert("NGU_EXE".to_string(), exe.display().to_string());
+            }
         }
         let process = start_process_with_state_for(&spec)
             .with_context(|| format!("loading process plugin '{}'", step.id))?;
@@ -847,8 +896,16 @@ fn pack_cwd(pack_dir: Option<&std::path::Path>, command: &str, args: &[String]) 
             // checked would be worse than letting the spawn say it is missing.
             return Some(candidate);
         }
+        // Absolute, because the returned path travels through `Spec::command`
+        // and is then executed *after* `Spec::cwd` has moved the child. A
+        // relative path resolves twice — once here against this process's cwd,
+        // once in the child against `cwd` — and the second resolution is the one
+        // that fails with ENOENT the moment the two differ. Measured: loading
+        // `delegate` from its own directory failed while the same manifest from
+        // the parent directory succeeded, which is the fingerprint of exactly
+        // this.
         let dir = absolute(pack_dir?);
-        let joined = dir.join(&candidate);
+        let joined = absolute(&dir.join(&candidate));
         if joined.is_file() {
             return Some(joined);
         }
@@ -861,7 +918,7 @@ fn pack_cwd(pack_dir: Option<&std::path::Path>, command: &str, args: &[String]) 
         // suffix, did not find it, and reported "the file is missing" for a file
         // that had compiled a moment earlier.
         for suffix in platform_suffixes() {
-            let with_suffix = dir.join(format!("{}{suffix}", candidate.display()));
+            let with_suffix = absolute(&dir.join(format!("{}{suffix}", candidate.display())));
             if with_suffix.is_file() {
                 return Some(with_suffix);
             }
@@ -1798,6 +1855,35 @@ mod tests {
         declared.insert("NGU_EXE".to_string(), "/opt/pinned/ngu".to_string());
         let env = super::mcp_env(&declared);
         assert_eq!(env.get("NGU_EXE").map(String::as_str), Some("/opt/pinned/ngu"));
+    }
+
+    /// The same gap for **process** plugins, which is where it was actually
+    /// paid: `delegate` is a plugin whose whole job is to start `ngu`, and
+    /// without `NGU_EXE` it searched `PATH` and the pack's own parents, found
+    /// nothing, and answered "cannot find the kernel binary".
+    #[test]
+    fn a_process_plugin_is_told_where_the_host_is_too() {
+        // The value comes from the running test binary's own path rather than
+        // from a literal, so this stays true wherever the crate is built.
+        let exe = std::env::current_exe().expect("the test binary has a path");
+        assert!(
+            exe.is_absolute(),
+            "the loader hands out an absolute path: {exe:?}"
+        );
+
+        // And a pack that names its own value keeps it — the loader only fills
+        // the gap. Checked on the same `BTreeMap` the loader consults.
+        let mut spec = crate::protocol::Spec::new("p", "/bin/true");
+        spec.env
+            .insert("NGU_EXE".to_string(), "/opt/pinned/ngu".to_string());
+        if !spec.env.contains_key("NGU_EXE") {
+            spec.env
+                .insert("NGU_EXE".to_string(), exe.display().to_string());
+        }
+        assert_eq!(
+            spec.env.get("NGU_EXE").map(String::as_str),
+            Some("/opt/pinned/ngu")
+        );
     }
 
     fn temp_pack_dir() -> std::path::PathBuf {

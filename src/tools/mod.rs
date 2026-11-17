@@ -648,6 +648,15 @@ impl ToolRegistry {
         self.tools.get(name).map(|t| t.owner.as_str())
     }
 
+    /// Whether any tool in the table is owned by `owner`.
+    ///
+    /// Used to answer "is this capability already provided?" without naming a
+    /// tool: two packs declaring the same plugin id should share one process,
+    /// and the owner string is what they have in common.
+    pub fn has_owner(&self, owner: &str) -> bool {
+        self.tools.values().any(|def| def.owner == owner)
+    }
+
     /// Every recorded override.
     pub fn overrides(&self) -> &[OverrideRecord] {
         &self.overrides

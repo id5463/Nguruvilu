@@ -120,6 +120,20 @@ fn tool() -> Value {
                     "description": "Which packs the subtask loads: `none` (base tools only, \
                                     121 ms), or `all` (this machine's packs, 339 ms). Pass `none` \
                                     unless the task needs a tool this conversation has."
+                },
+                "budget": {
+                    "type": "object",
+                    "description": "What this subtask is allowed to spend. Omit for the                                     defaults. A task that reads two files should not share a                                     budget with a refactor.",
+                    "properties": {
+                        "steps": {
+                            "type": "integer",
+                            "description": "Model rounds. Each round is one request."
+                        },
+                        "wall_secs": {
+                            "type": "integer",
+                            "description": "Wall clock before the subtask is killed."
+                        }
+                    }
                 }
             },
             "required": ["task"]
@@ -168,11 +182,36 @@ fn run(args: &Value) -> Result<String, String> {
         .filter(|packs| !packs.is_empty())
         .unwrap_or("all");
 
+    // What this subtask may spend. The argument wins over the environment,
+    // because a caller that named a number meant that number *for this task*: a
+    // query that reads two files and a refactor should not share a budget, and
+    // the caller is the only one that knows which it is dispatching.
+    let budget = args.get("budget");
+    let steps = budget
+        .and_then(|b| b.get("steps"))
+        .and_then(Value::as_u64)
+        .or_else(|| std::env::var("NGU_SUBAGENT_STEPS").ok().and_then(|raw| raw.parse().ok()))
+        .unwrap_or(DEFAULT_STEPS)
+        .max(1);
+    let wall_secs = budget
+        .and_then(|b| b.get("wall_secs"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            std::env::var("NGU_SUBAGENT_MINUTES")
+                .ok()
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .map(|minutes| minutes * 60)
+        })
+        .unwrap_or(DEFAULT_MINUTES * 60)
+        .max(1);
+
     let mut argv: Vec<String> = vec![
         "--bare".into(),
         "--packs".into(),
         packs.into(),
         "--json".into(),
+        "--max-steps".into(),
+        steps.to_string(),
         "-p".into(),
         task.into(),
     ];
@@ -180,12 +219,6 @@ fn run(args: &Value) -> Result<String, String> {
         if !model.trim().is_empty() {
             argv.push("--model".into());
             argv.push(model.trim().into());
-        }
-    }
-    if let Ok(steps) = std::env::var("NGU_SUBAGENT_STEPS") {
-        if !steps.trim().is_empty() {
-            argv.push("--max-steps".into());
-            argv.push(steps.trim().into());
         }
     }
 
@@ -203,13 +236,7 @@ fn run(args: &Value) -> Result<String, String> {
 
     // The wall clock. A subtask that hangs must not hold this call open for
     // ever: the caller cannot tell "slow" from "wedged" and has no way to ask.
-    let deadline = Duration::from_secs(
-        std::env::var("NGU_SUBAGENT_MINUTES")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_MINUTES)
-            * 60,
-    );
+    let deadline = Duration::from_secs(wall_secs);
     let started = Instant::now();
     loop {
         match child.try_wait() {
