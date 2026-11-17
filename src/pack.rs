@@ -705,7 +705,15 @@ pub struct PluginRef {
     /// Identifier.
     pub id: String,
     /// Where it comes from.
+    ///
+    /// `builtin:<name>` is a plugin compiled into this kernel, `plugin:<path>` a
+    /// process the kernel starts, `dylib:<path>` a shared library. The three are
+    /// rendered into the assembly verbatim, so a pack that ships a process
+    /// plugin says so here and nothing has to translate it.
     pub source: String,
+    /// How to build the executable from source shipped in the pack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<crate::assembly::BuildSpec>,
     /// Distribution licence.
     ///
     /// Absent is not an error: this kernel reports what an archive says
@@ -1370,10 +1378,30 @@ fn is_pack_archive_name(name: &str) -> bool {
 pub fn packable_files(dir: &Path, out: &Path) -> Result<PackContents> {
     let _ = out;
     let mut contents = inspect(dir)?;
-    contents
-        .files
-        .retain(|relative| !is_pack_archive_name(relative));
+    contents.files.retain(|relative| {
+        !is_pack_archive_name(relative) && !is_build_output(relative)
+    });
     Ok(contents)
+}
+
+/// Whether a path is a build tool's working directory rather than pack content.
+///
+/// A pack that ships a plugin's source has a `src/target/` beside it after the
+/// first build — hundreds of megabytes of object files that are not part of the
+/// pack and would be re-fetched by nobody. Measured on `packs/documents`, whose
+/// archive was 779 files for three of source.
+///
+/// The names are the conventions of the tools a pack realistically uses, and a
+/// pack that keeps real content under one of them can say so by shipping it
+/// outside — but the default has to be "do not ship a compiler's scratch space",
+/// because nobody notices a 779-file archive going by.
+fn is_build_output(relative: &str) -> bool {
+    relative.split('/').any(|segment| {
+        matches!(
+            segment,
+            "target" | "node_modules" | "__pycache__" | ".git" | "dist" | ".venv"
+        )
+    })
 }
 
 /// Write a zip of the given files.
@@ -2256,6 +2284,8 @@ fn render_assembly(manifest: &PackManifest, staging: &Path) -> Result<String> {
     struct OutPlugin {
         #[serde(flatten)]
         base: OutBase,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        build: Option<crate::assembly::BuildSpec>,
     }
     #[derive(Serialize)]
     struct OutMcp {
@@ -2313,11 +2343,17 @@ fn render_assembly(manifest: &PackManifest, staging: &Path) -> Result<String> {
             //
             // Everything else is fetched at install time and lands in
             // `files/<id>`, so the loader gets a path inside the pack.
+            // A source that names something already in reach is kept as
+            // written: `builtin:delegate` (compiled in), `plugin:bin/x` (a
+            // process the pack built), `dylib:…` (a library inside the pack),
+            // and a path inside the pack. Only an entry that has to be *fetched*
+            // gets rewritten to point at `files/<id>`, because that is where a
+            // fetch puts it.
             let named = matches!(
                 crate::fetch::Source::parse(&plugin.source),
                 Ok(crate::fetch::Source::Builtin { .. })
                     | Ok(crate::fetch::Source::Local { .. })
-            );
+            ) || plugin.source.starts_with("plugin:");
             let source = if named {
                 plugin.source.clone()
             } else {
@@ -2334,6 +2370,12 @@ fn render_assembly(manifest: &PackManifest, staging: &Path) -> Result<String> {
                     source,
                     scope: Some("global".into()),
                 },
+                // The build recipe travels with the entry, otherwise an
+                // installed pack loses the one thing that turns its source into
+                // an executable — and a raw install on a machine without the
+                // binary fails with "the file is missing" for a pack that
+                // carries everything it needs.
+                build: plugin.build.clone(),
             }
         })
         .collect();
@@ -2806,6 +2848,7 @@ mod tests {
             id: "x".into(),
             source: "no-colon-here".into(),
             license: "MIT".into(),
+            build: None,
             sha256: None,
             platforms: BTreeMap::new(),
         });
@@ -2828,6 +2871,7 @@ mod tests {
             id: "x".into(),
             source: "github:o/r@p@v".into(),
             license: "MIT".into(),
+            build: None,
             sha256: None,
             platforms,
         });
@@ -3424,6 +3468,7 @@ mod tests {
             id: "p".into(),
             source: "github:o/r@p@v".into(),
             license: "MIT".into(),
+            build: None,
             sha256: None,
             platforms,
         };
@@ -3489,6 +3534,7 @@ mod tests {
             id: "x".into(),
             source: "github:owner/repo@bin".into(),
             license: "MIT".into(),
+            build: None,
             sha256: None,
             platforms: BTreeMap::new(),
         });
@@ -3521,6 +3567,7 @@ mod tests {
             id: "local".into(),
             source: "dylib:files/x.dll".into(),
             license: "MIT".into(),
+            build: None,
             sha256: None,
             platforms: BTreeMap::new(),
         });
@@ -3597,6 +3644,7 @@ mod tests {
             id: "delegate".into(),
             source: "builtin:delegate".into(),
             license: "MIT".into(),
+            build: None,
             sha256: None,
             platforms: BTreeMap::new(),
         });
@@ -3623,6 +3671,7 @@ mod tests {
             id: "thing".into(),
             source: "github:owner/repo@thing@v1".into(),
             license: "MIT".into(),
+            build: None,
             sha256: None,
             platforms: BTreeMap::new(),
         });

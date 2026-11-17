@@ -12,8 +12,12 @@
   "plugins": [
     {
       "id": "judge",
-      "source": "builtin:judge",
-      "license": "MIT"
+      "source": "plugin:bin/ngu-judge",
+      "license": "MIT",
+      "build": {
+        "dir": "src",
+        "binary": "ngu-judge"
+      }
     }
   ]
-}
+}

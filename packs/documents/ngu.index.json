@@ -9,5 +9,15 @@
   "dependencies": {
     "nguruvilu": ">=0.1.0"
   },
-  "plugins": []
+  "plugins": [
+    {
+      "id": "documents",
+      "source": "plugin:bin/ngu-documents",
+      "license": "MIT",
+      "build": {
+        "dir": "src",
+        "binary": "ngu-documents"
+      }
+    }
+  ]
 }

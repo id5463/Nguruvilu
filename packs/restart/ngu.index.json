@@ -12,8 +12,12 @@
   "plugins": [
     {
       "id": "restart",
-      "source": "builtin:restart",
-      "license": "MIT"
+      "source": "plugin:bin/ngu-restart",
+      "license": "MIT",
+      "build": {
+        "dir": "src",
+        "binary": "ngu-restart"
+      }
     }
   ],
   "skills": [

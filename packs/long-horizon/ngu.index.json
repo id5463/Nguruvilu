@@ -9,7 +9,17 @@
   "dependencies": {
     "nguruvilu": ">=0.1.0"
   },
-  "plugins": [],
+  "plugins": [
+    {
+      "id": "long-horizon",
+      "source": "plugin:bin/ngu-long-horizon",
+      "license": "MIT",
+      "build": {
+        "dir": "src",
+        "binary": "ngu-long-horizon"
+      }
+    }
+  ],
   "skills": [
     {
       "id": "mission-protocol",

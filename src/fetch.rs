@@ -198,6 +198,18 @@ impl Source {
                 path: rest.to_string(),
             });
         }
+        // `plugin:<path>` is a process the pack carries. Local, not remote: the
+        // kernel starts it from the pack directory and there is nothing to
+        // fetch. Parsed as a local source so every "does this need the network"
+        // question answers itself.
+        if let Some(rest) = raw.strip_prefix("plugin:") {
+            if rest.trim().is_empty() {
+                return Err(anyhow!("'{raw}' names no plugin executable"));
+            }
+            return Ok(Source::Local {
+                path: rest.to_string(),
+            });
+        }
         if raw.starts_with("https://") || raw.starts_with("http://") {
             return Ok(Source::Url {
                 url: raw.to_string(),
@@ -313,6 +325,18 @@ impl Source {
         // A custom scheme is assumed to need the network: most do, and a
         // handler that answers from the filesystem can only make a fetch
         // cheaper, never wrong.
+        //
+        // `plugin:` is the exception, and it is not custom in the sense the
+        // others are: it names a process the pack carries and the kernel starts,
+        // so there is nothing to fetch. Left as remote, installing a pack that
+        // ships a plugin failed with "no handler for the 'plugin' scheme" —
+        // measured on `packs/restart`, whose archive installs fine and whose
+        // install step tried to download a file that was already inside it.
+        if let Source::Custom { scheme, .. } = self {
+            if scheme == "plugin" {
+                return false;
+            }
+        }
         !matches!(self, Source::Builtin { .. } | Source::Local { .. })
     }
 
@@ -2395,3 +2419,4 @@ mod tests {
         dir
     }
 }
+
