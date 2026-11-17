@@ -59,6 +59,35 @@ struct Cli {
     #[arg(short, long)]
     prompt: Option<String>,
 
+    /// Which packs to load: `all`, `none`, or a comma-separated list.
+    ///
+    /// A subagent answering one question rarely needs the thirteen MCP servers
+    /// an interactive session has, and each one costs a start. Measured on this
+    /// machine: `none` is 121 ms against 339 ms for `all`.
+    ///
+    /// Deliberately a plain list rather than named modes. "The same packs the
+    /// parent loaded" is a decision the *parent* makes — it knows what it loaded
+    /// and can write the list itself — and putting that word here would mean the
+    /// kernel had to know what a parent is.
+    #[arg(long, env = "NGU_PACKS", default_value = "all")]
+    packs: String,
+
+    /// Start minimal: no persona, no injection rules, no pack content, no
+    /// skills.
+    ///
+    /// For a subagent. A worker that is started to answer one question should
+    /// not inherit the persona, the retrieval rules, or the theme of the
+    /// conversation that started it — those describe a *conversation*, and this
+    /// process is not one. It keeps the base prompt (the four tools and how to
+    /// use them), the tool table, and the model route: without those it could
+    /// not work at all.
+    ///
+    /// Measured against a full start on this machine: what this skips is the
+    /// pack content and skills, which is where most of a session's non-MCP
+    /// start cost lives.
+    #[arg(long, env = "NGU_BARE")]
+    bare: bool,
+
     /// Model id.
     #[arg(short, long, env = "NGU_MODEL")]
     model: Option<String>,
@@ -564,6 +593,8 @@ struct CliConfig {
     /// before the session is resolved: the workspace does not exist until then,
     /// and a resumed session's mission must be named from its very first turn.
     session_workspace: Arc<Mutex<Option<PathBuf>>>,
+    /// Whether this process was started minimal. See [`Cli::bare`].
+    bare: bool,
 }
 
 /// The session's route, published so a plugin can build a subagent on it.
@@ -687,10 +718,18 @@ impl TurnConfig for CliConfig {
             }
         }
 
-        let tool_names = snapshot.tools.names();
-        if let Some(catalog) = self.skills.lock().expect("skills lock").catalog_with_tools(&tool_names, None) {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(&catalog);
+        // A bare start has no skills to advertise. The registry is empty in that
+        // case so `catalog_with_tools` would answer `None` anyway; the check is
+        // here so a future registry that answers `Some("")` cannot leave a stray
+        // blank line in a subagent's prompt.
+        if !self.bare {
+            let tool_names = snapshot.tools.names();
+            if let Some(catalog) = self.skills.lock().expect("skills lock").catalog_with_tools(&tool_names, None) {
+                system_prompt.push_str("
+
+");
+                system_prompt.push_str(&catalog);
+            }
         }
 
         TurnSettings {
@@ -777,9 +816,20 @@ async fn run() -> Result<()> {
     let cache_policy = parse_cache_policy(&cli.cache_policy)?;
 
     // Skills are scanned once up front so every mode sees the same catalog.
-    let mut skills = SkillRegistry::with_roots(SkillRegistry::default_roots());
-    for dir in &cli.skill_dirs {
-        skills.add_root(dir.clone());
+    //
+    // `--bare` starts with no roots at all: a subagent gets its task in the
+    // prompt, and a catalog of skills it was never told to use is prompt weight
+    // that changes its answers for no reason. The scan is skipped rather than
+    // filtered afterwards so the cost goes with it.
+    let mut skills = if cli.bare {
+        SkillRegistry::with_roots(Vec::new())
+    } else {
+        SkillRegistry::with_roots(SkillRegistry::default_roots())
+    };
+    if !cli.bare {
+        for dir in &cli.skill_dirs {
+            skills.add_root(dir.clone());
+        }
     }
     match skills.scan() {
         Ok(report) => {
@@ -971,6 +1021,15 @@ async fn run() -> Result<()> {
     // pay for a feature it may not use.
     let published = nguruvilu::state::Published::install(&mut kernel, settings.clone());
     settings = published.settings();
+    if cli.bare {
+        // A subagent is not the conversation that started it. The persona is
+        // the one prompt input that changes *how* the model talks, and a worker
+        // answering one question has no business speaking in somebody else's
+        // voice. Cleared after `install` so a pack that sets one later is still
+        // overridden — the flag means "this process", not "before packs".
+        *published.persona.write().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            nguruvilu::state::Persona::default();
+    }
     if !skills.is_empty() {
         register_skill_tool(kernel.tools_mut(), Arc::new(skills.clone()))?;
     }
@@ -1030,8 +1089,14 @@ async fn run() -> Result<()> {
             .parent()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
-        if let Ok(manifest) = nguruvilu::pack::read_manifest(&pack_dir) {
-            contents.push(nguruvilu::content::apply(&mut kernel, &pack_dir, &manifest)?);
+        // A bare start skips pack content: persona, themes, look, and the
+        // session defaults a pack overrides. Those describe how a *conversation*
+        // should look; a subagent answering one question has no page to draw and
+        // no defaults worth inheriting.
+        if !cli.bare {
+            if let Ok(manifest) = nguruvilu::pack::read_manifest(&pack_dir) {
+                contents.push(nguruvilu::content::apply(&mut kernel, &pack_dir, &manifest)?);
+            }
         }
     }
 
@@ -1049,10 +1114,29 @@ async fn run() -> Result<()> {
         Ok(_) => {}
         Err(error) => eprintln!("[preinstall] {error:#}"),
     }
+    // `--packs none` (or `no`) means the base tools and nothing else. A list is
+    // matched by manifest name, so a caller names what it wants rather than
+    // which directory happens to hold it.
+    let wanted: Option<Vec<String>> = match cli.packs.trim() {
+        "all" | "" => None,
+        "none" | "no" => Some(Vec::new()),
+        list => Some(
+            list.split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect(),
+        ),
+    };
     for pack in nguruvilu::pack::installed(&nguruvilu::pack::default_packs_dir())? {
         if !pack.enabled {
             eprintln!("[pack] {} is unloaded; files kept", pack.manifest.name);
             continue;
+        }
+        if let Some(list) = &wanted {
+            if !list.iter().any(|name| name == &pack.manifest.name) {
+                continue;
+            }
         }
         // A hand-placed pack carries no assembly and would silently load
         // nothing; render it from the manifest (reported, not fatal — one
@@ -1089,6 +1173,14 @@ async fn run() -> Result<()> {
             }
         }
         match nguruvilu::pack::read_manifest(&pack.path) {
+            Err(error) if cli.bare => {
+                // Nothing to apply, so nothing to report: a bare start does not
+                // read content and a missing manifest is not news to it.
+                let _ = error;
+            }
+            Ok(manifest) if cli.bare => {
+                let _ = manifest;
+            }
             Ok(manifest) => match nguruvilu::content::apply(&mut kernel, &pack.path, &manifest) {
                 Ok(content) => contents.push(content),
                 // Reported rather than fatal: one pack's content must not stop
@@ -1200,14 +1292,10 @@ async fn run() -> Result<()> {
     });
     nguruvilu::model::install(&mut kernel, Arc::clone(&access))?;
 
-    // A pack that asked for `builtin:delegate` was waiting on the route above;
-    // now that it is published the kernel activates it, and the turn's tool
-    // snapshot — taken long before any of this — is taken again so the session
-    // sees whatever just arrived.
+    // A pack may have been waiting on the route above; now that it is published
+    // the kernel activates it, and the turn's tool snapshot — taken long before
+    // any of this — is taken again so the session sees whatever just arrived.
     kernel.refresh()?;
-    if kernel.tools().get(nguruvilu::tools::subagent::TOOL).is_some() {
-        eprintln!("[subagent] delegate loaded by the subagent pack");
-    }
     // A refusal is not an error for this run: the session keeps the table it
     // already had and nothing downstream changes. It is still worth a line,
     // because the only other symptom of a denied swap is that a pack's tools
@@ -1244,6 +1332,7 @@ async fn run() -> Result<()> {
         policy: Arc::clone(&policy),
         injection: Arc::clone(&injection),
         session_workspace: Arc::clone(&session_workspace),
+        bare: cli.bare,
     });
 
     let snapshotter = if cli.git_snapshot {

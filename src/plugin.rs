@@ -1098,7 +1098,18 @@ impl Kernel {
     /// loads — defining is not enabling — and a pack can still replace any of
     /// these tools, because registration is `Override`.
     pub fn define_builtins(&mut self) {
-        crate::tools::subagent::define(self);
+        // Empty on purpose.
+        //
+        // Every capability this binary used to carry — `restart`, `judge`,
+        // `long-horizon`, `delegate` — is a pack now. What is left here are the
+        // four base tools, the job tools, and `pack`, all of which a kernel must
+        // have to be usable at all: without them a first pack cannot be built,
+        // installed, or run.
+        //
+        // Keeping this function rather than deleting it is deliberate: it is the
+        // place a future capability would have to argue its way into, and an
+        // empty function is an easier thing to keep empty than a missing one is
+        // to stay missing.
     }
 
     /// The base tools without a kernel, for a caller that only wants a registry.

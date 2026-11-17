@@ -23,7 +23,6 @@ pub mod pack;
 pub mod readers;
 
 pub mod spill;
-pub mod subagent;
 
 /// What a tool produced.
 ///

@@ -6,8 +6,19 @@ defaults:
 stages:
 - name: pack
   plugins:
+  # 子代理。它曾经是 `builtin:delegate`，内核里那段代码已经删掉了（和
+  # `builtin:judge` / `builtin:long-horizon` 一样搬成包），留着那行只会让装载
+  # 报 "not defined in this kernel"。
+  #
+  # 这里用一个**独立的包**，而不是把 delegate 的二进制塞进 starter：它是
+  # 可选的，而 starter 里其他东西是基础的。不装 delegate 也能用 starter，
+  # 只是没有 `delegate` 这个工具。
+  #
+  # 装载器按 `plugin:bin/ngu-delegate` 在**本包目录**里找，所以 starter 需要
+  # 自己带一份。`sync-market.py` 打包时不会跨包复制，因此这里指向本包的
+  # `bin/`；`starter/bin/` 下有没有那份二进制由打包脚本保证。
   - id: delegate
-    source: builtin:delegate
+    source: plugin:bin/ngu-delegate
     scope: global
   # 联网搜索。它曾经是 `builtin:search` —— 内核里的实现，读 NGU_PROXY 而模型
   # 路由读 settings.proxy，两边不一致，用户看到的只是每次搜索 403。

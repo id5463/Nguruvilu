@@ -1,0 +1,22 @@
+version: 1
+name: delegate
+defaults:
+  scope: session
+  on_failure: skip
+# 子代理。它以前是内核里的 `src/tools/subagent.rs`（962 行，用了 12 种内核
+# 类型），现在是这一个进程。
+#
+# 为什么搬出来：
+#
+#   * `ngu -p` 已经是一个完整的 agent，在内核里再组装一遍是重复
+#   * 进程可以 `--bare --packs none`，0.2 秒起；内嵌版和主代理共享同一套工具
+#   * 换一种子代理就是换一个包，不用改内核 —— 这是内嵌版给不了的
+#
+# 启动它需要的 ngu 二进制从 `NGU_EXE` 找，其次 `PATH`，再次包目录往上几级的
+# `target/release/`。装到别的机器上时设一次 `NGU_EXE` 就行。
+stages:
+- name: pack
+  plugins:
+  - id: delegate
+    source: plugin:bin/ngu-delegate
+    scope: global
