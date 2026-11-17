@@ -4,7 +4,9 @@
       "id": "cua-driver",
       "transport": "stdio",
       "command": "cua-driver",
-      "args": ["mcp"],
+      "args": [
+        "mcp"
+      ],
       "scope": "session",
       "platforms": {
         "win-x64": {
@@ -38,6 +40,15 @@
           "command": "cua-driver-rs-0.28.0-darwin-arm64/cua-driver"
         }
       }
+    },
+    {
+      "id": "web-search",
+      "transport": "stdio",
+      "command": "python",
+      "args": [
+        "bin/web_search.py"
+      ],
+      "scope": "session"
     }
   ]
-}
+}

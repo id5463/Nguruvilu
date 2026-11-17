@@ -9,3 +9,21 @@ stages:
   - id: delegate
     source: builtin:delegate
     scope: global
+  # 联网搜索。它曾经是 `builtin:search` —— 内核里的实现，读 NGU_PROXY 而模型
+  # 路由读 settings.proxy，两边不一致，用户看到的只是每次搜索 403。
+  #
+  # 那份实现被搬成 `packs/web-search`（Python MCP，由包自己管方言和代理顺
+  # 序），而这行留在了这里：我删掉了失效的 `builtin:search`，却没有把新的
+  # 补上，于是 starter 装完之后没有搜索。主人问"联网搜索可用吗"，答案是
+  # 没有 —— 因为起始包从来没装过它。
+  #
+  # `path` 指向同仓库的兄弟包；装 starter 时若那个包不在，这一条按
+  # on_failure: skip 跳过并如实报告，而不是静默。
+  mcp:
+  - id: web-search
+    source: stdio:python bin/web_search.py
+    scope: session
+    transport: stdio
+    command: python
+    args:
+    - bin/web_search.py

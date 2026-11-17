@@ -25,5 +25,12 @@
       "source": "builtin:delegate",
       "license": "MIT"
     }
+  ],
+  "skills": [
+    {
+      "id": "web-search",
+      "source": "skills/web-search",
+      "license": "MIT"
+    }
   ]
-}
+}

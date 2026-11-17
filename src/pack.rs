@@ -2347,11 +2347,30 @@ fn render_assembly(manifest: &PackManifest, staging: &Path) -> Result<String> {
     // `packs/web-search`, where the rendered assembly could not be applied at
     // all: the first time the pack was installed from an archive rather than run
     // from its source directory.
+    // Every id already spoken for in this assembly, before the skills are
+    // rendered. MCP server ids are read from `mcp.json` rather than assumed:
+    // the file is the authority on what they are called, and a set built from
+    // anything else would not notice a collision with one of them.
+    let mcp_ids: Vec<String> = match manifest.mcp.as_ref() {
+        Some(file) => {
+            let path = staging.join(file.path());
+            match std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<McpFile>(&text).ok())
+            {
+                Some(parsed) => parsed.servers.into_iter().map(|s| s.id).collect(),
+                // Unreadable here is reported by the MCP branch below, with the
+                // path in the message; this pass just has nothing to reserve.
+                None => Vec::new(),
+            }
+        }
+        None => Vec::new(),
+    };
     let mut taken: std::collections::BTreeSet<String> = manifest
         .plugins
         .iter()
         .map(|plugin| plugin.id.clone())
-        .chain(manifest.mcp.as_ref().map(|_| "mcp".to_string()))
+        .chain(mcp_ids.iter().cloned())
         .collect();
     let skills: Vec<OutSkill> = manifest
         .skills
