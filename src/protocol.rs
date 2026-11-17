@@ -45,7 +45,16 @@
 //! {"op":"call","tool":"x","args":{…}}                → {"result":…} | {"error":…}
 //! {"op":"state","get":"settings"}                    → {"value":…}
 //! {"op":"state","set":"judge","value":{…}}           → {"ok":true}
+//! {"op":"register","id":"p1","name":"some.route"}    → {"result":true}
+//! {"op":"next","id":"p1","layer":1,"args":{…}}       → {"result":…} | {"error":…}
 //! ```
+//!
+//! `register` and `next` are the two that make the pipe bidirectional in the
+//! sense that matters: `call` is the kernel calling a plugin, and `register` is
+//! a plugin putting itself in front of a name the kernel will call. `next` is
+//! the same road back — the plugin deciding the call is not its and handing it
+//! to the layer below, which is the `next(1, args)` of the route design arriving
+//! over a pipe instead of a closure.
 //!
 //! `state` is the operation that makes a plugin a peer of the kernel rather than
 //! a supply of tools: `"settings"` is a **runtime string**, looked up in the same
@@ -112,6 +121,168 @@ pub const SETTINGS: &str = "settings";
 pub const WORKSPACE: &str = "workspace";
 /// The session's id.
 pub const SESSION: &str = "session";
+
+/// What the protocol needs a router to do — and the whole of what it needs.
+///
+/// Two operations ask the router a question: `register` (a plugin wants its
+/// implementation in front of a name) and `next` (a plugin has decided the work
+/// is not its and wants the layer below to have it). Neither question is
+/// answerable here: this module knows frames, not routes. So the questions are
+/// handed to whoever implements this trait, and the protocol layer stays a
+/// codec.
+///
+/// The signatures are phrased in **plugin id and route name** only. No
+/// capability name appears in this file, there is no list of names a plugin may
+/// claim, and nothing here changes when the thousandth route is registered —
+/// the same rule the `state` keys follow.
+///
+/// The two methods are shaped differently on purpose:
+///
+/// - [`RouteHost::register`] is synchronous because putting a handler at the
+///   head of a chain is a table write. Making it a future would invite a router
+///   to do slow work (a spawn, a network call) while a plugin's frame waits.
+/// - [`RouteHost::next`] is not, because running the layer below *is* the work.
+pub trait RouteHost: Send + Sync {
+    /// The plugin `plugin` wants to be consulted for `name`. Returns whether it
+    /// was accepted.
+    ///
+    /// `plugin` is the id the **kernel** chose for the process, not the `id` a
+    /// plugin writes into its own frame: a plugin cannot be believed about who
+    /// it is, and the ownership recorded in the chain has to be the real one.
+    fn register(&self, plugin: &str, name: &str) -> bool;
+
+    /// The plugin `plugin` asks for the result of layer `layer` of `name` —
+    /// the `next(1, args)` of the route design, arriving over a pipe.
+    fn next(
+        &self,
+        plugin: &str,
+        name: &str,
+        layer: usize,
+        args: Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send>>;
+}
+
+/// What a plugin is told when it sends `register` or `next` to a process that
+/// was started without a router.
+///
+/// A constant so the test and the branch cannot drift, and so the sentence a
+/// plugin sees is one sentence rather than a paraphrase in three places.
+pub const NO_HOST: &str = "no route host installed";
+
+/// A plugin claiming a name.
+///
+/// Wire shape: `{"op":"register","id":"p1","name":"some.route"}`. `id` is the
+/// plugin's own name for itself, for diagnostics and log lines; the kernel does
+/// not trust it to say which process it is (see [`RouteHost::register`]).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Register {
+    /// Operation tag; always `"register"`.
+    #[serde(default)]
+    pub op: String,
+    /// The plugin's own name for itself.
+    #[serde(default)]
+    pub id: String,
+    /// The name it wants to be consulted for.
+    pub name: String,
+}
+
+impl Register {
+    /// One frame, from a plugin id and a route name.
+    pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            op: "register".to_string(),
+            id: id.into(),
+            name: name.into(),
+        }
+    }
+
+    /// Parse an already-decoded frame, or say why it is not one.
+    pub fn from_value(value: &Value) -> Result<Self> {
+        let this: Self = serde_json::from_value(value.clone())
+            .with_context(|| format!("not a register frame: {value}"))?;
+        this.validate()?;
+        Ok(this)
+    }
+
+    /// The parts serde cannot express.
+    ///
+    /// Checked here rather than by a serde attribute because the error has to be
+    /// readable: a plugin sending `{"op":"register"}` with no name needs to be
+    /// told the name is missing, not handed a `missing field` from four layers
+    /// down.
+    pub fn validate(&self) -> Result<()> {
+        if self.op != "register" {
+            return Err(anyhow!("expected op 'register', got '{}'", self.op));
+        }
+        if self.name.trim().is_empty() {
+            return Err(anyhow!("a register frame needs a 'name'"));
+        }
+        Ok(())
+    }
+}
+
+/// A plugin handing the work back to the layer below.
+///
+/// Wire shape: `{"op":"next","id":"p1","layer":1,"args":{…}}`. `name` is
+/// optional: a plugin called for `some.route` that sends `next` without a name
+/// means the name it was called for, which is the only name it could sensibly
+/// mean. `layer` defaults to 0 — no layer named means "from the top", which is
+/// what a plugin that was not told its depth would guess anyway.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Next {
+    /// Operation tag; always `"next"`.
+    #[serde(default)]
+    pub op: String,
+    /// The plugin's own name for itself.
+    #[serde(default)]
+    pub id: String,
+    /// The route; absent means "the one I was called for".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Which layer to run.
+    #[serde(default)]
+    pub layer: usize,
+    /// Arguments for the layer below.
+    #[serde(default)]
+    pub args: Value,
+}
+
+impl Next {
+    /// One frame, from a plugin id, an optional route name, a layer and args.
+    pub fn new(id: impl Into<String>, name: Option<String>, layer: usize, args: Value) -> Self {
+        Self {
+            op: "next".to_string(),
+            id: id.into(),
+            name,
+            layer,
+            args,
+        }
+    }
+
+    /// Parse an already-decoded frame, or say why it is not one.
+    pub fn from_value(value: &Value) -> Result<Self> {
+        let this: Self = serde_json::from_value(value.clone())
+            .with_context(|| format!("not a next frame: {value}"))?;
+        this.validate()?;
+        Ok(this)
+    }
+
+    /// The parts serde cannot express.
+    pub fn validate(&self) -> Result<()> {
+        if self.op != "next" {
+            return Err(anyhow!("expected op 'next', got '{}'", self.op));
+        }
+        Ok(())
+    }
+
+    /// The route this frame is about, given the route the plugin was called for.
+    pub fn route<'a>(&'a self, called_for: &'a str) -> &'a str {
+        match &self.name {
+            Some(name) if !name.trim().is_empty() => name.as_str(),
+            _ => called_for,
+        }
+    }
+}
 
 /// The largest frame this side will accept.
 ///
@@ -264,6 +435,18 @@ pub struct Process {
     /// operations — so the set of things a plugin can learn about the kernel is
     /// visible in `describe`, not hidden in a start-up environment.
     state: Option<std::sync::Arc<dyn Fn(&str) -> Option<Value> + Send + Sync>>,
+    /// Who answers the plugin's `register` and `next` frames.
+    ///
+    /// Separate from `state` rather than folded into it: `state` *answers*
+    /// questions about the kernel (*what pid are you*, *what is the workspace*),
+    /// while a route host *does something to* the kernel — it edits a table. One
+    /// closure could do both, and would then be a read-only-looking seam that
+    /// writes.
+    ///
+    /// `None` means the process was started by something with no router. That is
+    /// not an error at start-up — most plugins never register anything — and it
+    /// becomes a reported error the moment one tries.
+    routes: Option<std::sync::Arc<dyn RouteHost>>,
     inner: Mutex<Inner>,
     /// Next request number, for diagnostics only.
     pub requests: AtomicU64,
@@ -273,6 +456,14 @@ struct Inner {
     child: Child,
     stdin: ChildStdin,
     stdout: ChildStdout,
+    /// The route currently being called, so a `next` frame that omits `name`
+    /// can mean "the one I was called for".
+    ///
+    /// Kept here rather than threaded through `request` because the `next` frame
+    /// arrives *inside* the loop that is reading the answer to a `call` — the
+    /// name is out of scope there unless it was written down when the `call`
+    /// went out.
+    route: Option<String>,
 }
 
 impl std::fmt::Debug for Process {
@@ -305,6 +496,20 @@ impl Process {
     pub async fn start_with_state(
         spec: &Spec,
         state: Option<std::sync::Arc<dyn Fn(&str) -> Option<Value> + Send + Sync>>,
+    ) -> Result<Self> {
+        Self::start_full(spec, state, None).await
+    }
+
+    /// [`Process::start_with_state`] plus a router to answer `register`/`next`.
+    ///
+    /// Three entry points rather than one taking an options struct: the two seams
+    /// are independent — a plugin may ask about the kernel without ever
+    /// registering a route — and a plugin that does register with no router
+    /// installed has to be told so by name instead of silently losing its claim.
+    pub async fn start_full(
+        spec: &Spec,
+        state: Option<std::sync::Arc<dyn Fn(&str) -> Option<Value> + Send + Sync>>,
+        routes: Option<std::sync::Arc<dyn RouteHost>>,
     ) -> Result<Self> {
         let mut command = Command::new(&spec.command);
         command
@@ -343,7 +548,13 @@ impl Process {
             id: spec.id.clone(),
             description: Description::default(),
             state,
-            inner: Mutex::new(Inner { child, stdin, stdout }),
+            routes,
+            inner: Mutex::new(Inner {
+                child,
+                stdin,
+                stdout,
+                route: None,
+            }),
             requests: AtomicU64::new(0),
         };
 
@@ -392,6 +603,18 @@ impl Process {
             ));
         }
         let mut inner = self.inner.lock().await;
+        // Which route this exchange is about, for as long as it lasts. A `next`
+        // frame that omits `name` means "the one I was called for", and this is
+        // the only place that knows it.
+        inner.route = if message.get("op").and_then(Value::as_str) == Some("call") {
+            message
+                .get("name")
+                .or_else(|| message.get("tool"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        } else {
+            None
+        };
 
         // Length prefix, big endian, then the payload. One `write_all` for the
         // header and one for the body rather than concatenating: the header is
@@ -447,6 +670,28 @@ impl Process {
                     self.id, len
                 )
             })?;
+
+            // The two directions that are not questions: a plugin putting
+            // itself in front of a name (`register`), and a plugin handing the
+            // call down to the layer below (`next`).
+            //
+            // Handled *before* the `ask` match, and that order is the whole
+            // point: these frames carry no `ask` key, so falling through the
+            // match would return them to the caller as the answer to whatever
+            // request was in flight. A kernel that called `some.route` would
+            // then get `{"op":"register",…}` back as its result and be none the
+            // wiser. Answering them here and looping keeps them out of the
+            // result path entirely.
+            if let Some(op) = value.get("op").and_then(Value::as_str) {
+                if op == "register" || op == "next" {
+                    let called_for = inner.route.clone();
+                    let body = self
+                        .answer_route(op, &value, called_for.as_deref())
+                        .await?;
+                    write_frame_async(&mut inner.stdin, &body).await?;
+                    continue;
+                }
+            }
 
             let asked = match value.get("ask") {
                 Some(ask) => ask,
@@ -515,15 +760,26 @@ impl Process {
         let answer = self
             .request(json!({ "op": "call", "tool": tool, "args": args }))
             .await?;
-        if let Some(error) = answer.get("error") {
-            let message = error
-                .as_str()
-                .map(str::to_string)
-                .or_else(|| error.get("message").and_then(|m| m.as_str()).map(str::to_string))
-                .unwrap_or_else(|| error.to_string());
-            return Err(anyhow!("{}", message));
-        }
-        Ok(answer.get("result").cloned().unwrap_or(Value::Null))
+        error_or_result(answer)
+    }
+
+    /// Call the plugin **by route name**: `{"op":"call","id":…,"name":…}`.
+    ///
+    /// Separate from [`Process::call`], which speaks `"tool"`, because the two
+    /// are actually different questions and only one of them is a route. A tool
+    /// is a thing the kernel offers the model under a name the plugin declared;
+    /// a route is a slot in a chain the plugin has put itself in front of, and
+    /// the name in a route call is the one from `{"op":"register"}`, not
+    /// necessarily any tool the plugin declared.
+    ///
+    /// Overloading `call` to send `"name"` instead of `"tool"` would have been
+    /// one line and would have silently broken every plugin written against
+    /// `m.tool` — that is, all of them, including the ones in this file's tests.
+    pub async fn call_route(&self, name: &str, args: Value) -> Result<Value> {
+        let answer = self
+            .request(json!({ "op": "call", "id": self.id, "name": name, "args": args }))
+            .await?;
+        error_or_result(answer)
     }
 
     /// Ask a plugin to convert a file, from a blocking caller.
@@ -615,6 +871,89 @@ impl Process {
         Ok(())
     }
 
+    /// Answer one `register` or `next` frame from the plugin.
+    ///
+    /// The two ops are answered here rather than at the call site because both
+    /// need the same three things — who this process is, what route is live, and
+    /// the router — and splitting them would duplicate the "no host" branch.
+    ///
+    /// Neither failure is a transport error. A plugin that names no route, or a
+    /// kernel with no router, gets `{"error":…}` back on the same pipe and the
+    /// exchange continues: the plugin can log it and answer the original `call`
+    /// anyway, which is better than a frame that kills the process.
+    async fn answer_route(
+        &self,
+        op: &str,
+        value: &Value,
+        called_for: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        let host = match &self.routes {
+            Some(host) => host,
+            // Named, not silent. A plugin that registered a route and got
+            // `{"result":false}` would believe the router refused it; the truth
+            // is that there was never a router to ask.
+            None => {
+                return Ok(serde_json::to_vec(&json!({
+                    "op": op,
+                    "error": NO_HOST,
+                }))?)
+            }
+        };
+
+        if op == "register" {
+            let frame = match Register::from_value(value) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    return Ok(serde_json::to_vec(&json!({
+                        "op": "register",
+                        "error": format!("{error:#}"),
+                    }))?)
+                }
+            };
+            // `self.id`, never `frame.id`: the id inside the frame is the
+            // plugin's claim about itself, and the chain has to record the
+            // process the kernel actually started.
+            let accepted = host.register(&self.id, &frame.name);
+            return Ok(serde_json::to_vec(&json!({
+                "op": "register",
+                "name": frame.name,
+                "result": accepted,
+            }))?);
+        }
+
+        let frame = match Next::from_value(value) {
+            Ok(frame) => frame,
+            Err(error) => {
+                return Ok(serde_json::to_vec(&json!({
+                    "op": "next",
+                    "error": format!("{error:#}"),
+                }))?)
+            }
+        };
+        // Owned, not borrowed: the name outlives `frame` below, where `args` is
+        // moved into the router.
+        let name = frame.route(called_for.unwrap_or("")).to_string();
+        if name.is_empty() {
+            return Ok(serde_json::to_vec(&json!({
+                "op": "next",
+                "error": "a next frame needs a 'name' unless it is sent during a call",
+            }))?);
+        }
+        let answer = host.next(&self.id, &name, frame.layer, frame.args).await;
+        Ok(match answer {
+            Ok(result) => serde_json::to_vec(&json!({
+                "op": "next",
+                "name": name,
+                "result": result,
+            }))?,
+            Err(error) => serde_json::to_vec(&json!({
+                "op": "next",
+                "name": name,
+                "error": error,
+            }))?,
+        })
+    }
+
     /// Ask the plugin to exit, then make sure it did.
     ///
     /// Closing stdin is the ordinary way: a plugin reading frames sees end of
@@ -635,6 +974,26 @@ impl Process {
             }
         }
     }
+}
+
+/// Turn one answered frame into a `Result`: `{"error":…}` becomes an error,
+/// anything else yields `result` (or null when the frame has none).
+///
+/// A free function because `call` and `call_route` differ only in what they
+/// send, and two copies of this would be two places for the error shape to
+/// drift — the shape a plugin actually writes, which is occasionally
+/// `{"error":{"message":…}}` rather than a string.
+#[doc(hidden)]
+pub fn error_or_result(answer: Value) -> Result<Value> {
+    if let Some(error) = answer.get("error") {
+        let message = error
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| error.get("message").and_then(|m| m.as_str()).map(str::to_string))
+            .unwrap_or_else(|| error.to_string());
+        return Err(anyhow!("{}", message));
+    }
+    Ok(answer.get("result").cloned().unwrap_or(Value::Null))
 }
 
 /// Read a big-endian `u32` from an async stream.
@@ -845,6 +1204,188 @@ mod tests {
         let text = answer.as_str().unwrap_or("");
         assert!(text.contains("no state called"), "{text}");
         process.stop().await;
+    }
+
+    /// A router that records what the protocol asked it, so a test can check
+    /// that the frame reached the seam rather than that some plausible value
+    /// came back.
+    struct Recorder {
+        registered: std::sync::Mutex<Vec<(String, String)>>,
+        asked: std::sync::Mutex<Vec<(String, String, usize, Value)>>,
+    }
+
+    impl Recorder {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                registered: std::sync::Mutex::new(Vec::new()),
+                asked: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl RouteHost for Recorder {
+        fn register(&self, plugin: &str, name: &str) -> bool {
+            self.registered
+                .lock()
+                .unwrap()
+                .push((plugin.to_string(), name.to_string()));
+            true
+        }
+
+        fn next(
+            &self,
+            plugin: &str,
+            name: &str,
+            layer: usize,
+            args: Value,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send>>
+        {
+            self.asked.lock().unwrap().push((
+                plugin.to_string(),
+                name.to_string(),
+                layer,
+                args.clone(),
+            ));
+            let plugin = plugin.to_string();
+            let name = name.to_string();
+            Box::pin(async move { Ok(json!({ "from": plugin, "route": name, "args": args })) })
+        }
+    }
+
+    /// A plugin that registers once and then calls `next` once, reporting both
+    /// answers as the result of its `call`.
+    const CLAIMER: &str = r#"
+        const read = () => new Promise(r => {
+            let b = Buffer.alloc(0);
+            const on = d => { b = Buffer.concat([b, d]);
+                if (b.length >= 4) { const n = b.readUInt32BE(0);
+                    if (b.length >= 4 + n) { process.stdin.off('data', on);
+                        r(JSON.parse(b.subarray(4, 4 + n).toString())); } } };
+            process.stdin.on('data', on);
+        });
+        const write = o => { const p = Buffer.from(JSON.stringify(o));
+            const h = Buffer.alloc(4); h.writeUInt32BE(p.length);
+            process.stdout.write(Buffer.concat([h, p])); };
+        (async () => {
+            for (;;) {
+                let m; try { m = await read(); } catch { return; }
+                if (m.op === 'describe') { write({ tools: [{ name: 'claim' }] }); continue; }
+                if (m.op === 'call') {
+                    const seen = {};
+                    write({ op: 'register', id: 'liar', name: 'some.route' });
+                    seen.registered = await read();
+                    write({ op: 'next', id: 'liar', layer: 1, args: { kept: true } });
+                    seen.nexted = await read();
+                    write({ result: seen });
+                    continue;
+                }
+            }
+        })();
+    "#;
+
+    #[tokio::test]
+    async fn a_register_frame_reaches_the_route_host() {
+        // The protocol does not know what a route is; the host does. So the
+        // assertion is on what the host *received*: a reply of `true` only
+        // proves the frame parsed, and the recorded pair proves it reached the
+        // seam with the right name and the kernel's own plugin id.
+        let recorder = Recorder::new();
+        let process = Process::start_full(&node(CLAIMER), None, Some(recorder.clone()))
+            .await
+            .expect("start");
+        let answer = process
+            .call_route("some.route", json!({}))
+            .await
+            .expect("call");
+
+        assert_eq!(answer["registered"]["op"], json!("register"));
+        assert_eq!(answer["registered"]["result"], json!(true));
+
+        let registered = recorder.registered.lock().unwrap().clone();
+        assert_eq!(registered.len(), 1, "{registered:?}");
+        assert_eq!(registered[0].1, "some.route");
+        // The frame said `liar`; the host must have been told the process id
+        // instead, because a plugin cannot be believed about who it is.
+        assert_eq!(
+            registered[0].0, "test",
+            "the frame's own id must not be trusted"
+        );
+        process.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_next_frame_runs_the_layer_below_and_that_is_the_result() {
+        let recorder = Recorder::new();
+        let process = Process::start_full(&node(CLAIMER), None, Some(recorder.clone()))
+            .await
+            .expect("start");
+        // Called by *route*, which is what a router does after a register: the
+        // name in the frame is the one the plugin claimed, not a tool it
+        // declared.
+        let answer = process
+            .call_route("some.route", json!({}))
+            .await
+            .expect("call");
+
+        // The frame omitted the route name, so it has to have been filled in
+        // from the call in flight — the case a plugin will actually hit, and the
+        // case with no other source of truth.
+        assert_eq!(answer["nexted"]["name"], json!("some.route"));
+        assert_eq!(answer["nexted"]["result"]["route"], json!("some.route"));
+        assert_eq!(answer["nexted"]["result"]["args"]["kept"], json!(true));
+
+        let asked = recorder.asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert_eq!(asked[0].0, "test");
+        assert_eq!(asked[0].1, "some.route");
+        assert_eq!(asked[0].2, 1, "the layer the plugin named");
+        assert_eq!(asked[0].3["kept"], json!(true));
+        process.stop().await;
+    }
+
+    #[tokio::test]
+    async fn register_without_a_host_is_named_not_silently_refused() {
+        // A `{"result":false}` here would read as "the router declined", which is
+        // a different claim from "there is no router". The difference matters to
+        // a plugin deciding whether to answer the call itself.
+        let bare = Process::start(&node(CLAIMER)).await.expect("start");
+        let answer = bare
+            .call_route("some.route", json!({}))
+            .await
+            .expect("the call still answers");
+        assert_eq!(answer["registered"]["error"], json!(NO_HOST));
+        assert_eq!(answer["nexted"]["error"], json!(NO_HOST));
+        bare.stop().await;
+    }
+
+    #[test]
+    fn a_register_frame_that_names_nothing_says_so() {
+        // Parsed without a process: the failure is in the frame, and starting a
+        // child to discover that would be testing the child.
+        let missing = Register::from_value(&json!({ "op": "register", "id": "p1" }));
+        let error = format!("{:#}", missing.expect_err("no name"));
+        assert!(error.contains("name"), "{error}");
+
+        let wrong_op = Register::from_value(&json!({ "op": "call", "name": "a.b" }));
+        assert!(format!("{:#}", wrong_op.expect_err("wrong op")).contains("register"));
+
+        let ok = Register::from_value(&json!({ "op": "register", "id": "p1", "name": "a.b" }));
+        assert_eq!(ok.expect("parses").name, "a.b");
+    }
+
+    #[test]
+    fn a_next_frame_without_a_name_means_the_route_it_was_called_for() {
+        let frame =
+            Next::from_value(&json!({ "op": "next", "layer": 1, "args": {} })).expect("parses");
+        assert_eq!(frame.route("some.route"), "some.route");
+        assert_eq!(frame.layer, 1);
+
+        let named =
+            Next::from_value(&json!({ "op": "next", "name": "other.route" })).expect("parses");
+        assert_eq!(named.route("some.route"), "other.route");
+        // Nothing named and nothing in flight is not a route at all; the caller
+        // turns the empty string into an error rather than into the name "".
+        assert_eq!(frame.route(""), "");
     }
 
     #[tokio::test]
