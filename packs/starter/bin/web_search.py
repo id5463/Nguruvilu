@@ -74,12 +74,38 @@ def proxy_url():
     return configured.strip()
 
 
+def configured_search():
+    """The `search` block of settings.json, or an empty dict."""
+    block = (read_json(SETTINGS, {}) or {}).get("search") or {}
+    return block if isinstance(block, dict) else {}
+
+
+def search_key(name):
+    """The key for one provider: environment first, then the panel.
+
+    Environment first for the same reason `proxy_url` does it — a shell that
+    exports a key means that key. But an unexported key that *is* in
+    settings.json must be used, not ignored: measured on a server where
+    `search.apiKey` and `search.provider` were both set and the tool answered
+    "no API key configured", which reads as "this machine has none".
+    """
+    value = (os.environ.get(KEY_ENV[name]) or "").strip()
+    if value:
+        return value
+    block = configured_search()
+    if (block.get("provider") or "").strip().lower() == name:
+        return (block.get("apiKey") or "").strip()
+    return ""
+
+
 def pick_provider():
     named = (os.environ.get("SEARCH_PROVIDER") or "").strip().lower()
-    if named in DIALECTS and os.environ.get(KEY_ENV[named]):
+    if not named:
+        named = (configured_search().get("provider") or "").strip().lower()
+    if named in DIALECTS and search_key(named):
         return named
     for name in ("tavily", "brave", "exa"):
-        if os.environ.get(KEY_ENV[name]):
+        if search_key(name):
             return name
     return None
 
@@ -98,11 +124,15 @@ def search(query, max_results=5, provider=None):
     name = provider or pick_provider()
     if not name:
         return {"ok": False,
-                "error": "no provider configured: set TAVILY_API_KEY, BRAVE_API_KEY or EXA_API_KEY"}
+                "error": "no provider configured: export TAVILY_API_KEY, BRAVE_API_KEY "
+                         "or EXA_API_KEY, or set search.provider and search.apiKey in "
+                         "settings.json"}
     method, url, auth, path, snip, title_key, url_key = DIALECTS[name]
-    key = os.environ.get(KEY_ENV[name], "")
+    key = search_key(name)
     if not key:
-        return {"ok": False, "error": "%s is not set" % KEY_ENV[name]}
+        return {"ok": False,
+                "error": "%s is not set: export it, or set search.apiKey and "
+                         "search.provider in settings.json" % KEY_ENV[name]}
 
     headers = {"Accept": "application/json",
                "User-Agent": "nguruvilu-web-search/1.0"}

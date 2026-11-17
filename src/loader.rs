@@ -406,12 +406,32 @@ fn pack_cwd(pack_dir: Option<&std::path::Path>, command: &str, args: &[String]) 
         // entry would make unload try to unregister tools that were never
         // registered. What the pack *does* get is a line in the proxy's target
         // list, written below, and that is what has to be withdrawn on unload.
+        //
+        // Only when the proxy is actually here. A pack that says `via_proxy:
+        // mcp-proxy` is asking for the proxy *pack* to be installed, and nothing
+        // in the manifest can make that true — so a machine with the server but
+        // not the proxy used to lose the server's tools entirely, and report
+        // `skipped`, which reads as success. Measured on a server with
+        // browser-use, mail and moodle installed and no mcp-proxy: 46 tools
+        // vanished and no line said so.
+        //
+        // Falling through to a direct start is the honest answer: the tools the
+        // pack declares appear, unproxied, instead of not appearing at all.
         if let Some(proxy_id) = entry.via_proxy.as_deref() {
-            let line = proxy_target_line(step, entry, self.pack_dir.as_deref())?;
-            crate::loader::register_proxy_target(proxy_id, line);
-            return Ok(Outcome::Skipped(format!(
-                "handed to MCP proxy '{proxy_id}'"
-            )));
+            if self.kernel.tools().has_owner(&format!("plugin:{proxy_id}"))
+                || self.kernel.tools().has_owner(&format!("mcp:{proxy_id}"))
+            {
+                let line = proxy_target_line(step, entry, self.pack_dir.as_deref())?;
+                crate::loader::register_proxy_target(proxy_id, line);
+                return Ok(Outcome::Skipped(format!(
+                    "handed to MCP proxy '{proxy_id}'"
+                )));
+            }
+            // No proxy: say so once, then start the server directly.
+            eprintln!(
+                "[pack] {} asked for MCP proxy '{}', which is not installed;                  starting it directly so its tools are reachable",
+                step.id, proxy_id
+            );
         }
 
         let spec = match entry.transport {
