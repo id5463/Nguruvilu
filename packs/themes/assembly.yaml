@@ -1,0 +1,13 @@
+version: 1
+name: themes
+defaults:
+  scope: session
+  on_failure: skip
+# 纯外观包：两套主题，没有工具、没有 MCP、没有技能。
+#
+# Nothing to load is not the same as nothing to contribute: `look.json` is read
+# from the manifest by `content::apply`, which runs whether or not an assembly
+# exists. The assembly is here so `ngu apply` reports the pack as loaded instead
+# of saying "no assembly.yaml — the pack loads nothing yet", which reads like a
+# defect to anyone looking at it.
+stages: []

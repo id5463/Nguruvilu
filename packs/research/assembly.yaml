@@ -1,0 +1,26 @@
+version: 1
+name: research
+defaults:
+  scope: session
+  on_failure: skip
+# 一个纯技能的包：四个技能，没有工具也没有界面。
+#
+# It used to have no assembly at all, which meant it installed and contributed
+# nothing — the same failure `mail` and `moodle` had. A pack without plugins or
+# MCP servers still needs an assembly if it ships skills, because the skills load
+# through the assembly, not through the manifest.
+stages:
+- name: pack
+  skills:
+  - id: cite-sources
+    source: skills/cite-sources
+    scope: session
+  - id: draft-critique
+    source: skills/draft-critique
+    scope: session
+  - id: publish-figures
+    source: skills/publish-figures
+    scope: session
+  - id: deep-search
+    source: skills/deep-search
+    scope: session

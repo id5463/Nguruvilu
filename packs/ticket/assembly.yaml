@@ -1,0 +1,28 @@
+version: 1
+name: ticket
+defaults:
+  scope: session
+  on_failure: skip
+# 票板：一个 Node 的 MCP 服务器 + 两个技能 + 一块面板。
+#
+# The script lives under `files/` because that is what the manifest carries, and
+# `files/` is the one directory a pack may hold payload in. `ngu pack` refuses
+# such a pack unless `--offline` says the payload is deliberate — which it is
+# here, and which is why this pack had no archive in the market.
+stages:
+- name: pack
+  mcp:
+  - id: ticket
+    source: stdio:node files/ticket-mcp.mjs
+    scope: session
+    transport: stdio
+    command: node
+    args:
+    - files/ticket-mcp.mjs
+  skills:
+  - id: ticket-protocol
+    source: skills/ticket-protocol
+    scope: session
+  - id: ticket-review
+    source: skills/ticket-review
+    scope: session

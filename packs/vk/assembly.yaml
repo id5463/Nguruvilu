@@ -1,0 +1,21 @@
+version: 1
+name: vk
+defaults:
+  scope: session
+  on_failure: skip
+# `npm:vk-mcp-server` is fetched at install time into `files/vk-api/`, and the
+# loader runs whatever `.bin` shim npm produced. Declared here as well as in
+# `mcp.json`: an installed pack loads through its assembly, and this pack had
+# none — so it installed, reported success, and contributed no tools.
+stages:
+- name: pack
+  mcp:
+  - id: vk-api
+    source: npm:vk-mcp-server
+    scope: session
+    transport: stdio
+    command: vk-mcp-server
+  skills:
+  - id: vk
+    source: skills/vk
+    scope: session

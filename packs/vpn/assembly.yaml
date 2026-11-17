@@ -1,0 +1,27 @@
+version: 1
+name: vpn
+defaults:
+  scope: session
+  on_failure: skip
+# `python` rather than `python3`: on Windows `python3` resolves to the Microsoft
+# Store stub, which launches nothing and answers nothing. Measured: this pack
+# refused `initialize` with "MCP server closed the connection" until the command
+# was the portable name.
+#
+# The pack declares this itself rather than relying on `mcp.json` alone: an
+# installed pack loads through its assembly, and a pack with only an `mcp.json`
+# installs and then contributes nothing.
+stages:
+- name: pack
+  mcp:
+  - id: vpn-nodes
+    source: stdio:python scripts/vpn_mcp.py
+    scope: session
+    transport: stdio
+    command: python
+    args:
+    - scripts/vpn_mcp.py
+  skills:
+  - id: vpn
+    source: skills/vpn
+    scope: session

@@ -36,7 +36,14 @@ for name in sorted(os.listdir(packs_dir)):
         continue
 
     tmp = os.path.join(tempfile.gettempdir(), f'mk-{name}.ngupack')
-    r = subprocess.run([NGU, 'pack', d, '--out', tmp], capture_output=True)
+    # `--offline` when the pack carries payload under `files/`: the packer
+    # refuses such a pack unless the author says the payload is deliberate, and
+    # for `ticket` it is (a Node script it runs). Without this flag that pack
+    # silently never reached the market.
+    args = [NGU, 'pack', d, '--out', tmp]
+    if os.path.isdir(os.path.join(d, 'files')):
+        args.append('--offline')
+    r = subprocess.run(args, capture_output=True)
     if r.returncode != 0:
         print(f'SKIP {name}: pack failed {r.stderr.decode("utf-8","replace")[:90]}')
         continue

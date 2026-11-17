@@ -7,7 +7,7 @@
       "description": "浏览器自动化：通过 MCP 代理驱动 chrome-devtools，打开网页、点击、填表、截图、读控制台与网络。技能里写清 call 的用法。",
       "license": "MIT",
       "url": "https://raw.githubusercontent.com/id5463/Nguruvilu/main/packs/pack-market/store/browser-use-1.1.0.zip",
-      "sha256": "777be62390b24dfa79f67208b8e1495e9167bb1b70f1bc1053af6c1eef25f464",
+      "sha256": "546c4d17cd650fd5f1de4167f36ae18b8b38cc350936643a017e0e64dbb481e9",
       "size": 5911
     },
     {
@@ -16,8 +16,8 @@
       "description": "文档读取：documents 插件，读不了的格式会自己装环境再试（PDF/Office 等）",
       "license": "MIT",
       "url": "https://raw.githubusercontent.com/id5463/Nguruvilu/main/packs/pack-market/store/documents-1.0.0.zip",
-      "sha256": "f8ca6dbc919bf56ba6d1b9cff8215cf73627f17175bbd3ddfce3a57a54521cb3",
-      "size": 209707
+      "sha256": "03ed8231472e107d9a0e47df65641c7e5c9ea916150a85a6ef7a96471221175e",
+      "size": 209709
     },
     {
       "name": "greatwall-dev",
@@ -25,7 +25,7 @@
       "description": "长城开发：开发专用包。长程任务（任务实体落盘、只追加日志、可按行检索的记忆、检查点回滚、代理信箱）+ 票板派活（开票、派 worker、发预算、验收）。票、任务、事实全在工作区盘上，零内核改动，随时可卸载。soul 里写明 GitHub 操作用 gh。（长程任务工具已独立成 long-horizon 包，需另外安装）",
       "license": "MIT",
       "url": "https://raw.githubusercontent.com/id5463/Nguruvilu/main/packs/pack-market/store/greatwall-dev-1.1.0.zip",
-      "sha256": "7c9c376bc8279e5db65014463475c217a14d3300e642c4aa6e1bead0fdb0851d",
+      "sha256": "a59231eb5dada7c3c5674f378fbc03aa8288b629cfb73df3cc808e13751b07be",
       "size": 33313
     },
     {
@@ -34,7 +34,7 @@
       "description": "挂接点示例：给会话行加徽章，给状态栏加回合计数，不复制界面",
       "license": "MIT",
       "url": "https://raw.githubusercontent.com/id5463/Nguruvilu/main/packs/pack-market/store/hook-demo-1.0.0.zip",
-      "sha256": "27ef8215245409b465314f282884966c1942a8cd82abcde590469302831561a2",
+      "sha256": "95bf07c678ee4be5741e72ac10ca9ca1365d3881d6995738c06f67025acb5556",
       "size": 5228
     },
     {
@@ -43,8 +43,8 @@
       "description": "决策评审员：用独立模型给结论第二意见（顾问式，只建议不拦截；需配置 endpoint 和 key）",
       "license": "MIT",
       "url": "https://raw.githubusercontent.com/id5463/Nguruvilu/main/packs/pack-market/store/judge-1.0.0.zip",
-      "sha256": "f0cb539501524c6279ce9faae0d3e20654a98deef0d298fcfec3c599344ffaa8",
-      "size": 975491
+      "sha256": "bf11879d151830f8eb8165167dc7bfbfa42ecebeff9dfdb0938667c3bb9e5b2e",
+      "size": 975494
     },
     {
       "name": "long-horizon",
@@ -52,8 +52,8 @@
       "description": "长程任务：任务实体(目标/完成判据/下一步)落盘在会话工作区、只追加的日志、可按行检索的记忆(recall)、检查点回滚、代理信箱(横向聊天)。任务在 running 期间回合不结束，做完一步就记账接着做下一步。给超过上下文窗口几百倍、跑上百小时的任务用；界面带任务条。",
       "license": "MIT",
       "url": "https://raw.githubusercontent.com/id5463/Nguruvilu/main/packs/pack-market/store/long-horizon-1.0.0.zip",
-      "sha256": "ae2692360ce95da124633ec5a7dbbd6c9ba1cd08c84744676c5e56662a079492",
-      "size": 202553
+      "sha256": "0c758085e706e45148210fe51da9673d9d679f6eea6b11cb037961f685783670",
+      "size": 202564
     },
     {
       "name": "mail",
@@ -61,7 +61,7 @@
       "description": "邮箱：读发两个真实账号——本人 Yandex（无提供方页脚，给老师发信用这个）与腾讯 Agent Mail（一次性地址收验证码）。技能里写清 call 的用法与选号规则。",
       "license": "MIT",
       "url": "https://raw.githubusercontent.com/id5463/Nguruvilu/main/packs/pack-market/store/mail-1.1.0.zip",
-      "sha256": "13aa4cf7aa41072e32f0756654b05d2017ecb93632136c0e07bb63cfc1d96ead",
+      "sha256": "e1c0a44e66c339f0557d88c5725756204bc7949e20e99aec7eabda9d82473b91",
       "size": 10095
     },
     {
@@ -70,7 +70,7 @@
       "description": "MCP 代理：把多个 MCP 服务器合成一个 call 工具。填一次目标清单，工具表里只多一条，而不是几十条。支持三模态——full 全部暴露、single 每个服务器一个入口、proxy 全部合并成一个。",
       "license": "MIT",
       "url": "https://raw.githubusercontent.com/id5463/Nguruvilu/main/packs/pack-market/store/mcp-proxy-1.0.1.zip",
-      "sha256": "e87282b53b7107ec537fdd5628e9d1046be7f99994c54ec9bf7db615e81d4448",
+      "sha256": "7ca7bc41f766bb49f4f1430ad177d9cd9cb8b758dfa56d2b6fed72a62a3c18ca",
       "size": 15713
     },
     {
@@ -79,7 +79,7 @@
       "description": "Moodle 学习平台（moodle.herzen.spb.ru）：采集作业/课程、看详情、下载附件、提交作业（需登录凭据）",
       "license": "MIT",
       "url": "https://raw.githubusercontent.com/id5463/Nguruvilu/main/packs/pack-market/store/moodle-1.0.0.zip",
-      "sha256": "7af78c8359a585d140553da80557d948a089d659cb232856bf64d43bb514a661",
+      "sha256": "f80dd49aa7efe455d54be95ddeb0f2d0573a5559f06be7c45a50afd4882c6bcf",
       "size": 14225
     },
     {
@@ -88,8 +88,8 @@
       "description": "包商城：从远程索引浏览、搜索、下载 nguruvilu 包。自带一份 16 个包的本地索引（store/ 下是归档）。只下载不安装。",
       "license": "MIT",
       "url": "https://raw.githubusercontent.com/id5463/Nguruvilu/main/packs/pack-market/store/pack-market-1.2.1.zip",
-      "sha256": "fe3d2ea6f3f444bd05cf111d0b2724d87c0998dec9c8853ea2d02a4af756650b",
-      "size": 1611201
+      "sha256": "8c8cac64e740bb04108e2d2ad4cb8f0e2244023d4fdccb2709d0e252bff09312",
+      "size": 3391570
     },
     {
       "name": "research",
@@ -97,8 +97,8 @@
       "description": "深度研究：4 个技能（深度搜索、引用来源、草稿批评、出图发表）+ 研究员人格，做调研和写报告用",
       "license": "MIT",
       "url": "https://raw.githubusercontent.com/id5463/Nguruvilu/main/packs/pack-market/store/research-1.0.0.zip",
-      "sha256": "e388b5c26bf8f765a0fb072782c786b3991afa01a986407350a403aa123c75ab",
-      "size": 11003
+      "sha256": "a7a0b5dc020378dc453e21706d39d1a7716df03049437546fddd0b0edd3c6f21",
+      "size": 11525
     },
     {
       "name": "restart",
@@ -106,8 +106,8 @@
       "description": "让代理重启它自己所在的进程：改完配置、换掉包、更新二进制之后不必等人来重启（需要进程管理器，例如 systemd Restart=always，否则退出就是死掉）",
       "license": "MIT",
       "url": "https://raw.githubusercontent.com/id5463/Nguruvilu/main/packs/pack-market/store/restart-1.0.0.zip",
-      "sha256": "cd97bbd49bec7e9a298d2bb81ced521ab6246d55d1ce27387aa2e1142f9d9e61",
-      "size": 137143
+      "sha256": "4e72eab1891c9c1aaae46931aae10e4a6d3bb986129722bbdc5a2d3812aa79b9",
+      "size": 137140
     },
     {
       "name": "skill-router",
@@ -115,7 +115,7 @@
       "description": "技能路由：三个检索器（词法 BM25 / 字符 n-gram / JeV 判断）并存可切换，按需挑出相关技能，而不是把全部技能塞进提示词。遵循 Agent Skills 规范（agentskills.io/specification）。",
       "license": "MIT",
       "url": "https://raw.githubusercontent.com/id5463/Nguruvilu/main/packs/pack-market/store/skill-router-1.0.2.zip",
-      "sha256": "17bf9ce709bd7b769a962f09df13616bcd8a7d3ef1868f70f38798611f67086b",
+      "sha256": "26a2a84f14e55c9b54f61665ebd4a673dedaaa7d1e5c89b60eee7758971716d2",
       "size": 20859
     },
     {
@@ -124,7 +124,7 @@
       "description": "起始包（预装）：中文人格与注入、主题外观、网页搜索、子代理、桌面驱动 cua-driver、可改的内置界面",
       "license": "MIT",
       "url": "https://raw.githubusercontent.com/id5463/Nguruvilu/main/packs/pack-market/store/starter-1.0.0.zip",
-      "sha256": "f25ba33910562b3bd67f5a9b18257b6d0c264b76c60379052f1af152585436a5",
+      "sha256": "4a8fcc3c149de9ca6b5a0c313153a75042ea39685506af2689a79be55b32c6e0",
       "size": 75528
     },
     {
@@ -133,8 +133,17 @@
       "description": "主题外观：一组可切换的界面配色（look.json）",
       "license": "MIT",
       "url": "https://raw.githubusercontent.com/id5463/Nguruvilu/main/packs/pack-market/store/themes-1.0.0.zip",
-      "sha256": "4f33a648af4cf525a54b98e36a70cee0241699865ce4ec7d095793917232abcb",
-      "size": 1020
+      "sha256": "48026b998c95f217d4945f2028773b4ab8ee5175eb7f4d5a9cf3cc61f6a206cf",
+      "size": 1480
+    },
+    {
+      "name": "ticket",
+      "version": "1.0.0",
+      "description": "长程模式：把这条对话变成主代理——开票、派 worker、发预算、验收结果。票与事实全在工作区盘上，零内核改动，随时可借可卸载",
+      "license": "MIT",
+      "url": "https://raw.githubusercontent.com/id5463/Nguruvilu/main/packs/pack-market/store/ticket-1.0.0.zip",
+      "sha256": "2ac6d48dcdd1fc453a2c6e0326da7423e5af1a3c4f899b56da71ccc989bc09bb",
+      "size": 17341
     },
     {
       "name": "upload-bar",
@@ -142,7 +151,7 @@
       "description": "上传进度浮层：挂在输入框上方，不占页面网格，不用改 index.html",
       "license": "MIT",
       "url": "https://raw.githubusercontent.com/id5463/Nguruvilu/main/packs/pack-market/store/upload-bar-1.0.0.zip",
-      "sha256": "e02059d3bcf148ad6fa52828ed7ecb60455082bbb7fea5bdf55faa10278aeab2",
+      "sha256": "c6fb8cc1c1b56c663a30a7968604275c4eb7536b88126b5edc8575e1f38727ca",
       "size": 6095
     },
     {
@@ -151,8 +160,17 @@
       "description": "VK（VKontakte）社群：读写帖子的 MCP 工具 + 使用技能（读需服务密钥，写需社群 token）",
       "license": "MIT",
       "url": "https://raw.githubusercontent.com/id5463/Nguruvilu/main/packs/pack-market/store/vk-1.0.0.zip",
-      "sha256": "d768fe022b691f11620823f85932cc09a638e99249242a2c27ca576d45611328",
-      "size": 3973
+      "sha256": "b3b82e44048a1da834aeef9d9cb53161cd4fef1bffb93c15cd6d5847f6468cc0",
+      "size": 4393
+    },
+    {
+      "name": "vpn",
+      "version": "1.0.0",
+      "description": "管理本机 mihomo(Clash Meta)代理节点：查当前节点、测每个节点的真实延迟、切换节点（通过 mihomo 的 REST API）",
+      "license": "MIT",
+      "url": "https://raw.githubusercontent.com/id5463/Nguruvilu/main/packs/pack-market/store/vpn-1.0.0.zip",
+      "sha256": "f9be3c1e954ecaad9d3c926bdda0c8229bde2713cdef3de5de1abd6658d5cbd0",
+      "size": 8686
     },
     {
       "name": "web-search",
@@ -160,7 +178,7 @@
       "description": "Web search: one tool over Tavily, Brave and Exa. Lifted out of the kernel because a kernel tool that ignored settings.proxy could not be fixed from a pack.",
       "license": "MIT",
       "url": "https://raw.githubusercontent.com/id5463/Nguruvilu/main/packs/pack-market/store/web-search-1.0.0.zip",
-      "sha256": "bd15bcef144b7a26da8780a5e6c446ce540bd4ab80e4927b0227be870e5b8d69",
+      "sha256": "962d422ff398517b24cd40d0c7f12f42f11d67766d885527342c97518a688786",
       "size": 6425
     }
   ]

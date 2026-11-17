@@ -3,7 +3,7 @@
     {
       "id": "vpn-nodes",
       "transport": "stdio",
-      "command": "python3",
+      "command": "python",
       "args": [
         "scripts/vpn_mcp.py"
       ],
