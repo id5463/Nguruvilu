@@ -20,3 +20,6 @@ stages:
   - id: delegate
     source: plugin:bin/ngu-delegate
     scope: global
+    build:
+      dir: src
+      binary: ngu-delegate

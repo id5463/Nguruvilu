@@ -96,3 +96,8 @@ packs/*/bin/ngu-*
 # 插件构建产物:包携带源码,内核按需编译;二进制不是源码
 packs/*/ngu-*[!.]*
 packs/*/*.exe
+
+# 临时验证目录,不是仓库内容
+.selftest/
+.packtest/
+.verify/

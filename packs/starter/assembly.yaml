@@ -20,6 +20,9 @@ stages:
   - id: delegate
     source: plugin:bin/ngu-delegate
     scope: global
+    build:
+      dir: src
+      binary: ngu-delegate
   # 联网搜索。它曾经是 `builtin:search` —— 内核里的实现，读 NGU_PROXY 而模型
   # 路由读 settings.proxy，两边不一致，用户看到的只是每次搜索 403。
   #
