@@ -1668,6 +1668,16 @@ function panelDocument(panel, panelId) {
 
 // panelId -> iframe。这份表就是白名单：不在表里的 panelId 说什么都不转。
 let panelFrames = new Map();
+/// The only panel frame, when exactly one is loaded.
+///
+/// A `tool_result` names the panel it belongs to, but an older pack's panel may
+/// not have sent `panelId` — and refusing the answer over a missing field would
+/// be a worse outcome than answering the one frame that could have asked.
+function firstPanelFrame() {
+  if (panelFrames.size !== 1) return null;
+  for (const entry of panelFrames.values()) return entry;
+  return null;
+}
 // 面板 -> shell 的唯一通道。三条都成立才转：消息来自我们注册过的那一帧、panelId
 // 在白名单里、cmd 是个字符串。别的窗口、别的形状、别的消息体一律丢弃。
 window.addEventListener("message", (event) => {
@@ -3006,7 +3016,30 @@ function flushPendingEvents() {
 function dispatchEvent_(event) {
   const name = event.ev;
   try {
-  if (name === "status") {
+  // A panel asked for a tool and the answer is arriving here.
+  //
+  // `ngu.call` returns a promise that settles on a `panel-reply` carrying the
+  // request id it generated. The command's own HTTP response cannot carry the
+  // result: `POST /cmd` answers 202 and the tool runs afterwards, so the answer
+  // travels on this event stream instead. Without this branch the promise never
+  // settles — measured as a pack-market search that waits 30 seconds and then
+  // reports a timeout while the search itself succeeded.
+  if (name === "tool_result") {
+    const requestId = typeof event.requestId === "string" ? event.requestId : null;
+    if (requestId) {
+      const entry = event.panelId ? panelFrames.get(event.panelId) : null;
+      const target = entry || firstPanelFrame();
+      if (target && target.frame.contentWindow) {
+        target.frame.contentWindow.postMessage({
+          ngu: "panel-reply",
+          requestId: requestId,
+          ok: !event.error,
+          data: event.error ? null : (event.result || null),
+          error: event.error ? String(event.error.message || event.error) : null,
+        }, "*");
+      }
+    }
+  } else if (name === "status") {
     latest = event.status || {};
     if (latest.session) currentSessionId = latest.session;
   } else if (name === "sessions") {

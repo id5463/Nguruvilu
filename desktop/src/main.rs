@@ -1444,6 +1444,15 @@ pub(crate) async fn dispatch(
                 .or_else(|| command.get("arguments"))
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            // The page sends this back so the right panel frame is answered.
+            //
+            // A panel's `ngu.call` returns a promise that settles when a
+            // `panel-reply` carrying the same id arrives. The result cannot come
+            // back in this command's HTTP response — `POST /cmd` answers 202 and
+            // the real answer travels on the event stream — so the id has to
+            // ride with the result.
+            let request_id = command.get("requestId").cloned().unwrap_or(Value::Null);
+            let panel_id = command.get("panelId").cloned().unwrap_or(Value::Null);
 
             // The registry is cloned out under the lock and asked with the lock
             // released: a tool can be slow (an MCP round trip, a shell), and
@@ -1457,6 +1466,8 @@ pub(crate) async fn dispatch(
                 Ok(output) => json!({
                     "ev": "tool_result",
                     "tool": name,
+                    "requestId": request_id,
+                    "panelId": panel_id,
                     // The protocol shape a panel already knows how to read.
                     "result": {
                         "content": [{ "type": "text", "text": output.text }],
@@ -1465,6 +1476,8 @@ pub(crate) async fn dispatch(
                 Err(error) => json!({
                     "ev": "tool_result",
                     "tool": name,
+                    "requestId": request_id,
+                    "panelId": panel_id,
                     "error": { "message": format!("{error:#}") },
                 }),
             };

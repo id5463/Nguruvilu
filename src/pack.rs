@@ -2338,12 +2338,36 @@ fn render_assembly(manifest: &PackManifest, staging: &Path) -> Result<String> {
         })
         .collect();
 
+    // Skill ids must not collide with the plugin and MCP ids beside them.
+    //
+    // An assembly is one namespace: `duplicate entry id` is the loader refusing
+    // exactly what this rendered. The manifest's author writes a skill id for
+    // their own use (`web-search`), and it is entirely reasonable for that to be
+    // the pack's own name — which the MCP entry beside it also uses. Measured on
+    // `packs/web-search`, where the rendered assembly could not be applied at
+    // all: the first time the pack was installed from an archive rather than run
+    // from its source directory.
+    let mut taken: std::collections::BTreeSet<String> = manifest
+        .plugins
+        .iter()
+        .map(|plugin| plugin.id.clone())
+        .chain(manifest.mcp.as_ref().map(|_| "mcp".to_string()))
+        .collect();
     let skills: Vec<OutSkill> = manifest
         .skills
         .iter()
         .map(|skill| OutSkill {
             base: OutBase {
-                id: skill.id.clone(),
+                id: {
+                    let mut id = skill.id.clone();
+                    if taken.contains(&id) {
+                        // The suffix names what it is, so the rendered file says
+                        // why two entries exist rather than numbering them.
+                        id = format!("{id}-skill");
+                    }
+                    taken.insert(id.clone());
+                    id
+                },
                 // The authored source, unchanged — the same rule the plugin
                 // branch applies to what it *names*. A carried skill ships
                 // inside the archive (`skills/…`) and the loader resolves a

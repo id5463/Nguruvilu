@@ -11,7 +11,7 @@
   "mcp": "mcp.json",
   "skills": [
     {
-      "id": "web-search",
+      "id": "web-search-skill",
       "source": "skills/web-search",
       "license": "MIT"
     }
