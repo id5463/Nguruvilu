@@ -7,7 +7,55 @@
       "args": [
         "bin/skill-router.mjs"
       ],
-      "scope": "session"
+      "scope": "session",
+      "tools": [
+        {
+          "name": "skill_route",
+          "description": "Pick the skills relevant to a request, instead of putting every skill in the prompt. Three retrievers are available and can be switched or combined: `lexical` (BM25, local and free, best for English descriptions), `ngram` (character n-grams, needed for Chinese where there are no spaces), `jev` (a decision model that answers \"is this skill needed\" as a probability; most accurate, costs money). `hybrid` runs all three and merges by rank.",
+          "inputSchema": {
+            "properties": {
+              "limit": {
+                "description": "How many skills to return. Default 5.",
+                "type": "number"
+              },
+              "method": {
+                "description": "Which mechanism decides what to load. Four modes, plus three single-retriever modes for testing them in isolation. `full` loads everything (no selection at all); `regex` applies rules without any model; `jev` asks a decision model for each skill whether it is needed; `llm` asks a language model to pick from the whole catalog at once. Default: whatever NGU_SKILL_MODE says, else `hybrid`.",
+                "enum": [
+                  "full",
+                  "regex",
+                  "jev",
+                  "llm",
+                  "lexical",
+                  "ngram",
+                  "hybrid"
+                ],
+                "type": "string"
+              },
+              "query": {
+                "description": "The user request, verbatim. Do not summarise it: the retrievers match on the words the user actually used.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "skill_list",
+          "description": "List the skills that exist, with the checks the Agent Skills specification requires (agentskills.io/specification): `name` must be 1-64 characters of lowercase letters, digits and hyphens, and must not start or end with a hyphen or contain a doubled hyphen; `description` must be non-empty and at most 1024 characters. Reports violations rather than hiding them.",
+          "inputSchema": {
+            "properties": {
+              "check": {
+                "description": "Run the specification checks and report violations. Default true.",
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          }
+        }
+      ]
     }
   ]
 }

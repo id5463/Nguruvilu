@@ -827,6 +827,25 @@ pub struct McpFile {
     pub servers: Vec<McpServerDecl>,
 }
 
+/// One tool an MCP server exposes, as its pack declares it.
+///
+/// The same fields the protocol's own `tools/list` returns, spelled the way
+/// `mcp.json` already spells things (`inputSchema`, matching the wire format
+/// rather than this project's Rust style) so a pack author can copy a
+/// `tools/list` response into a manifest without translating it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpToolDecl {
+    /// Name as the server knows it, without the `mcp__server__` prefix.
+    pub name: String,
+    /// Description shown to the model.
+    #[serde(default)]
+    pub description: String,
+    /// JSON Schema for the arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<serde_json::Value>,
+}
+
 /// One MCP server declaration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -886,6 +905,20 @@ pub struct McpServerDecl {
     /// every request. Ignored for stdio.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    /// The tools this server provides, declared rather than discovered.
+    ///
+    /// Listing a server's tools is one round trip — but starting the server to
+    /// ask is not: measured on this machine, thirteen servers cost 6.2 s on a
+    /// cold start (2.7 s of it `chrome-devtools-mcp` alone) against 47 ms for a
+    /// process that loads nothing. Almost none of them is used in any given
+    /// turn, and a subagent answering one question pays the whole bill.
+    ///
+    /// So a pack says what its server exposes, the kernel registers those tools
+    /// at load, and the server starts the first time one of them is called. A
+    /// pack that omits this is still correct — the kernel starts the server to
+    /// learn the list, exactly as before — it is just slower.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<McpToolDecl>,
 }
 
 /// One platform's source for an MCP server.
@@ -2302,6 +2335,8 @@ fn render_assembly(manifest: &PackManifest, staging: &Path) -> Result<String> {
         url: Option<String>,
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         headers: BTreeMap<String, String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<McpToolDecl>,
     }
     #[derive(Serialize)]
     struct OutSkill {
@@ -2482,6 +2517,7 @@ fn render_assembly(manifest: &PackManifest, staging: &Path) -> Result<String> {
                             env: BTreeMap::new(),
                             url: server.url.clone(),
                             headers: server.headers.clone(),
+                            tools: server.tools.clone(),
                         };
                     }
                     // A fetched server runs from where it landed, so the
@@ -2515,6 +2551,7 @@ fn render_assembly(manifest: &PackManifest, staging: &Path) -> Result<String> {
                         env: server.env.clone(),
                         url: None,
                         headers: BTreeMap::new(),
+                        tools: server.tools.clone(),
                     }
                 })
                 .collect()
@@ -3722,6 +3759,7 @@ mod tests {
             .expect("another platform")
             .to_string();
         let base = || McpServerDecl {
+            tools: Vec::new(),
             id: "d".into(),
             transport: "stdio".into(),
             source: None,
@@ -3800,6 +3838,7 @@ mod tests {
         write_manifest(&dir, &manifest).unwrap();
         let declared = McpFile {
             servers: vec![McpServerDecl {
+                tools: Vec::new(),
                 id: "driver".into(),
                 transport: "stdio".into(),
                 source: None,
@@ -3876,6 +3915,7 @@ mod tests {
             .to_string();
         let declared = McpFile {
             servers: vec![McpServerDecl {
+                tools: Vec::new(),
                 id: "d".into(),
                 transport: "stdio".into(),
                 source: None,

@@ -236,6 +236,14 @@ pub struct McpEntry {
     /// than the tools it declared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via_proxy: Option<String>,
+    /// The tools this server provides, declared rather than discovered.
+    ///
+    /// When present, the kernel registers these tools at load and starts the
+    /// server on the first call to one of them. When absent it starts the
+    /// server to ask, which is correct and slow — see
+    /// [`crate::pack::McpToolDecl`] for the measurement.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<crate::pack::McpToolDecl>,
 }
 
 /// A skill entry.

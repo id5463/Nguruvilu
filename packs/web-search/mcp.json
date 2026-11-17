@@ -7,7 +7,31 @@
       "args": [
         "bin/web_search.py"
       ],
-      "scope": "session"
+      "scope": "session",
+      "tools": [
+        {
+          "name": "search_web",
+          "description": "Search the web and return titles, URLs and snippets. Choose the provider by setting TAVILY_API_KEY, BRAVE_API_KEY or EXA_API_KEY (Tavily wins if several are set), or name one with SEARCH_PROVIDER.",
+          "inputSchema": {
+            "additionalProperties": true,
+            "properties": {
+              "max_results": {
+                "description": "How many results to return (default 5).",
+                "type": "string"
+              },
+              "provider": {
+                "description": "Optional: tavily, brave or exa.",
+                "type": "string"
+              },
+              "query": {
+                "description": "What to search for.",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        }
+      ]
     }
   ]
 }

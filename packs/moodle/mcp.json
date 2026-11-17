@@ -7,7 +7,150 @@
       "args": [
         "scripts/moodle_mcp.py"
       ],
-      "scope": "session"
+      "scope": "session",
+      "tools": [
+        {
+          "name": "moodle_status",
+          "description": "Check Moodle login status: who is logged in, cache freshness, counts of known courses/assignments.",
+          "inputSchema": {
+            "additionalProperties": false,
+            "properties": {},
+            "type": "object"
+          }
+        },
+        {
+          "name": "moodle_list_courses",
+          "description": "List enrolled courses (id + name). Uses /my/ session.",
+          "inputSchema": {
+            "additionalProperties": false,
+            "properties": {},
+            "type": "object"
+          }
+        },
+        {
+          "name": "moodle_list_assignments",
+          "description": "Diffable assignment inventory across ALL course modules (assign/quiz/forum/workshop). Default returns only NEW and CHANGED items vs previous scan (cheap for context). Set refresh=true to re-crawl all courses (slow ~1-3 min) and update the cache; set new_only=false to get the full compact list without re-crawling.",
+          "inputSchema": {
+            "additionalProperties": false,
+            "properties": {
+              "course_id": {
+                "description": "restrict to one course id",
+                "type": "string"
+              },
+              "new_only": {
+                "description": "true(default)=only new/changed; false=full list",
+                "type": "boolean"
+              },
+              "refresh": {
+                "description": "Re-crawl all courses before answering (default false)",
+                "type": "boolean"
+              },
+              "types": {
+                "description": "module types filter (default all)",
+                "items": {
+                  "enum": [
+                    "assign",
+                    "quiz",
+                    "forum",
+                    "workshop"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        {
+          "name": "moodle_get_assignment",
+          "description": "Full detail of one assignment/quiz: title, course, due date, submission status, teacher attachments (downloadable URLs).",
+          "inputSchema": {
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "description": "module id, e.g. '914551'",
+                "type": "string"
+              },
+              "type": {
+                "default": "assign",
+                "enum": [
+                  "assign",
+                  "quiz",
+                  "forum",
+                  "workshop"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "moodle_download",
+          "description": "Download teacher attachment files of an assignment into a local folder. Returns saved file paths.",
+          "inputSchema": {
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "description": "module id",
+                "type": "string"
+              },
+              "out_dir": {
+                "description": "target folder; default ./moodle_downloads",
+                "type": "string"
+              },
+              "type": {
+                "default": "assign",
+                "enum": [
+                  "assign",
+                  "quiz",
+                  "forum",
+                  "workshop"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "moodle_submit",
+          "description": "Submit files to an assign module. SAFETY: dry_run=true (default) only parses the submission form and reports readiness WITHOUT posting. Pass dry_run=false to actually upload and submit.",
+          "inputSchema": {
+            "additionalProperties": false,
+            "properties": {
+              "dry_run": {
+                "default": true,
+                "description": "true=simulate only (default)",
+                "type": "boolean"
+              },
+              "files": {
+                "description": "local file paths to upload",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "id": {
+                "description": "assign module id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "files"
+            ],
+            "type": "object"
+          }
+        }
+      ]
     }
   ]
 }

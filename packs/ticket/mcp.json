@@ -4,8 +4,287 @@
       "id": "ticket",
       "transport": "stdio",
       "command": "node",
-      "args": ["files/ticket-mcp.mjs"],
-      "scope": "session"
+      "args": [
+        "files/ticket-mcp.mjs"
+      ],
+      "scope": "session",
+      "tools": [
+        {
+          "name": "ticket_open",
+          "description": "开一张票：目标原文冻结进 tickets/<id>/ticket.json，并生成交给 worker 的 brief.md。同目标已有活票时照开，只附一行提示。tried/files/never_touch 这三项不是必填，但填了 worker 就不会重复你踩过的坑。",
+          "inputSchema": {
+            "properties": {
+              "boundary": {
+                "description": "一句话：这次不要碰什么",
+                "type": "string"
+              },
+              "budget": {
+                "description": "{tool_timeout_secs,max_steps,wall_secs,profile}",
+                "type": "object"
+              },
+              "done_when": {
+                "description": "什么算完成",
+                "type": "string"
+              },
+              "files": {
+                "description": "相关文件的当前状态，带行号最好：src/x.rs:27 要删这行",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "goal": {
+                "description": "主人的原话，整段冻结",
+                "type": "string"
+              },
+              "never_touch": {
+                "description": "具体到文件和行：这次别动 src/pack.rs:1433",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "origin": {
+                "description": "person 或 external；只作为事实记录，不改变任何权限",
+                "type": "string"
+              },
+              "tried": {
+                "description": "你已经试过什么、为什么没成。worker 看到这段就不会重跑同一批命令",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "where": {
+                "description": "请求来自哪里",
+                "type": "string"
+              },
+              "workspace": {
+                "description": "本会话的工作目录（绝对路径）",
+                "type": "string"
+              }
+            },
+            "required": [
+              "workspace",
+              "goal"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "ticket_board",
+          "description": "看板：扫描 tickets/，列出每张票的状态、已跑多久、job、最后声明。要想知道现在什么情况就读它，不要靠记忆。",
+          "inputSchema": {
+            "properties": {
+              "id": {
+                "description": "只看某一张的全文",
+                "type": "string"
+              },
+              "workspace": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "workspace"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "ticket_start_payload",
+          "description": "新起一个 worker：全新上下文，只读 brief.md，不知道上一轮发生过什么。要续跑已有的 session 用 ticket_resume_payload。返回的 bash 参数已带 background:true, notify:true；起进程的是内核，不是本服务器。",
+          "inputSchema": {
+            "properties": {
+              "exe": {
+                "description": "ngu 可执行文件名，默认 ngu",
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "workspace": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "workspace",
+              "id"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "ticket_resume_payload",
+          "description": "续跑同一个 worker：复用它的 session，它记得上一轮读过什么、试过什么、为什么失败。这是自动续跑的手动版本——由你判断该不该继续，而不是让 worker 自己转下去。票里没有 session 时会退回新起一轮并说明。",
+          "inputSchema": {
+            "properties": {
+              "exe": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "text": {
+                "description": "这一轮要它做什么。空则只说\"继续\"",
+                "type": "string"
+              },
+              "workspace": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "workspace",
+              "id"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "ticket_start",
+          "description": "把派活结果记进票：job id、worker 的 session id（续跑和回话都要用它）。session 从 ngu --json 的输出里取，它在第一轮跑完后才知道。",
+          "inputSchema": {
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "job": {
+                "type": "string"
+              },
+              "session": {
+                "type": "string"
+              },
+              "workspace": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "workspace",
+              "id",
+              "job"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "ticket_deliver",
+          "description": "收回：读 worker 自己写的 report.json，状态由它决定（done→delivered，partial→partial，blocked 或缺字段→stuck）。证据按 verified/observed/assumed 三级列出，哪些需要你自己复核一眼就看得出。",
+          "inputSchema": {
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "workspace": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "workspace",
+              "id"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "ticket_grant",
+          "description": "给这张票追加预算（时间/步数/墙钟/工具面 profile）、补记 tried/files/never_touch，并重写 brief.md，所以**下一个** worker 看得到。正在跑的进程不因此改变。",
+          "inputSchema": {
+            "properties": {
+              "files": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "id": {
+                "type": "string"
+              },
+              "max_steps": {
+                "type": "integer"
+              },
+              "never_touch": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "profile": {
+                "type": "string"
+              },
+              "tool_timeout_secs": {
+                "type": "integer"
+              },
+              "tried": {
+                "description": "追加到已有的 tried 后面",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "wall_secs": {
+                "type": "integer"
+              },
+              "workspace": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "workspace",
+              "id"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "ticket_say_payload",
+          "description": "生成对 worker 说话用的 bash 参数（复用它的 session）。主代理用它要求 worker 自查、补证据、改方向——这是验收的唯一手段。和 ticket_resume_payload 是同一条命令，区别在意图：这个用来追问，那个用来让它接着干。",
+          "inputSchema": {
+            "properties": {
+              "exe": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "text": {
+                "description": "要跟 worker 说的话",
+                "type": "string"
+              },
+              "workspace": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "workspace",
+              "id",
+              "text"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "ticket_stop",
+          "description": "关闭这张票并记下原因。真正停进程用内核对那个 job 的 job_kill。",
+          "inputSchema": {
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "workspace": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "workspace",
+              "id",
+              "reason"
+            ],
+            "type": "object"
+          }
+        }
+      ]
     }
   ]
 }

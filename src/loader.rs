@@ -68,6 +68,30 @@ impl LoadReport {
 }
 
 /// Owns the kernel plus everything the loader manages alongside it.
+/// An MCP server that has not been started yet.
+///
+/// The tools it declares are already in the table, so the model sees exactly
+/// what it would see after a start. The first call starts the server; later ones
+/// reuse it. A failed start is not cached — the next call tries again, because a
+/// server that was missing a moment ago may have been installed since.
+struct LazyMcp {
+    spec: McpSpec,
+    client: tokio::sync::Mutex<Option<Arc<McpClient>>>,
+}
+
+impl LazyMcp {
+    async fn get(&self) -> Result<Arc<McpClient>> {
+        let mut slot = self.client.lock().await;
+        if let Some(client) = slot.as_ref() {
+            return Ok(Arc::clone(client));
+        }
+        let started = Arc::new(McpClient::connect(&self.spec).await?);
+        crate::mcp::track(&started);
+        *slot = Some(Arc::clone(&started));
+        Ok(started)
+    }
+}
+
 pub struct Loader {
     kernel: Kernel,
     skills: SkillRegistry,
@@ -81,6 +105,9 @@ pub struct Loader {
     /// Held rather than dropped because dropping one stops it: the process is
     /// the capability, and a plugin whose process ended contributes nothing.
     processes: Vec<Arc<crate::protocol::Process>>,
+    /// MCP servers declared but not started, kept so their pipes are not dropped
+    /// between calls.
+    lazy_mcp: Vec<Arc<LazyMcp>>,
 }
 
 impl Loader {
@@ -95,6 +122,7 @@ impl Loader {
             ledger_path,
             pack: pack.into(),
             processes: Vec::new(),
+            lazy_mcp: Vec::new(),
             pack_dir: None,
         }
     }
@@ -433,8 +461,80 @@ fn pack_cwd(pack_dir: Option<&std::path::Path>, command: &str, args: &[String]) 
             }
         };
 
-        let client = Arc::new(McpClient::connect(&spec).await?);
         let owner = format!("mcp:{}", step.id);
+
+        // Declared tools: register them and start the server on first use.
+        //
+        // Measured on this machine, thirteen servers cost 6.2 s on a cold start
+        // against 47 ms for a process that loads nothing — and a subagent
+        // answering one question paid the whole bill. With the list declared,
+        // the cost is a file read at load and the start happens on the call that
+        // needs it.
+        if !entry.tools.is_empty() {
+            let lazy = Arc::new(LazyMcp {
+                spec: spec.clone(),
+                client: tokio::sync::Mutex::new(None),
+            });
+            let mut registered: Vec<String> = Vec::new();
+            for decl in &entry.tools {
+                let exposed = format!("mcp__{}__{}", step.id, decl.name);
+                let handler = Arc::clone(&lazy);
+                let remote = decl.name.clone();
+                let name_for_closure = exposed.clone();
+                let def = ToolDef::new(
+                    exposed.clone(),
+                    if decl.description.is_empty() {
+                        format!("MCP tool '{}' from server '{}'", decl.name, step.id)
+                    } else {
+                        decl.description.clone()
+                    },
+                    decl.input_schema
+                        .clone()
+                        .unwrap_or_else(|| serde_json::json!({ "type": "object", "properties": {} })),
+                    owner.clone(),
+                    move |args| {
+                        let handler = Arc::clone(&handler);
+                        let tool = remote.clone();
+                        Box::pin(async move {
+                            let client = handler.get().await?;
+                            client.call(&tool, args).await
+                        }) as ToolFuture
+                    },
+                );
+                if let Err(error) = self
+                    .kernel
+                    .tools_mut()
+                    .register(def, ConflictPolicy::Override)
+                {
+                    for tool in &registered {
+                        self.kernel.tools_mut().unregister(tool);
+                    }
+                    return Err(error).with_context(|| {
+                        format!("registering '{}' from '{}'", name_for_closure, step.id)
+                    });
+                }
+                registered.push(exposed);
+            }
+            self.lazy_mcp.push(Arc::clone(&lazy));
+            self.ledger.record(LedgerEntry {
+                kind: EntryKind::Mcp.as_str().into(),
+                id: step.id.clone(),
+                source: format!("stdio:{} {}", spec.command, spec.args.join(" "))
+                    .trim()
+                    .to_string(),
+                sha1: None,
+                path: None,
+                scope: scope_name(step.scope).into(),
+                pack: self.pack.clone(),
+                installed_at: now_iso(),
+            });
+            if registered.is_empty() {
+                return Ok(Outcome::Skipped("server declared no tools".into()));
+            }
+            return Ok(Outcome::Loaded);
+        }
+
+        let client = Arc::new(McpClient::connect(&spec).await?);
 
         // The server is already registered under this owner (another
         // conversation loaded the same pack). Its tools are live, so this new

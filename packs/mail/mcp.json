@@ -7,7 +7,203 @@
       "args": [
         "scripts/mail_mcp.py"
       ],
-      "scope": "session"
+      "scope": "session",
+      "tools": [
+        {
+          "name": "yandex_status",
+          "description": "Check the Yandex mailbox: SMTP/IMAP auth and inbox size.",
+          "inputSchema": {
+            "additionalProperties": true,
+            "properties": {},
+            "type": "object"
+          }
+        },
+        {
+          "name": "yandex_send",
+          "description": "Send from l1u.shen@yandex.com via SMTP. No provider footer.",
+          "inputSchema": {
+            "additionalProperties": true,
+            "properties": {
+              "cc": {
+                "description": "optional cc",
+                "type": "string"
+              },
+              "from_name": {
+                "description": "display name",
+                "type": "string"
+              },
+              "html": {
+                "description": "optional html body",
+                "type": "string"
+              },
+              "subject": {
+                "description": "subject",
+                "type": "string"
+              },
+              "text": {
+                "description": "plain body",
+                "type": "string"
+              },
+              "to": {
+                "description": "recipient (comma separated ok)",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        {
+          "name": "yandex_list",
+          "description": "List the newest messages in a folder.",
+          "inputSchema": {
+            "additionalProperties": true,
+            "properties": {
+              "folder": {
+                "description": "mailbox folder, default INBOX",
+                "type": "string"
+              },
+              "limit": {
+                "description": "how many (default 20)",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        {
+          "name": "yandex_search",
+          "description": "Search a folder by FROM / TO / SUBJECT / TEXT.",
+          "inputSchema": {
+            "additionalProperties": true,
+            "properties": {
+              "field": {
+                "description": "FROM|TO|SUBJECT|TEXT (default FROM)",
+                "type": "string"
+              },
+              "folder": {
+                "description": "folder",
+                "type": "string"
+              },
+              "limit": {
+                "description": "max results",
+                "type": "string"
+              },
+              "query": {
+                "description": "search string",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        {
+          "name": "yandex_read",
+          "description": "Read one message by UID (from yandex_list / yandex_search).",
+          "inputSchema": {
+            "additionalProperties": true,
+            "properties": {
+              "folder": {
+                "description": "folder",
+                "type": "string"
+              },
+              "uid": {
+                "description": "IMAP uid",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        {
+          "name": "yandex_folders",
+          "description": "List IMAP folders.",
+          "inputSchema": {
+            "additionalProperties": true,
+            "properties": {},
+            "type": "object"
+          }
+        },
+        {
+          "name": "agentmail_status",
+          "description": "Show the Agent Mail (agent.qq.com) OAuth status.",
+          "inputSchema": {
+            "additionalProperties": true,
+            "properties": {},
+            "type": "object"
+          }
+        },
+        {
+          "name": "agentmail_whoami",
+          "description": "Show the Agent Mail alias and rate limits.",
+          "inputSchema": {
+            "additionalProperties": true,
+            "properties": {},
+            "type": "object"
+          }
+        },
+        {
+          "name": "agentmail_list",
+          "description": "List Agent Mail messages.",
+          "inputSchema": {
+            "additionalProperties": true,
+            "properties": {
+              "dir": {
+                "description": "inbox|sent|trash",
+                "type": "string"
+              },
+              "limit": {
+                "description": "max",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        {
+          "name": "agentmail_read",
+          "description": "Read one Agent Mail message.",
+          "inputSchema": {
+            "additionalProperties": true,
+            "properties": {
+              "message_id": {
+                "description": "msg_…",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        {
+          "name": "agentmail_send",
+          "description": "Send via Agent Mail (needs confirmation token from call 1).",
+          "inputSchema": {
+            "additionalProperties": true,
+            "properties": {
+              "confirmation_token": {
+                "description": "ctk_… from first call",
+                "type": "string"
+              },
+              "html": {
+                "description": "optional html",
+                "type": "string"
+              },
+              "subject": {
+                "description": "subject",
+                "type": "string"
+              },
+              "text": {
+                "description": "plain body",
+                "type": "string"
+              },
+              "to": {
+                "description": "recipient",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        }
+      ]
     }
   ]
 }

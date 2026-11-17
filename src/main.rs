@@ -3095,6 +3095,7 @@ fn classify_server(
                 })
                 .unwrap_or_default();
             return Ok(nguruvilu::pack::McpServerDecl {
+                tools: Vec::new(),
                 id: id.to_string(),
                 transport: "streamable-http".into(),
                 source: None,
@@ -3141,6 +3142,7 @@ fn classify_server(
         })
         .unwrap_or_default();
     Ok(nguruvilu::pack::McpServerDecl {
+        tools: Vec::new(),
         id: id.to_string(),
         transport: "stdio".into(),
         source: None,

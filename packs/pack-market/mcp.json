@@ -4,8 +4,64 @@
       "id": "pack-market",
       "transport": "stdio",
       "command": "node",
-      "args": ["bin/market.mjs"],
-      "scope": "session"
+      "args": [
+        "bin/market.mjs"
+      ],
+      "scope": "session",
+      "tools": [
+        {
+          "name": "market_search",
+          "description": "在远程包索引里搜索包：按 query 在 name / description / tags 中做不区分大小写的子串匹配。只返回摘要信息。",
+          "inputSchema": {
+            "properties": {
+              "limit": {
+                "description": "最多返回几条，默认 10",
+                "type": "number"
+              },
+              "query": {
+                "description": "搜索词；留空返回前 limit 条",
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "market_info",
+          "description": "查看某个包的完整索引条目（含 sha256、tags、dependencies）。",
+          "inputSchema": {
+            "properties": {
+              "name": {
+                "description": "包名，精确匹配（不区分大小写）",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "market_install",
+          "description": "下载包文件到 ~/.nguruvilu/market/<name>-<version>.ngupack 并校验 sha256。只下载，不安装——是否安装由调用方决定。",
+          "inputSchema": {
+            "properties": {
+              "name": {
+                "description": "包名，精确匹配（不区分大小写）",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "type": "object"
+          }
+        }
+      ]
     }
   ]
 }

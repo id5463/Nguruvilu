@@ -6,7 +6,137 @@
       "source": "npm:vk-mcp-server",
       "command": "vk-mcp-server",
       "args": [],
-      "scope": "session"
+      "scope": "session",
+      "tools": [
+        {
+          "name": "vk_users_get",
+          "description": "Look up VK users by numeric ID or short name (e.g. durov). Use this to resolve a name to an ID before calling other tools, or to check whether a profile is closed.",
+          "inputSchema": {
+            "properties": {
+              "fields": {
+                "description": "Profile fields to return",
+                "type": "string"
+              },
+              "user_ids": {
+                "description": "Comma-separated user IDs or screen names",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        {
+          "name": "vk_wall_get",
+          "description": "Read posts from a user or community wall, newest first. Pass domain for a short address (durov) or owner_id for a numeric one — negative for a community, positive for a person. Each post carries its likes, reposts, comments and views.",
+          "inputSchema": {
+            "properties": {
+              "count": {
+                "description": "Number of posts (1-100)",
+                "type": "number"
+              },
+              "domain": {
+                "description": "Short address of user or community",
+                "type": "string"
+              },
+              "filter": {
+                "description": "Filter: all, owner, others, postponed, suggests",
+                "enum": [
+                  "all",
+                  "owner",
+                  "others",
+                  "postponed",
+                  "suggests"
+                ],
+                "type": "string"
+              },
+              "offset": {
+                "description": "Offset for pagination",
+                "type": "number"
+              },
+              "owner_id": {
+                "description": "Wall owner ID (negative for community)",
+                "type": "number"
+              }
+            },
+            "type": "object"
+          }
+        },
+        {
+          "name": "vk_groups_get_members",
+          "description": "List the members of a community. Returns bare user IDs unless you ask for fields, in which case it returns profiles. Many communities hide their member list, which comes back as an access error rather than an empty list.",
+          "inputSchema": {
+            "properties": {
+              "count": {
+                "description": "Number of members to return (max 1000)",
+                "type": "number"
+              },
+              "fields": {
+                "description": "Additional profile fields to return (e.g. photo_200,online,sex,city)",
+                "type": "string"
+              },
+              "filter": {
+                "description": "Filter: managers, editors, mods, advertisers, friends, unsure",
+                "enum": [
+                  "managers",
+                  "editors",
+                  "mods",
+                  "advertisers",
+                  "friends",
+                  "unsure"
+                ],
+                "type": "string"
+              },
+              "group_id": {
+                "description": "Community ID or its short name (e.g. apiclub). Positive and without the minus sign — the minus belongs to owner_id on a wall, not here.",
+                "type": "string"
+              },
+              "offset": {
+                "description": "Offset for pagination",
+                "type": "number"
+              },
+              "sort": {
+                "description": "Sort order: id_asc, id_desc, time_asc, time_desc",
+                "enum": [
+                  "id_asc",
+                  "id_desc",
+                  "time_asc",
+                  "time_desc"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "group_id"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "vk_groups_get_by_id",
+          "description": "Look up communities by numeric ID or short name (e.g. apiclub). Use it to resolve a name to an ID, or to read the description, member count and type before deciding what to do with it.",
+          "inputSchema": {
+            "properties": {
+              "fields": {
+                "description": "Community fields",
+                "type": "string"
+              },
+              "group_ids": {
+                "description": "Comma-separated community IDs or short names (e.g. apiclub,vk). Positive and without the minus sign.",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        {
+          "name": "vk_token_info",
+          "description": "Say which VK token the server holds — a community token, a user token, a VK ID sign-in token or an app service key — which community it acts as and with which rights, which tools work with it, and for each tool that does not, what would make it work. Call it when unsure what you can do in VK, or before telling the user something cannot be done.",
+          "inputSchema": {
+            "properties": {},
+            "type": "object"
+          }
+        }
+      ]
     }
   ]
 }
