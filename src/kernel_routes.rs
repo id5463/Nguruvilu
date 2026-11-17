@@ -339,6 +339,48 @@ pub fn set_registry(registry: Arc<crate::tools::ToolRegistry>) {
     *registry_cell().write().expect("tool registry cell") = Some(registry);
 }
 
+/// 进程级的路由表。
+///
+/// 和工具表一样是单例：路由在启动时装一次，之后包往里插层。
+/// 做成静态而不是沿参数传递，是因为调用点在 `Agent::run` 深处，
+/// 为了一个查表操作把 `Arc<Dispatch>` 穿过十几层签名不划算 ——
+/// 而路由表本身是全局的，没有"两个内核各有一张表"的语义。
+static DISPATCH: std::sync::OnceLock<Arc<Dispatch>> = std::sync::OnceLock::new();
+
+/// 当前的进程级路由表，第一次调用时建好。
+pub fn dispatch() -> &'static Arc<Dispatch> {
+    DISPATCH.get_or_init(|| {
+        let d = Arc::new(Dispatch::new());
+        let catalog = Arc::new(Catalog::new());
+        // 状态容器也要活到进程结束：`state.*` 路由拿着它的 Arc。
+        let _ = CATALOG.set(catalog.clone());
+        install(&d, &catalog);
+        d
+    })
+}
+
+/// 进程级的状态容器。`dispatch()` 里建的那一个。
+static CATALOG: std::sync::OnceLock<Arc<Catalog>> = std::sync::OnceLock::new();
+
+/// 当前的状态容器。**必须先调过 `dispatch()`**，否则 panic ——
+/// 因为两者是一起建的，单独取它说明接线顺序错了。
+pub fn catalog() -> &'static Arc<Catalog> {
+    let _ = dispatch();
+    CATALOG.get().expect("catalog is built with dispatch")
+}
+
+/// 启动序列的一行接线：把工具表和路由表都装好。
+///
+/// 在 `Kernel` 建完之后调一次。幂等 —— 重复调用只是把同一份工具表再装一遍。
+pub fn route_everything(kernel: &crate::plugin::Kernel) {
+    // 工具表要能被 `tool.execute` 拿到。Kernel 自己的那份是 `&ToolRegistry`，
+    // 而路由是在别的线程上跑的，所以拷一份 Arc 出来 —— 注册表内部全是 Arc，
+    // 这次拷贝不复制任何 handler。
+    let registry = Arc::new(kernel.tools().clone());
+    set_registry(registry);
+    let _ = dispatch();
+}
+
 /// 当前的工具表，没装时 `None`。
 pub fn registry() -> Option<Arc<crate::tools::ToolRegistry>> {
     registry_cell().read().expect("tool registry cell").clone()

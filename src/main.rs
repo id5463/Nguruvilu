@@ -325,6 +325,18 @@ enum Command {
         r#for: Option<String>,
     },
     Runtime,
+    /// List the routes the kernel can answer, and call one.
+    ///
+    /// 这是"一切皆调用"的验证入口：`ngu routes` 看到表里有什么，
+    /// `ngu routes --call <名字> [--args <JSON>]` 真的走一遍。
+    Routes {
+        /// Call this route instead of listing them.
+        #[arg(long)]
+        call: Option<String>,
+        /// JSON arguments for `--call`.
+        #[arg(long, default_value = "{}")]
+        args: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -629,13 +641,24 @@ impl nguruvilu::model::ModelAccess for CliModelAccess {
             Ok(client) => client,
             Err(_) => return Vec::new(),
         };
-        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            return Vec::new();
-        };
-        runtime.block_on(async { client.list_models().await.unwrap_or_default() })
+        // 这个方法在 turn 内部被调到，而 turn 本身跑在 `main` 的 runtime 里。
+        // 另建一个 runtime 再 block_on 会 panic（"Cannot start a runtime from
+        // within a runtime"），这就是 `ngu -p` 每次退出都报错的原因。
+        // 复用当前 runtime：block_in_place 让出 worker，Handle::block_on 等结果。
+        let fetch = async { client.list_models().await.unwrap_or_default() };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fetch)),
+            // 没有 runtime 时（比如单元测试直接调）才自己建一个。
+            Err(_) => {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return Vec::new();
+                };
+                runtime.block_on(fetch)
+            }
+        }
     }
 
     fn context_policy(&self) -> Arc<dyn ContextPolicy> {
@@ -772,6 +795,8 @@ async fn run() -> Result<()> {
         Err(error) => eprintln!("[skills] scan failed: {error:#}"),
     }
 
+    // 路由命令要等 Kernel 建好才有表可列，先记下来。
+    let mut pending_routes: Option<(Option<String>, String)> = None;
     match &cli.command {
         Some(Command::Sessions) => return list_sessions(&store, cli.json),
         Some(Command::Show { id }) => return show_session(&store, id),
@@ -902,6 +927,11 @@ async fn run() -> Result<()> {
             // Described below, once the kernel is assembled: the tool table
             // and the published services do not exist until then.
         }
+        Some(Command::Routes { call, args }) => {
+            // 内核默认路由在建 Kernel 之后才装好，所以这里不能提前 return。
+            // 记下来，装配完再执行。
+            pending_routes = Some((call.clone(), args.clone()));
+        }
         None => {}
     }
 
@@ -930,6 +960,13 @@ async fn run() -> Result<()> {
     // CLI, `ngu apply`, and the desktop cannot disagree about what exists.
     // Defining is not enabling: a pack's assembly still decides what loads.
     kernel.define_builtins();
+    // 一切皆调用的接线：内核默认实现进路由表，工具表进活对象槽。
+    // 这里装一次，之后内核和包走同一条路 —— 否则"暴露"只是对外的假象。
+    nguruvilu::kernel_routes::route_everything(&kernel);
+    // `ngu routes` 在这里就能答了：表和工具都装好了。
+    if let Some((call, raw_args)) = pending_routes.take() {
+        return routes_command(call.as_deref(), &raw_args, cli.json);
+    }
     // The judge keeps its settings in the host's cell rather than in the plugin,
     // so a settings save can re-apply the fibers without rebuilding anything.
     // The kernel's own state, published where a pack can reach and change it:
@@ -2436,6 +2473,7 @@ async fn apply_assembly(
     // assembly names a builtin, which is how it drifted before.
     kernel.install_bootstrap()?;
     kernel.define_builtins();
+    nguruvilu::kernel_routes::route_everything(&kernel);
     // The agent can build and install packs itself.
     nguruvilu::tools::pack::register(kernel.tools_mut())?;
     // The model access service. `delegate` injects it, so without this a pack
@@ -4661,5 +4699,61 @@ mod tests {
         assert!(!block.contains("broken"), "{block}");
 
         std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+/// `ngu routes` —— 列出路由表，或调一条。
+///
+/// 这是"一切皆调用"的可验证入口：表里有什么、能不能调通，一条命令看清。
+fn routes_command(call: Option<&str>, raw_args: &str, json: bool) -> Result<()> {
+    let dispatch = nguruvilu::kernel_routes::dispatch();
+
+    let Some(name) = call else {
+        let names = dispatch.names();
+        if json {
+            println!("{}", serde_json::to_string_pretty(&names)?);
+        } else {
+            for line in &names {
+                println!("{line}");
+            }
+            println!();
+            println!("{} 条路由。加 --call <名字> --args '<JSON>' 真的调一条。", names.len());
+        }
+        return Ok(());
+    };
+
+    let args: serde_json::Value =
+        serde_json::from_str(raw_args).with_context(|| format!("--args 不是 JSON：{raw_args}"))?;
+
+    // 已经在 tokio 的 runtime 里了（`run` 整个跑在 block_on 之内），
+    // 再 `block_on` 一次就是 "Cannot start a runtime from within a runtime"。
+    // 所以这里用 `block_in_place` + `Handle::block_on`，让出当前 worker 去等，
+    // 而不是另起一个 runtime。
+    let call = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(dispatch.call(name, args))
+    });
+
+    match call {
+        Ok(value) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "route": name,
+                    "result": value,
+                }))?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "route": name,
+                    "error": e,
+                }))?);
+                std::process::exit(1);
+            }
+            anyhow::bail!("路由 {name} 失败：{e}")
+        }
     }
 }
