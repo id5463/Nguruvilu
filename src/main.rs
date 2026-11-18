@@ -576,6 +576,24 @@ impl AgentObserver for PrettyObserver {
 /// because it belongs to the CLI's view of the prompt rather than to the
 /// runtime's state. The mission block is here for the same reason: it describes
 /// this session's workspace, which the runtime knows nothing about.
+/// Whether a pack has taken responsibility for choosing skills.
+///
+/// The kernel knows one thing here: a pack called `skill-router` said it would
+/// answer, and the answer is a mode name in that pack's own settings block. Any
+/// mode other than `all`/`full` means the catalog is that pack's business, so
+/// the kernel stops writing every skill into the prompt.
+///
+/// `false` for everything else — no setting, an empty string, `all`, `full` —
+/// which is the behaviour every machine had before this existed.
+fn skills_are_routed(packs: &std::collections::BTreeMap<String, serde_json::Value>) -> bool {
+    packs
+        .get("skill-router")
+        .and_then(|block| block.get("skill_mode"))
+        .and_then(serde_json::Value::as_str)
+        .map(|mode| !matches!(mode, "" | "all" | "full"))
+        .unwrap_or(false)
+}
+
 struct CliConfig {
     runtime: Arc<Mutex<Runtime>>,
     base_prompt: String,
@@ -595,6 +613,14 @@ struct CliConfig {
     session_workspace: Arc<Mutex<Option<PathBuf>>>,
     /// Whether this process was started minimal. See [`Cli::bare`].
     bare: bool,
+    /// Per-pack settings, straight from the settings file.
+    ///
+    /// Here rather than read off `Runtime` because `Runtime` is the hot-reload
+    /// view (tools, route, persona) and pack settings are not part of it. The
+    /// kernel does not interpret the block: it looks up `skill-router` because
+    /// that is the pack that said it would answer, and reads one string out of
+    /// whatever the user put there.
+    packs: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// The session's route, published so a plugin can build a subagent on it.
@@ -722,7 +748,20 @@ impl TurnConfig for CliConfig {
         // case so `catalog_with_tools` would answer `None` anyway; the check is
         // here so a future registry that answers `Some("")` cannot leave a stray
         // blank line in a subagent's prompt.
-        if !self.bare {
+        // A pack that routes skills says so in its own settings block; the kernel
+        // reads the answer and does not know what a router is.
+        //
+        // This is the seam the skill table was published for. Without it the
+        // prompt carried every skill on the machine and a router beside them
+        // would only add weight: the model reads all fifty *and* a tool that can
+        // pick from them. With it, a pack that has taken responsibility for
+        // selection turns the automatic catalog off, and the model asks for the
+        // two skills that matter.
+        //
+        // Absent or `all` keeps today's behaviour, so a machine that never
+        // configures a router is unchanged.
+        let skills_routed = skills_are_routed(&self.packs);
+        if !self.bare && !skills_routed {
             let tool_names = snapshot.tools.names();
             if let Some(catalog) = self.skills.lock().expect("skills lock").catalog_with_tools(&tool_names, None) {
                 system_prompt.push_str("
@@ -1355,6 +1394,11 @@ async fn run() -> Result<()> {
     // are assembled before that, so this cell is how the workspace reaches them.
     let session_workspace: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
 
+    // What each pack put in its own settings block. Copied once here so a later
+    // settings save in the same process does not move a prompt out from under a
+    // running turn — the same rule the settings snapshot follows.
+    let pack_blocks = settings.packs.clone();
+
     let config: Arc<dyn TurnConfig> = Arc::new(CliConfig {
         runtime: Arc::clone(&runtime),
         base_prompt,
@@ -1363,6 +1407,7 @@ async fn run() -> Result<()> {
         injection: Arc::clone(&injection),
         session_workspace: Arc::clone(&session_workspace),
         bare: cli.bare,
+        packs: pack_blocks.clone(),
     });
 
     let snapshotter = if cli.git_snapshot {
@@ -4661,6 +4706,40 @@ fn model_route(cli: &Cli, settings: &Settings, kernel: Option<&Kernel>) -> Model
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The switch that decides whether the prompt carries every skill.
+    ///
+    /// The default has to be `false`: a machine that never configures a router
+    /// must behave exactly as before, and a typo in the mode name must not
+    /// silently empty the catalog.
+    #[test]
+    fn a_router_takes_over_the_skill_catalog_only_when_it_says_so() {
+        let none = std::collections::BTreeMap::new();
+        assert!(!skills_are_routed(&none), "no pack settings: kernel keeps the catalog");
+
+        let mut packs = std::collections::BTreeMap::new();
+        // Configured, but asking for everything: the catalog stays.
+        packs.insert("skill-router".to_string(), serde_json::json!({ "skill_mode": "all" }));
+        assert!(!skills_are_routed(&packs));
+        packs.insert("skill-router".to_string(), serde_json::json!({ "skill_mode": "full" }));
+        assert!(!skills_are_routed(&packs));
+        packs.insert("skill-router".to_string(), serde_json::json!({ "skill_mode": "" }));
+        assert!(!skills_are_routed(&packs));
+
+        // Any real selection mode means the pack answers instead.
+        for mode in ["lexical", "ngram", "jev", "hybrid", "llm", "regex"] {
+            packs.insert(
+                "skill-router".to_string(),
+                serde_json::json!({ "skill_mode": mode }),
+            );
+            assert!(skills_are_routed(&packs), "{mode} should route");
+        }
+
+        // Another pack's block is not this pack's answer.
+        let mut other = std::collections::BTreeMap::new();
+        other.insert("judge".to_string(), serde_json::json!({ "skill_mode": "lexical" }));
+        assert!(!skills_are_routed(&other));
+    }
 
     #[test]
     fn remote_specs_are_recognised_and_paths_are_not() {
