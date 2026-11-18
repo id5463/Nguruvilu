@@ -1,21 +1,30 @@
-// 被劫持的服务器的入口。
+// 被劫持服务器在内核眼里的样子。
 //
-// 内核读到的 `command:` 被 `hijack.mjs` 改成了 `node shim.mjs <真实命令> ...`，
-// 于是内核启动的是这个文件，而不是原来的 MCP 服务器。
+// # 它做两件事，方向相反
 //
-// 它做三件事，都很小：
+// 内核问 `tools/list` 时，**不转发**：回的是一个 `call` 工具。所以内核的
+// 表里只有一条，而不是那个服务器的三十七条。这是"合并"的全部意义 ——
+// 一条工具说明，模型读一行就够。
 //
-//   1. 把内核发来的每一帧记下来（`NGU_PROXY_TRACE` 开了才记），
-//   2. 起真正的服务器，把帧原样转发进去，
-//   3. 把答案原样转发回内核。
+// 内核调 `call` 时，拆成真实的 `tools/call` 发给服务器，把结果翻回内核
+// 能读的样子。参数原样透传，不解释。
 //
-// **它不修改内容。** 一个会改内容的中间人会让"这个工具到底做了什么"变成
-// 一个无法回答的问题 —— 而这个包的全部目的是让工具变少，不是让它们变奇怪。
-// 记日志是观察，改内容是欺骗，两者不是一回事。
+// # 什么被改，什么没被改
 //
-// 真正的服务器不是这个文件起的：它请 `proxy.mjs` 起，这样同一份服务器只有
-// 一个实例，代理的 `call` 工具和内核的直连走的是同一个进程。
+// 改的只有 `tools/list` 的**回答形状**：从 N 条变成 1 条。
+// `initialize` 原样转发（协议版本、能力集要真实）；`tools/call` 的参数
+// 和结果一个字节不改；服务器发来的通知原样送上去。
+//
+// 一个会篡改结果的中间人会让"这个工具到底做了什么"变成无法回答的问题。
+// 这个不篡改：它只决定**列出多少**，不决定**做了什么**。
+//
+// # 为什么不是把所有服务器合成一个
+//
+// 每个被劫持的服务器各有一个 shim，各自暴露一个 `call`。所以装了五个
+// 服务器就有五个 `call`（名字带服务器前缀），而不是一个。把它们再合成一个
+// 需要跨 shim 协调，那是 mcp-proxy 自己的合并模式，不是 shim 的事。
 import { spawn } from 'node:child_process';
+import path from 'node:path';
 
 const argv = process.argv.slice(2);
 if (argv.length === 0) {
@@ -24,55 +33,213 @@ if (argv.length === 0) {
 }
 
 const [command, ...args] = argv;
+
+// 这个服务器的短名：取命令的第一个词，够区分，也够短。
+const serverName = path.basename(command).replace(/\.(exe|cmd|bat|js|mjs|py)$/i, '');
+const TOOL = 'call';
 const trace = process.env.NGU_PROXY_TRACE === '1';
 
 function log(...parts) {
-  if (trace) process.stderr.write('[shim] ' + parts.join(' ') + '\n');
+  if (trace) process.stderr.write(`[shim:${serverName}] ` + parts.join(' ') + '\n');
 }
 
 log('启动真实服务器:', command, args.join(' '));
 
-// 在自己和真实服务器之间放一条管道。
-//
-// `inherit` 不能用于 stdio：内核的管道属于内核，这个进程用它自己的两段
-// 去对接，才能看得见每一帧。`piped` 让 spawn 建新管道，两头都在这里。
 const child = spawn(command, args, {
   stdio: ['pipe', 'pipe', 'inherit'],
   env: process.env,
-  // 别让 shim 成为孤儿的父进程：内核关掉 stdin 时我们要跟着退出。
   detached: false,
 });
 
 child.on('error', (error) => {
-  process.stderr.write(`[shim] 起不来 ${command}: ${error.message}\n`);
+  process.stderr.write(`[shim:${serverName}] 起不来 ${command}: ${error.message}\n`);
   process.exit(1);
 });
-
 child.on('exit', (code, signal) => {
   log(`真实服务器退出 code=${code} signal=${signal}`);
   process.exit(code == null ? 0 : code);
 });
 
-// 内核 → 真实服务器。逐字节转发，不改一个字节。
-process.stdin.pipe(child.stdin);
-process.stdin.on('end', () => {
-  // 内核关了 stdin 就是在说"结束"。关掉自己这一侧，让真实服务器看到 EOF。
-  try { child.stdin.end(); } catch { /* 已经关了 */ }
-});
+// ---------------------------------------------------------------- 帧处理
+//
+// MCP over stdio 是**逐行**的 JSON-RPC，不是长度前缀。所以这里按行切，
+// 一行一帧。内核那一侧用 length-prefix 是因为它的插件协议是自己的；
+// 它连 MCP 时也按行。
 
-// 真实服务器 → 内核。
-if (trace) {
-  // 只有要记录时才截流：不记录时直接 pipe，省一次拷贝。
-  child.stdout.on('data', (chunk) => {
-    log('→', chunk.toString().trim().slice(0, 200));
-    process.stdout.write(chunk);
-  });
-} else {
-  child.stdout.pipe(process.stdout);
+let stdoutBuffer = '';
+
+function sendToKernel(obj) {
+  process.stdout.write(JSON.stringify(obj) + '\n');
 }
 
-// 这个进程自己没有逻辑，两个方向都是管道。任何一侧断掉就整体退出，
-// 免得留下一个还在跑但已经没人说话的服务器。
+/// 这个服务器的工具表，第一次问过之后缓存。
+let realTools = null;
+/// 等 `tools/list` 的回答：id → resolve。
+const waiting = new Map();
+let nextUpstreamId = 1e6;   // 和内核发来的 id 分开，免得撞号
+
+function askUpstream(method, params) {
+  return new Promise((resolve, reject) => {
+    const id = nextUpstreamId++;
+    waiting.set(id, { resolve, reject });
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+    setTimeout(() => {
+      if (waiting.delete(id)) reject(new Error(`${method} 超时`));
+    }, 30000).unref?.();
+  });
+}
+
+child.stdout.on('data', (chunk) => {
+  stdoutBuffer += chunk.toString();
+  let at;
+  while ((at = stdoutBuffer.indexOf('\n')) >= 0) {
+    const line = stdoutBuffer.slice(0, at).trim();
+    stdoutBuffer = stdoutBuffer.slice(at + 1);
+    if (!line) continue;
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      // 不是 JSON 就不是协议的一部分（服务器往 stdout 打日志是它的 bug）。
+      // 转给内核会毁掉一帧，丢掉并记下来。
+      log('丢弃非 JSON 输出:', line.slice(0, 120));
+      continue;
+    }
+    // 是我发的上游请求的回答？
+    if (message.id != null && waiting.has(message.id)) {
+      const { resolve, reject } = waiting.get(message.id);
+      waiting.delete(message.id);
+      if (message.error) reject(new Error(message.error.message || 'upstream error'));
+      else resolve(message.result);
+      continue;
+    }
+    // 别的（通知、内核发的 id 的回答）原样送上去。
+    sendToKernel(message);
+  }
+});
+
+// ---------------------------------------------------------------- 主循环
+
+let stdinBuffer = '';
+
+process.stdin.on('data', (chunk) => {
+  stdinBuffer += chunk.toString();
+  let at;
+  while ((at = stdinBuffer.indexOf('\n')) >= 0) {
+    const line = stdinBuffer.slice(0, at).trim();
+    stdinBuffer = stdinBuffer.slice(at + 1);
+    if (!line) continue;
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      log('内核发来非 JSON:', line.slice(0, 120));
+      continue;
+    }
+    handle(message).catch((error) => {
+      log('处理失败:', error.message);
+      if (message.id != null) {
+        sendToKernel({ jsonrpc: '2.0', id: message.id, error: { code: -32603, message: error.message } });
+      }
+    });
+  }
+});
+
+process.stdin.on('end', () => {
+  try { child.stdin.end(); } catch { /* 已关 */ }
+});
+
+async function handle(message) {
+  const { id, method } = message;
+
+  // 列出工具：不转发，回答一条。
+  if (method === 'tools/list') {
+    if (!realTools) {
+      // 第一次问时把真实表取一次，只为了知道工具名 —— 调用时要校验，
+      // 一个不存在的工具名是最常见的失败，直接说有哪些比猜好。
+      try {
+        const listed = await askUpstream('tools/list', {});
+        realTools = (listed && listed.tools) || [];
+        log(`真实工具 ${realTools.length} 个`);
+      } catch (error) {
+        log('取真实工具表失败:', error.message);
+        realTools = [];
+      }
+    }
+    sendToKernel({
+      jsonrpc: '2.0',
+      id,
+      result: {
+        tools: [{
+          name: TOOL,
+          description:
+            `调用 ${serverName} 上的一个工具。先用 action="list" 看有哪些工具，` +
+            `action="call" 时才需要 tool 和 args。`,
+          inputSchema: {
+            type: 'object',
+            properties: {
+              action: { type: 'string', enum: ['list', 'call'], description: 'list 列工具，call 调用' },
+              tool: { type: 'string', description: '工具原名' },
+              args: { type: 'object', description: '工具参数，原样转发' },
+            },
+            required: ['action'],
+          },
+        }],
+      },
+    });
+    return;
+  }
+
+  // 调用：拆成真实的 tools/call。
+  if (method === 'tools/call' && message.params && message.params.name === TOOL) {
+    const a = message.params.arguments || {};
+    const action = a.action || 'list';
+
+    if (action === 'list') {
+      if (!realTools) {
+        try {
+          const listed = await askUpstream('tools/list', {});
+          realTools = (listed && listed.tools) || [];
+        } catch (error) {
+          sendToKernel(replyText(id, `取工具表失败：${error.message}`));
+          return;
+        }
+      }
+      const names = realTools.map((t) => ({ name: t.name, description: (t.description || '').slice(0, 120) }));
+      sendToKernel(replyText(id, JSON.stringify({ server: serverName, tools: names }, null, 2)));
+      return;
+    }
+
+    if (action !== 'call') {
+      sendToKernel(replyText(id, `不认识 action="${action}"，只有 list 和 call`));
+      return;
+    }
+    if (!a.tool) {
+      sendToKernel(replyText(id, 'action="call" 需要 tool 参数。用 action="list" 看有哪些。'));
+      return;
+    }
+    // 名字校验：一个拼错的工具名会让服务器回一句难懂的话，先在这里拦下。
+    if (realTools && realTools.length && !realTools.some((t) => t.name === a.tool)) {
+      sendToKernel(replyText(id, `${serverName} 没有 ${a.tool}。它有：${realTools.map((t) => t.name).join(', ')}`));
+      return;
+    }
+    try {
+      const result = await askUpstream('tools/call', { name: a.tool, arguments: a.args || {} });
+      sendToKernel({ jsonrpc: '2.0', id, result });
+    } catch (error) {
+      sendToKernel(replyText(id, `调用 ${a.tool} 失败：${error.message}`));
+    }
+    return;
+  }
+
+  // 别的（initialize、通知、别的工具名）原样转发，等上游的回答照原 id 送回去。
+  child.stdin.write(JSON.stringify(message) + '\n');
+}
+
+function replyText(id, text) {
+  return { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }], isError: false } };
+}
+
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
     try { child.kill(signal); } catch { /* 已退出 */ }
