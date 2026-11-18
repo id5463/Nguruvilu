@@ -1289,6 +1289,29 @@ async fn run() -> Result<()> {
     let skills = Arc::new(Mutex::new(skills));
     let policy = Arc::new(Mutex::new(policy));
 
+    // The rest of the kernel's own state, published beside `settings`, `route`
+    // and `persona`. Not a special case for any one pack: the rule is that
+    // kernel state is reachable, and these three were the ones still held in a
+    // local the kernel did not share.
+    //
+    // `skills` is the one that was actually missed. A prompt is assembled from
+    // every skill on the machine, and a pack that wants to choose *which* had no
+    // way to say so — it could add a skill, never narrow the set. The same
+    // `Arc<Mutex<_>>` the kernel reads is what gets published, so a pack's write
+    // lands in the memory the next turn reads rather than in a copy.
+    kernel.publish_state_arc(
+        nguruvilu::state::SKILLS,
+        Arc::clone(&skills) as Arc<dyn std::any::Any + Send + Sync>,
+    );
+    kernel.publish_state_arc(
+        nguruvilu::state::POLICY,
+        Arc::clone(&policy) as Arc<dyn std::any::Any + Send + Sync>,
+    );
+    kernel.publish_state_arc(
+        nguruvilu::state::TOOLS,
+        Arc::clone(&tools) as Arc<dyn std::any::Any + Send + Sync>,
+    );
+
     // Published before anything can ask for it: a plugin loaded from a pack
     // needs the service to exist already.
     let access: Arc<dyn nguruvilu::model::ModelAccess> = Arc::new(CliModelAccess {

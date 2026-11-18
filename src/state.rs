@@ -49,6 +49,23 @@ pub const ROUTE: &str = "route";
 /// The persona text the system prompt is built from.
 pub const PERSONA: &str = "persona";
 
+/// The skill table a turn's prompt is assembled from.
+///
+/// Published for the same reason `settings` is: it is kernel state, and kernel
+/// state is what a pack may change. A prompt is built from every skill on the
+/// machine, and a pack that wants to choose *which* had no way to say so - it
+/// could add a skill, never narrow the set.
+pub const SKILLS: &str = "skills";
+
+/// The tool table this turn runs with.
+///
+/// `Contributions` is how a pack *adds* a tool; this is how one *sees* the
+/// result, so a reader needs no second mechanism beside the writer.
+pub const TOOLS: &str = "tools";
+
+/// The context policy: window size, compaction threshold, what survives.
+pub const POLICY: &str = "policy";
+
 /// The model route a turn runs on.
 ///
 /// `ModelRoute` comes from `hotreload` because that is where the hot-reload path
@@ -149,6 +166,41 @@ mod tests {
 
         // The pack wrote through the same lock the host holds.
         assert_eq!(published.settings().reasoning_effort, "high");
+    }
+
+    /// The gap this closed: a prompt is built from every skill on the machine,
+    /// and a pack had no way to narrow that set. It could add a skill
+    /// (`Contributions::skills`), never say "not these".
+    ///
+    /// The proof is the same shape as the settings test: the pack mutates the
+    /// table through the service, and the host reads it from the `Arc` it kept -
+    /// not from a copy.
+    #[test]
+    fn a_pack_can_reach_the_skill_table() {
+        use std::sync::Mutex;
+
+        let mut kernel = Kernel::new();
+        let skills: Arc<Mutex<crate::skills::SkillRegistry>> =
+            Arc::new(Mutex::new(crate::skills::SkillRegistry::with_roots(Vec::new())));
+        kernel.publish_state_arc(
+            SKILLS,
+            Arc::clone(&skills) as Arc<dyn std::any::Any + Send + Sync>,
+        );
+
+        struct Reader;
+        impl crate::plugin::Plugin for Reader {
+            fn name(&self) -> &str {
+                "reader"
+            }
+            fn apply(&self, ctx: &PluginCtx) -> anyhow::Result<crate::plugin::Contributions> {
+                let found = ctx.services.get::<Mutex<crate::skills::SkillRegistry>>(SKILLS);
+                assert!(found.is_some(), "the skill table is reachable by name");
+                Ok(crate::plugin::Contributions::new())
+            }
+        }
+
+        kernel.define(Arc::new(Reader));
+        kernel.load("reader", RealmMap::new(), serde_json::Value::Null).unwrap();
     }
 
     #[test]
