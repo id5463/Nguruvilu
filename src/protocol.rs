@@ -87,8 +87,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use std::io::{Read, Write};
+// A plugin is one round trip at a time, serialised by the mutex below, so the
+// pipes are plain blocking ones. Async pipes were the earlier choice and they
+// tied every read and write to the reactor of the runtime that spawned them:
+// a plugin started from a short-lived runtime answered `describe` and then
+// became unwritable, reported as `writing to plugin 'x'` against a child that
+// was alive with an intact pipe. Blocking pipes belong to no runtime.
 use tokio::sync::Mutex;
 
 /// The state keys the kernel answers, and nothing else.
@@ -453,9 +458,20 @@ pub struct Process {
 }
 
 struct Inner {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: ChildStdout,
+    child: std::process::Child,
+    /// `None` after a stop: taking the handle out and dropping it is how a
+    /// plain pipe is closed, and a closed pipe is what the child reads as end
+    /// of file.
+    stdin: Option<std::process::ChildStdin>,
+    /// One frame per `recv`, filled by a reader thread that owns the pipe.
+    ///
+    /// A blocking `read_exact` on a plugin that never answers cannot be
+    /// cancelled from outside — the async pipes this replaced could, via
+    /// `tokio::time::timeout`. The thread plus a channel puts that ability
+    /// back: the read may stay parked for ever, while `request` stops waiting
+    /// at its bound and reports a wedged plugin instead of hanging the kernel
+    /// on one child.
+    frames: tokio::sync::mpsc::UnboundedReceiver<Result<Value>>,
     /// The route currently being called, so a `next` frame that omits `name`
     /// can mean "the one I was called for".
     ///
@@ -511,7 +527,7 @@ impl Process {
         state: Option<std::sync::Arc<dyn Fn(&str) -> Option<Value> + Send + Sync>>,
         routes: Option<std::sync::Arc<dyn RouteHost>>,
     ) -> Result<Self> {
-        let mut command = Command::new(&spec.command);
+        let mut command = std::process::Command::new(&spec.command);
         command
             .args(&spec.args)
             .stdin(Stdio::piped())
@@ -519,8 +535,7 @@ impl Process {
             // stderr is left alone rather than piped: a plugin's log line is for
             // whoever is watching the terminal, and a plugin that writes a lot
             // must not be able to fill a pipe the kernel never drains.
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
+            .stderr(Stdio::inherit());
         if let Some(dir) = &spec.cwd {
             command.current_dir(dir);
         }
@@ -544,6 +559,31 @@ impl Process {
             .take()
             .ok_or_else(|| anyhow!("plugin '{}' has no stdout", spec.id))?;
 
+        // The reader thread owns stdout from here on. It ends when the pipe
+        // ends, which is when the child leaves — no shutdown handshake needed.
+        let (tx, frames) = tokio::sync::mpsc::unbounded_channel::<Result<Value>>();
+        {
+            let server = spec.id.clone();
+            let mut stdout = stdout;
+            std::thread::Builder::new()
+                .name(format!("plugin-read:{server}"))
+                .spawn(move || loop {
+                    let frame = read_one_frame(&mut stdout)
+                        .with_context(|| format!("plugin '{server}' closed its output"));
+                    let terminal = frame.is_err();
+                    if tx.send(frame).is_err() {
+                        // Nobody is listening any more: the process is gone.
+                        break;
+                    }
+                    if terminal {
+                        break;
+                    }
+                })
+                .map_err(|error| {
+                    anyhow!("starting a reader for plugin '{}': {error}", spec.id)
+                })?;
+        }
+
         let mut process = Self {
             id: spec.id.clone(),
             description: Description::default(),
@@ -551,8 +591,8 @@ impl Process {
             routes,
             inner: Mutex::new(Inner {
                 child,
-                stdin,
-                stdout,
+                stdin: Some(stdin),
+                frames,
                 route: None,
             }),
             requests: AtomicU64::new(0),
@@ -622,20 +662,18 @@ impl Process {
         // avoidable cost this module exists to not have.
         let mut header = [0u8; 4];
         header.copy_from_slice(&(body.len() as u32).to_be_bytes());
-        inner
-            .stdin
+        let stdin = match inner.stdin.as_mut() {
+            Some(stdin) => stdin,
+            None => return Err(anyhow!("plugin '{}' has been stopped", self.id)),
+        };
+        stdin
             .write_all(&header)
-            .await
             .with_context(|| format!("writing to plugin '{}'", self.id))?;
-        inner
-            .stdin
+        stdin
             .write_all(&body)
-            .await
             .with_context(|| format!("writing to plugin '{}'", self.id))?;
-        inner
-            .stdin
+        stdin
             .flush()
-            .await
             .with_context(|| format!("flushing plugin '{}'", self.id))?;
 
         // Read until this request is answered. A frame that carries no `error`
@@ -648,28 +686,19 @@ impl Process {
         // environment variables did — but then the set of things it can learn is
         // fixed before it runs and invisible to anyone reading `describe`.
         loop {
-            let len = read_u32_async(&mut inner.stdout)
-                .await
-                .with_context(|| format!("plugin '{}' closed its output", self.id))?;
-            let len = len as usize;
-            if len > MAX_FRAME {
-                return Err(anyhow!(
-                    "plugin '{}' announced a {len}-byte frame, over the {MAX_FRAME} limit",
-                    self.id
-                ));
-            }
-            let mut buf = vec![0u8; len];
-            inner
-                .stdout
-                .read_exact(&mut buf)
-                .await
-                .with_context(|| format!("plugin '{}' truncated its answer", self.id))?;
-            let value: Value = serde_json::from_slice(&buf).with_context(|| {
-                format!(
-                    "plugin '{}' answered with {} bytes that are not JSON",
-                    self.id, len
-                )
-            })?;
+            let bound = read_bound();
+            let value = match tokio::time::timeout(bound, inner.frames.recv()).await {
+                Ok(Some(Ok(value))) => value,
+                Ok(Some(Err(error))) => return Err(error),
+                Ok(None) => return Err(anyhow!("plugin '{}' closed its output", self.id)),
+                Err(_) => {
+                    return Err(anyhow!(
+                        "plugin '{}' did not answer within {} seconds. It may be wedged; the \n                         kernel stopped waiting rather than hang on one child. \n                         `NGU_PLUGIN_READ_SECS` moves the bound.",
+                        self.id,
+                        bound.as_secs()
+                    ))
+                }
+            };
 
             // The two directions that are not questions: a plugin putting
             // itself in front of a name (`register`), and a plugin handing the
@@ -688,7 +717,7 @@ impl Process {
                     let body = self
                         .answer_route(op, &value, called_for.as_deref())
                         .await?;
-                    write_frame_async(&mut inner.stdin, &body).await?;
+                    write_frame_sync(&mut inner.stdin, &body)?;
                     continue;
                 }
             }
@@ -717,7 +746,7 @@ impl Process {
                         "error": "this process was started without a state provider",
                     }))?,
                 };
-                write_frame_async(&mut inner.stdin, &body).await?;
+                write_frame_sync(&mut inner.stdin, &body)?;
                 continue;
             }
             let (key, id) = match asked.get("state") {
@@ -733,7 +762,7 @@ impl Process {
                         "ask": { "id": Value::Null },
                         "error": format!("unknown question: {asked}"),
                     }))?;
-                    write_frame_async(&mut inner.stdin, &body).await?;
+                    write_frame_sync(&mut inner.stdin, &body)?;
                     continue;
                 }
             };
@@ -751,7 +780,7 @@ impl Process {
                 }),
             };
             let body = serde_json::to_vec(&answer)?;
-            write_frame_async(&mut inner.stdin, &body).await?;
+            write_frame_sync(&mut inner.stdin, &body)?;
         }
     }
 
@@ -964,13 +993,29 @@ impl Process {
         {
             let mut inner = self.inner.lock().await;
             // Dropping the write half is what a reader sees as end of file.
-            let _ = inner.stdin.shutdown().await;
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
-            if tokio::time::timeout_at(deadline, inner.child.wait())
-                .await
-                .is_err()
-            {
-                let _ = inner.child.start_kill();
+            //
+            // `ChildStdin` is a plain pipe now, so end of file is the drop
+            // itself: there is no shutdown call to make and no reactor to tell.
+            drop(inner.stdin.take());
+
+            // Then wait for it to leave, without blocking the caller for ever.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            loop {
+                match inner.child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        if std::time::Instant::now() >= deadline {
+                            // A plugin that ignores end of file would otherwise
+                            // outlive the pack that loaded it and hold its pipes
+                            // open.
+                            let _ = inner.child.kill();
+                            let _ = inner.child.wait();
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(_) => break,
+                }
             }
         }
     }
@@ -997,19 +1042,57 @@ pub fn error_or_result(answer: Value) -> Result<Value> {
 }
 
 /// Read a big-endian `u32` from an async stream.
-async fn read_u32_async(stream: &mut ChildStdout) -> std::io::Result<u32> {
+fn read_u32_sync(stream: &mut std::process::ChildStdout) -> std::io::Result<u32> {
     let mut buf = [0u8; 4];
-    stream.read_exact(&mut buf).await?;
+    stream.read_exact(&mut buf)?;
     Ok(u32::from_be_bytes(buf))
 }
 
+/// How long one frame may take before the caller gives up on it.
+///
+/// Ten minutes is not a guess at how long work takes — a `call` may legitimately
+/// be long — it is the point past which "still working" stops being believable.
+/// The env var exists because the right number depends on what a pack does, and
+/// only the person who wrote the pack knows.
+fn read_bound() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        std::env::var("NGU_PLUGIN_READ_SECS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .unwrap_or(600),
+    )
+}
+
+/// Read one whole frame: four length bytes, then exactly that many of payload.
+///
+/// Called only from the reader thread, which owns the pipe for the process's
+/// lifetime. Errors are terminal — a pipe that fails once does not recover — so
+/// the caller stops on the first one.
+fn read_one_frame(stdout: &mut std::process::ChildStdout) -> Result<Value> {
+    let len = read_u32_sync(stdout)? as usize;
+    if len > MAX_FRAME {
+        return Err(anyhow!(
+            "a plugin announced a {len}-byte frame, over the {MAX_FRAME} limit"
+        ));
+    }
+    let mut buf = vec![0u8; len];
+    stdout.read_exact(&mut buf)?;
+    serde_json::from_slice(&buf)
+        .map_err(|error| anyhow!("a plugin answered with {len} bytes that are not JSON: {error}"))
+}
+
 /// Write one already-serialised frame.
-async fn write_frame_async(stream: &mut ChildStdin, body: &[u8]) -> Result<()> {
+fn write_frame_sync(stream: &mut Option<std::process::ChildStdin>, body: &[u8]) -> Result<()> {
+    let stream = match stream {
+        Some(stream) => stream,
+        None => return Err(anyhow!("this plugin has already been stopped")),
+    };
     let mut header = [0u8; 4];
     header.copy_from_slice(&(body.len() as u32).to_be_bytes());
-    stream.write_all(&header).await?;
-    stream.write_all(body).await?;
-    stream.flush().await?;
+    stream.write_all(&header)?;
+    stream.write_all(body)?;
+    stream.flush()?;
     Ok(())
 }
 
@@ -1402,11 +1485,22 @@ mod tests {
     async fn a_plugin_that_never_answers_is_an_error_not_a_hang() {
         // It starts, it stays silent. The `describe` has to fail rather than
         // wait for ever — a load that hangs is worse than one that fails.
+        // Two bounds, and both are wanted. The inner one is the pipe's own read
+        // timeout — the primary mechanism now, since a blocking read cannot be
+        // cancelled from outside — set short here so the test does not sit for
+        // the production ten minutes. The outer one catches a failure of that
+        // mechanism, which is what the test is actually about.
+        //
+        // This pair exists because making the pipes blocking replaced an async
+        // `timeout` with nothing: the test caught a silent plugin holding the
+        // call open for ever, which is exactly what it was written to prevent.
+        std::env::set_var("NGU_PLUGIN_READ_SECS", "2");
         let reached = tokio::time::timeout(
-            std::time::Duration::from_millis(1500),
+            std::time::Duration::from_millis(8000),
             Process::start(&node("process.stdin.resume();")),
         )
         .await;
+        std::env::remove_var("NGU_PLUGIN_READ_SECS");
         // Either it reported a timeout-free error or the test's own bound fired;
         // both are "did not hang for ever", and on a slow machine the second is
         // the honest outcome.
