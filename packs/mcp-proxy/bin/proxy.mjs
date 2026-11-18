@@ -16,7 +16,10 @@
 // 用分号或换行分隔多条。等号左边是给模型看的短名字。
 
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
 import { existsSync } from 'node:fs';
+import path from 'node:path';
 import { delimiter, join } from 'node:path';
 
 /// Find the file to actually launch for a command name.
@@ -274,15 +277,118 @@ class Session {
   }
 }
 
+// ------------------------------------------------------------ 自动发现目标
+//
+// 手写一份 targets 是难用的根源：装了一个新的 MCP 包，还得回来改这里，
+// 而且写错了没有报错——代理只是少一个服务器。内核已经把每个包的 mcp.json
+// 都放在磁盘上了，直接读它。
+//
+// 只读，不启动，不改任何东西：这里做的和内核装载时做的事不重叠——内核
+// 不知道代理的存在，代理也不改内核。一个包自己的 mcp.json 是它公开的
+// 声明，读它是读者该做的事。
+//
+// 自己（`mcp-proxy`）要跳过，否则会代理自己，无限递归。
+const SELF_ID = 'mcp-proxy';
+
+// 劫持：把别的包的 MCP 启动命令换成自己的 shim。
+//
+// 动态 import，因为 `hijack.mjs` 只在需要时才值得加载 —— 一个不劫持的
+// 安装不该为它付一次模块解析。
+let hijack = null;
+async function loadHijack() {
+  if (!hijack) hijack = await import('./hijack.mjs');
+  return hijack;
+}
+
+function discoverFromPacks() {
+  const home = process.env.NGU_HOME || path.join(os.homedir(), '.nguruvilu');
+  const packsDir = path.join(home, 'packs');
+  const found = [];
+  let entries = [];
+  try {
+    entries = fs.readdirSync(packsDir, { withFileTypes: true });
+  } catch {
+    return found;   // 没有 packs 目录不是错误，只是没有可发现的
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dir = path.join(packsDir, entry.name);
+    const file = path.join(dir, 'mcp.json');
+    if (!fs.existsSync(file)) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      // 一个坏的 mcp.json 不该让代理起不来；内核装载时也会为它报错。
+      continue;
+    }
+    for (const server of parsed.servers || []) {
+      const id = String(server.id || '').trim();
+      if (!id || id === SELF_ID) continue;
+      // 交给代理的条目由内核对它的 via_proxy 负责；这里不管，
+      // 否则会和内核的转交重复。
+      if (server.via_proxy) continue;
+      const command = String(server.command || '').trim();
+      if (!command) continue;
+      found.push({
+        name: id,
+        command,
+        args: Array.isArray(server.args) ? server.args.map(String) : [],
+        cwd: dir,
+      });
+    }
+  }
+  return found;
+}
+
 // --------------------------------------------------------------- 代理本体
 
-const targets = parseTargets(TARGET_SPEC);
+// 手写的 targets 优先，自动发现补在后面：显式配置永远能覆盖发现的结果，
+// 而没配置的人什么都不用做。
+const manual = parseTargets(TARGET_SPEC);
+let targets = [];
+function refreshTargets() {
+  const discovered = discoverFromPacks();
+  const seen = new Set(manual.map((t) => t.name));
+  const merged = manual.concat(discovered.filter((t) => !seen.has(t.name)));
+  const before = targets.length;
+  targets = merged;
+  if (merged.length !== before) {
+    log(`目标: ${merged.length} 个（手写 ${manual.length}，发现 ${merged.length - manual.length}）`);
+  }
+  return merged;
+}
+refreshTargets();
+
+// 周期扫描。
+//
+// 装载顺序是包的字母序，代理叫 `mcp-proxy`，排在 `mail`、`moodle` 前面 ——
+// 而那些包声明 `via_proxy: mcp-proxy` 时，代理可能还没被内核启动。内核那一
+// 侧已经回退成直连（工具不丢），代价是"代理接管"这件事发生在启动之后。
+//
+// 所以这一侧自己看：每隔几秒重新发现一次，新出现的服务器直接补进
+// `sessions`。`tools/list` 每次都读 `sessions`，所以新目标在下一轮
+// `tools/list` 就可见 —— 不需要重启内核，也不需要内核知道这件事。
+const RESCAN_MS = Number(process.env.NGU_PROXY_RESCAN_MS || 5000);
+const rescan = setInterval(() => {
+  const next = refreshTargets();
+  if (next.length > sessions.size) {
+    // 有新的：起它们。失败照旧记进 `failures`，不影响已有的。
+    ensureSessions().catch(() => {});
+  }
+}, RESCAN_MS);
+// 守护定时器不该把进程吊住：stdin 关闭时我们要能退出。
+if (typeof rescan.unref === 'function') rescan.unref();
 const sessions = new Map();
 const failures = [];
 
 async function ensureSessions() {
+  // 只起还没起的：重复调用是常态（每次 tools/list 都来一遍，周期扫描也
+  // 来），而起第二个同名服务器会把第一个的管道丢在地上。
+  const pending = targets.filter((target) => !sessions.has(target.name));
+  if (pending.length === 0) return;
   const started = await Promise.allSettled(
-    targets.map(async (target) => {
+    pending.map(async (target) => {
       const session = new Session(target);
       sessions.set(target.name, session);
       await session.start();
@@ -292,7 +398,11 @@ async function ensureSessions() {
   for (let i = 0; i < started.length; i += 1) {
     if (started[i].status === 'rejected') {
       // 一个起不来不该让别的也起不来：记下来，在 tools/list 和调用时如实说。
-      failures.push(`${targets[i].name}: ${started[i].reason && started[i].reason.message}`);
+      // 失败的不留在 `sessions` 里，下一轮扫描会再试 —— 一个包刚装好、
+      // 依赖还没就位的情况是真实的。
+      sessions.delete(pending[i].name);
+      const reason = `${pending[i].name}: ${started[i].reason && started[i].reason.message}`;
+      if (!failures.includes(reason)) failures.push(reason);
     }
   }
 }
@@ -313,7 +423,8 @@ function toolList() {
       inputSchema: {
         type: 'object',
         properties: {
-          action: { type: 'string', enum: ['list', 'call'], description: 'list 列目录，call 调用' },
+          action: { type: 'string', enum: ['list', 'call', 'hijacked', 'hijack', 'restore'],
+                    description: 'list 列目录；call 调用；hijacked 看谁被劫持了；hijack 重新劫持；restore 全部还原' },
           server: { type: 'string', description: '服务器短名，如 chrome-devtools' },
           tool: { type: 'string', description: '工具原名，如 navigate_page' },
           args: { type: 'object', description: '工具参数，原样转发' },
@@ -368,6 +479,27 @@ async function handleCall(args) {
   const action = args.action || 'list';
   if (action === 'list') {
     return text(JSON.stringify(listPayload(args.server), null, 2));
+  }
+  if (action === 'hijacked') {
+    // 自己交代：改了哪些文件、原来的命令是什么。一个不肯被念出来的劫持
+    // 才需要被怀疑。
+    const mod = await loadHijack();
+    return text(JSON.stringify(mod.hijackedReport(), null, 2));
+  }
+  if (action === 'hijack') {
+    // 重新劫持一次（装完新包之后）。
+    const mod = await loadHijack();
+    const results = mod.hijackAll();
+    return text(
+      `劫持完成：${results.filter((r) => r.hijacked).length} 个包。\n` +
+        JSON.stringify(results, null, 2) +
+        "\n重启内核后生效。",
+    );
+  }
+  if (action === 'restore') {
+    const mod = await loadHijack();
+    const packs = mod.restoreAll();
+    return text(`已还原 ${packs.length} 个包：${packs.join(', ') || '(无)'}`);
   }
   const serverName = args.server || Array.from(sessions.keys())[0];
   const session = sessions.get(serverName);
@@ -489,4 +621,5 @@ function shutdown() {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 process.stdin.on('end', shutdown);
+
 
