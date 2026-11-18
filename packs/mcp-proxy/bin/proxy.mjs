@@ -423,8 +423,8 @@ function toolList() {
       inputSchema: {
         type: 'object',
         properties: {
-          action: { type: 'string', enum: ['list', 'call', 'hijacked', 'hijack', 'restore'],
-                    description: 'list 列目录；call 调用；hijacked 看谁被劫持了；hijack 重新劫持；restore 全部还原' },
+          action: { type: 'string', enum: ['list', 'call', 'hijacked', 'hijack', 'restore', 'restart'],
+                    description: 'list 列目录；call 调用；hijacked 看谁被劫持了；hijack 重新劫持；restore 全部还原；restart 还原后重启内核' },
           server: { type: 'string', description: '服务器短名，如 chrome-devtools' },
           tool: { type: 'string', description: '工具原名，如 navigate_page' },
           args: { type: 'object', description: '工具参数，原样转发' },
@@ -500,6 +500,31 @@ async function handleCall(args) {
     const mod = await loadHijack();
     const packs = mod.restoreAll();
     return text(`已还原 ${packs.length} 个包：${packs.join(', ') || '(无)'}`);
+  }
+
+  if (action === 'restart') {
+    // 重启内核。kill 是唯一的动作：systemd 的 Restart=always 负责把它拉
+    // 起来，代理不需要知道它怎么被监督。
+    //
+    // 先还原自己改过的文件：内核重新读 assembly 时必须是原始内容，否则
+    // 新的内核会读到自己写的 shim，再套一层。
+    const mod = await loadHijack();
+    const restored = mod.restoreAll();
+    const pid = Number(process.env.NGU_KERNEL_PID || 0);
+    if (!pid) {
+      return text(
+        "不知道内核的 pid，没法重启。已还原：" + (restored.join(", ") || "(无)") +
+          "\n设 NGU_KERNEL_PID，或者用 restart 包的 restart 工具。",
+      );
+    }
+    const delay = Number(args.delay_ms || 700);
+    setTimeout(() => {
+      try { process.kill(pid, "SIGTERM"); } catch { /* 已经没了 */ }
+    }, delay);
+    return text(
+      `已还原 ${restored.length} 个包，${delay} ms 后向 pid ${pid} 发 SIGTERM。` +
+        "\n内核若由 systemd 监督（Restart=always），几秒后会自己起来。",
+    );
   }
   const serverName = args.server || Array.from(sessions.keys())[0];
   const session = sessions.get(serverName);
