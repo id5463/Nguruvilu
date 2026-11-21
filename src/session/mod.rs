@@ -9,15 +9,16 @@
 //!
 //! # Layout
 //!
-//! One file per functional unit: `model` holds the records, `store` the replaceable
-//! backend trait and the service a plugin sees, `jsonl` the shipped backend,
-//! `replay` the folding. Everything this module exported before is re-exported
-//! here, so `crate::session::X` still names the same item.
+//! One file per functional unit, each reachable on its own path: `model` holds
+//! the records, `store` the replaceable backend trait and the service a plugin
+//! sees, `jsonl` the shipped backend and `replay` the folding. Everything this
+//! module exported before is re-exported here, so `crate::session::X` still
+//! names the same item.
 
-mod jsonl;
-mod model;
-mod replay;
-mod store;
+pub mod jsonl;
+pub mod model;
+pub mod replay;
+pub mod store;
 
 pub use jsonl::{JsonlStore, StoreHandle};
 pub use model::{Session, SessionSummary, SessionTotals, TurnStats};

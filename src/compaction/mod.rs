@@ -36,18 +36,19 @@
 //!
 //! # Layout
 //!
-//! One file per functional unit: `record` (the compaction and its summary message),
-//! `anchor` (finding the replaced run), `plan` (what to summarize), `summarize`
-//! (the replaceable summarizer), `apply` (rewriting a history) and `prune`
-//! (thinning old tool output). Every item this module exported before is
-//! re-exported here, so `crate::compaction::X` still names the same item.
+//! One file per functional unit, each reachable on its own path: `record` (the
+//! compaction and its summary message), `anchor` (finding the replaced run),
+//! `plan` (what to summarize), `summarize` (the replaceable summarizer), `apply`
+//! (rewriting a history) and `prune` (thinning old tool output). Every item this
+//! module exported before is re-exported here, so `crate::compaction::X` still
+//! names the same item.
 
-mod anchor;
-mod apply;
-mod plan;
-mod prune;
-mod record;
-mod summarize;
+pub mod anchor;
+pub mod apply;
+pub mod plan;
+pub mod prune;
+pub mod record;
+pub mod summarize;
 
 pub use anchor::{anchor_of, anchors_of, locate_span, ANCHOR_HEX};
 pub use apply::{apply, replay};
