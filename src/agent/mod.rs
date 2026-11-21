@@ -1,33 +1,34 @@
-//! The agent loop, one file per function.
+//! The agent loop, one file per concern.
 //!
-//! One turn is: send the history, stream the reply, dispatch any requested tools
-//! in parallel, append their results, and repeat until the model stops asking
-//! for tools.
+//! A turn sends the history, streams the reply, dispatches the tools the model
+//! asked for — in parallel — and repeats until the model asks for nothing.
 //!
-//! * `loop` — [`Agent`], [`AgentLoop`], and the process-wide installed slot.
-//! * `observer` — [`AgentObserver`], what a host renders a turn with.
-//! * `config` — [`TurnConfig`] and the frozen [`TurnSettings`] of one turn.
-//! * `hooks` — [`PluginHooks`], the seam a pack answers a turn through.
-//! * `state` — [`LoopState`], [`AgentOutcome`], and one step's result.
+//! # Layout
 //!
-//! Three rules from the spec live across these files:
+//! * [`contract`] — `AgentLoop`: what a turn runs on, and how to install one.
+//!   This is the largest seam in the kernel: replacing it changes how a turn
+//!   thinks.
+//! * [`builder`] — `Agent` and its `with_*` methods: assembling a turn.
+//! * [`run`] — running it: the request, the stream, the tools, the accounting.
+//! * [`observer`] — progress out of the loop, and where it goes.
+//! * [`config`] — where a turn's settings come from (`TurnConfig`).
+//! * [`hooks`] — what the loop asks plugins (`PluginHooks`).
+//! * [`state`] — the data a turn carries.
 //!
-//! * **Independent tool calls run concurrently.** Serial dispatch is the single
-//!   largest avoidable cost in an agent turn.
-//! * **Each turn takes one snapshot.** Settings are read once at the start of a
-//!   turn, so a hot reload landing mid-turn cannot change a request already in
-//!   flight. A turn sees changes; a turn never sees half of one.
-//! * **Timing is measured, not guessed.** Every turn reports how long the model
-//!   took versus how long tools took.
+//! Every item this module exported before is re-exported here, so
+//! `crate::agent::X` still names the same item.
 
-mod config;
-mod hooks;
-mod r#loop;
-mod observer;
-mod state;
+pub mod builder;
+pub mod config;
+pub mod contract;
+pub mod hooks;
+pub mod observer;
+pub mod run;
+pub mod state;
 
+pub use builder::Agent;
 pub use config::{StaticConfig, TurnConfig, TurnSettings};
+pub use contract::{install_loop, installed_loop, uninstall_loop, AgentLoop, BuiltinLoop};
 pub use hooks::PluginHooks;
 pub use observer::{AgentObserver, SilentObserver};
-pub use r#loop::{install_loop, installed_loop, uninstall_loop, Agent, AgentLoop, BuiltinLoop};
-pub use state::{AgentOutcome, LoopState, TurnTiming, CONTINUATION_BATCHES};
+pub use state::{AgentOutcome, LoopState, StepOutput, TurnTiming};

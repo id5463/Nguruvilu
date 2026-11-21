@@ -41,7 +41,11 @@ mod cli;
 
 use cli::args::*;
 use cli::observer::{PrettyObserver, SessionEnd};
-use cli::{events_command, mcp_import_command, plugin_command, show_injections, ui_command};
+use cli::{
+    adopt_content, apply_assembly, events_command, list_skills, mcp_import_command,
+    model_route, plugin_command, routes_command, show_assembly, show_injections, show_runtime,
+    snapshot_command, ui_command,
+};
 use cli::config::require_key;
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a coding agent. Your working directory is the \
@@ -631,7 +635,7 @@ async fn run() -> Result<()> {
     cli::export::register(nguruvilu::kernel_routes::dispatch());
     cli::config::register(nguruvilu::kernel_routes::dispatch());
     cli::pack::register(nguruvilu::kernel_routes::dispatch());
-    cli::runtime::register(nguruvilu::kernel_routes::dispatch());
+    cli::cli_routes::register(nguruvilu::kernel_routes::dispatch());
     // The judge keeps its settings in the host's cell rather than in the plugin,
     // so a settings save can re-apply the fibers without rebuilding anything.
     // The kernel's own state, published where a pack can reach and change it:

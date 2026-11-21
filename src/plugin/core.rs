@@ -1,108 +1,35 @@
-//! The plugin kernel: the [`Plugin`] contract and the machinery that runs it.
+//! 内核本身：fiber、服务、权限，以及跑它们的机器。
 //!
-//! [`Kernel`] holds the fibers, the service table, the tool table and the
-//! serials. Activation is split into stage — run `apply` and check every claim
-//! — and install, which cannot fail, so a reload builds the replacement before
-//! it tears the running version down.
+//! # 三个平面
+//!
+//! - **fiber**：一个插件实例。它的状态、它的 epoch、它贡献了什么。
+//! - **service**：一个名字 + 一个隔离域 → 一个活对象。这是"包替换一个模块"
+//!   落地的地方：后注册的 provider 覆盖先前的，旧视图立刻变 `Stale`。
+//! - **seam**：一个插件可以改写的值。拦截在这里发生，而不是在调用的每一处。
+//!
+//! # 为什么 `Kernel` 的字段是私有的
+//!
+//! 每个字段旁边有一条不变量：哪个 fiber 贡献了哪些工具（卸载要刚好撤掉它的）、
+//! 版本号什么时候动（调用方据此判断快照是否过期）。公开字段等于公开这些不变量。
 
-use crate::tools::{ConflictPolicy, ToolDef, ToolRegistry};
-use anyhow::{anyhow, Result};
-use serde_json::Value;
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
-use super::ctx::{Contributions, Disposer, PluginCtx, StateHandle};
-use super::fiber::{Epoch, Fiber, FiberState, ReleaseOutcome, Staged, StagedClaims};
-use super::realm::{RealmId, RealmMap};
-use super::seam::{Seam, ToolCallView, TurnContext};
-use super::service::{ServiceEntry, ServiceTable, ServiceView};
+use anyhow::{anyhow, Context, Result};
 
-/// A plugin.
-pub trait Plugin: Send + Sync {
-    /// Plugin name, unique per kernel.
-    fn name(&self) -> &str;
+use crate::plugin::contract::Plugin;
+use crate::plugin::ctx::{Contributions, PluginCtx, StateHandle};
+use crate::plugin::fiber::{Epoch, Fiber, FiberState, ReleaseOutcome, Staged, StagedClaims};
+use crate::plugin::realm::{RealmId, RealmMap};
+use crate::plugin::seam::{Seam, TurnContext, ToolCallView};
+use crate::plugin::service::{ServiceEntry, ServiceTable, ServiceView};
+use crate::tools::{ToolIdentity, ToolRegistry};
+use crate::ui::UiPanel;
 
-    /// Services that must exist before this plugin loads.
-    fn inject(&self) -> Vec<String> {
-        Vec::new()
-    }
+use super::model::ReloadEvent;
 
-    /// Services this plugin will provide. Advisory: it lets the kernel reject a
-    /// clash before `apply` runs, but the authoritative check happens at
-    /// install time, where a plugin may provide something it did not declare.
-    fn provide(&self) -> Vec<String> {
-        Vec::new()
-    }
-
-    /// Produce contributions. Called only when every dependency is present.
-    fn apply(&self, ctx: &PluginCtx) -> Result<Contributions>;
-
-    // ---- what a plugin may do while the agent runs ----
-    //
-    // These are methods, not a registry of named points. The difference
-    // matters: a registry means the kernel publishes a fixed list of moments
-    // and a plugin hopes one matches; a method means the kernel asks every
-    // plugin the question it already knows how to ask. Adding a moment is
-    // adding a method here — the plugin says what it can do by implementing
-    // it, and there is no name to misspell and no table to look up.
-
-    /// Text to append to this turn's system prompt.
-    ///
-    /// Called once per turn, after the base prompt and the skill catalog are
-    /// assembled, with the user's message in hand. Returning nothing is the
-    /// common case; returning text is how a retriever says "you will probably
-    /// need these skills" without the kernel knowing what a retriever is.
-    fn build_prompt(&self, _ctx: &TurnContext) -> Option<String> {
-        None
-    }
-
-    /// Which of these tool names survive for one request.
-    ///
-    /// Runs after the registry is snapshotted and before the body is built, so
-    /// a server advertising fifty-five primitives can be cut to the six a task
-    /// needs. Names rather than definitions: the registry owns the handlers, and
-    /// handing them out to be rebuilt invites a plugin to drop one by accident.
-    /// `None` leaves the table whole, and nothing is unregistered either way —
-    /// the next turn starts from the full set again.
-    fn filter_tools(&self, _ctx: &TurnContext, _names: Vec<String>) -> Option<Vec<String>> {
-        None
-    }
-
-    /// A last word before a tool call runs.
-    ///
-    /// Returning `Some(reason)` refuses the call and hands the reason back to
-    /// the model as the tool result. This is advice with teeth the other
-    /// directions do not have: it is the only place a plugin can say no.
-    fn before_tool_call(&self, _ctx: &TurnContext, _call: &ToolCallView) -> Option<String> {
-        None
-    }
-
-    /// News after a tool call returned.
-    ///
-    /// Observational, like the event bus, but typed: the output is here rather
-    /// than in a JSON blob, and a plugin that wants to count calls does not
-    /// have to parse anything.
-    fn after_tool_call(&self, _ctx: &TurnContext, _call: &ToolCallView, _ok: bool) {}
-
-    /// Change one piece of data as it passes through the loop.
-    ///
-    /// One method for every seam instead of one method per seam. A seam that
-    /// needs its own method means the kernel grows a method each time someone
-    /// wants to touch something new; a seam that is a `Slot` variant means the
-    /// plugin says which data it cares about and does not care how many kinds
-    /// exist. Adding a kind is a variant here plus one call site, not a new
-    /// trait method that every plugin has to keep implementing.
-    ///
-    /// The default returns the value untouched, so a plugin that does not care
-    /// pays one match.
-    fn intercept(&self, _ctx: &TurnContext, seam: Seam) -> Seam {
-        seam
-    }
-}
-
-/// What the kernel did during one refresh.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReloadEvent {
     /// Fiber affected.
