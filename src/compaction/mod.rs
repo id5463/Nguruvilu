@@ -36,7 +36,7 @@
 //!
 //! # Layout
 //!
-//! One file per function: `record` (the compaction and its summary message),
+//! One file per functional unit: `record` (the compaction and its summary message),
 //! `anchor` (finding the replaced run), `plan` (what to summarize), `summarize`
 //! (the replaceable summarizer), `apply` (rewriting a history) and `prune`
 //! (thinning old tool output). Every item this module exported before is
