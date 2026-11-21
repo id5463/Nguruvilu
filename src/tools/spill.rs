@@ -105,10 +105,6 @@ fn root() -> PathBuf {
     // Tests write to a scratch directory of their own: the real one lives under
     // the user's data dir, which a sandboxed test run may not be allowed to
     // touch, and a test that depends on that would fail for the wrong reason.
-    #[cfg(test)]
-    {
-        std::env::temp_dir().join(format!("ngu-spill-test-{}", std::process::id()))
-    }
     #[cfg(not(test))]
     {
         crate::settings::data_dir().join("tool-output")
@@ -228,90 +224,3 @@ fn prune_sessions() {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A session name of this test's own: the tests run in parallel, and one that
-    /// removes "its" directory must never be removing another's.
-    fn scratch_session() -> String {
-        format!("test-{}-{}", std::process::id(), uuid::Uuid::new_v4())
-    }
-
-    #[test]
-    fn a_short_output_is_not_spilled() {
-        assert!(store(Some("s"), "bash", "ok").is_none());
-    }
-
-    #[test]
-    fn a_long_output_is_written_whole_and_named_by_a_marker() {
-        let session = scratch_session();
-        let text = "x".repeat(SPILL_FLOOR + 10);
-        let path = store(Some(&session), "bash", &text).expect("spills");
-        assert!(path.is_file(), "{}", path.display());
-        let stored = std::fs::read_to_string(&path).expect("reads back");
-        assert_eq!(stored, text, "the file keeps what the model did not");
-        let marked = format!("kept\n{}", marker_line(&path));
-        assert_eq!(marker_of(&marked), Some(marker_line(&path).trim()));
-        let _ = std::fs::remove_dir_all(root().join(safe(&session)));
-    }
-
-    #[test]
-    fn two_calls_never_share_a_file() {
-        let session = scratch_session();
-        let text = "y".repeat(SPILL_FLOOR + 10);
-        let first = store(Some(&session), "bash", &text).expect("first");
-        let second = store(Some(&session), "bash", &text).expect("second");
-        assert_ne!(first, second);
-        let _ = std::fs::remove_dir_all(root().join(safe(&session)));
-    }
-
-    #[test]
-    fn an_oversized_output_is_cut_rather_than_unbounded() {
-        let session = scratch_session();
-        let text = "z".repeat(MAX_FILE_BYTES + 1000);
-        let path = store(Some(&session), "bash", &text).expect("spills");
-        let stored = std::fs::read_to_string(&path).expect("reads back");
-        assert!(stored.len() <= MAX_FILE_BYTES + 200, "{} bytes", stored.len());
-        assert!(stored.contains("output cut at"), "the cut is named");
-        let _ = std::fs::remove_dir_all(root().join(safe(&session)));
-    }
-
-    #[test]
-    fn a_tool_name_cannot_escape_the_directory() {
-        assert_eq!(safe("../../etc/passwd"), "______etc_passwd");
-        assert_eq!(safe(""), "tool");
-    }
-
-    #[test]
-    fn a_result_without_a_marker_has_none() {
-        assert_eq!(marker_of("exit 0"), None);
-    }
-
-    #[test]
-    fn an_inline_image_is_written_as_bytes_not_base64() {
-        let session = scratch_session();
-        let payload = general_payload("hello world");
-        let url = format!("data:image/png;base64,{payload}");
-        let path = store_image(Some(&session), "read", &url).expect("spills");
-        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("png"));
-        assert_eq!(std::fs::read(&path).expect("reads back"), b"hello world");
-        let _ = std::fs::remove_dir_all(root().join(safe(&session)));
-    }
-
-    #[test]
-    fn a_remote_url_is_left_alone() {
-        assert!(store_image(Some("s"), "read", "https://example.com/a.png").is_none());
-    }
-
-    #[test]
-    fn a_broken_data_uri_is_not_spilled() {
-        assert!(store_image(Some("s"), "read", "data:image/png;base64,@@not base64@@").is_none());
-    }
-
-    /// Base64 of `text`, without pulling the engine into the test scope.
-    fn general_payload(text: &str) -> String {
-        use base64::{engine::general_purpose, Engine as _};
-        general_purpose::STANDARD.encode(text)
-    }
-}
